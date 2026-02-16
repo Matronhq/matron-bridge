@@ -1,0 +1,1634 @@
+import 'dotenv/config';
+import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin } from 'matrix-bot-sdk';
+import { spawn } from 'child_process';
+import { createServer } from 'http';
+import { createHmac } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import os from 'os';
+
+// --- Config ---
+
+const MATRIX_HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL || 'http://localhost:6167';
+const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN;
+if (!MATRIX_ACCESS_TOKEN) {
+  console.error('MATRIX_ACCESS_TOKEN is required in .env');
+  process.exit(1);
+}
+
+const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
+  .split(',')
+  .map(id => id.trim())
+  .filter(Boolean);
+
+const DEFAULT_WORKDIR = process.env.DEFAULT_WORKDIR || process.cwd();
+const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
+const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
+const DEBUG = process.env.DEBUG === '1';
+const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+const HMAC_SECRET = process.env.HMAC_SECRET || '';
+const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
+const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
+
+// Plan file patterns — files that get a "view in browser" link
+const PLAN_FILE_PATTERNS = [
+  /plan/i, /todo/i, /task/i, /readme/i, /\.md$/i, /checklist/i, /notes/i, /summary/i,
+];
+
+function generateFileLink(filePath) {
+  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
+  const payload = Buffer.from(JSON.stringify({ path: filePath, exp })).toString('base64url');
+  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
+  return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
+}
+
+function isPlanFile(filePath) {
+  const basename = path.basename(filePath);
+  return PLAN_FILE_PATTERNS.some(p => p.test(basename));
+}
+
+function debug(...args) {
+  if (DEBUG) console.log('[DEBUG]', ...args);
+}
+
+// --- Session Persistence ---
+
+function loadPersistedSessions() {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf-8'));
+    }
+  } catch (e) {
+    console.error('Failed to load sessions file:', e.message);
+  }
+  return {};
+}
+
+function savePersistedSessions(data) {
+  try {
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('Failed to save sessions file:', e.message);
+  }
+}
+
+function persistSession(roomId, sessionId, workdir) {
+  const data = loadPersistedSessions();
+  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now() };
+  savePersistedSessions(data);
+}
+
+function getPersistedSession(roomId) {
+  const data = loadPersistedSessions();
+  return data[String(roomId)] || null;
+}
+
+// --- Session Manager ---
+
+const sessions = new Map(); // roomId -> session
+
+function createSession(roomId, workdir, resumeSessionId) {
+  const cwd = workdir || DEFAULT_WORKDIR;
+  const args = [
+    '--print',
+    '--verbose',
+    '--input-format', 'stream-json',
+    '--output-format', 'stream-json',
+    '--dangerously-skip-permissions',
+    '--disallowed-tools', 'AskUserQuestion',
+    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-matrix-user__ask_matrix_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.',
+    '--include-partial-messages',
+    '--mcp-config', path.join(__dirname, 'mcp-config.json'),
+  ];
+  if (resumeSessionId) {
+    args.push('--resume', resumeSessionId);
+  }
+
+  debug(`Spawning claude with args: ${args.join(' ')}`);
+  debug(`Working directory: ${cwd}`);
+
+  const proc = spawn('claude', args, {
+    cwd,
+    env: {
+      ...process.env,
+      CLAUDECODE: '',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  const session = {
+    proc,
+    roomId,
+    workdir: cwd,
+    responseBuffer: '',
+    sendCallback: null,
+    pendingPlan: null,
+    pendingPlanDenialId: null,
+    sendHtml: null,
+    showWorking: false,
+    alive: true,
+    startedAt: Date.now(),
+    restartCount: 0,
+    claudeSessionId: resumeSessionId || null,
+    busy: false,
+    lineBuf: '',
+    toolCalls: [], // collected tool indicators for this turn
+    waitingForAnswer: null,
+    // Captured from system init event
+    initData: null,
+    // Accumulated usage stats
+    totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
+    turnCount: 0,
+  };
+
+  // Parse newline-delimited JSON from stdout
+  proc.stdout.on('data', (chunk) => {
+    session.lineBuf += chunk.toString();
+    const lines = session.lineBuf.split('\n');
+    // Keep the last (possibly incomplete) line in the buffer
+    session.lineBuf = lines.pop();
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      let event;
+      try {
+        event = JSON.parse(trimmed);
+      } catch (e) {
+        debug('Failed to parse JSON line:', trimmed);
+        continue;
+      }
+
+      debug('Event:', JSON.stringify(event));
+      handleClaudeEvent(session, event);
+    }
+  });
+
+  proc.stderr.on('data', (chunk) => {
+    const text = chunk.toString();
+    debug('stderr:', text);
+  });
+
+  proc.on('close', (exitCode) => {
+    session.alive = false;
+    debug(`Claude process exited with code ${exitCode}`);
+
+    // Flush any remaining response
+    flushResponse(session);
+
+    if (sessions.get(roomId) === session) {
+      if (exitCode !== 0 && session.restartCount < 3) {
+        const restarted = createSession(roomId, cwd, session.claudeSessionId);
+        restarted.restartCount = session.restartCount + 1;
+        restarted.sendCallback = session.sendCallback;
+        sessions.set(roomId, restarted);
+        if (restarted.sendCallback) {
+          restarted.sendCallback(
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
+          );
+        }
+      } else {
+        sessions.delete(roomId);
+        if (session.sendCallback) {
+          session.sendCallback(`[Session ended (exit ${exitCode})]`);
+        }
+      }
+    }
+  });
+
+  session.resetTimeout = () => {}; // no-op, kept for call-site compatibility
+
+  sessions.set(roomId, session);
+  return session;
+}
+
+// --- Structured Question Handling ---
+
+function parseAskUserQuestion(input) {
+  // Handle structured questions JSON
+  if (input.questions && Array.isArray(input.questions)) {
+    return { questions: input.questions };
+  }
+
+  // Try parsing the question field as JSON
+  const questionText = input.question || input.text || '';
+  try {
+    const parsed = JSON.parse(questionText);
+    if (parsed.questions && Array.isArray(parsed.questions)) {
+      return { questions: parsed.questions };
+    }
+  } catch {}
+
+  // Simple text question
+  return {
+    questions: [{
+      question: questionText || JSON.stringify(input),
+      header: null,
+      options: [],
+      multiSelect: false,
+    }]
+  };
+}
+
+function formatQuestion(q, index, total) {
+  let msg = '';
+  const prefix = total > 1 ? `--- Question ${index + 1}/${total} ---` : '--- Question ---';
+
+  if (q.header) {
+    msg += `${prefix} — ${q.header}\n\n`;
+  } else {
+    msg += `${prefix}\n\n`;
+  }
+
+  msg += q.question + '\n';
+
+  if (q.options && q.options.length > 0) {
+    msg += '\n';
+    q.options.forEach((opt, i) => {
+      const letter = String.fromCharCode(65 + i); // A, B, C...
+      const label = opt.label || opt;
+      const desc = opt.description || '';
+      msg += `${letter}. ${typeof label === 'string' ? label : String(label)}\n`;
+      if (desc) {
+        msg += `   ${desc}\n`;
+      }
+    });
+    msg += `\nReply with a letter (A, B, C…) or number (1, 2, 3…), or type a custom answer.`;
+  }
+
+  return msg;
+}
+
+function formatQuestionHtml(q, index, total) {
+  let msg = '';
+  const prefix = total > 1 ? `❓ Question ${index + 1}/${total}` : '❓';
+
+  if (q.header) {
+    msg += `${prefix} — <b>${escapeHtml(q.header)}</b>\n\n`;
+  } else {
+    msg += `${prefix}\n\n`;
+  }
+
+  msg += escapeHtml(q.question) + '\n';
+
+  if (q.options && q.options.length > 0) {
+    msg += '\n';
+    q.options.forEach((opt, i) => {
+      const letter = String.fromCharCode(65 + i);
+      const label = opt.label || opt;
+      const desc = opt.description || '';
+      msg += `<b>${letter}.</b> ${escapeHtml(typeof label === 'string' ? label : String(label))}\n`;
+      if (desc) {
+        msg += `   <i>${escapeHtml(desc)}</i>\n`;
+      }
+    });
+    msg += `\nReply with a letter (A, B, C…) or number (1, 2, 3…), or type a custom answer.`;
+  }
+
+  return msg;
+}
+
+function sendAllQuestions(session) {
+  const questions = session.pendingQuestions;
+  if (!questions || questions.length === 0) return;
+
+  const total = questions.length;
+  const plainText = questions.map((q, i) => formatQuestion(q, i, total)).join('\n\n');
+  const html = questions.map((q, i) => formatQuestionHtml(q, i, total)).join('\n\n');
+
+  if (session.sendHtml) {
+    session.sendHtml(plainText, html);
+  } else if (session.sendCallback) {
+    session.sendCallback(plainText);
+  }
+}
+
+function submitAnswer(session, answerText) {
+  const mode = session.waitingForAnswer;
+  session.waitingForAnswer = null;
+  session.pendingQuestions = null;
+  session.currentQuestionIndex = 0;
+  session.questionAnswers = [];
+
+  if (typeof mode === 'string' && mode.startsWith('mcp:')) {
+    // MCP tool question — store the answer so the MCP server can poll for it
+    const questionId = mode.slice(4);
+    const q = pendingMcpQuestions.get(questionId);
+    if (q) {
+      q.answered = true;
+      q.answer = answerText;
+      debug(`MCP question ${questionId} answered: ${answerText}`);
+    }
+    // Start typing — Claude will continue once the MCP tool returns
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
+  } else if (mode === 'text-reply') {
+    // AskUserQuestion was auto-rejected — send the answer as a regular user message
+    sendTextToSession(session, answerText);
+  } else {
+    // Normal tool_result flow
+    session.busy = true;
+    const jsonMsg = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          tool_use_id: mode,
+          type: 'tool_result',
+          content: answerText,
+        }]
+      }
+    }) + '\n';
+    debug('Sending answer to stdin:', jsonMsg.trim());
+    session.proc.stdin.write(jsonMsg);
+    if (session.resetTimeout) session.resetTimeout();
+
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
+  }
+}
+
+function resolveQuestionAnswer(session, text) {
+  const q = session.pendingQuestions[session.currentQuestionIndex];
+  const trimmed = text.trim();
+
+  if (q.options && q.options.length > 0) {
+    // Try letter (A, B, C...)
+    const upper = trimmed.toUpperCase();
+    if (upper.length === 1 && upper >= 'A' && upper <= 'Z') {
+      const idx = upper.charCodeAt(0) - 65;
+      if (idx < q.options.length) {
+        const opt = q.options[idx];
+        return typeof opt.label === 'string' ? opt.label : String(opt);
+      }
+    }
+
+    // Try number (1, 2, 3...)
+    const num = parseInt(trimmed, 10);
+    if (!isNaN(num) && num >= 1 && num <= q.options.length) {
+      const opt = q.options[num - 1];
+      return typeof opt.label === 'string' ? opt.label : String(opt);
+    }
+  }
+
+  // Custom text answer
+  return trimmed;
+}
+
+// --- Claude Event Handler ---
+
+function handleClaudeEvent(session, event) {
+  // Capture session ID from any event that carries it
+  if (event.session_id && !session.claudeSessionId) {
+    session.claudeSessionId = event.session_id;
+    persistSession(session.roomId, session.claudeSessionId, session.workdir);
+    console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
+  }
+
+  switch (event.type) {
+    case 'assistant': {
+      const content = event.message?.content;
+      if (!Array.isArray(content)) break;
+
+      const isPartial = event.message?.stop_reason === null;
+      const messageId = event.message?.id;
+
+      const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
+      if (textParts.length > 0) {
+        if (isPartial && messageId && session._lastAssistantMsgId === messageId) {
+          session.responseBuffer = textParts.join('');
+        } else if (!isPartial && messageId && session._lastAssistantMsgId === messageId) {
+          session.responseBuffer = textParts.join('');
+        } else {
+          if (session.responseBuffer.trim() && !session.waitingForAnswer) {
+            flushResponse(session);
+          }
+          session.responseBuffer = session.waitingForAnswer ? '' : textParts.join('');
+        }
+        session._lastAssistantMsgId = messageId;
+      }
+
+      for (const block of content) {
+        if (block.type !== 'tool_use') continue;
+
+        if (session.responseBuffer.trim() && !session.waitingForAnswer) {
+          flushResponse(session);
+        }
+
+        const toolName = block.name;
+        const input = block.input || {};
+
+        if (toolName === 'AskUserQuestion') {
+          debug(`AskUserQuestion tool_use block.id=${block.id}, waitingForAnswer=${session.waitingForAnswer}, input keys=${Object.keys(input).join(',')}`);
+          if (session.waitingForAnswer) { debug('Skipping AskUserQuestion — already waiting'); continue; }
+
+          const parsed = parseAskUserQuestion(input);
+          if (!parsed.questions.length || !parsed.questions[0].question) continue;
+
+          if (session.typingInterval) {
+            clearInterval(session.typingInterval);
+            session.typingInterval = null;
+          }
+
+          session.responseBuffer = '';
+
+          session.waitingForAnswer = 'text-reply';
+          session.pendingQuestions = parsed.questions;
+          session.currentQuestionIndex = 0;
+          session.questionAnswers = [];
+
+          if (session.sendCallback) {
+            sendAllQuestions(session);
+          }
+        } else {
+          // Collect tool indicator
+          let indicator = `🔧 ${toolName}`;
+          let isKeyEvent = false;
+
+          if (toolName === 'Bash' && input.command) {
+            const cmd = input.command.length > 100
+              ? input.command.slice(0, 100) + '…'
+              : input.command;
+            indicator = `🔧 \`${cmd}\``;
+          } else if (toolName === 'Read' && input.file_path) {
+            indicator = `📖 ${input.file_path}`;
+          } else if (toolName === 'Write' && input.file_path) {
+            indicator = `✏️ Writing ${input.file_path}`;
+            isKeyEvent = true;
+            if (isPlanFile(input.file_path)) {
+              const absPath = path.isAbsolute(input.file_path)
+                ? input.file_path
+                : path.join(session.workdir, input.file_path);
+              const link = generateFileLink(absPath);
+              if (link) indicator += `\n🔗 View in browser (expires ${LINK_EXPIRY_MS / 60000}min): ${link}`;
+            }
+          } else if (toolName === 'Edit' && input.file_path) {
+            indicator = `✏️ Editing ${input.file_path}`;
+            isKeyEvent = true;
+            if (isPlanFile(input.file_path)) {
+              const absPath = path.isAbsolute(input.file_path)
+                ? input.file_path
+                : path.join(session.workdir, input.file_path);
+              const link = generateFileLink(absPath);
+              if (link) indicator += `\n🔗 View in browser (expires ${LINK_EXPIRY_MS / 60000}min): ${link}`;
+            }
+          } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
+            indicator = `🔍 ${input.pattern}`;
+          } else if (toolName === 'WebSearch' && input.query) {
+            indicator = `🌐 ${input.query}`;
+            isKeyEvent = true;
+          } else if (toolName === 'WebFetch' && input.url) {
+            indicator = `🌐 ${input.url}`;
+          } else if (toolName === 'Task') {
+            indicator = `🔀 Subtask: ${(input.description || input.prompt || '').slice(0, 80)}`;
+            isKeyEvent = true;
+          } else if (toolName === 'TodoWrite') {
+            const todos = (input.todos || []).map(t => {
+              const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
+              return `${icon} ${t.content || t.text || ''}`;
+            }).join('\n');
+            indicator = `📋 Todos:\n${todos}`;
+            isKeyEvent = true;
+          }
+
+          session.toolCalls.push(indicator);
+
+          if (isKeyEvent && session.sendCallback) {
+            session.sendCallback(indicator);
+          }
+        }
+      }
+      break;
+    }
+
+    case 'result': {
+      // Accumulate usage stats
+      session.turnCount++;
+      const u = event.usage;
+      if (u) {
+        session.totalUsage.input_tokens += (u.input_tokens || 0);
+        session.totalUsage.output_tokens += (u.output_tokens || 0);
+        session.totalUsage.cache_read += (u.cache_read_input_tokens || 0);
+        session.totalUsage.cache_create += (u.cache_creation_input_tokens || 0);
+      }
+      if (typeof event.total_cost_usd === 'number') {
+        session.totalUsage.cost_usd = event.total_cost_usd;
+      }
+
+      // Send collected tool calls as one message before the result (only if showWorking)
+      if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
+        const toolSummary = session.toolCalls.join('\n');
+        const chunks = splitMessage(toolSummary);
+        for (const chunk of chunks) {
+          session.sendCallback(chunk);
+        }
+      }
+      session.toolCalls = [];
+
+      if (!session.waitingForAnswer) {
+        const text = extractTextContent(event);
+        if (text) {
+          session.responseBuffer = text;
+        }
+        flushResponse(session);
+      } else {
+        session.responseBuffer = '';
+      }
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+      }
+
+      // Check for ExitPlanMode permission denial — present Build prompt
+      const denials = event.permission_denials || [];
+      const planDenial = denials.find(d => d.tool_name === 'ExitPlanMode');
+      if (planDenial && session.sendCallback) {
+        const planText = planDenial.tool_input?.plan || '';
+        session.pendingPlan = planText;
+        session.pendingPlanDenialId = planDenial.tool_use_id;
+
+        const planPreview = planText.length > 500
+          ? planText.slice(0, 500) + '…'
+          : planText;
+
+        session.sendCallback(
+          `--- Plan Ready ---\n\n${planPreview}\n\nReply "build" to execute, or send feedback.`
+        );
+      }
+
+      // Send any queued messages now that Claude is free
+      if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
+        const queued = session.queuedMessages;
+        session.queuedMessages = null;
+        if (session.sendCallback) {
+          session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}...`);
+        }
+        flushQueue(session, queued);
+      }
+      break;
+    }
+
+    case 'system': {
+      if (event.subtype === 'init') {
+        session.initData = event;
+        debug('Captured init data: model=%s, tools=%d, mcp=%d',
+          event.model, event.tools?.length, event.mcp_servers?.length);
+      } else if (event.subtype === 'compact' || event.subtype === 'context_compaction') {
+        if (session.sendCallback) {
+          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
+        }
+      } else if (event.subtype === 'task_notification') {
+        const status = event.status === 'completed' ? '✅' : '❌';
+        if (session.sendCallback) {
+          session.sendCallback(`${status} Task: ${event.summary || 'unknown'}`);
+        }
+      }
+      break;
+    }
+
+    case 'stream_event': {
+      const evt = event.event;
+      if (evt?.type === 'message_delta' && evt?.context_management?.applied_edits?.length > 0) {
+        if (session.sendCallback) {
+          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
+        }
+      }
+      break;
+    }
+
+    case 'user': {
+      const userContent = event.message?.content;
+      if (Array.isArray(userContent)) {
+        for (const block of userContent) {
+          if (block.type === 'tool_result' && block.is_error) {
+            debug(`Auto tool_result: tool_use_id=${block.tool_use_id}, content=${JSON.stringify(block.content).slice(0, 100)}`);
+          }
+        }
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// --- Text Helpers ---
+
+function extractTextContent(event) {
+  if (event.type === 'result' && typeof event.result === 'string') {
+    return event.result;
+  }
+
+  const content = event.message?.content || event.content;
+  if (!content) return '';
+
+  if (typeof content === 'string') return content;
+
+  if (Array.isArray(content)) {
+    return content
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('');
+  }
+
+  return '';
+}
+
+function flushResponse(session) {
+  const text = session.responseBuffer.trim();
+  session.responseBuffer = '';
+
+  if (!text) return;
+
+  if (session.sendCallback) {
+    const chunks = splitMessage(text);
+    for (const chunk of chunks) {
+      session.sendCallback(chunk);
+    }
+  }
+}
+
+function sendToSession(session, contentBlocks) {
+  if (!session.alive) return false;
+
+  session.responseBuffer = '';
+  session.toolCalls = [];
+  session.busy = true;
+
+  if (session.typingInterval) clearInterval(session.typingInterval);
+  session.typingInterval = startTyping(session.roomId);
+
+  const jsonMsg = JSON.stringify({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: contentBlocks
+    }
+  }) + '\n';
+  debug('Sending to stdin:', jsonMsg.length > 1000
+    ? jsonMsg.slice(0, 500) + `... [${jsonMsg.length} chars total]`
+    : jsonMsg.trim());
+  session.proc.stdin.write(jsonMsg);
+  if (session.resetTimeout) session.resetTimeout();
+  return true;
+}
+
+function sendTextToSession(session, text) {
+  return sendToSession(session, [{ type: 'text', text }]);
+}
+
+function flushQueue(session, queued) {
+  const merged = [];
+  let textAccum = [];
+
+  function flushText() {
+    if (textAccum.length === 0) return;
+    const combined = textAccum.map(blocks =>
+      blocks.map(b => b.text).join('\n')
+    ).join('\n\n');
+    merged.push({ type: 'text', text: combined });
+    textAccum = [];
+  }
+
+  for (const blocks of queued) {
+    const isTextOnly = blocks.every(b => b.type === 'text');
+    if (isTextOnly) {
+      textAccum.push(blocks);
+    } else {
+      flushText();
+      merged.push(...blocks);
+    }
+  }
+  flushText();
+
+  if (merged.length > 0) {
+    sendToSession(session, merged);
+  }
+}
+
+function splitMessage(text) {
+  if (text.length <= MAX_MSG_LENGTH) return [text];
+
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= MAX_MSG_LENGTH) {
+      chunks.push(remaining);
+      break;
+    }
+
+    let splitAt = remaining.lastIndexOf('\n', MAX_MSG_LENGTH);
+    if (splitAt < MAX_MSG_LENGTH * 0.5) {
+      splitAt = remaining.lastIndexOf(' ', MAX_MSG_LENGTH);
+    }
+    if (splitAt < MAX_MSG_LENGTH * 0.5) {
+      splitAt = MAX_MSG_LENGTH;
+    }
+
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+
+  return chunks;
+}
+
+// --- Auth helper ---
+
+function isAllowed(userId) {
+  if (ALLOWED_USER_IDS.length === 0) return true;
+  return ALLOWED_USER_IDS.includes(String(userId));
+}
+
+// --- Markdown to HTML ---
+
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function markdownToHtml(text) {
+  let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
+
+  const parts = processed.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+
+  return parts.map((part, i) => {
+    if (i % 2 === 1) {
+      if (part.startsWith('```')) {
+        const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
+        return `<pre>${escapeHtml(inner)}</pre>`;
+      }
+      return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
+    }
+
+    let html = escapeHtml(part);
+
+    html = html.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');
+    html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+    html = html.replace(/__(.+?)__/g, '<b>$1</b>');
+    html = html.replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, '<i>$1</i>');
+    html = html.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
+    html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
+
+    html = html.replace(/‹b›‹code›/g, '<b><code>');
+    html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
+
+    return html;
+  }).join('');
+}
+
+// --- File Helpers ---
+
+function deduplicateFilename(dir, filename) {
+  let target = path.join(dir, filename);
+  if (!fs.existsSync(target)) return target;
+
+  const ext = path.extname(filename);
+  const base = path.basename(filename, ext);
+  let i = 1;
+  while (fs.existsSync(target)) {
+    target = path.join(dir, `${base}-${i}${ext}`);
+    i++;
+  }
+  return target;
+}
+
+// --- Matrix Typing Indicator ---
+
+function startTyping(roomId) {
+  const send = () => client.setTyping(roomId, true, 30000).catch(() => {});
+  send();
+  // Refresh every 25s (Matrix typing expires after timeout)
+  return setInterval(send, 25000);
+}
+
+// --- Matrix Client ---
+
+const storage = new SimpleFsStorageProvider(path.join(os.homedir(), '.claude-matrix-bot-state.json'));
+const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, storage);
+AutojoinRoomsMixin.setupOnClient(client);
+
+let botUserId;
+
+// --- Send to Matrix Room ---
+
+async function sendToRoom(roomId, text, html) {
+  const content = {
+    msgtype: 'm.text',
+    body: text,
+  };
+  if (html) {
+    content.format = 'org.matrix.custom.html';
+    content.formatted_body = html;
+  }
+  try {
+    await client.sendMessage(roomId, content);
+  } catch (e) {
+    console.error('Failed to send message:', e.message);
+  }
+}
+
+// --- Media Handling ---
+
+async function downloadMatrixFile(mxcUrl) {
+  const content = await client.downloadContent(mxcUrl);
+  return Buffer.from(content.data);
+}
+
+async function buildMediaContentBlocks(event, session) {
+  const blocks = [];
+  const content = event.content;
+  const mxcUrl = content.url;
+
+  if (!mxcUrl) return blocks;
+
+  const buffer = await downloadMatrixFile(mxcUrl);
+  const fileName = content.body || 'file';
+  const mime = content.info?.mimetype || 'application/octet-stream';
+
+  if (content.msgtype === 'm.image') {
+    blocks.push({
+      type: 'image',
+      source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
+    });
+  } else {
+    // Save file to workdir
+    const savePath = deduplicateFilename(session.workdir, fileName);
+    fs.writeFileSync(savePath, buffer);
+    blocks.push({ type: 'text', text: `File saved to ${savePath}` });
+
+    if (mime === 'application/pdf') {
+      blocks.push({
+        type: 'document',
+        source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') }
+      });
+    } else if (mime.startsWith('image/')) {
+      blocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
+      });
+    } else if (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/csv'].includes(mime)) {
+      blocks.push({ type: 'text', text: `Contents of ${fileName}:\n${buffer.toString('utf-8')}` });
+    } else {
+      blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
+    }
+  }
+
+  // Caption: for m.file events, the filename differs from body when there's a caption
+  if (content.msgtype === 'm.file' && content.filename !== content.body) {
+    blocks.push({ type: 'text', text: content.body });
+  }
+
+  return blocks;
+}
+
+// --- Command Handler ---
+
+async function handleCommand(roomId, text, sendReply, sendHtml) {
+  const parts = text.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  switch (cmd) {
+    case '!start': {
+      const existing = sessions.get(roomId);
+      if (existing && existing.alive) {
+        await sendReply(
+          `Session already active (workdir: ${existing.workdir}). Send !stop first.`
+        );
+        return;
+      }
+
+      const arg = parts[1];
+      const forceFresh = arg === 'now' || arg === 'fresh';
+      const explicitWorkdir = arg && !forceFresh ? arg : null;
+
+      if (!forceFresh && !explicitWorkdir) {
+        const prev = getPersistedSession(roomId);
+        if (prev && prev.sessionId) {
+          const ago = Math.round((Date.now() - prev.lastUsed) / 60000);
+          await sendReply(
+            `Previous session found:\n` +
+            `  Session: ${prev.sessionId.slice(0, 8)}...\n` +
+            `  Workdir: ${prev.workdir}\n` +
+            `  Last used: ${ago} min ago\n\n` +
+            `Reply "resume" to continue, or "!start now" for a fresh session.`
+          );
+          return;
+        }
+      }
+
+      const workdir = explicitWorkdir || DEFAULT_WORKDIR;
+      const session = createSession(roomId, workdir);
+      session.sendCallback = sendReply;
+      session.sendHtml = sendHtml;
+      await sendReply(
+        `Session started.\nWorkdir: ${workdir}\nTimeout: ${SESSION_TIMEOUT / 1000}s\n\nSend any message to interact with Claude Code.`
+      );
+      break;
+    }
+
+    case '!stop': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session.');
+        return;
+      }
+      session.proc.kill();
+      sessions.delete(roomId);
+      await sendReply('Session stopped.');
+      break;
+    }
+
+    case '!restart': {
+      const existing = sessions.get(roomId);
+      if (!existing || !existing.alive) {
+        await sendReply('No active session. Use !start to begin.');
+        return;
+      }
+      const restartSessionId = existing.claudeSessionId;
+      const restartWorkdir = existing.workdir;
+      sessions.delete(roomId);
+      existing.proc.kill();
+      await sendReply('🔄 Restarting session...');
+      const restarted = createSession(roomId, restartWorkdir, restartSessionId);
+      restarted.sendCallback = sendReply;
+      restarted.sendHtml = sendHtml;
+      await sendReply(
+        `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}`
+      );
+      break;
+    }
+
+    case '!resume': {
+      const existing = sessions.get(roomId);
+      if (existing && existing.alive) {
+        await sendReply(
+          `Session already active (workdir: ${existing.workdir}). Send !stop first.`
+        );
+        return;
+      }
+
+      const prev = getPersistedSession(roomId);
+      const resumeArg = parts[1]?.replace(/\.+$/, '') || undefined;
+
+      let resumeSessionId = prev?.sessionId;
+      let resumeWorkdir = prev?.workdir || DEFAULT_WORKDIR;
+
+      if (resumeArg) {
+        const encodedPath = resumeWorkdir.replace(/\//g, '-');
+        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+
+        if (!fs.existsSync(projectDir)) {
+          await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
+          return;
+        }
+
+        const files = fs.readdirSync(projectDir)
+          .filter(f => f.endsWith('.jsonl'))
+          .map(f => f.replace('.jsonl', ''))
+          .sort((a, b) => {
+            const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
+            const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
+            return sb.mtimeMs - sa.mtimeMs;
+          });
+
+        const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
+        if (!isNaN(num) && num >= 1 && num <= files.length) {
+          resumeSessionId = files[num - 1];
+        } else {
+          const match = files.find(f => f.startsWith(resumeArg));
+          if (match) {
+            resumeSessionId = match;
+          } else {
+            await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
+            return;
+          }
+        }
+      }
+
+      if (!resumeSessionId) {
+        await sendReply(
+          'No previous session found to resume. Send !start to begin a new session.'
+        );
+        return;
+      }
+
+      const session = createSession(roomId, resumeWorkdir, resumeSessionId);
+      session.sendCallback = sendReply;
+      session.sendHtml = sendHtml;
+      await sendReply(
+        `Resuming session ${resumeSessionId.slice(0, 8)}...\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`
+      );
+      break;
+    }
+
+    case '!workdir': {
+      const newDir = parts.slice(1).join(' ');
+      if (!newDir) {
+        const session = sessions.get(roomId);
+        const current = session?.workdir || DEFAULT_WORKDIR;
+        await sendReply(`Current workdir: ${current}\n\nUsage: !workdir <path>`);
+        return;
+      }
+
+      const resolved = path.resolve(newDir);
+
+      try {
+        const stat = fs.statSync(resolved);
+        if (!stat.isDirectory()) {
+          await sendReply(`Not a directory: ${resolved}`);
+          return;
+        }
+      } catch {
+        await sendReply(`Directory not accessible: ${resolved}`);
+        return;
+      }
+
+      const existing = sessions.get(roomId);
+      if (existing && existing.alive) {
+        existing.proc.kill();
+        sessions.delete(roomId);
+      }
+
+      const session = createSession(roomId, resolved);
+      session.sendCallback = sendReply;
+      session.sendHtml = sendHtml;
+      await sendReply(
+        `Session started in new workdir.\nWorkdir: ${resolved}\nTimeout: ${SESSION_TIMEOUT / 1000}s`
+      );
+      break;
+    }
+
+    case '!status': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Send !start to begin.');
+        return;
+      }
+      const uptime = Math.round((Date.now() - session.startedAt) / 1000);
+      await sendReply(
+        `Session active\n` +
+          `Workdir: ${session.workdir}\n` +
+          `Session ID: ${session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '...' : '(pending)'}\n` +
+          `Uptime: ${uptime}s\n` +
+          `Restarts: ${session.restartCount}/3\n` +
+          `Busy: ${session.busy ? 'yes' : 'no'}`
+      );
+      break;
+    }
+
+    case '!show':
+    case '!show_working':
+    case '!working': {
+      const session = sessions.get(roomId);
+      if (!session) {
+        await sendReply('No active session.');
+        break;
+      }
+      session.showWorking = !session.showWorking;
+      await sendReply(`Tool call visibility: ${session.showWorking ? 'ON — will show working' : 'OFF — hidden'}`);
+      break;
+    }
+
+    case '!sessions': {
+      const currentSession = sessions.get(roomId);
+      const prev = getPersistedSession(roomId);
+      const workdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
+
+      const encodedPath = workdir.replace(/\//g, '-');
+      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+
+      if (!fs.existsSync(projectDir)) {
+        await sendReply('No sessions found for this workdir.');
+        break;
+      }
+
+      const files = fs.readdirSync(projectDir)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => {
+          const sessionId = f.replace('.jsonl', '');
+          const filePath = path.join(projectDir, f);
+          const stat = fs.statSync(filePath);
+
+          let summary = '';
+          try {
+            const content = fs.readFileSync(filePath, 'utf-8');
+            for (const line of content.split('\n')) {
+              if (!line.trim()) continue;
+              const record = JSON.parse(line);
+              if (record.type === 'user' && record.message) {
+                const msg = record.message;
+                const text = typeof msg.content === 'string'
+                  ? msg.content
+                  : Array.isArray(msg.content)
+                    ? msg.content.find(b => b.type === 'text')?.text || ''
+                    : '';
+                if (text && !text.startsWith('<local-command') && !text.startsWith('<command-name>')) {
+                  summary = text.replace(/<[^>]+>/g, '').trim().slice(0, 80);
+                  if (text.trim().length > 80) summary += '…';
+                  break;
+                }
+              }
+            }
+          } catch {}
+
+          return { sessionId, modified: stat.mtimeMs, summary };
+        })
+        .sort((a, b) => b.modified - a.modified);
+
+      if (files.length === 0) {
+        await sendReply('No sessions found.');
+        break;
+      }
+
+      const activeId = currentSession?.claudeSessionId;
+      const list = files.slice(0, 15).map((s, i) => {
+        const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
+        const shortId = s.sessionId.slice(0, 8);
+        const active = s.sessionId === activeId ? ' ⚡' : '';
+        const desc = s.summary ? `\n   ${s.summary}` : '';
+        return `${i + 1}. ${shortId} — ${date}${active}${desc}`;
+      }).join('\n');
+
+      await sendReply(
+        `Sessions for ${workdir}:\n\n${list}\n\n` +
+        `Use !resume <number> or !resume <id> to resume a specific session.`
+      );
+      break;
+    }
+
+    case '!help': {
+      await sendReply(
+        `Available commands:\n\n` +
+          `!start — Start a new Claude Code session\n` +
+          `!start <workdir> — Start in a specific directory\n` +
+          `!start now — Start fresh (skip resume offer)\n` +
+          `!stop — Stop the current session\n` +
+          `!restart — Stop and immediately resume the session\n` +
+          `!resume — Resume the previous session\n` +
+          `!resume <n> — Resume session #n from !sessions list\n` +
+          `!resume <id> — Resume session by ID prefix\n` +
+          `!sessions — List all past sessions\n` +
+          `!workdir <path> — Change working directory (restarts session)\n` +
+          `!status — Show current session info\n` +
+          `!working — Toggle tool call visibility\n` +
+          `!mcp — Show MCP server status\n` +
+          `!model — Show current model\n` +
+          `!cost — Show session cost\n` +
+          `!usage — Show token usage\n` +
+          `!tools — List available tools\n` +
+          `!help — Show this help message\n\n` +
+          `While Claude is working:\n` +
+          `  Messages are queued automatically\n` +
+          `  Send "interrupt" to force interrupt\n\n` +
+          `Claude Code slash commands (e.g. /commit, /review-pr) are passed through directly.\n\n` +
+          `Send any other text to chat with Claude Code.\n\n` +
+          `You can also send photos and documents (PDFs, images, text files) — they'll be forwarded to Claude Code directly.`
+      );
+      break;
+    }
+
+    case '!mcp': {
+      const session = sessions.get(roomId);
+      if (session?.initData?.mcp_servers) {
+        const servers = session.initData.mcp_servers;
+        const list = servers.map(s => {
+          const icon = s.status === 'connected' ? '🟢' :
+                       s.status === 'failed' ? '🔴' :
+                       s.status === 'needs-auth' ? '🟡' : '⚪';
+          return `${icon} ${s.name} — ${s.status}`;
+        }).join('\n');
+        await sendReply(`MCP Servers (live):\n\n${list}`);
+      } else {
+        try {
+          const configPath = path.join(__dirname, 'mcp-config.json');
+          const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+          const names = Object.keys(config.mcpServers || {});
+          if (names.length === 0) {
+            await sendReply('No MCP servers configured.');
+          } else {
+            const list = names.map(n => `⚪ ${n} — configured`).join('\n');
+            await sendReply(`MCP Servers (from config, no active session):\n\n${list}\n\nStart a session to see live status.`);
+          }
+        } catch {
+          await sendReply('No MCP config found and no active session.');
+        }
+      }
+      break;
+    }
+
+    case '!model': {
+      const session = sessions.get(roomId);
+      if (session?.initData) {
+        const model = session.initData.model || '(unknown)';
+        const version = session.initData.claude_code_version || '(unknown)';
+        const fast = session.initData.fast_mode_state || 'off';
+        await sendReply(`Model: ${model}\nClaude Code: v${version}\nFast mode: ${fast}`);
+      } else {
+        await sendReply('No active session. Start a session to see model info.');
+      }
+      break;
+    }
+
+    case '!cost': {
+      const session = sessions.get(roomId);
+      if (!session) {
+        await sendReply('No active session.');
+        break;
+      }
+      const cost = session.totalUsage.cost_usd;
+      await sendReply(
+        `Session cost: $${cost.toFixed(4)}\n` +
+        `Turns: ${session.turnCount}`
+      );
+      break;
+    }
+
+    case '!usage': {
+      const session = sessions.get(roomId);
+      if (!session) {
+        await sendReply('No active session.');
+        break;
+      }
+      const u = session.totalUsage;
+      await sendReply(
+        `Token usage (cumulative):\n\n` +
+        `Input: ${u.input_tokens.toLocaleString()}\n` +
+        `Output: ${u.output_tokens.toLocaleString()}\n` +
+        `Cache read: ${u.cache_read.toLocaleString()}\n` +
+        `Cache create: ${u.cache_create.toLocaleString()}\n` +
+        `Turns: ${session.turnCount}\n` +
+        `Cost: $${u.cost_usd.toFixed(4)}`
+      );
+      break;
+    }
+
+    case '!tools': {
+      const session = sessions.get(roomId);
+      if (!session?.initData?.tools) {
+        await sendReply('No session data available. Start a session first.');
+        break;
+      }
+      const tools = session.initData.tools;
+      const mcpTools = tools.filter(t => t.startsWith('mcp__'));
+      const builtIn = tools.filter(t => !t.startsWith('mcp__'));
+      let msg = `Built-in tools (${builtIn.length}):\n${builtIn.join(', ')}\n\n`;
+      if (mcpTools.length > 0) {
+        const grouped = {};
+        for (const t of mcpTools) {
+          const parts = t.split('__');
+          const server = parts[1] || 'unknown';
+          if (!grouped[server]) grouped[server] = [];
+          grouped[server].push(parts[2] || t);
+        }
+        msg += `MCP tools:\n`;
+        for (const [server, serverTools] of Object.entries(grouped)) {
+          msg += `  ${server} (${serverTools.length}): ${serverTools.join(', ')}\n`;
+        }
+      }
+      await sendReply(msg);
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// --- Matrix Message Handler ---
+
+client.on('room.message', async (roomId, event) => {
+  // Ignore own messages
+  if (event.sender === botUserId) return;
+  // Ignore non-message events and edits
+  if (!event.content?.msgtype) return;
+  if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
+
+  const sender = event.sender;
+  if (!isAllowed(sender)) return;
+
+  const msgtype = event.content.msgtype;
+  let text = '';
+  let hasMedia = false;
+
+  if (msgtype === 'm.text' || msgtype === 'm.notice') {
+    text = (event.content.body || '').trim();
+  } else if (msgtype === 'm.image' || msgtype === 'm.file') {
+    hasMedia = true;
+    text = (event.content.body || '').trim();
+  }
+
+  if (!text && !hasMedia) return;
+
+  console.log(
+    `Message from ${sender} in ${roomId}: ${text.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
+  );
+
+  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
+  const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
+
+  // Bridge commands use ! prefix
+  if (text.startsWith('!')) {
+    const bridgeCommands = new Set([
+      '!start', '!stop', '!restart', '!resume', '!workdir', '!status',
+      '!show', '!show_working', '!working', '!sessions', '!help',
+      '!mcp', '!model', '!cost', '!usage', '!tools',
+    ]);
+    const cmd = text.split(/\s+/)[0].toLowerCase();
+    if (bridgeCommands.has(cmd)) {
+      await handleCommand(roomId, text, sendReply, sendHtmlFn);
+      return;
+    }
+    // Fall through — forward to Claude Code session
+  }
+
+  // Forward to Claude Code session
+  const session = sessions.get(roomId);
+  if (!session || !session.alive) {
+    await sendReply('No active session. Send !start to begin.');
+    return;
+  }
+
+  // If Claude Code asked a question, handle the answer
+  if (session.waitingForAnswer) {
+    const q = session.pendingQuestions?.[0];
+    if (q?.options?.length > 0) {
+      const answer = resolveQuestionAnswer(session, text);
+      const header = q.header ? `${q.header}: ` : '';
+      submitAnswer(session, `${header}${answer}`);
+    } else {
+      submitAnswer(session, text);
+    }
+    return;
+  }
+
+  // Handle text "build" for plan approval
+  if (session.pendingPlan && text.toLowerCase().trim() === 'build') {
+    sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
+    session.pendingPlan = null;
+    await sendReply('▶️ Building...');
+    return;
+  }
+
+  // Handle "resume" text response (from !start prompt)
+  if (!session.busy && text.toLowerCase().trim() === 'resume') {
+    await handleCommand(roomId, '!resume', sendReply, sendHtmlFn);
+    return;
+  }
+
+  // Queue/interrupt logic when Claude is busy
+  if (session.busy) {
+    const lowerText = text.toLowerCase().trim();
+    if (lowerText === 'interrupt' || lowerText === '!interrupt') {
+      const queued = session.queuedMessages || [];
+      session.queuedMessages = null;
+      await sendReply(`⚡ Interrupting Claude...${queued.length > 0 ? ` (sending ${queued.length} queued message${queued.length > 1 ? 's' : ''})` : ''}`);
+      if (queued.length > 0) {
+        flushQueue(session, queued);
+      }
+      return;
+    }
+    // Queue the message
+    if (!session.queuedMessages) session.queuedMessages = [];
+
+    if (hasMedia) {
+      try {
+        const blocks = await buildMediaContentBlocks(event, session);
+        session.queuedMessages.push(blocks);
+      } catch (err) {
+        console.error('Media queue error:', err);
+        await sendReply(`Failed to process file: ${err.message}`);
+        return;
+      }
+    } else {
+      session.queuedMessages.push([{ type: 'text', text }]);
+    }
+    const count = session.queuedMessages.length;
+    const preview = hasMedia
+      ? (event.content.body || '[media]')
+      : (text.length > 40 ? text.slice(0, 37) + '…' : text);
+    await sendReply(`📨 Queued (${count}): ${preview}\nSend "interrupt" to force send now.`);
+    return;
+  }
+
+  session.queuedMessages = null;
+
+  if (hasMedia) {
+    try {
+      const blocks = await buildMediaContentBlocks(event, session);
+      if (blocks.length === 0) {
+        await sendReply('Could not process the file.');
+        return;
+      }
+      if (!sendToSession(session, blocks)) {
+        await sendReply('Session is not available. Send !start to begin a new one.');
+      }
+    } catch (err) {
+      console.error('Media processing error:', err);
+      await sendReply(`Failed to process file: ${err.message}`);
+    }
+  } else {
+    if (!sendTextToSession(session, text)) {
+      await sendReply('Session is not available. Send !start to begin a new one.');
+    }
+  }
+});
+
+// --- MCP Question Store ---
+
+const pendingMcpQuestions = new Map();
+let mcpQuestionCounter = 0;
+
+// --- Local HTTP API ---
+
+const API_PORT = parseInt(process.env.API_PORT || '9802', 10);
+
+const apiServer = createServer((req, res) => {
+  const url = new URL(req.url, `http://localhost:${API_PORT}`);
+
+  // GET /ask/:id — MCP server polls for answer
+  if (req.method === 'GET' && url.pathname.startsWith('/ask/')) {
+    const questionId = url.pathname.split('/')[2];
+    const q = pendingMcpQuestions.get(questionId);
+    if (!q) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Question not found' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ answered: q.answered, answer: q.answer || null }));
+    if (q.answered) {
+      pendingMcpQuestions.delete(questionId);
+    }
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.writeHead(405);
+    res.end('Method not allowed');
+    return;
+  }
+
+  let body = '';
+  req.on('data', chunk => body += chunk);
+  req.on('end', () => {
+    try {
+      const data = JSON.parse(body);
+
+      // POST /ask — MCP server posts a question
+      if (url.pathname === '/ask') {
+        const { question, header, options } = data;
+        if (!question) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'question is required' }));
+          return;
+        }
+
+        const questionId = String(++mcpQuestionCounter);
+
+        pendingMcpQuestions.set(questionId, {
+          question, header, options,
+          answered: false, answer: null,
+        });
+
+        // Find the active session and show the question
+        let activeSession = null;
+        for (const [, s] of sessions) {
+          if (s.alive) { activeSession = s; break; }
+        }
+
+        if (activeSession) {
+          const parsed = {
+            questions: [{
+              question,
+              header: header || null,
+              options: options || [],
+              multiSelect: false,
+            }]
+          };
+
+          if (activeSession.typingInterval) {
+            clearInterval(activeSession.typingInterval);
+            activeSession.typingInterval = null;
+          }
+
+          activeSession.waitingForAnswer = `mcp:${questionId}`;
+          activeSession.pendingQuestions = parsed.questions;
+          activeSession.currentQuestionIndex = 0;
+          activeSession.questionAnswers = [];
+          activeSession.responseBuffer = '';
+
+          if (activeSession.sendCallback) {
+            sendAllQuestions(activeSession);
+          }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ questionId }));
+        return;
+      }
+
+      if (url.pathname === '/send') {
+        const { roomId, message } = data;
+        if (!roomId || !message) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and message required' }));
+          return;
+        }
+        const session = sessions.get(roomId);
+        if (!session || !session.alive) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No active session for this room' }));
+          return;
+        }
+        sendTextToSession(session, message);
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+
+      } else if (url.pathname === '/message') {
+        const { roomId, text } = data;
+        if (!roomId || !text) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and text required' }));
+          return;
+        }
+        sendToRoom(roomId, text).then(() => {
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true }));
+        }).catch(err => {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: err.message }));
+        });
+
+      } else if (url.pathname === '/sessions') {
+        const list = [];
+        for (const [roomId, session] of sessions) {
+          list.push({
+            roomId,
+            alive: session.alive,
+            busy: session.busy,
+            workdir: session.workdir,
+            claudeSessionId: session.claudeSessionId,
+            uptime: Math.round((Date.now() - session.startedAt) / 1000),
+          });
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(list));
+
+      } else {
+        res.writeHead(404);
+        res.end('Not found');
+      }
+    } catch (e) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+    }
+  });
+});
+
+apiServer.listen(API_PORT, '127.0.0.1', () => {
+  console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
+});
+
+// --- Startup ---
+
+async function main() {
+  botUserId = await client.getUserId();
+  console.log(`Bot logged in as ${botUserId}`);
+  console.log(`Homeserver: ${MATRIX_HOMESERVER_URL}`);
+  console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
+  console.log(`Default workdir: ${DEFAULT_WORKDIR}`);
+  console.log(`Session timeout: ${SESSION_TIMEOUT}ms`);
+  console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
+
+  await client.start();
+  console.log('Matrix client started, listening for messages...');
+}
+
+main().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nShutting down...');
+  for (const [, session] of sessions) {
+    if (session.alive) session.proc.kill();
+  }
+  client.stop();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  for (const [, session] of sessions) {
+    if (session.alive) session.proc.kill();
+  }
+  client.stop();
+  process.exit(0);
+});
