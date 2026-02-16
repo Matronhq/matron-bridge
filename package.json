@@ -1,0 +1,20 @@
+{
+  "name": "claude-matrix-bridge",
+  "version": "1.0.0",
+  "description": "Bridge Matrix messages directly to Claude Code CLI sessions",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "matrix-bot-sdk": "^0.7.0",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^4.3.6"
+  }
+}
