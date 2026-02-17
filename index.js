@@ -182,7 +182,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     flushResponse(session);
 
     if (sessions.get(roomId) === session) {
-      if (exitCode !== 0 && session.restartCount < 3) {
+      if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         const restarted = createSession(roomId, cwd, session.claudeSessionId);
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -507,6 +507,24 @@ function handleClaudeEvent(session, event) {
     }
 
     case 'result': {
+      // Handle fatal errors (e.g. failed resume with invalid session ID)
+      if (event.is_error && event.errors?.length) {
+        const noSession = event.errors.some(e => /no conversation found/i.test(e));
+        if (noSession) {
+          console.log(`Resume failed for room ${session.roomId}: session not found, clearing stale ID`);
+          session.claudeSessionId = null;
+          session._resumeFailed = true;
+          // Remove stale persisted session so future !resume won't retry it
+          const data = loadPersistedSessions();
+          delete data[String(session.roomId)];
+          savePersistedSessions(data);
+          if (session.sendCallback) {
+            session.sendCallback('Previous session not found (expired or deleted). Send !start to begin a new session.');
+          }
+          break;
+        }
+      }
+
       // Accumulate usage stats
       session.turnCount++;
       const u = event.usage;
