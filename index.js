@@ -1456,10 +1456,27 @@ client.on('room.message', async (roomId, event) => {
   }
 
   // Forward to Claude Code session
-  const session = sessions.get(roomId);
+  let session = sessions.get(roomId);
   if (!session || !session.alive) {
-    await sendReply('No active session. Send !start to begin.');
-    return;
+    // Auto-resume if this room has a persisted session (session-specific room)
+    const prev = getPersistedSession(roomId);
+    if (prev && prev.sessionId) {
+      // Clean up dead session if present
+      if (session) sessions.delete(roomId);
+
+      const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
+      newSession.originRoomId = prev.originRoomId || null;
+      newSession.firstMessageCaptured = true;
+      newSession.sendCallback = sendReply;
+      newSession.sendHtml = sendHtmlFn;
+      session = newSession;
+
+      const shortId = prev.sessionId.slice(0, 8);
+      await sendReply(`Auto-resuming session ${shortId}…`);
+    } else {
+      await sendReply('No active session. Send !start to begin.');
+      return;
+    }
   }
 
   // If Claude Code asked a question, handle the answer
