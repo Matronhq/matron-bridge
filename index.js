@@ -1,4 +1,5 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin } from 'matrix-bot-sdk';
 import { spawn } from 'child_process';
 import { createServer } from 'http';
@@ -1303,6 +1304,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
 // --- Matrix Message Handler ---
 
 client.on('room.message', async (roomId, event) => {
+  try {
   // Ignore own messages
   if (event.sender === botUserId) return;
   // Ignore non-message events and edits
@@ -1436,6 +1438,9 @@ client.on('room.message', async (roomId, event) => {
     if (!sendTextToSession(session, text)) {
       await sendReply('Session is not available. Send !start to begin a new one.');
     }
+  }
+  } catch (err) {
+    console.error('[ERROR] room.message handler:', err);
   }
 });
 
