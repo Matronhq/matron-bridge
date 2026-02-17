@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
-import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin, RustSdkCryptoStorageProvider } from 'matrix-bot-sdk';
+import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin } from 'matrix-bot-sdk';
 import { spawn } from 'child_process';
 import { createServer } from 'http';
 import { createHmac } from 'crypto';
@@ -829,8 +829,7 @@ function startTyping(roomId) {
 // --- Matrix Client ---
 
 const storage = new SimpleFsStorageProvider(path.join(os.homedir(), '.claude-matrix-bot-state.json'));
-const cryptoStorage = new RustSdkCryptoStorageProvider(path.join(os.homedir(), '.claude-matrix-bot-crypto'));
-const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, storage, cryptoStorage);
+const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, storage);
 AutojoinRoomsMixin.setupOnClient(client);
 
 let botUserId;
