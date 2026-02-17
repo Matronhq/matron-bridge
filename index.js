@@ -1257,18 +1257,32 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const activeId = currentSession?.claudeSessionId;
-      const list = files.slice(0, 15).map((s, i) => {
+      const items = files.slice(0, 15);
+
+      // Plain text fallback
+      const plainList = items.map((s, i) => {
         const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
         const shortId = s.sessionId.slice(0, 8);
         const active = s.sessionId === activeId ? ' ⚡' : '';
-        const desc = s.summary ? `\n   ${s.summary}` : '';
-        return `${i + 1}. ${shortId} — ${date}${active}${desc}`;
+        const desc = s.summary ? ` — ${s.summary}` : '';
+        return `${i + 1}. ${shortId} ${date}${active}${desc}`;
       }).join('\n');
 
-      await sendReply(
-        `Sessions for ${workdir}:\n\n${list}\n\n` +
-        `Use !resume <number> or !resume <id> to resume a specific session.`
-      );
+      // HTML formatted version
+      const htmlRows = items.map((s, i) => {
+        const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
+        const shortId = s.sessionId.slice(0, 8);
+        const active = s.sessionId === activeId ? ' ⚡' : '';
+        const desc = s.summary
+          ? `<br/><span style="color:gray">${s.summary.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>`
+          : '';
+        return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
+      }).join('\n');
+
+      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse !resume <number> or !resume <id> to resume.`;
+      const html = `<b>Sessions for ${workdir}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>!resume &lt;number&gt;</code> or <code>!resume &lt;id&gt;</code> to resume.</i>`;
+
+      await sendHtml(plainText, html);
       break;
     }
 
