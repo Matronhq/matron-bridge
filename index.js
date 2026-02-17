@@ -806,8 +806,24 @@ function markdownToHtml(text) {
     html = html.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
     html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
 
+    // Horizontal rules
+    html = html.replace(/^-{3,}$/gm, '<hr/>');
+
+    // Unordered lists: lines starting with - or *
+    html = html.replace(/^(?:[-*])\s+(.+)$/gm, '<li>$1</li>');
+
+    // Ordered lists: lines starting with 1. 2. etc
+    html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
+
     html = html.replace(/‹b›‹code›/g, '<b><code>');
     html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
+
+    // Convert newlines to <br/> (but not before/after block elements)
+    html = html.replace(/\n/g, '<br/>');
+
+    // Clean up excessive <br/> around block elements
+    html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul)(?:\s[^>]*)?>)/g, '$1');
+    html = html.replace(/(<\/?(?:hr|li|pre|ol|ul)(?:\s[^>]*)?>)<br\/>/g, '$1');
 
     return html;
   }).join('');
