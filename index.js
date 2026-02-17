@@ -1110,6 +1110,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
 
+      // Persist immediately — we already know the session ID, don't wait for Claude's event
+      persistSession(sessionRoomId, resumeSessionId, resumeWorkdir, roomId);
+
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
       await sessionSendReply(
