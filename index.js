@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin, RustSdkCryptoStorageProvider } from 'matrix-bot-sdk';
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import { createServer } from 'http';
 import { createHmac } from 'crypto';
 import fs from 'fs';
@@ -29,6 +29,8 @@ const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
 // Server label for room names: "dev-2" → "D2", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
