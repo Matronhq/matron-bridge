@@ -29,6 +29,14 @@ const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+
+// Server label for room names: "dev-2" → "D2", fallback to SERVER_LABEL env var
+const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
+  const hostname = os.hostname();
+  const match = hostname.match(/^(\w+)-(\d+)/);
+  if (match) return match[1].charAt(0).toUpperCase() + match[2];
+  return hostname.slice(0, 4).toUpperCase();
+})();
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
@@ -76,9 +84,9 @@ function savePersistedSessions(data) {
   }
 }
 
-function persistSession(roomId, sessionId, workdir) {
+function persistSession(roomId, sessionId, workdir, originRoomId) {
   const data = loadPersistedSessions();
-  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now() };
+  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null };
   savePersistedSessions(data);
 }
 
@@ -138,6 +146,9 @@ function createSession(roomId, workdir, resumeSessionId) {
     lineBuf: '',
     toolCalls: [], // collected tool indicators for this turn
     waitingForAnswer: null,
+    // Per-session room tracking
+    originRoomId: null,
+    firstMessageCaptured: false,
     // Captured from system init event
     initData: null,
     // Accumulated usage stats
@@ -386,7 +397,7 @@ function handleClaudeEvent(session, event) {
   // Capture session ID from any event that carries it
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
-    persistSession(session.roomId, session.claudeSessionId, session.workdir);
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
   }
 
@@ -561,6 +572,7 @@ function handleClaudeEvent(session, event) {
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
         session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
       }
 
       // Check for ExitPlanMode permission denial — present Build prompt
@@ -853,6 +865,33 @@ async function sendToRoom(roomId, text, html) {
   }
 }
 
+// --- Room Management ---
+
+async function createSessionRoom(inviteUserId) {
+  const roomId = await client.createRoom({
+    preset: 'private_chat',
+    name: `${SERVER_LABEL}: New session`,
+    invite: [inviteUserId],
+    initial_state: [
+      {
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      },
+    ],
+  });
+  debug(`Created session room ${roomId} for ${inviteUserId}`);
+  return roomId;
+}
+
+async function updateRoomName(roomId, name) {
+  try {
+    await client.sendStateEvent(roomId, 'm.room.name', '', { name });
+  } catch (e) {
+    debug(`Failed to update room name: ${e.message}`);
+  }
+}
+
 // --- Media Handling ---
 
 async function downloadMatrixFile(mxcUrl) {
@@ -909,45 +948,47 @@ async function buildMediaContentBlocks(event, session) {
 
 // --- Command Handler ---
 
-async function handleCommand(roomId, text, sendReply, sendHtml) {
+async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
   switch (cmd) {
     case '!start': {
-      const existing = sessions.get(roomId);
-      if (existing && existing.alive) {
-        await sendReply(
-          `Session already active (workdir: ${existing.workdir}). Send !stop first.`
-        );
+      if (!sender) {
+        await sendReply('Cannot determine sender. Please try again.');
         return;
       }
 
       const arg = parts[1];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
+      const workdir = explicitWorkdir || DEFAULT_WORKDIR;
 
-      if (!forceFresh && !explicitWorkdir) {
-        const prev = getPersistedSession(roomId);
-        if (prev && prev.sessionId) {
-          const ago = Math.round((Date.now() - prev.lastUsed) / 60000);
-          await sendReply(
-            `Previous session found:\n` +
-            `  Session: ${prev.sessionId.slice(0, 8)}...\n` +
-            `  Workdir: ${prev.workdir}\n` +
-            `  Last used: ${ago} min ago\n\n` +
-            `Reply "resume" to continue, or "!start now" for a fresh session.`
-          );
-          return;
-        }
+      // Create a new room for this session
+      let sessionRoomId;
+      try {
+        sessionRoomId = await createSessionRoom(sender);
+      } catch (e) {
+        console.error('Failed to create session room:', e);
+        await sendReply(`Failed to create session room: ${e.message}`);
+        return;
       }
 
-      const workdir = explicitWorkdir || DEFAULT_WORKDIR;
-      const session = createSession(roomId, workdir);
-      session.sendCallback = sendReply;
-      session.sendHtml = sendHtml;
-      await sendReply(
-        `Session started.\nWorkdir: ${workdir}\nTimeout: ${SESSION_TIMEOUT / 1000}s\n\nSend any message to interact with Claude Code.`
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
+      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+
+      const session = createSession(sessionRoomId, workdir);
+      session.originRoomId = roomId;
+      session.sendCallback = sessionSendReply;
+      session.sendHtml = sessionSendHtml;
+
+      // Confirm in origin room with a link to the new room
+      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      await sendReply(`Session started in new room: ${roomLink}`);
+
+      // Welcome message in the session room
+      await sessionSendReply(
+        `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`
       );
       break;
     }
@@ -960,6 +1001,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       }
       session.proc.kill();
       sessions.delete(roomId);
+      // Append [done] to the session room name
+      try {
+        const nameEvent = await client.getRoomStateEvent(session.roomId, 'm.room.name', '');
+        const currentName = nameEvent?.name || '';
+        if (currentName && !currentName.endsWith('[done]')) {
+          updateRoomName(session.roomId, `${currentName} [done]`);
+        }
+      } catch { /* room name not set */ }
       await sendReply('Session stopped.');
       break;
     }
@@ -985,69 +1034,96 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
     }
 
     case '!resume': {
-      const existing = sessions.get(roomId);
-      if (existing && existing.alive) {
-        await sendReply(
-          `Session already active (workdir: ${existing.workdir}). Send !stop first.`
-        );
+      if (!sender) {
+        await sendReply('Cannot determine sender. Please try again.');
         return;
       }
 
-      const prev = getPersistedSession(roomId);
       const resumeArg = parts[1]?.replace(/\.+$/, '') || undefined;
 
-      let resumeSessionId = prev?.sessionId;
-      let resumeWorkdir = prev?.workdir || DEFAULT_WORKDIR;
-
-      if (resumeArg) {
-        const encodedPath = resumeWorkdir.replace(/\//g, '-');
-        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
-
-        if (!fs.existsSync(projectDir)) {
-          await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
-          return;
-        }
-
-        const files = fs.readdirSync(projectDir)
-          .filter(f => f.endsWith('.jsonl'))
-          .map(f => f.replace('.jsonl', ''))
-          .sort((a, b) => {
-            const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
-            const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
-            return sb.mtimeMs - sa.mtimeMs;
-          });
-
-        const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
-        if (!isNaN(num) && num >= 1 && num <= files.length) {
-          resumeSessionId = files[num - 1];
-        } else {
-          const match = files.find(f => f.startsWith(resumeArg));
-          if (match) {
-            resumeSessionId = match;
-          } else {
-            await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
-            return;
-          }
-        }
-      }
-
-      if (!resumeSessionId) {
-        await sendReply(
-          'No previous session found to resume. Send !start to begin a new session.'
-        );
+      if (!resumeArg) {
+        // No arg — show sessions list inline
+        await handleCommand(roomId, '!sessions', sendReply, sendHtml, sender);
         return;
       }
 
-      const session = createSession(roomId, resumeWorkdir, resumeSessionId);
-      session.sendCallback = sendReply;
-      session.sendHtml = sendHtml;
-      await sendReply(
-        `Resuming session ${resumeSessionId.slice(0, 8)}...\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`
+      const resumeWorkdir = DEFAULT_WORKDIR;
+      const encodedPath = resumeWorkdir.replace(/\//g, '-');
+      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+
+      if (!fs.existsSync(projectDir)) {
+        await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
+        return;
+      }
+
+      const files = fs.readdirSync(projectDir)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => f.replace('.jsonl', ''))
+        .sort((a, b) => {
+          const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
+          const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
+          return sb.mtimeMs - sa.mtimeMs;
+        });
+
+      let resumeSessionId;
+      const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
+      if (!isNaN(num) && num >= 1 && num <= files.length) {
+        resumeSessionId = files[num - 1];
+      } else {
+        const match = files.find(f => f.startsWith(resumeArg));
+        if (match) {
+          resumeSessionId = match;
+        } else {
+          await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
+          return;
+        }
+      }
+
+      // Check if there's already an active room for this Claude session
+      for (const [activeRoomId, activeSession] of sessions) {
+        if (activeSession.claudeSessionId === resumeSessionId && activeSession.alive) {
+          const roomLink = `https://matrix.to/#/${activeRoomId}`;
+          await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active: ${roomLink}`);
+          return;
+        }
+      }
+
+      // Create a new room for the resumed session
+      let sessionRoomId;
+      try {
+        sessionRoomId = await createSessionRoom(sender);
+      } catch (e) {
+        console.error('Failed to create session room:', e);
+        await sendReply(`Failed to create session room: ${e.message}`);
+        return;
+      }
+
+      const shortId = resumeSessionId.slice(0, 8);
+      await updateRoomName(sessionRoomId, `${SERVER_LABEL}: Resumed ${shortId}`);
+
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
+      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+
+      const session = createSession(sessionRoomId, resumeWorkdir, resumeSessionId);
+      session.originRoomId = roomId;
+      session.firstMessageCaptured = true; // don't re-rename on first message
+      session.sendCallback = sessionSendReply;
+      session.sendHtml = sessionSendHtml;
+
+      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
+      await sessionSendReply(
+        `Resuming session ${shortId}…\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`
       );
       break;
     }
 
     case '!workdir': {
+      if (!sender) {
+        await sendReply('Cannot determine sender. Please try again.');
+        return;
+      }
+
       const newDir = parts.slice(1).join(' ');
       if (!newDir) {
         const session = sessions.get(roomId);
@@ -1069,17 +1145,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         return;
       }
 
-      const existing = sessions.get(roomId);
-      if (existing && existing.alive) {
-        existing.proc.kill();
-        sessions.delete(roomId);
+      // Create a new room for this session
+      let sessionRoomId;
+      try {
+        sessionRoomId = await createSessionRoom(sender);
+      } catch (e) {
+        console.error('Failed to create session room:', e);
+        await sendReply(`Failed to create session room: ${e.message}`);
+        return;
       }
 
-      const session = createSession(roomId, resolved);
-      session.sendCallback = sendReply;
-      session.sendHtml = sendHtml;
-      await sendReply(
-        `Session started in new workdir.\nWorkdir: ${resolved}\nTimeout: ${SESSION_TIMEOUT / 1000}s`
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
+      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+
+      const session = createSession(sessionRoomId, resolved);
+      session.originRoomId = roomId;
+      session.sendCallback = sessionSendReply;
+      session.sendHtml = sessionSendHtml;
+
+      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      await sendReply(`Session started in new room: ${roomLink}\nWorkdir: ${resolved}`);
+      await sessionSendReply(
+        `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`
       );
       break;
     }
@@ -1185,16 +1272,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
     case '!help': {
       await sendReply(
         `Available commands:\n\n` +
-          `!start — Start a new Claude Code session\n` +
+          `!start — Start a new session (creates a new room)\n` +
           `!start <workdir> — Start in a specific directory\n` +
-          `!start now — Start fresh (skip resume offer)\n` +
           `!stop — Stop the current session\n` +
           `!restart — Stop and immediately resume the session\n` +
-          `!resume — Resume the previous session\n` +
           `!resume <n> — Resume session #n from !sessions list\n` +
           `!resume <id> — Resume session by ID prefix\n` +
           `!sessions — List all past sessions\n` +
-          `!workdir <path> — Change working directory (restarts session)\n` +
+          `!workdir <path> — Start session in a different directory\n` +
           `!status — Show current session info\n` +
           `!working — Toggle tool call visibility\n` +
           `!mcp — Show MCP server status\n` +
@@ -1203,6 +1288,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
           `!usage — Show token usage\n` +
           `!tools — List available tools\n` +
           `!help — Show this help message\n\n` +
+          `Each !start, !resume, and !workdir creates a new encrypted room for the session.\n` +
+          `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
           `While Claude is working:\n` +
           `  Messages are queued automatically\n` +
           `  Send "interrupt" to force interrupt\n\n` +
@@ -1362,7 +1449,7 @@ client.on('room.message', async (roomId, event) => {
     ]);
     const cmd = text.split(/\s+/)[0].toLowerCase();
     if (bridgeCommands.has(cmd)) {
-      await handleCommand(roomId, text, sendReply, sendHtmlFn);
+      await handleCommand(roomId, text, sendReply, sendHtmlFn, sender);
       return;
     }
     // Fall through — forward to Claude Code session
@@ -1393,12 +1480,6 @@ client.on('room.message', async (roomId, event) => {
     sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
     session.pendingPlan = null;
     await sendReply('▶️ Building...');
-    return;
-  }
-
-  // Handle "resume" text response (from !start prompt)
-  if (!session.busy && text.toLowerCase().trim() === 'resume') {
-    await handleCommand(roomId, '!resume', sendReply, sendHtmlFn);
     return;
   }
 
@@ -1448,6 +1529,11 @@ client.on('room.message', async (roomId, event) => {
       }
       if (!sendToSession(session, blocks)) {
         await sendReply('Session is not available. Send !start to begin a new one.');
+      } else if (!session.firstMessageCaptured) {
+        session.firstMessageCaptured = true;
+        const fileName = event.content.body || 'file';
+        const label = `${SERVER_LABEL}: ${fileName.slice(0, 50)}`;
+        updateRoomName(session.roomId, label);
       }
     } catch (err) {
       console.error('Media processing error:', err);
@@ -1456,6 +1542,10 @@ client.on('room.message', async (roomId, event) => {
   } else {
     if (!sendTextToSession(session, text)) {
       await sendReply('Session is not available. Send !start to begin a new one.');
+    } else if (!session.firstMessageCaptured) {
+      session.firstMessageCaptured = true;
+      const summary = text.length > 50 ? text.slice(0, 50) + '…' : text;
+      updateRoomName(session.roomId, `${SERVER_LABEL}: ${summary}`);
     }
   }
   } catch (err) {
