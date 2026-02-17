@@ -476,7 +476,7 @@ function handleClaudeEvent(session, event) {
                 ? input.file_path
                 : path.join(session.workdir, input.file_path);
               const link = generateFileLink(absPath);
-              if (link) indicator += `\n🔗 View in browser (expires ${LINK_EXPIRY_MS / 60000}min): ${link}`;
+              if (link) indicator += `\n[🔗 View in browser](${link})`;
             }
           } else if (toolName === 'Edit' && input.file_path) {
             indicator = `✏️ Editing ${input.file_path}`;
@@ -486,7 +486,7 @@ function handleClaudeEvent(session, event) {
                 ? input.file_path
                 : path.join(session.workdir, input.file_path);
               const link = generateFileLink(absPath);
-              if (link) indicator += `\n🔗 View in browser (expires ${LINK_EXPIRY_MS / 60000}min): ${link}`;
+              if (link) indicator += `\n[🔗 View in browser](${link})`;
             }
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
@@ -806,8 +806,11 @@ function markdownToHtml(text) {
     html = html.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
     html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
 
-    // Linkify URLs (not already inside tags)
-    html = html.replace(/(https?:\/\/[^\s<>"']+)/g, '<a href="$1">$1</a>');
+    // Markdown links: [text](url)
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+
+    // Linkify remaining bare URLs (not already inside tags)
+    html = html.replace(/(?<!href="|">)(https?:\/\/[^\s<>"']+)/g, '<a href="$1">$1</a>');
 
     // Horizontal rules
     html = html.replace(/^-{3,}$/gm, '<hr/>');
