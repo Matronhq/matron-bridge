@@ -238,7 +238,7 @@ async function main() {
     }
 
     try {
-      await fetch(`${HOMESERVER_URL}/_matrix/client/v3/logout`, {
+      const resp = await fetch(`${HOMESERVER_URL}/_matrix/client/v3/logout`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${loginResp.access_token}`,
@@ -246,7 +246,11 @@ async function main() {
         },
         body: '{}',
       });
-      log('  Temp device logged out.');
+      if (resp.ok) {
+        log('  Temp device logged out.');
+      } else {
+        log(`  Logout returned ${resp.status} (device will expire on its own).`);
+      }
     } catch {
       log('  Logout request failed (device will expire on its own).');
     }
