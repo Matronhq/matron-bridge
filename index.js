@@ -54,6 +54,14 @@ function generateFileLink(filePath) {
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
 
+function generateActionLink(action, roomId) {
+  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
+  const payload = Buffer.from(JSON.stringify({ action, roomId, exp })).toString('base64url');
+  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
+  return `${VIEWER_BASE_URL}/action?token=${payload}.${sig}`;
+}
+
 function isPlanFile(filePath) {
   const basename = path.basename(filePath);
   return PLAN_FILE_PATTERNS.some(p => p.test(basename));
@@ -198,14 +206,22 @@ function createSession(roomId, workdir, resumeSessionId) {
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         sessions.set(roomId, restarted);
-        if (restarted.sendCallback) {
+        if (restarted.sendHtml) {
+          const n = notice('warning',
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+          restarted.sendHtml(n.plain, n.html);
+        } else if (restarted.sendCallback) {
           restarted.sendCallback(
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
           );
         }
       } else {
         sessions.delete(roomId);
-        if (session.sendCallback) {
+        if (session.sendHtml) {
+          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
       }
@@ -459,6 +475,7 @@ function handleClaudeEvent(session, event) {
         } else {
           // Collect tool indicator
           let indicator = `🔧 ${toolName}`;
+          let indicatorHtml = null;
           let isKeyEvent = false;
 
           if (toolName === 'Bash' && input.command) {
@@ -466,37 +483,52 @@ function handleClaudeEvent(session, event) {
               ? input.command.slice(0, 100) + '…'
               : input.command;
             indicator = `🔧 \`${cmd}\``;
+            indicatorHtml = `🔧 <code>${escapeHtml(cmd)}</code>`;
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
+            indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
           } else if (toolName === 'Write' && input.file_path) {
             indicator = `✏️ Writing ${input.file_path}`;
+            indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
             isKeyEvent = true;
             if (isPlanFile(input.file_path)) {
               const absPath = path.isAbsolute(input.file_path)
                 ? input.file_path
                 : path.join(session.workdir, input.file_path);
               const link = generateFileLink(absPath);
-              if (link) indicator += `\n[🔗 View in browser](${link})`;
+              if (link) {
+                indicator += `\n[🔗 View in browser](${link})`;
+                indicatorHtml += `<br/><a href="${link}">🔗 View in browser</a>`;
+              }
             }
           } else if (toolName === 'Edit' && input.file_path) {
             indicator = `✏️ Editing ${input.file_path}`;
+            indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
             isKeyEvent = true;
             if (isPlanFile(input.file_path)) {
               const absPath = path.isAbsolute(input.file_path)
                 ? input.file_path
                 : path.join(session.workdir, input.file_path);
               const link = generateFileLink(absPath);
-              if (link) indicator += `\n[🔗 View in browser](${link})`;
+              if (link) {
+                indicator += `\n[🔗 View in browser](${link})`;
+                indicatorHtml += `<br/><a href="${link}">🔗 View in browser</a>`;
+              }
             }
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
+            indicatorHtml = `🔍 <code>${escapeHtml(input.pattern)}</code>`;
           } else if (toolName === 'WebSearch' && input.query) {
             indicator = `🌐 ${input.query}`;
+            indicatorHtml = `🌐 <i>${escapeHtml(input.query)}</i>`;
             isKeyEvent = true;
           } else if (toolName === 'WebFetch' && input.url) {
             indicator = `🌐 ${input.url}`;
+            indicatorHtml = `🌐 <a href="${escapeHtml(input.url)}">${escapeHtml(input.url)}</a>`;
           } else if (toolName === 'Task') {
-            indicator = `🔀 Subtask: ${(input.description || input.prompt || '').slice(0, 80)}`;
+            const desc = (input.description || input.prompt || '').slice(0, 80);
+            indicator = `🔀 Subtask: ${desc}`;
+            indicatorHtml = `🔀 Subtask: <i>${escapeHtml(desc)}</i>`;
             isKeyEvent = true;
           } else if (toolName === 'TodoWrite') {
             const todos = (input.todos || []).map(t => {
@@ -504,12 +536,19 @@ function handleClaudeEvent(session, event) {
               return `${icon} ${t.content || t.text || ''}`;
             }).join('\n');
             indicator = `📋 Todos:\n${todos}`;
+            const todosHtml = (input.todos || []).map(t => {
+              const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
+              return `<li>${icon} ${escapeHtml(t.content || t.text || '')}</li>`;
+            }).join('');
+            indicatorHtml = `📋 <b>Todos:</b><ul>${todosHtml}</ul>`;
             isKeyEvent = true;
           }
 
           session.toolCalls.push(indicator);
 
-          if (isKeyEvent && session.sendCallback) {
+          if (isKeyEvent && session.sendHtml && indicatorHtml) {
+            session.sendHtml(indicator, indicatorHtml);
+          } else if (isKeyEvent && session.sendCallback) {
             session.sendCallback(indicator);
           }
         }
@@ -565,6 +604,25 @@ function handleClaudeEvent(session, event) {
           session.responseBuffer = text;
         }
         flushResponse(session);
+
+        // Send action links after the result
+        if (session.sendHtml) {
+          const stopLink = generateActionLink('stop', session.roomId);
+          const interruptLink = generateActionLink('interrupt', session.roomId);
+          if (stopLink || interruptLink) {
+            const links = [];
+            const plainLinks = [];
+            if (interruptLink) {
+              links.push(`<a href="${interruptLink}">⚡ Interrupt</a>`);
+              plainLinks.push('⚡ Interrupt');
+            }
+            if (stopLink) {
+              links.push(`<a href="${stopLink}">🛑 Stop Session</a>`);
+              plainLinks.push('🛑 Stop Session');
+            }
+            session.sendHtml(plainLinks.join(' · '), links.join(' · '));
+          }
+        }
       } else {
         session.responseBuffer = '';
       }
@@ -587,9 +645,15 @@ function handleClaudeEvent(session, event) {
           ? planText.slice(0, 500) + '…'
           : planText;
 
-        session.sendCallback(
-          `--- Plan Ready ---\n\n${planPreview}\n\nReply "build" to execute, or send feedback.`
-        );
+        const plainPlan = `--- Plan Ready ---\n\n${planPreview}\n\nReply "build" to execute, or send feedback.`;
+        if (session.sendHtml) {
+          const htmlPlan =
+            `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(planPreview)}</blockquote>` +
+            `Reply <code>build</code> to execute, or send feedback.`;
+          session.sendHtml(plainPlan, htmlPlan);
+        } else {
+          session.sendCallback(plainPlan);
+        }
       }
 
       // Send any queued messages now that Claude is free
@@ -610,13 +674,20 @@ function handleClaudeEvent(session, event) {
         debug('Captured init data: model=%s, tools=%d, mcp=%d',
           event.model, event.tools?.length, event.mcp_servers?.length);
       } else if (event.subtype === 'compact' || event.subtype === 'context_compaction') {
-        if (session.sendCallback) {
+        if (session.sendHtml) {
+          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space.');
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
           session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
         }
       } else if (event.subtype === 'task_notification') {
-        const status = event.status === 'completed' ? '✅' : '❌';
-        if (session.sendCallback) {
-          session.sendCallback(`${status} Task: ${event.summary || 'unknown'}`);
+        const isComplete = event.status === 'completed';
+        const taskPlain = `${isComplete ? '✅' : '❌'} Task: ${event.summary || 'unknown'}`;
+        if (session.sendHtml) {
+          const n = notice(isComplete ? 'success' : 'error', taskPlain);
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
+          session.sendCallback(taskPlain);
         }
       }
       break;
@@ -625,7 +696,10 @@ function handleClaudeEvent(session, event) {
     case 'stream_event': {
       const evt = event.event;
       if (evt?.type === 'message_delta' && evt?.context_management?.applied_edits?.length > 0) {
-        if (session.sendCallback) {
+        if (session.sendHtml) {
+          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space.');
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
           session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
         }
       }
@@ -783,6 +857,36 @@ function escapeHtml(text) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function color(text, hex) {
+  return `<font color="${hex}">${text}</font>`;
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `${h}h ${rm}m` : `${h}h`;
+}
+
+const NOTICE_COLORS = {
+  success: '#3fb950',
+  error: '#f85149',
+  warning: '#f0883e',
+  info: '#58a6ff',
+};
+
+function notice(type, plainText, htmlContent) {
+  const hex = NOTICE_COLORS[type] || NOTICE_COLORS.info;
+  return {
+    plain: plainText,
+    html: `${color('▌', hex)} ${htmlContent || escapeHtml(plainText)}`,
+  };
+}
+
 function markdownToHtml(text) {
   let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
 
@@ -792,6 +896,10 @@ function markdownToHtml(text) {
     if (i % 2 === 1) {
       if (part.startsWith('```')) {
         const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
+        const lineCount = inner.split('\n').length;
+        if (lineCount > 15) {
+          return `<details><summary>Code (${lineCount} lines)</summary><pre>${escapeHtml(inner)}</pre></details>`;
+        }
         return `<pre>${escapeHtml(inner)}</pre>`;
       }
       return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
@@ -814,6 +922,12 @@ function markdownToHtml(text) {
 
     // Horizontal rules
     html = html.replace(/^-{3,}$/gm, '<hr/>');
+
+    // Blockquotes: consecutive > lines
+    html = html.replace(/(^&gt;\s?.+(\n|$))+/gm, (match) => {
+      const inner = match.replace(/^&gt;\s?/gm, '').trim();
+      return `<blockquote>${inner}</blockquote>`;
+    });
 
     // Unordered lists: lines starting with - or *
     html = html.replace(/^(?:[-*])\s+(.+)$/gm, '<li>$1</li>');
@@ -850,6 +964,11 @@ function markdownToHtml(text) {
       return tableHtml;
     });
 
+    // Wrap consecutive <li> in <ul>
+    html = html.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, (match) => {
+      return `<ul>${match}</ul>`;
+    });
+
     html = html.replace(/‹b›‹code›/g, '<b><code>');
     html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
 
@@ -857,11 +976,19 @@ function markdownToHtml(text) {
     html = html.replace(/\n/g, '<br/>');
 
     // Clean up excessive <br/> around block elements
-    html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td)(?:\s[^>]*)?>)/g, '$1');
-    html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td)(?:\s[^>]*)?>)<br\/>/g, '$1');
+    html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
+    html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)<br\/>/g, '$1');
 
     return html;
   }).join('');
+}
+
+// Improve plain text body for clients that don't render HTML (e.g. Element X)
+// Wraps pipe tables in code fences so they render monospaced
+function plainTextFormat(text) {
+  return text.replace(/((?:^\|.+\|\n?)+)/gm, (match) => {
+    return '```\n' + match.trimEnd() + '\n```';
+  });
 }
 
 // --- File Helpers ---
@@ -1050,7 +1177,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
 
       const session = createSession(sessionRoomId, workdir);
@@ -1063,9 +1190,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       await sendReply(`Session started in new room: ${roomLink}`);
 
       // Welcome message in the session room
-      await sessionSendReply(
-        `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`
-      );
+      const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
+      const welcomeHtml =
+        `<b>Session started</b><br/>` +
+        `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
+        `<i>Send any message to interact with Claude Code.</i>`;
+      await sessionSendHtml(welcomePlain, welcomeHtml);
       break;
     }
 
@@ -1181,7 +1311,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : `${SERVER_LABEL}: Resumed ${shortId}`;
       await updateRoomName(sessionRoomId, roomName);
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
 
       const session = createSession(sessionRoomId, resumeWorkdir, resumeSessionId);
@@ -1195,9 +1325,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
-      await sessionSendReply(
-        `Resuming session ${shortId}…\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`
-      );
+      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`;
+      const resumeHtml =
+        `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
+        `Workdir: <code>${escapeHtml(resumeWorkdir)}</code><br/><br/>` +
+        `<i>Send any message to continue.</i>`;
+      await sessionSendHtml(resumePlain, resumeHtml);
       break;
     }
 
@@ -1238,7 +1371,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
 
       const session = createSession(sessionRoomId, resolved);
@@ -1248,9 +1381,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Session started in new room: ${roomLink}\nWorkdir: ${resolved}`);
-      await sessionSendReply(
-        `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`
-      );
+      const wdPlain = `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`;
+      const wdHtml =
+        `<b>Session started</b><br/>` +
+        `Workdir: <code>${escapeHtml(resolved)}</code><br/><br/>` +
+        `<i>Send any message to interact with Claude Code.</i>`;
+      await sessionSendHtml(wdPlain, wdHtml);
       break;
     }
 
@@ -1260,15 +1396,29 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session. Send !start to begin.');
         return;
       }
-      const uptime = Math.round((Date.now() - session.startedAt) / 1000);
-      await sendReply(
-        `Session active\n` +
-          `Workdir: ${session.workdir}\n` +
-          `Session ID: ${session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '...' : '(pending)'}\n` +
-          `Uptime: ${uptime}s\n` +
-          `Restarts: ${session.restartCount}/3\n` +
-          `Busy: ${session.busy ? 'yes' : 'no'}`
-      );
+      const uptimeMs = Date.now() - session.startedAt;
+      const shortId = session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '…' : '(pending)';
+      const busyText = session.busy ? 'yes' : 'no';
+
+      const plainStatus =
+        `Session active\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
+        `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
+
+      const busyHtml = session.busy
+        ? color('● busy', '#f0883e')
+        : color('● idle', '#3fb950');
+      const htmlStatus =
+        `<b>Session Status</b><table>` +
+        `<tr><td>State</td><td>${busyHtml}</td></tr>` +
+        `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
+        `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
+        `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
+        `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
+        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
+        `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>` +
+        `</table>`;
+
+      await sendHtml(plainStatus, htmlStatus);
       break;
     }
 
@@ -1345,33 +1495,69 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     }
 
     case '!help': {
-      await sendReply(
+      const plainHelp =
         `Available commands:\n\n` +
-          `!start — Start a new session (creates a new room)\n` +
-          `!start <workdir> — Start in a specific directory\n` +
-          `!stop — Stop the current session\n` +
-          `!restart — Stop and immediately resume the session\n` +
-          `!resume <n> — Resume session #n from !sessions list\n` +
-          `!resume <id> — Resume session by ID prefix\n` +
-          `!sessions — List all past sessions\n` +
-          `!workdir <path> — Start session in a different directory\n` +
-          `!status — Show current session info\n` +
-          `!working — Toggle tool call visibility\n` +
-          `!mcp — Show MCP server status\n` +
-          `!model — Show current model\n` +
-          `!cost — Show session cost\n` +
-          `!usage — Show token usage\n` +
-          `!tools — List available tools\n` +
-          `!help — Show this help message\n\n` +
-          `Each !start, !resume, and !workdir creates a new encrypted room for the session.\n` +
-          `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
-          `While Claude is working:\n` +
-          `  Messages are queued automatically\n` +
-          `  Send "interrupt" to force interrupt\n\n` +
-          `Claude Code slash commands (e.g. /commit, /review-pr) are passed through directly.\n\n` +
-          `Send any other text to chat with Claude Code.\n\n` +
-          `You can also send photos and documents (PDFs, images, text files) — they'll be forwarded to Claude Code directly.`
-      );
+        `!start — Start a new session (creates a new room)\n` +
+        `!start <workdir> — Start in a specific directory\n` +
+        `!stop — Stop the current session\n` +
+        `!restart — Stop and immediately resume the session\n` +
+        `!resume <n> — Resume session #n from !sessions list\n` +
+        `!resume <id> — Resume session by ID prefix\n` +
+        `!sessions — List all past sessions\n` +
+        `!workdir <path> — Start session in a different directory\n` +
+        `!status — Show current session info\n` +
+        `!working — Toggle tool call visibility\n` +
+        `!mcp — Show MCP server status\n` +
+        `!model — Show current model\n` +
+        `!cost — Show session cost\n` +
+        `!usage — Show token usage\n` +
+        `!tools — List available tools\n` +
+        `!help — Show this help message\n\n` +
+        `Each !start, !resume, and !workdir creates a new encrypted room for the session.\n` +
+        `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
+        `While Claude is working:\n` +
+        `  Messages are queued automatically\n` +
+        `  Send "interrupt" to force interrupt\n\n` +
+        `Claude Code slash commands (e.g. /commit, /review-pr) are passed through directly.\n` +
+        `Send any other text to chat with Claude Code.\n` +
+        `You can also send photos and documents (PDFs, images, text files).`;
+
+      const cmdGroup = (title, cmds) => {
+        const items = cmds.map(([c, d]) => `<li><code>${c}</code> — ${d}</li>`).join('');
+        return `<b>${title}</b><ul>${items}</ul>`;
+      };
+
+      const htmlHelp =
+        cmdGroup('Sessions', [
+          ['!start', 'Start a new session (creates a new room)'],
+          ['!start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['!stop', 'Stop the current session'],
+          ['!restart', 'Stop and immediately resume the session'],
+          ['!resume &lt;n&gt;', 'Resume session #n from !sessions list'],
+          ['!resume &lt;id&gt;', 'Resume session by ID prefix'],
+          ['!sessions', 'List all past sessions'],
+          ['!workdir &lt;path&gt;', 'Start session in a different directory'],
+        ]) +
+        cmdGroup('Info', [
+          ['!status', 'Show current session info'],
+          ['!working', 'Toggle tool call visibility'],
+          ['!mcp', 'Show MCP server status'],
+          ['!model', 'Show current model'],
+          ['!cost', 'Show session cost'],
+          ['!usage', 'Show token usage'],
+          ['!tools', 'List available tools'],
+          ['!help', 'Show this help message'],
+        ]) +
+        `<b>Tips</b><ul>` +
+        `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new encrypted room</li>` +
+        `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
+        `<li>Messages are queued automatically while Claude is working</li>` +
+        `<li>Send <code>interrupt</code> to force interrupt</li>` +
+        `<li>Slash commands (e.g. <code>/commit</code>) are passed through directly</li>` +
+        `<li>You can send photos and documents (PDFs, images, text files)</li>` +
+        `</ul>`;
+
+      await sendHtml(plainHelp, htmlHelp);
       break;
     }
 
@@ -1379,13 +1565,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const session = sessions.get(roomId);
       if (session?.initData?.mcp_servers) {
         const servers = session.initData.mcp_servers;
-        const list = servers.map(s => {
+        const plainList = servers.map(s => {
           const icon = s.status === 'connected' ? '🟢' :
                        s.status === 'failed' ? '🔴' :
                        s.status === 'needs-auth' ? '🟡' : '⚪';
           return `${icon} ${s.name} — ${s.status}`;
         }).join('\n');
-        await sendReply(`MCP Servers (live):\n\n${list}`);
+        const statusDot = (st) => {
+          const clr = st === 'connected' ? '#3fb950' :
+                      st === 'failed' ? '#f85149' :
+                      st === 'needs-auth' ? '#f0883e' : '#8b949e';
+          return color('●', clr);
+        };
+        const htmlRows = servers.map(s =>
+          `<tr><td>${statusDot(s.status)}</td><td><code>${escapeHtml(s.name)}</code></td><td>${escapeHtml(s.status)}</td></tr>`
+        ).join('');
+        const htmlMcp = `<b>MCP Servers</b><table>${htmlRows}</table>`;
+        await sendHtml(`MCP Servers (live):\n\n${plainList}`, htmlMcp);
       } else {
         try {
           const configPath = path.join(__dirname, 'mcp-config.json');
@@ -1424,10 +1620,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const cost = session.totalUsage.cost_usd;
-      await sendReply(
-        `Session cost: $${cost.toFixed(4)}\n` +
-        `Turns: ${session.turnCount}`
-      );
+      const costClr = cost < 0.5 ? '#3fb950' : cost < 2 ? '#f0883e' : '#f85149';
+      const plainCost = `Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`;
+      const htmlCost =
+        `<b>Session Cost</b><table>` +
+        `<tr><td>Cost</td><td>${color('$' + cost.toFixed(4), costClr)}</td></tr>` +
+        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
+        `</table>`;
+      await sendHtml(plainCost, htmlCost);
       break;
     }
 
@@ -1438,15 +1638,25 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const u = session.totalUsage;
-      await sendReply(
+      const uCostClr = u.cost_usd < 0.5 ? '#3fb950' : u.cost_usd < 2 ? '#f0883e' : '#f85149';
+      const plainUsage =
         `Token usage (cumulative):\n\n` +
         `Input: ${u.input_tokens.toLocaleString()}\n` +
         `Output: ${u.output_tokens.toLocaleString()}\n` +
         `Cache read: ${u.cache_read.toLocaleString()}\n` +
         `Cache create: ${u.cache_create.toLocaleString()}\n` +
         `Turns: ${session.turnCount}\n` +
-        `Cost: $${u.cost_usd.toFixed(4)}`
-      );
+        `Cost: $${u.cost_usd.toFixed(4)}`;
+      const htmlUsage =
+        `<b>Token Usage</b><table>` +
+        `<tr><td>Input</td><td>${u.input_tokens.toLocaleString()}</td></tr>` +
+        `<tr><td>Output</td><td>${u.output_tokens.toLocaleString()}</td></tr>` +
+        `<tr><td>Cache read</td><td>${u.cache_read.toLocaleString()}</td></tr>` +
+        `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>` +
+        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
+        `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>` +
+        `</table>`;
+      await sendHtml(plainUsage, htmlUsage);
       break;
     }
 
@@ -1459,21 +1669,35 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const tools = session.initData.tools;
       const mcpTools = tools.filter(t => t.startsWith('mcp__'));
       const builtIn = tools.filter(t => !t.startsWith('mcp__'));
-      let msg = `Built-in tools (${builtIn.length}):\n${builtIn.join(', ')}\n\n`;
+
+      // Plain text
+      let plainMsg = `Built-in tools (${builtIn.length}):\n${builtIn.join(', ')}\n\n`;
+      const grouped = {};
+      for (const t of mcpTools) {
+        const tParts = t.split('__');
+        const server = tParts[1] || 'unknown';
+        if (!grouped[server]) grouped[server] = [];
+        grouped[server].push(tParts[2] || t);
+      }
       if (mcpTools.length > 0) {
-        const grouped = {};
-        for (const t of mcpTools) {
-          const parts = t.split('__');
-          const server = parts[1] || 'unknown';
-          if (!grouped[server]) grouped[server] = [];
-          grouped[server].push(parts[2] || t);
-        }
-        msg += `MCP tools:\n`;
+        plainMsg += `MCP tools:\n`;
         for (const [server, serverTools] of Object.entries(grouped)) {
-          msg += `  ${server} (${serverTools.length}): ${serverTools.join(', ')}\n`;
+          plainMsg += `  ${server} (${serverTools.length}): ${serverTools.join(', ')}\n`;
         }
       }
-      await sendReply(msg);
+
+      // HTML
+      let htmlMsg = `<b>Built-in tools (${builtIn.length})</b><br/>` +
+        builtIn.map(t => `<code>${escapeHtml(t)}</code>`).join(', ');
+      if (mcpTools.length > 0) {
+        for (const [server, serverTools] of Object.entries(grouped)) {
+          htmlMsg += `<details><summary><b>${escapeHtml(server)}</b> (${serverTools.length})</summary>` +
+            serverTools.map(t => `<code>${escapeHtml(t)}</code>`).join(', ') +
+            `</details>`;
+        }
+      }
+
+      await sendHtml(plainMsg, htmlMsg);
       break;
     }
 
@@ -1512,7 +1736,7 @@ client.on('room.message', async (roomId, event) => {
     `Message from ${sender} in ${roomId}: ${text.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
   );
 
-  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
+  const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
 
   // Bridge commands use ! prefix
@@ -1547,7 +1771,8 @@ client.on('room.message', async (roomId, event) => {
       session = newSession;
 
       const shortId = prev.sessionId.slice(0, 8);
-      await sendReply(`Auto-resuming session ${shortId}…`);
+      const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
+      await sendHtmlFn(arNotice.plain, arNotice.html);
     } else {
       await sendReply('No active session. Send !start to begin.');
       return;
@@ -1571,7 +1796,8 @@ client.on('room.message', async (roomId, event) => {
   if (session.pendingPlan && text.toLowerCase().trim() === 'build') {
     sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
     session.pendingPlan = null;
-    await sendReply('▶️ Building...');
+    const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
+    await sendHtmlFn(buildNotice.plain, buildNotice.html);
     return;
   }
 
@@ -1606,7 +1832,14 @@ client.on('room.message', async (roomId, event) => {
     const preview = hasMedia
       ? (event.content.body || '[media]')
       : (text.length > 40 ? text.slice(0, 37) + '…' : text);
-    await sendReply(`📨 Queued (${count}): ${preview}\nSend "interrupt" to force send now.`);
+    const interruptLink = generateActionLink('interrupt', roomId);
+    const plainQueue = `📨 Queued (${count}): ${preview}\nSend "interrupt" to force send now.`;
+    if (interruptLink) {
+      const htmlQueue = `📨 Queued (${count}): ${escapeHtml(preview)}<br/><a href="${interruptLink}">⚡ Interrupt</a>`;
+      await sendHtmlFn(plainQueue, htmlQueue);
+    } else {
+      await sendReply(plainQueue);
+    }
     return;
   }
 
@@ -1763,7 +1996,7 @@ const apiServer = createServer((req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, text, markdownToHtml(text)).then(() => {
+        sendToRoom(roomId, plainTextFormat(text), markdownToHtml(text)).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
