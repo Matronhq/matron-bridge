@@ -1208,7 +1208,10 @@ async function buildMediaContentBlocks(event, session) {
   const fileName = content.body || 'file';
   const mime = content.info?.mimetype || 'application/octet-stream';
 
-  if (content.msgtype === 'm.image') {
+  if (content.msgtype === 'm.audio') {
+    const transcription = await transcribeAudio(buffer, mime);
+    blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
+  } else if (content.msgtype === 'm.image') {
     blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
