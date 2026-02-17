@@ -1117,6 +1117,59 @@ function getSessionSummary(sessionId, workdir) {
   return '';
 }
 
+// --- Voice Note Transcription ---
+
+const MIME_TO_EXT = {
+  'audio/ogg': '.ogg',
+  'audio/opus': '.opus',
+  'audio/mp4': '.m4a',
+  'audio/mpeg': '.mp3',
+  'audio/wav': '.wav',
+  'audio/webm': '.webm',
+  'audio/aac': '.aac',
+  'audio/x-caf': '.caf',
+};
+
+async function transcribeAudio(buffer, mime) {
+  const { promisify } = await import('util');
+  const execFileAsync = promisify(execFile);
+
+  const ext = MIME_TO_EXT[mime] || '.ogg';
+  const id = Math.random().toString(36).slice(2, 10);
+  const inputPath = path.join(os.tmpdir(), `voice-${id}${ext}`);
+  const wavPath = path.join(os.tmpdir(), `voice-${id}.wav`);
+
+  try {
+    // Write audio buffer to temp file
+    fs.writeFileSync(inputPath, buffer);
+
+    // Convert to 16kHz mono WAV
+    await execFileAsync('ffmpeg', [
+      '-i', inputPath,
+      '-ar', '16000',
+      '-ac', '1',
+      '-f', 'wav',
+      '-y',
+      wavPath,
+    ], { timeout: 30000 });
+
+    // Transcribe with whisper-cli
+    const { stdout } = await execFileAsync(
+      path.join(path.dirname(WHISPER_MODEL_PATH), '../build/bin/whisper-cli'),
+      ['-m', WHISPER_MODEL_PATH, '-f', wavPath, '--no-timestamps', '-l', WHISPER_LANGUAGE],
+      { timeout: 120000 },
+    );
+
+    const text = stdout.replace(/\[.*?\]/g, '').trim();
+    if (!text) throw new Error('empty transcription result');
+    return text;
+  } finally {
+    // Clean up temp files
+    try { fs.unlinkSync(inputPath); } catch {}
+    try { fs.unlinkSync(wavPath); } catch {}
+  }
+}
+
 // --- Media Handling ---
 
 async function downloadMatrixFile(mxcUrl, fileInfo) {
