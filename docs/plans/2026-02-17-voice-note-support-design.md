@@ -87,7 +87,7 @@ Both have sensible defaults so the bridge works without explicit configuration a
 Idempotent install script:
 
 - Installs `ffmpeg` via apt (if not present)
-- Downloads a specific tagged whisper.cpp prebuilt release binary from GitHub
+- Clones and builds whisper.cpp from source (no Linux prebuilt binaries available)
 - Downloads the `ggml-small.bin` model via the whisper.cpp model download script
 - Places binaries and model in `~/.local/share/whisper-cpp/`
 - Verifies installation by running `whisper-cli --help`
@@ -114,7 +114,7 @@ Add the two new vars with comments explaining them.
 ## System Requirements
 
 - **ffmpeg:** via apt (Ubuntu 24.04)
-- **whisper-cli:** prebuilt binary from whisper.cpp GitHub releases
+- **whisper-cli:** built from source (no Linux prebuilt binaries available)
 - **ggml-small.bin model:** ~466 MB
 - **Disk:** ~500 MB total for binary + model
 - **RAM:** ~1 GB during transcription (freed after)
