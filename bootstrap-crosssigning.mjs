@@ -126,126 +126,130 @@ async function main() {
 
   log(`  Temp device: ${loginResp.device_id}`);
 
-  // Step 2: Create a proper client with the new credentials
-  const matrixClient = sdk.createClient({
-    baseUrl: HOMESERVER_URL,
-    accessToken: loginResp.access_token,
-    userId: loginResp.user_id,
-    deviceId: loginResp.device_id,
-  });
+  // Wrap everything after login in try/finally to ensure temp device cleanup
+  let matrixClient;
+  try {
+    // Step 2: Create a proper client with the new credentials
+    matrixClient = sdk.createClient({
+      baseUrl: HOMESERVER_URL,
+      accessToken: loginResp.access_token,
+      userId: loginResp.user_id,
+      deviceId: loginResp.device_id,
+    });
 
-  // Step 3: Initialize Rust crypto
-  log('Step 2: Initializing crypto...');
-  await matrixClient.initRustCrypto({ useIndexedDB: false });
+    // Step 3: Initialize Rust crypto
+    log('Step 2: Initializing crypto...');
+    await matrixClient.initRustCrypto({ useIndexedDB: false });
 
-  const crypto = matrixClient.getCrypto();
+    const crypto = matrixClient.getCrypto();
 
-  // Step 4: Start sync and wait for it to be ready
-  // This processes outgoing requests (keys/upload, keys/query) which the crypto
-  // module needs before we can bootstrap cross-signing.
-  log('Step 3: Syncing to exchange device keys...');
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error('Sync timed out after 30 seconds'));
-    }, 30000);
+    // Step 4: Start sync and wait for it to be ready
+    // This processes outgoing requests (keys/upload, keys/query) which the crypto
+    // module needs before we can bootstrap cross-signing.
+    log('Step 3: Syncing to exchange device keys...');
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Sync timed out after 30 seconds'));
+      }, 30000);
 
-    matrixClient.once(sdk.ClientEvent.Sync, (state) => {
-      clearTimeout(timeout);
-      if (state === 'PREPARED' || state === 'SYNCING') {
-        resolve();
+      matrixClient.once(sdk.ClientEvent.Sync, (state) => {
+        clearTimeout(timeout);
+        if (state === 'PREPARED' || state === 'SYNCING') {
+          resolve();
+        } else {
+          reject(new Error(`Sync failed with state: ${state}`));
+        }
+      });
+
+      matrixClient.startClient({ initialSyncLimit: 0 });
+    });
+    log('  Sync ready.');
+
+    // Brief delay to let outgoing crypto requests complete
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Step 5: Bootstrap cross-signing
+    log('Step 4: Bootstrapping cross-signing...');
+    try {
+      await crypto.bootstrapCrossSigning({
+        authUploadDeviceSigningKeys: async (makeRequest) => {
+          return makeRequest({
+            type: 'm.login.password',
+            identifier: { type: 'm.id.user', user: loginResp.user_id },
+            password: BOT_PASSWORD,
+          });
+        },
+      });
+      log('  Cross-signing keys uploaded.');
+    } catch (err) {
+      // If cross-signing already exists, that's fine
+      if (err.message?.includes('already exists') || err.message?.includes('already set up')) {
+        log('  Cross-signing already set up.');
       } else {
-        reject(new Error(`Sync failed with state: ${state}`));
+        throw err;
       }
-    });
-
-    matrixClient.startClient({ initialSyncLimit: 0 });
-  });
-  log('  Sync ready.');
-
-  // Brief delay to let outgoing crypto requests complete
-  await new Promise(r => setTimeout(r, 2000));
-
-  // Step 5: Bootstrap cross-signing
-  log('Step 4: Bootstrapping cross-signing...');
-  try {
-    await crypto.bootstrapCrossSigning({
-      authUploadDeviceSigningKeys: async (makeRequest) => {
-        return makeRequest({
-          type: 'm.login.password',
-          identifier: { type: 'm.id.user', user: loginResp.user_id },
-          password: BOT_PASSWORD,
-        });
-      },
-    });
-    log('  Cross-signing keys uploaded.');
-  } catch (err) {
-    // If cross-signing already exists, that's fine
-    if (err.message?.includes('already exists') || err.message?.includes('already set up')) {
-      log('  Cross-signing already set up.');
-    } else {
-      throw err;
     }
-  }
 
-  // Step 6: Cross-sign the bot-sdk device
-  if (botDeviceId && botDeviceId !== loginResp.device_id) {
-    log(`Step 5: Cross-signing bot device ${botDeviceId}...`);
+    // Step 6: Cross-sign the bot-sdk device
+    if (botDeviceId && botDeviceId !== loginResp.device_id) {
+      log(`Step 5: Cross-signing bot device ${botDeviceId}...`);
 
-    // Fetch fresh device info
-    const devices = await crypto.getUserDeviceInfo([loginResp.user_id]);
-    const userDevices = devices.get(loginResp.user_id);
+      // Fetch fresh device info
+      const devices = await crypto.getUserDeviceInfo([loginResp.user_id]);
+      const userDevices = devices.get(loginResp.user_id);
 
-    if (userDevices && userDevices.has(botDeviceId)) {
-      try {
-        await crypto.crossSignDevice(botDeviceId);
-        log(`  Device ${botDeviceId} signed.`);
-      } catch (err) {
-        console.error(`  Failed to cross-sign device: ${err.message}`);
-        console.error('  The device may need manual verification from Element.');
+      if (userDevices && userDevices.has(botDeviceId)) {
+        try {
+          await crypto.crossSignDevice(botDeviceId);
+          log(`  Device ${botDeviceId} signed.`);
+        } catch (err) {
+          console.error(`  Failed to cross-sign device: ${err.message}`);
+          console.error('  The device may need manual verification from Element.');
+        }
+      } else {
+        const knownDevices = userDevices ? Array.from(userDevices.keys()) : [];
+        log(`  Device ${botDeviceId} not found on server.`);
+        log(`  Known devices: ${knownDevices.join(', ') || '(none)'}`);
+        log('  The bot device will be signed on next bootstrap run after the bridge starts.');
       }
+    } else if (!botDeviceId) {
+      log('Step 5: No bot-sdk device detected — skipping device signing.');
     } else {
-      const knownDevices = userDevices ? Array.from(userDevices.keys()) : [];
-      log(`  Device ${botDeviceId} not found on server.`);
-      log(`  Known devices: ${knownDevices.join(', ') || '(none)'}`);
-      log('  The bot device will be signed on next bootstrap run after the bridge starts.');
+      log('Step 5: Bot device is the temp device — already signed by bootstrap.');
     }
-  } else if (!botDeviceId) {
-    log('Step 5: No bot-sdk device detected — skipping device signing.');
-  } else {
-    log('Step 5: Bot device is the temp device — already signed by bootstrap.');
-  }
 
-  // Step 7: Show status
-  const status = await crypto.getCrossSigningStatus();
-  log('');
-  log('Cross-signing status:');
-  log(`  Keys on device: ${status.publicKeysOnDevice}`);
-  const local = status.privateKeysCachedLocally;
-  log(`  Master key:     ${local.masterKey ? 'yes' : 'no'}`);
-  log(`  Self-signing:   ${local.selfSigningKey ? 'yes' : 'no'}`);
-  log(`  User-signing:   ${local.userSigningKey ? 'yes' : 'no'}`);
+    // Step 7: Show status
+    const status = await crypto.getCrossSigningStatus();
+    log('');
+    log('Cross-signing status:');
+    log(`  Keys on device: ${status.publicKeysOnDevice}`);
+    const local = status.privateKeysCachedLocally;
+    log(`  Master key:     ${local.masterKey ? 'yes' : 'no'}`);
+    log(`  Self-signing:   ${local.selfSigningKey ? 'yes' : 'no'}`);
+    log(`  User-signing:   ${local.userSigningKey ? 'yes' : 'no'}`);
 
-  // Step 8: Stop client and log out
-  log('');
-  log('Cleaning up...');
-  matrixClient.stopClient();
+  } finally {
+    // Always clean up: stop client and logout temp device
+    log('');
+    log('Cleaning up...');
+    if (matrixClient) {
+      matrixClient.stopClient();
+      await new Promise(r => setTimeout(r, 1000));
+    }
 
-  // Give background tasks a moment to settle
-  await new Promise(r => setTimeout(r, 1000));
-
-  try {
-    // Use raw HTTP to log out since the client is stopped
-    await fetch(`${HOMESERVER_URL}/_matrix/client/v3/logout`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${loginResp.access_token}`,
-        'Content-Type': 'application/json',
-      },
-      body: '{}',
-    });
-    log('  Temp device logged out.');
-  } catch {
-    log('  Logout request failed (device will expire on its own).');
+    try {
+      await fetch(`${HOMESERVER_URL}/_matrix/client/v3/logout`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${loginResp.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      });
+      log('  Temp device logged out.');
+    } catch {
+      log('  Logout request failed (device will expire on its own).');
+    }
   }
 
   log('');
