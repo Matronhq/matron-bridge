@@ -118,7 +118,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
-    '--disallowed-tools', 'AskUserQuestion',
+    '--disallowed-tools', 'AskUserQuestion,EnterPlanMode,ExitPlanMode',
     '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-matrix-user__ask_matrix_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.',
     '--include-partial-messages',
     '--mcp-config', path.join(__dirname, 'mcp-config.json'),
