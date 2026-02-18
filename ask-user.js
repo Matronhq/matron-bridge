@@ -65,5 +65,47 @@ server.tool(
   }
 );
 
+server.tool(
+  'request_secret',
+  'Request a secret from the user via a secure web form. The secret is written to a file and the file path is returned. Use this for API keys, tokens, passwords — anything that should not appear in chat.',
+  {
+    label: z.string().describe('A short label describing what secret is needed, e.g. "AWS access key" or "database password"'),
+  },
+  async ({ label }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/secret`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label }),
+      });
+
+      if (!postRes.ok) {
+        const err = await postRes.text();
+        return { content: [{ type: 'text', text: `Error requesting secret: ${err}` }] };
+      }
+
+      const { secretId } = await postRes.json();
+
+      // Poll for the secret to be submitted
+      const deadline = Date.now() + POLL_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+
+        const pollRes = await fetch(`${BRIDGE_API}/secret/${secretId}`);
+        if (!pollRes.ok) continue;
+
+        const data = await pollRes.json();
+        if (data.answered) {
+          return { content: [{ type: 'text', text: `Secret written to: ${data.path}` }] };
+        }
+      }
+
+      return { content: [{ type: 'text', text: 'Secret request timed out — no input received within 5 minutes.' }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
