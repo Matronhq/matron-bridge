@@ -145,6 +145,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     env: {
       ...process.env,
       CLAUDECODE: '',
+      BRIDGE_ROOM_ID: roomId,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -2050,7 +2051,7 @@ const apiServer = createServer((req, res) => {
 
       // POST /ask — MCP server posts a question
       if (url.pathname === '/ask') {
-        const { question, header, options } = data;
+        const { question, header, options, roomId } = data;
         if (!question) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'question is required' }));
@@ -2064,10 +2065,12 @@ const apiServer = createServer((req, res) => {
           answered: false, answer: null,
         });
 
-        // Find the active session and show the question
-        let activeSession = null;
-        for (const [, s] of sessions) {
-          if (s.alive) { activeSession = s; break; }
+        // Find the session — prefer the specific room, fall back to first alive
+        let activeSession = roomId ? sessions.get(roomId) : null;
+        if (!activeSession) {
+          for (const [, s] of sessions) {
+            if (s.alive) { activeSession = s; break; }
+          }
         }
 
         if (activeSession) {
@@ -2102,7 +2105,7 @@ const apiServer = createServer((req, res) => {
       }
 
       if (url.pathname === '/secret') {
-        const { label } = data;
+        const { label, roomId } = data;
         if (!label) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'label is required' }));
@@ -2117,10 +2120,12 @@ const apiServer = createServer((req, res) => {
           path: null,
         });
 
-        // Find active session and send the link to its room
-        let activeSession = null;
-        for (const [, s] of sessions) {
-          if (s.alive) { activeSession = s; break; }
+        // Find the session — prefer the specific room, fall back to first alive
+        let activeSession = roomId ? sessions.get(roomId) : null;
+        if (!activeSession) {
+          for (const [, s] of sessions) {
+            if (s.alive) { activeSession = s; break; }
+          }
         }
 
         if (activeSession) {
