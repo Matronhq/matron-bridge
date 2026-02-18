@@ -8,15 +8,15 @@
       }
     },
     "puppeteer": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
+      "command": "xvfb-run",
+      "args": ["--auto-servernum", "--server-args=-screen 0 1920x1080x24", "npx", "-y", "@modelcontextprotocol/server-puppeteer"],
       "env": {
         "PUPPETEER_LAUNCH_OPTIONS": "{\"headless\": false, \"args\": [\"--no-sandbox\", \"--disable-setuid-sandbox\"]}"
       }
     },
     "chrome-devtools": {
-      "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
+      "command": "xvfb-run",
+      "args": ["--auto-servernum", "--server-args=-screen 0 1920x1080x24", "npx", "-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
     }
   }
 }
