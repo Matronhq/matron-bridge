@@ -1878,9 +1878,13 @@ client.on('room.message', async (roomId, event) => {
           await editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
         }
       }
-      if (queue.length === 0) {
+      const remaining = queue.length;
+      if (remaining === 0) {
         session.queuedMessages = null;
       }
+      await sendReply(remaining === 0
+        ? 'Cancelled queued message (queue empty).'
+        : `Cancelled queued message (${remaining} remaining).`);
       return;
     }
     // Queue the message
