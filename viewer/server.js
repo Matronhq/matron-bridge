@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 
-const PORT = process.env.PORT || 9801;
+const PORT = process.env.MATRIX_VIEWER_PORT || 9803;
 const SECRET = process.env.HMAC_SECRET;
 const TOKEN_EXPIRY_SECONDS = parseInt(process.env.TOKEN_EXPIRY || '3600', 10);
 
