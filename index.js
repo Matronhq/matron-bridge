@@ -156,6 +156,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     env: {
       ...process.env,
       CLAUDECODE: '',
+      MATRIX_BRIDGE_API_PORT: String(API_PORT),
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
