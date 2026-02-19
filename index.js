@@ -30,6 +30,12 @@ const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+
+// Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON)
+const MCP_CONFIG_PATH = path.join(__dirname, '.mcp-config-generated.json');
+const mcpConfig = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
+mcpConfig.mcpServers['ask-user'].args[0] = path.join(__dirname, 'ask-user.js');
+fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(mcpConfig, null, 2));
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
@@ -131,7 +137,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.',
     '--include-partial-messages',
-    '--mcp-config', path.join(__dirname, 'mcp-config.json'),
+    '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify({
       hooks: {
         PreCompact: [{
