@@ -132,7 +132,17 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.',
     '--include-partial-messages',
     '--mcp-config', path.join(__dirname, 'mcp-config.json'),
-    '--settings', path.join(__dirname, 'hooks-settings.json'),
+    '--settings', JSON.stringify({
+      hooks: {
+        PreCompact: [{
+          hooks: [{
+            type: 'command',
+            command: path.join(__dirname, 'hooks', 'compact-notify.sh'),
+            timeout: 5,
+          }],
+        }],
+      },
+    }),
   ];
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId);
