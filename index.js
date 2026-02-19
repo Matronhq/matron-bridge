@@ -132,6 +132,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.',
     '--include-partial-messages',
     '--mcp-config', path.join(__dirname, 'mcp-config.json'),
+    '--settings', path.join(__dirname, 'hooks-settings.json'),
   ];
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId);
@@ -673,10 +674,10 @@ function handleClaudeEvent(session, event) {
           event.model, event.tools?.length, event.mcp_servers?.length);
       } else if (event.subtype === 'compact' || event.subtype === 'context_compaction') {
         if (session.sendHtml) {
-          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space.');
+          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
-          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
+          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
         }
       } else if (event.subtype === 'task_notification') {
         const isComplete = event.status === 'completed';
@@ -695,10 +696,10 @@ function handleClaudeEvent(session, event) {
       const evt = event.event;
       if (evt?.type === 'message_delta' && evt?.context_management?.applied_edits?.length > 0) {
         if (session.sendHtml) {
-          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space.');
+          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
-          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
+          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
         }
       }
       break;
@@ -2275,6 +2276,26 @@ const apiServer = createServer((req, res) => {
           res.writeHead(500);
           res.end(JSON.stringify({ error: err.message }));
         });
+
+      } else if (url.pathname === '/compact-start') {
+        // PreCompact hook notifies us that compaction is about to begin
+        const { session_id } = data;
+        let target = null;
+        if (session_id) {
+          for (const [, s] of sessions) {
+            if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
+          }
+        }
+        if (target) {
+          if (target.sendHtml) {
+            const n = notice('info', '🗜️ Compacting context — summarizing conversation history…');
+            target.sendHtml(n.plain, n.html);
+          } else if (target.sendCallback) {
+            target.sendCallback('🗜️ Compacting context — summarizing conversation history…');
+          }
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
 
       } else if (url.pathname === '/sessions') {
         const list = [];

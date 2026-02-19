@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/danbarker/claude-matrix-bridge/hooks/compact-notify.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
