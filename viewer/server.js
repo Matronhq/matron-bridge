@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 
-const PORT = process.env.PORT || 9801;
+const PORT = process.env.MATRIX_VIEWER_PORT || 9803;
 const SECRET = process.env.HMAC_SECRET;
 const TOKEN_EXPIRY_SECONDS = parseInt(process.env.TOKEN_EXPIRY || '3600', 10);
 
@@ -189,7 +189,8 @@ app.get('/action', async (req, res) => {
 
     if (!resp.ok) {
       const err = await resp.text();
-      return res.type('html').send(`<!DOCTYPE html><html><body><h2>Action failed</h2><p>${err}</p></body></html>`);
+      const safeErr = err.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      return res.type('html').send(`<!DOCTYPE html><html><body><h2>Action failed</h2><p>${safeErr}</p></body></html>`);
     }
 
     res.type('html').send(`<!DOCTYPE html>
@@ -233,8 +234,9 @@ app.post('/secret', async (req, res) => {
 
     if (!resp.ok) {
       const err = await resp.text();
+      const safeErr = err.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
       return res.status(resp.status).type('html').send(
-        `<!DOCTYPE html><html><body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;"><div><h2>Submission failed</h2><p>${err}</p></div></body></html>`
+        `<!DOCTYPE html><html><body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;"><div><h2>Submission failed</h2><p>${safeErr}</p></div></body></html>`
       );
     }
 

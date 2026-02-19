@@ -9,6 +9,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
+const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
 const POLL_TIMEOUT_MS = 300000; // 5 min max wait
 
@@ -34,7 +35,7 @@ server.tool(
       const postRes = await fetch(`${BRIDGE_API}/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, header, options }),
+        body: JSON.stringify({ question, header, options, roomId: ROOM_ID }),
       });
 
       if (!postRes.ok) {
@@ -76,7 +77,7 @@ server.tool(
       const postRes = await fetch(`${BRIDGE_API}/secret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label }),
+        body: JSON.stringify({ label, roomId: ROOM_ID }),
       });
 
       if (!postRes.ok) {
