@@ -1906,6 +1906,52 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
+  // Handle native button responses
+  if (event.content['chat.matron.button_response'] === true) {
+    const relatesTo = event.content['m.relates_to'];
+    const originalEventId = relatesTo?.event_id;
+    const value = (event.content.body || '').trim();
+
+    // Check if this is a queue action response
+    if (value === 'interrupt') {
+      const queued = session.queuedMessages || [];
+      session.queuedMessages = null;
+      stripQueueNotificationLinks(session);
+      if (queued.length > 0) {
+        if (session.sendCallback) {
+          session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
+        }
+        flushQueue(session, queued);
+      }
+      return;
+    }
+
+    const cancelMatch = value.match(/^cancel:(\d+)$/);
+    if (cancelMatch) {
+      const index = parseInt(cancelMatch[1], 10);
+      const queue = session.queuedMessages;
+      if (queue && index >= 0 && index < queue.length) {
+        queue.splice(index, 1);
+        const notifs = session.queueNotifications || [];
+        if (index < notifs.length) {
+          const { eventId, plain } = notifs.splice(index, 1)[0];
+          if (eventId) editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
+        }
+        if (queue.length === 0) session.queuedMessages = null;
+        if (session.sendCallback) {
+          const remaining = queue.length;
+          session.sendCallback(remaining === 0
+            ? '✕ Cancelled queued message (queue empty)'
+            : `✕ Cancelled queued message (${remaining} remaining)`);
+        }
+      }
+      return;
+    }
+
+    // Otherwise treat as a question answer — fall through to waitingForAnswer handling
+    // The value is already the button label, so resolveQuestionAnswer will use it as-is
+  }
+
   // If Claude Code asked a question, handle the answer
   if (session.waitingForAnswer) {
     const q = session.pendingQuestions?.[0];
