@@ -52,10 +52,6 @@ const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 
-// Plan file patterns — files that get a "view in browser" link
-const PLAN_FILE_PATTERNS = [
-  /plan/i, /todo/i, /task/i, /readme/i, /\.md$/i, /checklist/i, /notes/i, /summary/i,
-];
 
 function generateFileLink(filePath) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
@@ -81,10 +77,7 @@ function generateSecretLink(secretId, label, roomId) {
   return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
 
-function isPlanFile(filePath) {
-  const basename = path.basename(filePath);
-  return PLAN_FILE_PATTERNS.some(p => p.test(basename));
-}
+
 
 function debug(...args) {
   if (DEBUG) console.log('[DEBUG]', ...args);
@@ -519,36 +512,35 @@ function handleClaudeEvent(session, event) {
               : input.command;
             indicator = `🔧 \`${cmd}\``;
             indicatorHtml = `🔧 <code>${escapeHtml(cmd)}</code>`;
+            isKeyEvent = true;
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
             indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
           } else if (toolName === 'Write' && input.file_path) {
-            indicator = `✏️ Writing ${input.file_path}`;
-            indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
             isKeyEvent = true;
-            if (isPlanFile(input.file_path)) {
-              const absPath = path.isAbsolute(input.file_path)
-                ? input.file_path
-                : path.join(session.workdir, input.file_path);
-              const link = generateFileLink(absPath);
-              if (link) {
-                indicator += `\n[🔗 View in browser](${link})`;
-                indicatorHtml += `<br/><a href="${link}">🔗 View in browser</a>`;
-              }
+            const absPath = path.isAbsolute(input.file_path)
+              ? input.file_path
+              : path.join(session.workdir, input.file_path);
+            const link = generateFileLink(absPath);
+            if (link) {
+              indicator = `✏️ Writing [${input.file_path}](${link})`;
+              indicatorHtml = `✏️ Writing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
+            } else {
+              indicator = `✏️ Writing ${input.file_path}`;
+              indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
             }
           } else if (toolName === 'Edit' && input.file_path) {
-            indicator = `✏️ Editing ${input.file_path}`;
-            indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
             isKeyEvent = true;
-            if (isPlanFile(input.file_path)) {
-              const absPath = path.isAbsolute(input.file_path)
-                ? input.file_path
-                : path.join(session.workdir, input.file_path);
-              const link = generateFileLink(absPath);
-              if (link) {
-                indicator += `\n[🔗 View in browser](${link})`;
-                indicatorHtml += `<br/><a href="${link}">🔗 View in browser</a>`;
-              }
+            const absPath = path.isAbsolute(input.file_path)
+              ? input.file_path
+              : path.join(session.workdir, input.file_path);
+            const link = generateFileLink(absPath);
+            if (link) {
+              indicator = `✏️ Editing [${input.file_path}](${link})`;
+              indicatorHtml = `✏️ Editing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
+            } else {
+              indicator = `✏️ Editing ${input.file_path}`;
+              indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
             }
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
