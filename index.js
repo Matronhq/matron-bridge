@@ -1057,6 +1057,27 @@ async function sendToRoom(roomId, text, html) {
   }
 }
 
+async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
+  const content = {
+    msgtype: 'm.text',
+    body: fallbackBody,
+    format: 'org.matrix.custom.html',
+    formatted_body: fallbackHtml,
+    'com.yearbook.buttons': {
+      mode,       // 'pick_one' or 'pick_many'
+      prompt,
+      buttons,    // [{ id, label, value }]
+    },
+  };
+  try {
+    const eventId = await client.sendMessage(roomId, content);
+    return eventId || null;
+  } catch (e) {
+    console.error('Failed to send button message:', e.message);
+    return null;
+  }
+}
+
 // --- Room Management ---
 
 async function createSessionRoom(inviteUserId) {
