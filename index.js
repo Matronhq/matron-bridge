@@ -378,6 +378,7 @@ function sendAllQuestions(session) {
         : (q.header ? `${q.header}\n\n${q.question}` : q.question);
 
       const mode = q.multiSelect ? 'pick_many' : 'pick_one';
+      console.log(`[BUTTONS] sendAllQuestions: q.multiSelect=${q.multiSelect}, mode=${mode}`);
       session.sendButtonMessage(prompt, buttons, mode, plainText, html);
     } else if (session.sendHtml) {
       session.sendHtml(plainText, html);
@@ -1082,6 +1083,7 @@ async function sendToRoom(roomId, text, html) {
 }
 
 async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
+  console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const content = {
     msgtype: 'm.text',
     body: fallbackBody,
@@ -2178,7 +2180,7 @@ const apiServer = createServer((req, res) => {
 
       // POST /ask — MCP server posts a question
       if (url.pathname === '/ask') {
-        const { question, header, options, roomId } = data;
+        const { question, header, options, multiSelect, roomId } = data;
         if (!question) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'question is required' }));
@@ -2206,7 +2208,7 @@ const apiServer = createServer((req, res) => {
               question,
               header: header || null,
               options: options || [],
-              multiSelect: false,
+              multiSelect: multiSelect || false,
             }]
           };
 
