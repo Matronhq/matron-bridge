@@ -937,9 +937,9 @@ function markdownToHtml(text) {
         const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
         const lineCount = inner.split('\n').length;
         if (lineCount > 15) {
-          return `<details><summary>Code (${lineCount} lines)</summary><pre>${escapeHtml(inner)}</pre></details>`;
+          return `<details><summary>Code (${lineCount} lines)</summary><pre><code>${escapeHtml(inner)}</code></pre></details>`;
         }
-        return `<pre>${escapeHtml(inner)}</pre>`;
+        return `<pre><code>${escapeHtml(inner)}</code></pre>`;
       }
       return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
     }
@@ -988,8 +988,24 @@ function markdownToHtml(text) {
     return `<ul>${match}</ul>`;
   });
 
+  // Protect newlines inside <pre> blocks before converting to <br/>
+  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
+    return '<pre><code>' + inner.replace(/\n/g, '&#10;') + '</code></pre>';
+  });
+  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
+    return '<pre>' + inner.replace(/\n/g, '&#10;') + '</pre>';
+  });
+
   // Convert newlines to <br/> (but not before/after block elements)
   html = html.replace(/\n/g, '<br/>');
+
+  // Restore newlines in <pre> blocks
+  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
+    return '<pre><code>' + inner.replace(/&#10;/g, '\n') + '</code></pre>';
+  });
+  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
+    return '<pre>' + inner.replace(/&#10;/g, '\n') + '</pre>';
+  });
 
   // Clean up excessive <br/> around block elements
   html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
