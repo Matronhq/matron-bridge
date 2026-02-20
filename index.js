@@ -231,6 +231,7 @@ function createSession(roomId, workdir, resumeSessionId) {
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
+        restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
         sessions.set(roomId, restarted);
@@ -353,13 +354,36 @@ function sendAllQuestions(session) {
   if (!questions || questions.length === 0) return;
 
   const total = questions.length;
-  const plainText = questions.map((q, i) => formatQuestion(q, i, total)).join('\n\n');
-  const html = questions.map((q, i) => formatQuestionHtml(q, i, total)).join('\n\n');
 
-  if (session.sendHtml) {
-    session.sendHtml(plainText, html);
-  } else if (session.sendCallback) {
-    session.sendCallback(plainText);
+  for (let i = 0; i < total; i++) {
+    const q = questions[i];
+    const plainText = formatQuestion(q, i, total);
+    const html = formatQuestionHtml(q, i, total);
+
+    if (q.options && q.options.length > 0 && session.sendButtonMessage) {
+      // Build button array from options
+      const buttons = q.options.map((opt, idx) => {
+        const label = typeof opt.label === 'string' ? opt.label : typeof opt === 'string' ? opt : String(opt);
+        const letter = String.fromCharCode(65 + idx);
+        return {
+          id: `opt_${letter.toLowerCase()}`,
+          label: label,
+          value: label,
+        };
+      });
+
+      const prefix = total > 1 ? `Question ${i + 1}/${total}` : '';
+      const prompt = prefix
+        ? (q.header ? `${prefix} — ${q.header}\n\n${q.question}` : `${prefix}\n\n${q.question}`)
+        : (q.header ? `${q.header}\n\n${q.question}` : q.question);
+
+      const mode = q.multiSelect ? 'pick_many' : 'pick_one';
+      session.sendButtonMessage(prompt, buttons, mode, plainText, html);
+    } else if (session.sendHtml) {
+      session.sendHtml(plainText, html);
+    } else if (session.sendCallback) {
+      session.sendCallback(plainText);
+    }
   }
 }
 
@@ -1267,11 +1291,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
       const session = createSession(sessionRoomId, workdir);
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
+      session.sendButtonMessage = sessionSendButtons;
 
       // Confirm in origin room with a link to the new room
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
@@ -1321,6 +1348,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const restarted = createSession(roomId, restartWorkdir, restartSessionId);
       restarted.sendCallback = sendReply;
       restarted.sendHtml = sendHtml;
+      restarted.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
       restarted.originRoomId = existing.originRoomId;
       restarted.firstMessageCaptured = existing.firstMessageCaptured;
       await sendReply(
@@ -1403,12 +1432,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
       const session = createSession(sessionRoomId, resumeWorkdir, resumeSessionId);
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
+      session.sendButtonMessage = sessionSendButtons;
 
       // Persist immediately — we already know the session ID, don't wait for Claude's event
       persistSession(sessionRoomId, resumeSessionId, resumeWorkdir, roomId);
@@ -1463,11 +1495,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
       const session = createSession(sessionRoomId, resolved);
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
+      session.sendButtonMessage = sessionSendButtons;
 
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Session started in new room: ${roomLink}\nWorkdir: ${resolved}`);
@@ -1858,6 +1893,8 @@ client.on('room.message', async (roomId, event) => {
       newSession.firstMessageCaptured = true;
       newSession.sendCallback = sendReply;
       newSession.sendHtml = sendHtmlFn;
+      newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
       session = newSession;
 
       const shortId = prev.sessionId.slice(0, 8);
