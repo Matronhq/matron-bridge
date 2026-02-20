@@ -1244,6 +1244,10 @@ async function buildMediaContentBlocks(event, session) {
     const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
   } else if (content.msgtype === 'm.image') {
+    // Save image to workdir
+    const imgPath = deduplicateFilename(session.workdir, fileName);
+    fs.writeFileSync(imgPath, buffer);
+    blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
