@@ -730,8 +730,6 @@ function handleClaudeEvent(session, event) {
         flushQueue(session, queued);
       }
 
-      // Update room name and pinned summary via Gemini summarization
-      maybeUpdatePinnedSummary(session);
       break;
     }
 
@@ -828,6 +826,8 @@ function flushResponse(session) {
     if (session.claudeSessionId) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
     }
+    // Update room name and pinned summary after adding message
+    maybeUpdatePinnedSummary(session);
   }
 
   if (session.sendCallback) {
