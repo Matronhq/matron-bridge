@@ -104,9 +104,9 @@ function savePersistedSessions(data) {
   }
 }
 
-function persistSession(roomId, sessionId, workdir, originRoomId) {
+function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const data = loadPersistedSessions();
-  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null };
+  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null, ...(extra || {}) };
   savePersistedSessions(data);
 }
 
@@ -168,7 +168,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
-    pendingPlanDenialId: null,
+    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
     sendHtml: null,
     showWorking: false,
     alive: true,
@@ -511,8 +511,16 @@ function handleClaudeEvent(session, event) {
         const toolName = block.name;
         const input = block.input || {};
 
-        if (toolName === 'ExitPlanMode' || toolName === 'EnterPlanMode') {
-          console.log(`[PLAN-DEBUG] Tool call: ${toolName} | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
+        if (toolName === 'ExitPlanMode') {
+          console.log(`[PLAN-DEBUG] Tool call: ExitPlanMode | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
+          // Persist the tool_use_id so "build" can send a tool_result even after bridge restart
+          session.pendingPlanDenialId = block.id;
+          if (session.claudeSessionId) {
+            persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: block.id });
+          }
+        }
+        if (toolName === 'EnterPlanMode') {
+          console.log(`[PLAN-DEBUG] Tool call: EnterPlanMode | block.id: ${block.id}`);
         }
 
         if (toolName === 'AskUserQuestion') {
@@ -2033,11 +2041,39 @@ client.on('room.message', async (roomId, event) => {
 
   // Handle text "build" for plan approval
   console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
-  if (session.pendingPlan && text.toLowerCase().trim() === 'build') {
-    debug('Build triggered! Sending approval to session.');
-    sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
-    session.pendingPlan = null;
-    session.pendingPlanDenialId = null;
+  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId)) {
+    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${session.pendingPlanDenialId}`);
+    if (session.pendingPlanDenialId) {
+      // Send a tool_result to properly exit plan mode
+      const toolUseId = session.pendingPlanDenialId;
+      session.pendingPlan = null;
+      session.pendingPlanDenialId = null;
+      // Clear persisted denial ID
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+      }
+      session.busy = true;
+      const jsonMsg = JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{
+            tool_use_id: toolUseId,
+            type: 'tool_result',
+            content: 'Plan approved. Execute the plan now.',
+          }]
+        }
+      }) + '\n';
+      console.log(`[PLAN-DEBUG] Sending tool_result for ExitPlanMode: ${toolUseId}`);
+      session.proc.stdin.write(jsonMsg);
+      if (session.resetTimeout) session.resetTimeout();
+      if (session.typingInterval) clearInterval(session.typingInterval);
+      session.typingInterval = startTyping(session.roomId);
+    } else {
+      // Fallback: send as text
+      sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
+      session.pendingPlan = null;
+    }
     const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
     await sendHtmlFn(buildNotice.plain, buildNotice.html);
     return;
@@ -2048,6 +2084,9 @@ client.on('room.message', async (roomId, event) => {
   if (session.pendingPlan && !session.busy) {
     session.pendingPlan = null;
     session.pendingPlanDenialId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
     // Falls through to normal message handling below
   }
 
