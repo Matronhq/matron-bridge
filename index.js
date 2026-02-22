@@ -1291,7 +1291,7 @@ async function maybeUpdatePinnedSummary(session) {
 
     // Update room name (keep short - UI truncates around 30 chars)
     if (titleMatch) {
-      const name = `${SERVER_LABEL}:${sessionShort}: ${titleMatch[1].trim().slice(0, 30)}`;
+      const name = `${SERVER_LABEL}:${sessionShort} ${titleMatch[1].trim().slice(0, 30)}`;
       updateRoomName(session.roomId, name);
     }
 
@@ -2330,7 +2330,7 @@ client.on('room.message', async (roomId, event) => {
         session.firstMessageCaptured = true;
         const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
         const fileName = event.content.body || 'file';
-        const label = `${SERVER_LABEL}:${sessionShort}: ${fileName.slice(0, 30)}`;
+        const label = `${SERVER_LABEL}:${sessionShort} ${fileName.slice(0, 30)}`;
         updateRoomName(session.roomId, label);
       }
     } catch (err) {
@@ -2348,7 +2348,7 @@ client.on('room.message', async (roomId, event) => {
         session.firstMessageCaptured = true;
         const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
         const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
-        updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort}: ${summary}`);
+        updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
       }
     }
   }
