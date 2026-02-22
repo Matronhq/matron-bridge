@@ -10,6 +10,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // --- Config ---
 
@@ -52,6 +53,10 @@ const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 
+// Gemini client for room topic summarization
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+const TOPIC_UPDATE_INTERVAL = 60000; // min 60s between updates
 
 function generateFileLink(filePath) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
@@ -187,6 +192,12 @@ function createSession(roomId, workdir, resumeSessionId) {
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
+    // Chat history for topic summarization
+    chatHistory: [],         // { role, text } for topic summarization
+    lastTopicUpdate: 0,      // timestamp of last room name update
+    lastTopicMessageCount: 0, // chatHistory length at last update
+    pinnedSummaryEventId: null, // event ID of pinned summary message
+    pendingWelcome: true,    // whether to send welcome on user join
   };
 
   // Parse newline-delimited JSON from stdout
@@ -721,6 +732,9 @@ function handleClaudeEvent(session, event) {
         }
         flushQueue(session, queued);
       }
+
+      // Update room name and pinned summary via Gemini summarization
+      maybeUpdatePinnedSummary(session);
       break;
     }
 
@@ -806,6 +820,13 @@ function flushResponse(session) {
   session.responseBuffer = '';
 
   if (!text) return;
+
+  // Track assistant response for topic summarization (strip code blocks)
+  const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
+  if (cleanText) {
+    session.chatHistory.push({ role: 'assistant', text: cleanText.slice(0, 200) });
+    if (session.chatHistory.length > 20) session.chatHistory.shift();
+  }
 
   if (session.sendCallback) {
     const chunks = splitMessage(text);
@@ -1221,6 +1242,96 @@ async function updateRoomName(roomId, name) {
   }
 }
 
+async function maybeUpdatePinnedSummary(session) {
+  if (!genAI) return;
+  if (session.chatHistory.length <= session.lastTopicMessageCount) return;
+  if (Date.now() - session.lastTopicUpdate < TOPIC_UPDATE_INTERVAL) return;
+  if (session.chatHistory.length < 2) return;
+
+  session.lastTopicUpdate = Date.now();
+  session.lastTopicMessageCount = session.chatHistory.length;
+
+  try {
+    // Get current pinned summary content
+    let currentSummary = '';
+    if (session.pinnedSummaryEventId) {
+      try {
+        const event = await client.getEvent(session.roomId, session.pinnedSummaryEventId);
+        currentSummary = event.content?.body || '';
+        // Remove "📌 Session Summary\n\n" prefix if present
+        currentSummary = currentSummary.replace(/^📌 Session Summary\n\n/, '');
+      } catch (e) {
+        // Pinned message was deleted or inaccessible
+        session.pinnedSummaryEventId = null;
+      }
+    }
+
+    const messages = session.chatHistory.slice(-10).map(m =>
+      `${m.role}: ${m.text}`
+    ).join('\n');
+
+    const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
+    const prompt = currentSummary
+      ? `Based on this recent conversation, provide:\n1. A 5-10 word title (what's currently being worked on)\n2. A brief 1-sentence summary of what was just accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nRecent chat:\n${messages}`
+      : `Based on this conversation, provide:\n1. A 5-10 word title (what's being worked on)\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\n${messages}`;
+
+    const result = await model.generateContent(prompt);
+    const text = result.response.text().trim();
+    const titleMatch = text.match(/TITLE:\s*(.+)/i);
+    const summaryMatch = text.match(/SUMMARY:\s*(.+)/i);
+    const newMatch = text.match(/NEW:\s*(.+)/i);
+
+    const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+
+    // Update room name
+    if (titleMatch) {
+      const name = `${SERVER_LABEL}:${sessionShort}: ${titleMatch[1].trim().slice(0, 50)}`;
+      updateRoomName(session.roomId, name);
+    }
+
+    // Build cumulative summary for pinned message
+    let updatedSummary = '';
+    if (newMatch && currentSummary) {
+      updatedSummary = `${currentSummary}\n• ${newMatch[1].trim()}`;
+    } else if (summaryMatch) {
+      updatedSummary = summaryMatch[1].trim();
+    }
+
+    if (updatedSummary) {
+      const plainText = `📌 Session Summary\n\n${updatedSummary}`;
+      const htmlText = `<b>📌 Session Summary</b><br/><br/>${escapeHtml(updatedSummary).replace(/\n/g, '<br/>')}`;
+
+      if (session.pinnedSummaryEventId) {
+        // Edit existing pinned message
+        await editMessage(session.roomId, session.pinnedSummaryEventId, plainText, htmlText);
+      } else {
+        // Create new pinned message
+        const eventId = await client.sendMessage(session.roomId, {
+          msgtype: 'm.text',
+          body: plainText,
+          format: 'org.matrix.custom.html',
+          formatted_body: htmlText,
+        });
+        session.pinnedSummaryEventId = eventId;
+
+        // Pin the message
+        try {
+          const pinnedEvents = await client.getRoomStateEvent(session.roomId, 'm.room.pinned_events', '').catch(() => ({ pinned: [] }));
+          const pinned = Array.isArray(pinnedEvents?.pinned) ? pinnedEvents.pinned : [];
+          if (!pinned.includes(eventId)) {
+            pinned.push(eventId);
+            await client.sendStateEvent(session.roomId, 'm.room.pinned_events', '', { pinned });
+          }
+        } catch (e) {
+          debug(`Failed to pin message: ${e.message}`);
+        }
+      }
+    }
+  } catch (e) {
+    debug(`Failed to update pinned summary: ${e.message}`);
+  }
+}
+
 function getSessionSummary(sessionId, workdir) {
   const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
   const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
@@ -1370,13 +1481,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Session started in new room: ${roomLink}`);
 
-      // Welcome message in the session room
-      const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
-      const welcomeHtml =
-        `<b>Session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
-        `<i>Send any message to interact with Claude Code.</i>`;
-      await sessionSendHtml(welcomePlain, welcomeHtml);
+      // Welcome message will be sent when user joins (see room.join handler)
       break;
     }
 
@@ -2057,14 +2162,20 @@ client.on('room.message', async (roomId, event) => {
         type: 'user',
         message: {
           role: 'user',
-          content: [{
-            tool_use_id: toolUseId,
-            type: 'tool_result',
-            content: 'Plan approved. Execute the plan now.',
-          }]
+          content: [
+            {
+              tool_use_id: toolUseId,
+              type: 'tool_result',
+              content: 'Plan approved by user.',
+            },
+            {
+              type: 'text',
+              text: 'Go ahead and execute the plan now.',
+            }
+          ]
         }
       }) + '\n';
-      console.log(`[PLAN-DEBUG] Sending tool_result for ExitPlanMode: ${toolUseId}`);
+      console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
       session.proc.stdin.write(jsonMsg);
       if (session.resetTimeout) session.resetTimeout();
       if (session.typingInterval) clearInterval(session.typingInterval);
@@ -2211,8 +2322,9 @@ client.on('room.message', async (roomId, event) => {
         await sendReply('Session is not available. Send !start to begin a new one.');
       } else if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
+        const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
         const fileName = event.content.body || 'file';
-        const label = `${SERVER_LABEL}: ${fileName.slice(0, 50)}`;
+        const label = `${SERVER_LABEL}:${sessionShort}: ${fileName.slice(0, 50)}`;
         updateRoomName(session.roomId, label);
       }
     } catch (err) {
@@ -2222,14 +2334,51 @@ client.on('room.message', async (roomId, event) => {
   } else {
     if (!sendTextToSession(session, text)) {
       await sendReply('Session is not available. Send !start to begin a new one.');
-    } else if (!session.firstMessageCaptured) {
-      session.firstMessageCaptured = true;
-      const summary = text.length > 50 ? text.slice(0, 50) + '…' : text;
-      updateRoomName(session.roomId, `${SERVER_LABEL}: ${summary}`);
+    } else {
+      // Track user message for topic summarization
+      session.chatHistory.push({ role: 'user', text: text.slice(0, 200) });
+      if (session.chatHistory.length > 20) session.chatHistory.shift();
+
+      if (!session.firstMessageCaptured) {
+        session.firstMessageCaptured = true;
+        const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+        const summary = text.length > 50 ? text.slice(0, 50) + '…' : text;
+        updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort}: ${summary}`);
+      }
     }
   }
   } catch (err) {
     console.error('[ERROR] room.message handler:', err);
+  }
+});
+
+// --- Room Membership Handler ---
+
+client.on('room.join', async (roomId, event) => {
+  try {
+    // Check if this is a user joining a session room
+    const session = sessions.get(roomId);
+    if (!session || !session.pendingWelcome) return;
+
+    // Check if the joining user is the invited user (not the bot)
+    if (event.sender === botUserId) return;
+
+    // Mark welcome as sent
+    session.pendingWelcome = false;
+
+    // Send welcome message now that user has joined
+    const workdir = session.workdir;
+    const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
+    const welcomeHtml =
+      `<b>Session started</b><br/>` +
+      `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
+      `<i>Send any message to interact with Claude Code.</i>`;
+
+    if (session.sendHtml) {
+      await session.sendHtml(welcomePlain, welcomeHtml);
+    }
+  } catch (err) {
+    console.error('[ERROR] room.join handler:', err);
   }
 });
 
