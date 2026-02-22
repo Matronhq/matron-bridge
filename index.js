@@ -824,6 +824,10 @@ function flushResponse(session) {
     if (!session.chatHistory) session.chatHistory = [];
     session.chatHistory.push({ role: 'assistant', text: cleanText });
     debug(`Added assistant message to chatHistory, length now: ${session.chatHistory.length}`);
+    // Persist chatHistory for resume across restarts
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+    }
   }
 
   if (session.sendCallback) {
@@ -2077,6 +2081,7 @@ client.on('room.message', async (roomId, event) => {
       const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
       newSession.originRoomId = prev.originRoomId || null;
       newSession.firstMessageCaptured = true;
+      newSession.chatHistory = prev.chatHistory || [];
       newSession.sendCallback = sendReply;
       newSession.sendHtml = sendHtmlFn;
       newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
@@ -2353,6 +2358,10 @@ client.on('room.message', async (roomId, event) => {
       if (!session.chatHistory) session.chatHistory = [];
       session.chatHistory.push({ role: 'user', text: text });
       debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
+      // Persist chatHistory for resume across restarts
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+      }
 
       if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
