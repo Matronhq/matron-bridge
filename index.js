@@ -1928,11 +1928,18 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
-  // Handle native button responses
-  if (event.content['com.yearbook.button_response'] === true) {
+  // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
+  if (event.content['com.yearbook.button_response']) {
     const relatesTo = event.content['m.relates_to'];
     const originalEventId = relatesTo?.event_id;
-    const value = (event.content.body || '').trim();
+    const responseData = event.content['com.yearbook.button_response'];
+    const selectedValues = (typeof responseData === 'object' && Array.isArray(responseData.selected_values))
+      ? responseData.selected_values
+      : null;
+    // Use structured values if available, fall back to body
+    const value = selectedValues ? selectedValues.join(', ') : (event.content.body || '').trim();
+    // Override body-based text so the answer handler also uses structured values
+    if (selectedValues) text = value;
 
     // Check if this is a queue action response
     if (value === 'interrupt') {
