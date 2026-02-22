@@ -1241,8 +1241,8 @@ async function updateRoomName(roomId, name) {
 async function maybeUpdatePinnedSummary(session) {
   if (!genAI) return;
 
-  // Trigger every 20 messages
-  if (session.chatHistory.length < 20 || session.chatHistory.length % 20 !== 0) return;
+  // Trigger every 10 messages
+  if (session.chatHistory.length < 10 || session.chatHistory.length % 10 !== 0) return;
 
   try {
     // Get current pinned summary content
@@ -1272,13 +1272,13 @@ async function maybeUpdatePinnedSummary(session) {
       bulletCount = 0; // Reset after compacting
     }
 
-    // Get last 20 messages for summarization
-    const recentMessages = session.chatHistory.slice(-20).map(m =>
+    // Get last 10 messages for summarization
+    const recentMessages = session.chatHistory.slice(-10).map(m =>
       `${m.role}: ${m.text}`
     ).join('\n\n');
 
     const prompt = currentSummary
-      ? `Based on these 20 recent messages, provide:\n1. A 2-3 word noun phrase title (topic/feature being worked on - avoid verbs, prefer nouns like "plan mode fix" not "fixing plan mode")\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      ? `Based on these 10 recent messages, provide:\n1. A 2-3 word noun phrase title (topic/feature being worked on - avoid verbs, prefer nouns like "plan mode fix" not "fixing plan mode")\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
       : `Based on these messages, provide:\n1. A 2-3 word noun phrase title (topic/feature - avoid verbs, prefer nouns like "bridge summarization" not "adding summaries")\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
 
     const result = await model.generateContent(prompt);
