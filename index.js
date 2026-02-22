@@ -821,6 +821,7 @@ function flushResponse(session) {
   // Track assistant response for topic summarization (strip code blocks)
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
   if (cleanText) {
+    if (!session.chatHistory) session.chatHistory = [];
     session.chatHistory.push({ role: 'assistant', text: cleanText });
     debug(`Added assistant message to chatHistory, length now: ${session.chatHistory.length}`);
   }
@@ -1245,6 +1246,7 @@ async function maybeUpdatePinnedSummary(session) {
     return;
   }
 
+  if (!session.chatHistory) session.chatHistory = [];
   debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
 
   // Trigger every 10 messages
@@ -2348,6 +2350,7 @@ client.on('room.message', async (roomId, event) => {
       await sendReply('Session is not available. Send !start to begin a new one.');
     } else {
       // Track user message for topic summarization (full text)
+      if (!session.chatHistory) session.chatHistory = [];
       session.chatHistory.push({ role: 'user', text: text });
       debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
 
