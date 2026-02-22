@@ -2347,8 +2347,28 @@ client.on('room.message', async (roomId, event) => {
       if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
         const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-        const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
-        updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
+
+        // Generate initial 3-word name via Gemini
+        if (genAI) {
+          (async () => {
+            try {
+              const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
+              const result = await model.generateContent(
+                `Generate a 2-3 word noun phrase title for a conversation starting with this message. Use nouns, avoid verbs.\n\nMessage: ${text.slice(0, 500)}`
+              );
+              const title = result.response.text().trim().slice(0, 30);
+              updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${title}`);
+            } catch (e) {
+              // Fallback to first message if Gemini fails
+              const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
+              updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
+            }
+          })();
+        } else {
+          // No Gemini configured - use first message
+          const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
+          updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
+        }
       }
     }
   }
