@@ -1122,6 +1122,23 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
 
 // --- Room Management ---
 
+const YEARBOOK_COMMANDS = [
+  { command: 'start', args: '[workdir]', description: 'Start a new session' },
+  { command: 'stop', description: 'Stop the current session' },
+  { command: 'restart', description: 'Stop and immediately resume' },
+  { command: 'resume', args: '<n|id>', description: 'Resume a past session' },
+  { command: 'sessions', description: 'List past sessions' },
+  { command: 'workdir', args: '<path>', description: 'Start in a specific directory' },
+  { command: 'status', description: 'Show session info' },
+  { command: 'working', description: 'Toggle tool call visibility' },
+  { command: 'mcp', description: 'Show MCP server status' },
+  { command: 'model', description: 'Show current model' },
+  { command: 'cost', description: 'Show session cost' },
+  { command: 'usage', description: 'Show token usage' },
+  { command: 'tools', description: 'List available tools' },
+  { command: 'help', description: 'Show all commands' },
+];
+
 async function createSessionRoom(inviteUserId) {
   const roomId = await client.createRoom({
     preset: 'private_chat',
@@ -1132,6 +1149,11 @@ async function createSessionRoom(inviteUserId) {
         type: 'm.room.encryption',
         state_key: '',
         content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      },
+      {
+        type: 'com.yearbook.commands',
+        state_key: '',
+        content: { commands: YEARBOOK_COMMANDS },
       },
     ],
   });
@@ -1634,8 +1656,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
       }).join('\n');
 
-      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse !resume <number> or !resume <id> to resume.`;
-      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>!resume &lt;number&gt;</code> or <code>!resume &lt;id&gt;</code> to resume.</i>`;
+      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse /resume <number> or /resume <id> to resume.`;
+      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume &lt;number&gt;</code> or <code>/resume &lt;id&gt;</code> to resume.</i>`;
 
       await sendHtml(plainText, html);
       break;
@@ -1644,28 +1666,27 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     case '!help': {
       const plainHelp =
         `Available commands:\n\n` +
-        `!start — Start a new session (creates a new room)\n` +
-        `!start <workdir> — Start in a specific directory\n` +
-        `!stop — Stop the current session\n` +
-        `!restart — Stop and immediately resume the session\n` +
-        `!resume <n> — Resume session #n from !sessions list\n` +
-        `!resume <id> — Resume session by ID prefix\n` +
-        `!sessions — List all past sessions\n` +
-        `!workdir <path> — Start session in a different directory\n` +
-        `!status — Show current session info\n` +
-        `!working — Toggle tool call visibility\n` +
-        `!mcp — Show MCP server status\n` +
-        `!model — Show current model\n` +
-        `!cost — Show session cost\n` +
-        `!usage — Show token usage\n` +
-        `!tools — List available tools\n` +
-        `!help — Show this help message\n\n` +
-        `Each !start, !resume, and !workdir creates a new encrypted room for the session.\n` +
+        `/start — Start a new session (creates a new room)\n` +
+        `/start <workdir> — Start in a specific directory\n` +
+        `/stop — Stop the current session\n` +
+        `/restart — Stop and immediately resume the session\n` +
+        `/resume <n> — Resume session #n from /sessions list\n` +
+        `/resume <id> — Resume session by ID prefix\n` +
+        `/sessions — List all past sessions\n` +
+        `/workdir <path> — Start session in a different directory\n` +
+        `/status — Show current session info\n` +
+        `/working — Toggle tool call visibility\n` +
+        `/mcp — Show MCP server status\n` +
+        `/model — Show current model\n` +
+        `/cost — Show session cost\n` +
+        `/usage — Show token usage\n` +
+        `/tools — List available tools\n` +
+        `/help — Show this help message\n\n` +
+        `Each /start, /resume, and /workdir creates a new encrypted room for the session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
         `  Send "interrupt" to force interrupt\n\n` +
-        `Claude Code slash commands (e.g. /commit, /review-pr) are passed through directly.\n` +
         `Send any other text to chat with Claude Code.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
@@ -1676,31 +1697,30 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const htmlHelp =
         cmdGroup('Sessions', [
-          ['!start', 'Start a new session (creates a new room)'],
-          ['!start &lt;workdir&gt;', 'Start in a specific directory'],
-          ['!stop', 'Stop the current session'],
-          ['!restart', 'Stop and immediately resume the session'],
-          ['!resume &lt;n&gt;', 'Resume session #n from !sessions list'],
-          ['!resume &lt;id&gt;', 'Resume session by ID prefix'],
-          ['!sessions', 'List all past sessions'],
-          ['!workdir &lt;path&gt;', 'Start session in a different directory'],
+          ['/start', 'Start a new session (creates a new room)'],
+          ['/start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['/stop', 'Stop the current session'],
+          ['/restart', 'Stop and immediately resume the session'],
+          ['/resume &lt;n&gt;', 'Resume session #n from /sessions list'],
+          ['/resume &lt;id&gt;', 'Resume session by ID prefix'],
+          ['/sessions', 'List all past sessions'],
+          ['/workdir &lt;path&gt;', 'Start session in a different directory'],
         ]) +
         cmdGroup('Info', [
-          ['!status', 'Show current session info'],
-          ['!working', 'Toggle tool call visibility'],
-          ['!mcp', 'Show MCP server status'],
-          ['!model', 'Show current model'],
-          ['!cost', 'Show session cost'],
-          ['!usage', 'Show token usage'],
-          ['!tools', 'List available tools'],
-          ['!help', 'Show this help message'],
+          ['/status', 'Show current session info'],
+          ['/working', 'Toggle tool call visibility'],
+          ['/mcp', 'Show MCP server status'],
+          ['/model', 'Show current model'],
+          ['/cost', 'Show session cost'],
+          ['/usage', 'Show token usage'],
+          ['/tools', 'List available tools'],
+          ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
-        `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new encrypted room</li>` +
+        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new encrypted room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
-        `<li>Slash commands (e.g. <code>/commit</code>) are passed through directly</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
@@ -1886,16 +1906,19 @@ client.on('room.message', async (roomId, event) => {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
 
-  // Bridge commands use ! prefix
-  if (text.startsWith('!')) {
-    const bridgeCommands = new Set([
-      '!start', '!stop', '!restart', '!resume', '!workdir', '!status',
-      '!show', '!show_working', '!working', '!sessions', '!help',
-      '!mcp', '!model', '!cost', '!usage', '!tools',
+  // Bridge commands use / or ! prefix
+  if (text.startsWith('!') || text.startsWith('/')) {
+    const bridgeCommandNames = new Set([
+      'start', 'stop', 'restart', 'resume', 'workdir', 'status',
+      'show', 'show_working', 'working', 'sessions', 'help',
+      'mcp', 'model', 'cost', 'usage', 'tools',
     ]);
-    const cmd = text.split(/\s+/)[0].toLowerCase();
-    if (bridgeCommands.has(cmd)) {
-      await handleCommand(roomId, text, sendReply, sendHtmlFn, sender);
+    const firstWord = text.split(/\s+/)[0].toLowerCase();
+    const cmdName = firstWord.slice(1); // strip ! or /
+    if (bridgeCommandNames.has(cmdName)) {
+      // Normalize to ! prefix for the handler
+      const normalizedText = '!' + text.slice(1);
+      await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
       return;
     }
     // Fall through — forward to Claude Code session
