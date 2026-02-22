@@ -56,7 +56,6 @@ const SECRET_TTL_MS = 3600000; // 1 hour
 // Gemini client for room topic summarization
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
-const TOPIC_UPDATE_INTERVAL = 60000; // min 60s between updates
 
 function generateFileLink(filePath) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
@@ -193,9 +192,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     // Chat history for topic summarization
-    chatHistory: [],         // { role, text } for topic summarization
-    lastTopicUpdate: 0,      // timestamp of last room name update
-    lastTopicMessageCount: 0, // chatHistory length at last update
+    chatHistory: [],         // { role, text } - full messages (code/tools stripped)
     pinnedSummaryEventId: null, // event ID of pinned summary message
     pendingWelcome: true,    // whether to send welcome on user join
   };
@@ -824,8 +821,7 @@ function flushResponse(session) {
   // Track assistant response for topic summarization (strip code blocks)
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
   if (cleanText) {
-    session.chatHistory.push({ role: 'assistant', text: cleanText.slice(0, 200) });
-    if (session.chatHistory.length > 20) session.chatHistory.shift();
+    session.chatHistory.push({ role: 'assistant', text: cleanText });
   }
 
   if (session.sendCallback) {
@@ -1244,36 +1240,46 @@ async function updateRoomName(roomId, name) {
 
 async function maybeUpdatePinnedSummary(session) {
   if (!genAI) return;
-  if (session.chatHistory.length <= session.lastTopicMessageCount) return;
-  if (Date.now() - session.lastTopicUpdate < TOPIC_UPDATE_INTERVAL) return;
-  if (session.chatHistory.length < 2) return;
 
-  session.lastTopicUpdate = Date.now();
-  session.lastTopicMessageCount = session.chatHistory.length;
+  // Trigger every 20 messages
+  if (session.chatHistory.length < 20 || session.chatHistory.length % 20 !== 0) return;
 
   try {
     // Get current pinned summary content
     let currentSummary = '';
+    let bulletCount = 0;
     if (session.pinnedSummaryEventId) {
       try {
         const event = await client.getEvent(session.roomId, session.pinnedSummaryEventId);
         currentSummary = event.content?.body || '';
         // Remove "📌 Session Summary\n\n" prefix if present
         currentSummary = currentSummary.replace(/^📌 Session Summary\n\n/, '');
+        // Count existing bullets
+        bulletCount = (currentSummary.match(/^•/gm) || []).length;
       } catch (e) {
         // Pinned message was deleted or inaccessible
         session.pinnedSummaryEventId = null;
       }
     }
 
-    const messages = session.chatHistory.slice(-10).map(m =>
-      `${m.role}: ${m.text}`
-    ).join('\n');
-
     const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
+
+    // Check if we need to compact (>15 bullets)
+    if (bulletCount > 15 && currentSummary) {
+      const compactPrompt = `Condense this session summary into 3-5 key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
+      const compactResult = await model.generateContent(compactPrompt);
+      currentSummary = compactResult.response.text().trim();
+      bulletCount = 0; // Reset after compacting
+    }
+
+    // Get last 20 messages for summarization
+    const recentMessages = session.chatHistory.slice(-20).map(m =>
+      `${m.role}: ${m.text}`
+    ).join('\n\n');
+
     const prompt = currentSummary
-      ? `Based on this recent conversation, provide:\n1. A 5-10 word title (what's currently being worked on)\n2. A brief 1-sentence summary of what was just accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nRecent chat:\n${messages}`
-      : `Based on this conversation, provide:\n1. A 5-10 word title (what's being worked on)\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\n${messages}`;
+      ? `Based on these 20 recent messages, provide:\n1. A 5-10 word title (what's currently being worked on)\n2. A brief 1-sentence summary of what was accomplished in these messages\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      : `Based on these messages, provide:\n1. A 5-10 word title (what's being worked on)\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().trim();
@@ -2335,9 +2341,8 @@ client.on('room.message', async (roomId, event) => {
     if (!sendTextToSession(session, text)) {
       await sendReply('Session is not available. Send !start to begin a new one.');
     } else {
-      // Track user message for topic summarization
-      session.chatHistory.push({ role: 'user', text: text.slice(0, 200) });
-      if (session.chatHistory.length > 20) session.chatHistory.shift();
+      // Track user message for topic summarization (full text)
+      session.chatHistory.push({ role: 'user', text: text });
 
       if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
