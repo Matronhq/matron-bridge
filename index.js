@@ -1278,8 +1278,8 @@ async function maybeUpdatePinnedSummary(session) {
     ).join('\n\n');
 
     const prompt = currentSummary
-      ? `Based on these 20 recent messages, provide:\n1. A 5-10 word title (what's currently being worked on)\n2. A brief 1-sentence summary of what was accomplished in these messages\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
-      : `Based on these messages, provide:\n1. A 5-10 word title (what's being worked on)\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
+      ? `Based on these 20 recent messages, provide:\n1. A 2-3 word noun phrase title (topic/feature being worked on - avoid verbs, prefer nouns like "plan mode fix" not "fixing plan mode")\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      : `Based on these messages, provide:\n1. A 2-3 word noun phrase title (topic/feature - avoid verbs, prefer nouns like "bridge summarization" not "adding summaries")\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().trim();
@@ -1289,9 +1289,9 @@ async function maybeUpdatePinnedSummary(session) {
 
     const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
 
-    // Update room name
+    // Update room name (keep short - UI truncates around 30 chars)
     if (titleMatch) {
-      const name = `${SERVER_LABEL}:${sessionShort}: ${titleMatch[1].trim().slice(0, 50)}`;
+      const name = `${SERVER_LABEL}:${sessionShort}: ${titleMatch[1].trim().slice(0, 30)}`;
       updateRoomName(session.roomId, name);
     }
 
@@ -2330,7 +2330,7 @@ client.on('room.message', async (roomId, event) => {
         session.firstMessageCaptured = true;
         const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
         const fileName = event.content.body || 'file';
-        const label = `${SERVER_LABEL}:${sessionShort}: ${fileName.slice(0, 50)}`;
+        const label = `${SERVER_LABEL}:${sessionShort}: ${fileName.slice(0, 30)}`;
         updateRoomName(session.roomId, label);
       }
     } catch (err) {
@@ -2347,7 +2347,7 @@ client.on('room.message', async (roomId, event) => {
       if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
         const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-        const summary = text.length > 50 ? text.slice(0, 50) + '…' : text;
+        const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
         updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort}: ${summary}`);
       }
     }
