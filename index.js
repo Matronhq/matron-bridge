@@ -2192,7 +2192,7 @@ client.on('room.message', async (roomId, event) => {
 
   // User sent feedback on the plan (not "build") — clear plan state and forward as message.
   // Only do this when Claude is idle; if busy, leave pendingPlan so "build" still works later.
-  if (session.pendingPlan && !session.busy) {
+  if ((session.pendingPlan || session.pendingPlanDenialId) && !session.busy) {
     session.pendingPlan = null;
     session.pendingPlanDenialId = null;
     if (session.claudeSessionId) {
