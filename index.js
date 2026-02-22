@@ -40,11 +40,11 @@ fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(mcpConfig, null, 2));
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
-// Server label for room names: "dev-2" → "D2", fallback to SERVER_LABEL env var
+// Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
   const hostname = os.hostname();
   const match = hostname.match(/^(\w+)-(\d+)/);
-  if (match) return match[1].charAt(0).toUpperCase() + match[2];
+  if (match) return match[2]; // Just the number
   return hostname.slice(0, 4).toUpperCase();
 })();
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
