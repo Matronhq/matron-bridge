@@ -822,6 +822,7 @@ function flushResponse(session) {
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
   if (cleanText) {
     session.chatHistory.push({ role: 'assistant', text: cleanText });
+    debug(`Added assistant message to chatHistory, length now: ${session.chatHistory.length}`);
   }
 
   if (session.sendCallback) {
@@ -1239,7 +1240,12 @@ async function updateRoomName(roomId, name) {
 }
 
 async function maybeUpdatePinnedSummary(session) {
-  if (!genAI) return;
+  if (!genAI) {
+    debug('Skipping summary: genAI not configured');
+    return;
+  }
+
+  debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
 
   // Trigger every 10 messages
   if (session.chatHistory.length < 10 || session.chatHistory.length % 10 !== 0) return;
@@ -2343,6 +2349,7 @@ client.on('room.message', async (roomId, event) => {
     } else {
       // Track user message for topic summarization (full text)
       session.chatHistory.push({ role: 'user', text: text });
+      debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
 
       if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
