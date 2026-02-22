@@ -128,7 +128,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
-    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.',
+    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.\nExitPlanMode is handled by the bridge — when you call it, the bridge will show the plan to the user and wait for their approval before continuing.',
     '--include-partial-messages',
     '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify({
@@ -470,6 +470,14 @@ function handleClaudeEvent(session, event) {
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
   }
 
+  // Log all event types for plan mode debugging
+  if (event.type) {
+    const extras = [];
+    if (event.permission_denials?.length) extras.push(`denials=${JSON.stringify(event.permission_denials)}`);
+    if (event.subtype) extras.push(`subtype=${event.subtype}`);
+    console.log(`[PLAN-DEBUG] Event type=${event.type}${extras.length ? ' | ' + extras.join(' | ') : ''}`);
+  }
+
   switch (event.type) {
     case 'assistant': {
       const content = event.message?.content;
@@ -502,6 +510,10 @@ function handleClaudeEvent(session, event) {
 
         const toolName = block.name;
         const input = block.input || {};
+
+        if (toolName === 'ExitPlanMode' || toolName === 'EnterPlanMode') {
+          console.log(`[PLAN-DEBUG] Tool call: ${toolName} | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
+        }
 
         if (toolName === 'AskUserQuestion') {
           debug(`AskUserQuestion tool_use block.id=${block.id}, waitingForAnswer=${session.waitingForAnswer}, input keys=${Object.keys(input).join(',')}`);
@@ -669,8 +681,10 @@ function handleClaudeEvent(session, event) {
 
       // Check for ExitPlanMode permission denial — present Build prompt
       const denials = event.permission_denials || [];
+      console.log(`[PLAN-DEBUG] Room ${session.roomId} | result event | denials: ${JSON.stringify(denials)} | pendingPlan: ${!!session.pendingPlan}`);
       const planDenial = denials.find(d => d.tool_name === 'ExitPlanMode');
       if (planDenial && session.sendCallback) {
+        console.log(`[PLAN-DEBUG] ExitPlanMode denial found! tool_use_id: ${planDenial.tool_use_id} | plan length: ${(planDenial.tool_input?.plan || '').length}`);
         const planText = planDenial.tool_input?.plan || '';
         session.pendingPlan = planText;
         session.pendingPlanDenialId = planDenial.tool_use_id;
@@ -2018,12 +2032,23 @@ client.on('room.message', async (roomId, event) => {
   }
 
   // Handle text "build" for plan approval
+  console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
   if (session.pendingPlan && text.toLowerCase().trim() === 'build') {
+    debug('Build triggered! Sending approval to session.');
     sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
     session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
     const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
     await sendHtmlFn(buildNotice.plain, buildNotice.html);
     return;
+  }
+
+  // User sent feedback on the plan (not "build") — clear plan state and forward as message.
+  // Only do this when Claude is idle; if busy, leave pendingPlan so "build" still works later.
+  if (session.pendingPlan && !session.busy) {
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    // Falls through to normal message handling below
   }
 
   // Queue/interrupt logic when Claude is busy
@@ -2528,6 +2553,21 @@ async function main() {
 
   await client.start();
   console.log('Matrix client started, listening for messages...');
+
+  // Ensure all joined rooms have the com.yearbook.commands state event
+  try {
+    const rooms = await client.getJoinedRooms();
+    for (const roomId of rooms) {
+      try {
+        await client.sendStateEvent(roomId, 'com.yearbook.commands', '', { commands: YEARBOOK_COMMANDS });
+      } catch (e) {
+        debug(`Could not set commands state in ${roomId}: ${e.message}`);
+      }
+    }
+    console.log(`Updated com.yearbook.commands in ${rooms.length} rooms`);
+  } catch (e) {
+    console.error('Failed to update command state events:', e.message);
+  }
 }
 
 main().catch(err => {
