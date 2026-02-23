@@ -1384,6 +1384,35 @@ function getSessionSummary(sessionId, workdir) {
   return '';
 }
 
+/**
+ * Check if the session's JSONL history already contains a tool_result for the given tool_use_id.
+ * This prevents sending duplicate tool_results which cause API 400 errors.
+ */
+function hasToolResultInHistory(sessionId, workdir, toolUseId) {
+  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n');
+    // Scan from end (most recent) for efficiency
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      // Quick string check before parsing JSON
+      if (!line.includes(toolUseId)) continue;
+      const record = JSON.parse(line);
+      if (record.type === 'user' && Array.isArray(record.message?.content)) {
+        for (const block of record.message.content) {
+          if (block.type === 'tool_result' && block.tool_use_id === toolUseId) {
+            return true;
+          }
+        }
+      }
+    }
+  } catch {}
+  return false;
+}
+
 // --- Media Handling ---
 
 async function downloadMatrixFile(mxcUrl, fileInfo) {
@@ -1481,7 +1510,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const arg = parts[1];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
-      const workdir = explicitWorkdir || DEFAULT_WORKDIR;
+      let workdir = DEFAULT_WORKDIR;
+      if (explicitWorkdir) {
+        const resolved = path.resolve(explicitWorkdir);
+        try {
+          const stat = fs.statSync(resolved);
+          if (!stat.isDirectory()) {
+            await sendReply(`Not a directory: ${resolved}`);
+            return;
+          }
+        } catch {
+          await sendReply(`Directory not accessible: ${resolved}`);
+          return;
+        }
+        workdir = resolved;
+      }
 
       // Create a new room for this session
       let sessionRoomId;
@@ -1550,6 +1593,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
       restarted.originRoomId = existing.originRoomId;
       restarted.firstMessageCaptured = existing.firstMessageCaptured;
+      // Persist immediately so auto-resume works if the bridge restarts
+      if (restartSessionId) {
+        persistSession(roomId, restartSessionId, restartWorkdir, existing.originRoomId);
+      }
       await sendReply(
         `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}`
       );
@@ -1570,7 +1617,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const resumeWorkdir = DEFAULT_WORKDIR;
+      const currentSession = sessions.get(roomId);
+      const prev = getPersistedSession(roomId);
+      const resumeWorkdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
       const encodedPath = resumeWorkdir.replace(/\//g, '-');
       const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
@@ -2175,13 +2224,30 @@ client.on('room.message', async (roomId, event) => {
   // Handle text "build" for plan approval
   console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
   if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId)) {
-    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${session.pendingPlanDenialId}`);
-    if (session.pendingPlanDenialId) {
-      // Send a tool_result to properly exit plan mode
-      const toolUseId = session.pendingPlanDenialId;
+    const toolUseId = session.pendingPlanDenialId;
+    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
+
+    // Check if a tool_result already exists in the session history for this tool_use_id.
+    // Claude CLI auto-generates a tool_result for permission denials, so sending another
+    // one causes a duplicate tool_result API 400 error.
+    const alreadyAnswered = toolUseId && session.claudeSessionId
+      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
+      : false;
+    console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
+
+    if (!toolUseId || alreadyAnswered) {
+      // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
       session.pendingPlan = null;
       session.pendingPlanDenialId = null;
-      // Clear persisted denial ID
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+      }
+      console.log(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
+      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+    } else {
+      // No existing tool_result — send tool_result to properly exit plan mode
+      session.pendingPlan = null;
+      session.pendingPlanDenialId = null;
       if (session.claudeSessionId) {
         persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
       }
@@ -2208,10 +2274,6 @@ client.on('room.message', async (roomId, event) => {
       if (session.resetTimeout) session.resetTimeout();
       if (session.typingInterval) clearInterval(session.typingInterval);
       session.typingInterval = startTyping(session.roomId);
-    } else {
-      // Fallback: send as text
-      sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
-      session.pendingPlan = null;
     }
     const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
     await sendHtmlFn(buildNotice.plain, buildNotice.html);
@@ -2446,7 +2508,7 @@ const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, vi
 
 const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || '9802', 10);
 
-const apiServer = createServer((req, res) => {
+const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
   // GET /ask/:id — MCP server polls for answer
@@ -2525,7 +2587,7 @@ const apiServer = createServer((req, res) => {
 
   let body = '';
   req.on('data', chunk => body += chunk);
-  req.on('end', () => {
+  req.on('end', async () => {
     try {
       const data = JSON.parse(body);
 
