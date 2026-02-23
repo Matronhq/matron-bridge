@@ -110,7 +110,8 @@ function savePersistedSessions(data) {
 
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const data = loadPersistedSessions();
-  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null, ...(extra || {}) };
+  const existing = data[String(roomId)] || {};
+  data[String(roomId)] = { ...existing, sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null, ...(extra || {}) };
   savePersistedSessions(data);
 }
 
