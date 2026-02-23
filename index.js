@@ -1285,14 +1285,14 @@ async function maybeUpdatePinnedSummary(session) {
       bulletCount = 0; // Reset after compacting
     }
 
-    // Get last 10 messages for summarization
-    const recentMessages = session.chatHistory.slice(-10).map(m =>
+    // Get last 50 messages for summarization (broad context for better titles)
+    const recentMessages = session.chatHistory.slice(-50).map(m =>
       `${m.role}: ${m.text}`
     ).join('\n\n');
 
     const prompt = currentSummary
-      ? `Based on these 10 recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
-      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
+      ? `Based on these recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().trim();
