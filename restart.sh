@@ -37,7 +37,7 @@ if lsof -ti :$PORT >/dev/null 2>&1; then
 fi
 
 echo "Starting bridge..."
-nohup node index.js > /tmp/claude-matrix-bridge.log 2>&1 &
+./start-bridge.sh &
 NEW_PID=$!
 sleep 1
 
