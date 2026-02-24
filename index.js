@@ -2751,9 +2751,9 @@ const apiServer = createServer(async (req, res) => {
 
       if (url.pathname === '/share-sensitive') {
         const { label, content, ttl, roomId } = data;
-        if (!label || !content) {
+        if (!label || !content || !roomId) {
           res.writeHead(400);
-          res.end(JSON.stringify({ error: 'label and content are required' }));
+          res.end(JSON.stringify({ error: 'label, content, and roomId are required' }));
           return;
         }
 
@@ -2777,12 +2777,7 @@ const apiServer = createServer(async (req, res) => {
         });
 
         // Send notification to user in Matrix chat
-        let activeSession = roomId ? sessions.get(roomId) : null;
-        if (!activeSession) {
-          for (const [, s] of sessions) {
-            if (s.alive) { activeSession = s; break; }
-          }
-        }
+        const activeSession = sessions.get(roomId);
 
         if (activeSession && activeSession.sendHtml) {
           const plain = `🔐 Secure data: ${label} — View: ${link}`;
