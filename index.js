@@ -2617,9 +2617,9 @@ const apiServer = createServer(async (req, res) => {
       // POST /ask — MCP server posts a question
       if (url.pathname === '/ask') {
         const { question, header, options, multiSelect, roomId } = data;
-        if (!question) {
+        if (!question || !roomId) {
           res.writeHead(400);
-          res.end(JSON.stringify({ error: 'question is required' }));
+          res.end(JSON.stringify({ error: 'question and roomId are required' }));
           return;
         }
 
@@ -2630,13 +2630,7 @@ const apiServer = createServer(async (req, res) => {
           answered: false, answer: null,
         });
 
-        // Find the session — prefer the specific room, fall back to first alive
-        let activeSession = roomId ? sessions.get(roomId) : null;
-        if (!activeSession) {
-          for (const [, s] of sessions) {
-            if (s.alive) { activeSession = s; break; }
-          }
-        }
+        const activeSession = sessions.get(roomId);
 
         if (activeSession) {
           const parsed = {
@@ -2671,9 +2665,9 @@ const apiServer = createServer(async (req, res) => {
 
       if (url.pathname === '/secret') {
         const { label, roomId } = data;
-        if (!label) {
+        if (!label || !roomId) {
           res.writeHead(400);
-          res.end(JSON.stringify({ error: 'label is required' }));
+          res.end(JSON.stringify({ error: 'label and roomId are required' }));
           return;
         }
 
@@ -2685,13 +2679,7 @@ const apiServer = createServer(async (req, res) => {
           path: null,
         });
 
-        // Find the session — prefer the specific room, fall back to first alive
-        let activeSession = roomId ? sessions.get(roomId) : null;
-        if (!activeSession) {
-          for (const [, s] of sessions) {
-            if (s.alive) { activeSession = s; break; }
-          }
-        }
+        const activeSession = sessions.get(roomId);
 
         if (activeSession) {
           const link = generateSecretLink(secretId, label, activeSession.roomId);
