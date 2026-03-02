@@ -1323,7 +1323,7 @@ async function maybeUpdatePinnedSummary(session) {
       // Store accumulated summary in session (source of truth)
       session.pinnedSummaryText = updatedSummary;
       if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory, pinnedSummaryText: updatedSummary });
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory, pinnedSummaryText: updatedSummary, pinnedSummaryEventId: session.pinnedSummaryEventId || null });
       }
 
       const plainText = `📌 Session Summary\n\n${updatedSummary}`;
@@ -1347,6 +1347,9 @@ async function maybeUpdatePinnedSummary(session) {
           formatted_body: htmlText,
         });
         session.pinnedSummaryEventId = eventId;
+        if (session.claudeSessionId) {
+          persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pinnedSummaryEventId: eventId });
+        }
 
         // Pin the message
         try {
@@ -2170,6 +2173,7 @@ client.on('room.message', async (roomId, event) => {
       newSession.firstMessageCaptured = true;
       newSession.chatHistory = prev.chatHistory || [];
       newSession.pinnedSummaryText = prev.pinnedSummaryText || '';
+      newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
       newSession.sendCallback = sendReply;
       newSession.sendHtml = sendHtmlFn;
       newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
