@@ -893,7 +893,7 @@ function formatQueueSummary(queued) {
       const preview = text.length > 200 ? text.slice(0, 197) + '…' : text;
       lines.push({ index: i + 1, text: preview });
     } else {
-      const types = blocks.map(b => b.type === 'image' ? 'image' : b.type === 'audio' ? 'audio' : 'file');
+      const types = blocks.filter(b => b.type !== 'text').map(b => b.type === 'image' ? 'image' : b.type === 'audio' ? 'audio' : 'file');
       lines.push({ index: i + 1, text: `[${types.join(', ')}]` });
     }
   }
