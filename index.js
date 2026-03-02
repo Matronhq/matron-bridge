@@ -210,6 +210,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     // Chat history for topic summarization
     chatHistory: [],         // { role, text } - full messages (code/tools stripped)
     pinnedSummaryEventId: null, // event ID of pinned summary message
+    pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
     pendingWelcome: true,    // whether to send welcome on user join
   };
 
@@ -1300,31 +1301,20 @@ async function maybeUpdatePinnedSummary(session) {
   if (session.chatHistory.length < 5 || session.chatHistory.length % 5 !== 0) return;
 
   try {
-    // Get current pinned summary content
-    let currentSummary = '';
-    let bulletCount = 0;
-    if (session.pinnedSummaryEventId) {
-      try {
-        const event = await client.getEvent(session.roomId, session.pinnedSummaryEventId);
-        currentSummary = event.content?.body || '';
-        // Remove "📌 Session Summary\n\n" prefix if present
-        currentSummary = currentSummary.replace(/^📌 Session Summary\n\n/, '');
-        // Count existing bullets
-        bulletCount = (currentSummary.match(/^•/gm) || []).length;
-      } catch (e) {
-        // Pinned message was deleted or inaccessible
-        session.pinnedSummaryEventId = null;
-      }
-    }
+    // Use in-memory summary as source of truth (not Matrix, since getEvent returns original, not edits)
+    let currentSummary = session.pinnedSummaryText || '';
+    let bulletCount = (currentSummary.match(/^•/gm) || []).length;
 
     const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
 
     // Check if we need to compact (>15 bullets)
     if (bulletCount > 15 && currentSummary) {
-      const compactPrompt = `Condense this session summary into 3-5 key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
+      const compactPrompt = `Condense this session summary into exactly 3 bullet points (using • prefix) capturing the key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
       const compactResult = await model.generateContent(compactPrompt);
       currentSummary = compactResult.response.text().trim();
-      bulletCount = 0; // Reset after compacting
+      bulletCount = (currentSummary.match(/^•/gm) || []).length;
+      // Persist compacted result immediately so it isn't lost if the next LLM call fails to match
+      session.pinnedSummaryText = currentSummary;
     }
 
     // Get last 50 messages for summarization (broad context for better titles)
@@ -1354,18 +1344,34 @@ async function maybeUpdatePinnedSummary(session) {
     let updatedSummary = '';
     if (newMatch && currentSummary) {
       updatedSummary = `${currentSummary}\n• ${newMatch[1].trim()}`;
-    } else if (summaryMatch) {
-      updatedSummary = summaryMatch[1].trim();
+    } else if (summaryMatch && !currentSummary) {
+      // Only use SUMMARY: for the initial summary, not after compaction
+      updatedSummary = `• ${summaryMatch[1].trim()}`;
+    } else if (currentSummary) {
+      // LLM didn't produce a match — keep the existing summary (e.g. after compaction)
+      updatedSummary = currentSummary;
     }
 
     if (updatedSummary) {
+      // Store accumulated summary in session (source of truth)
+      session.pinnedSummaryText = updatedSummary;
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory, pinnedSummaryText: updatedSummary, pinnedSummaryEventId: session.pinnedSummaryEventId || null });
+      }
+
       const plainText = `📌 Session Summary\n\n${updatedSummary}`;
       const htmlText = `<b>📌 Session Summary</b><br/><br/>${escapeHtml(updatedSummary).replace(/\n/g, '<br/>')}`;
 
       if (session.pinnedSummaryEventId) {
-        // Edit existing pinned message
-        await editMessage(session.roomId, session.pinnedSummaryEventId, plainText, htmlText);
-      } else {
+        // Verify pinned message still exists; reset if deleted so next block creates a new one
+        try {
+          await client.getEvent(session.roomId, session.pinnedSummaryEventId);
+          await editMessage(session.roomId, session.pinnedSummaryEventId, plainText, htmlText);
+        } catch {
+          session.pinnedSummaryEventId = null;
+        }
+      }
+      if (!session.pinnedSummaryEventId) {
         // Create new pinned message
         const eventId = await client.sendMessage(session.roomId, {
           msgtype: 'm.text',
@@ -1374,6 +1380,9 @@ async function maybeUpdatePinnedSummary(session) {
           formatted_body: htmlText,
         });
         session.pinnedSummaryEventId = eventId;
+        if (session.claudeSessionId) {
+          persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pinnedSummaryEventId: eventId });
+        }
 
         // Pin the message
         try {
@@ -2196,6 +2205,8 @@ client.on('room.message', async (roomId, event) => {
       newSession.originRoomId = prev.originRoomId || null;
       newSession.firstMessageCaptured = true;
       newSession.chatHistory = prev.chatHistory || [];
+      newSession.pinnedSummaryText = prev.pinnedSummaryText || '';
+      newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
       newSession.sendCallback = sendReply;
       newSession.sendHtml = sendHtmlFn;
       newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
