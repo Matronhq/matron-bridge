@@ -57,6 +57,12 @@ const SECRET_TTL_MS = 3600000; // 1 hour
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 
+function expandHome(p) {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
 function generateFileLink(filePath) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
@@ -1514,7 +1520,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const explicitWorkdir = arg && !forceFresh ? arg : null;
       let workdir = DEFAULT_WORKDIR;
       if (explicitWorkdir) {
-        const resolved = path.resolve(explicitWorkdir);
+        const resolved = path.resolve(expandHome(explicitWorkdir));
         try {
           const stat = fs.statSync(resolved);
           if (!stat.isDirectory()) {
@@ -1740,7 +1746,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const resolved = path.resolve(newDir);
+      const resolved = path.resolve(expandHome(newDir));
 
       try {
         const stat = fs.statSync(resolved);
