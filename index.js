@@ -2110,6 +2110,11 @@ client.on('room.message', async (roomId, event) => {
   if (!event.content?.msgtype) return;
   if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
+  // Skip all events from the initial sync — processing them would replay
+  // old commands (creating duplicate sessions) and send replies into rooms
+  // (bumping them to the top of the user's room list).
+  if (!initialSyncDone) return;
+
   const sender = event.sender;
   if (!isAllowed(sender)) return;
 
@@ -2143,12 +2148,6 @@ client.on('room.message', async (roomId, event) => {
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
     if (bridgeCommandNames.has(cmdName)) {
-      // Skip commands replayed during initial sync — they were already handled
-      // before the restart and would otherwise trigger duplicate sessions.
-      if (!initialSyncDone) {
-        debug(`Skipping initial-sync command ${cmdName} in ${roomId} from ${sender}`);
-        return;
-      }
       // Normalize to ! prefix for the handler
       const normalizedText = '!' + text.slice(1);
       await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
