@@ -32,6 +32,12 @@ const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
+const MATRIX_EVENT_NAMESPACE = 'com.matron';
+const LEGACY_MATRIX_EVENT_NAMESPACE = 'com.yearbook';
+const COMMAND_EVENT_TYPES = [
+  `${MATRIX_EVENT_NAMESPACE}.commands`,
+  `${LEGACY_MATRIX_EVENT_NAMESPACE}.commands`,
+];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON)
@@ -1381,6 +1387,12 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
       prompt,
       buttons,    // [{ id, label, value }]
     },
+    // Keep deployed clients working while they migrate from the Yearbook namespace.
+    [`${LEGACY_MATRIX_EVENT_NAMESPACE}.buttons`]: {
+      mode,
+      prompt,
+      buttons,
+    },
   };
   try {
     const eventId = await client.sendMessage(roomId, content);
@@ -1392,9 +1404,6 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
 }
 
 // --- Room Management ---
-
-const MATRIX_EVENT_NAMESPACE = 'com.matron';
-const LEGACY_MATRIX_EVENT_NAMESPACE = 'com.yearbook';
 
 const MATRON_COMMANDS = [
   { command: 'start', args: '[workdir]', description: 'Start a new session' },
@@ -1420,11 +1429,11 @@ async function createSessionRoom(inviteUserId) {
       state_key: '',
       content: { algorithm: 'm.megolm.v1.aes-sha2' },
     }] : []),
-    {
-      type: `${MATRIX_EVENT_NAMESPACE}.commands`,
+    ...COMMAND_EVENT_TYPES.map(type => ({
+      type,
       state_key: '',
       content: { commands: MATRON_COMMANDS },
-    },
+    })),
   ];
 
   const roomId = await client.createRoom({
@@ -3277,18 +3286,20 @@ async function main() {
     const newCommandsJson = JSON.stringify({ commands: MATRON_COMMANDS });
     let updated = 0;
     for (const roomId of rooms) {
-      try {
-        const existing = await client.getRoomStateEvent(roomId, `${MATRIX_EVENT_NAMESPACE}.commands`, '');
-        if (JSON.stringify(existing) === newCommandsJson) continue;
-      } catch { /* state event doesn't exist yet */ }
-      try {
-        await client.sendStateEvent(roomId, `${MATRIX_EVENT_NAMESPACE}.commands`, '', { commands: MATRON_COMMANDS });
-        updated++;
-      } catch (e) {
-        debug(`Could not set commands state in ${roomId}: ${e.message}`);
+      for (const eventType of COMMAND_EVENT_TYPES) {
+        try {
+          const existing = await client.getRoomStateEvent(roomId, eventType, '');
+          if (JSON.stringify(existing) === newCommandsJson) continue;
+        } catch { /* state event doesn't exist yet */ }
+        try {
+          await client.sendStateEvent(roomId, eventType, '', { commands: MATRON_COMMANDS });
+          updated++;
+        } catch (e) {
+          debug(`Could not set commands state ${eventType} in ${roomId}: ${e.message}`);
+        }
       }
     }
-    console.log(`Checked ${MATRIX_EVENT_NAMESPACE}.commands in ${rooms.length} rooms (updated ${updated})`);
+    console.log(`Checked command state events in ${rooms.length} rooms (updated ${updated})`);
   } catch (e) {
     console.error('Failed to update command state events:', e.message);
   }
