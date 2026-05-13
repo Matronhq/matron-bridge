@@ -243,10 +243,21 @@ function createSession(roomId, workdir, resumeSessionId) {
   debug(`Spawning claude with args: ${args.join(' ')}`);
   debug(`Working directory: ${cwd}`);
 
+  // Ensure the node binary running the bridge is reachable from the spawned
+  // claude process. The ask-user MCP server and the matron-tee Bash hook both
+  // resolve `node` via PATH; when the bridge is launched non-interactively
+  // (e.g. launchd) nvm hasn't loaded and PATH lacks the node bin dir.
+  const nodeBinDir = path.dirname(process.execPath);
+  const existingPath = process.env.PATH || '';
+  const pathWithNode = existingPath.split(':').includes(nodeBinDir)
+    ? existingPath
+    : `${nodeBinDir}:${existingPath}`;
+
   const proc = spawn('claude', args, {
     cwd,
     env: {
       ...process.env,
+      PATH: pathWithNode,
       CLAUDECODE: '',
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
