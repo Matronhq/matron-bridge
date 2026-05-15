@@ -73,6 +73,35 @@ describe('createInteractiveSession', () => {
     expect(session.alive).toBe(false);
   }, 10000);
 
+  it('detects a TUI prompt and responds via keystroke', async () => {
+    const txPath = path.join(dir, 'session.jsonl');
+    const session = createInteractiveSession({
+      roomId: 'room-prompt',
+      workdir: dir,
+      sessionId: 'sid-prompt',
+      claudeBin: process.execPath,
+      claudeArgs: [STUB],
+      env: { ...process.env, TRANSCRIPT_PATH: txPath, MATRON_BASH_TEE_ENABLED: undefined },
+      transcriptPath: txPath,
+    });
+    const events = [];
+    const prompts = [];
+    session.on('event', e => events.push(e));
+    session.on('prompt', p => prompts.push(p));
+    // Trigger the stub's fake prompt.
+    session.sendText('__prompt__');
+    await waitFor(() => prompts.length >= 1, { timeout: 4000 });
+    expect(prompts[0].kind).toBe('yes-no');
+    // Respond 'y'. The stub treats 'y' followed by Enter as a normal user
+    // message, so it'll emit user/assistant/result events.
+    session.respondToPrompt({ kind: 'yes-no', key: 'y' });
+    await waitFor(() => events.filter(e => e.type === 'result').length >= 1, { timeout: 4000 });
+    const userEvent = events.find(e => e.type === 'user');
+    expect(userEvent.message.content[0].text).toBe('y');
+    session.sendText('/exit');
+    await new Promise(resolve => session.on('exit', resolve));
+  }, 15000);
+
   it('writes workspace trust to a custom claudeJsonPath before spawning', async () => {
     const txPath = path.join(dir, 'session.jsonl');
     const claudeJsonPath = path.join(dir, '.claude.json');
