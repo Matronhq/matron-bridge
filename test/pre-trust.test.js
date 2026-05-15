@@ -30,6 +30,17 @@ describe('ensureWorkspaceTrusted', () => {
     expect(c.lastOnboardingVersion.length).toBeGreaterThan(0);
   });
 
+  it('primes bypassPermissionsModeAccepted so --dangerously-skip-permissions does not modal-loop', () => {
+    // Real reproduction: bridge spawns claude with
+    // --dangerously-skip-permissions; on first run claude shows a modal
+    // whose default highlighted option is "No, exit". Default answer
+    // exits with code 1, bridge restarts, repeats. Setting this flag
+    // skips the modal entirely.
+    ensureWorkspaceTrusted('/foo/bar', claudeJsonPath);
+    const c = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    expect(c.bypassPermissionsModeAccepted).toBe(true);
+  });
+
   it('does not overwrite an existing lastOnboardingVersion', () => {
     fs.writeFileSync(claudeJsonPath, JSON.stringify({
       hasCompletedOnboarding: true,
@@ -78,6 +89,7 @@ describe('ensureWorkspaceTrusted', () => {
     fs.writeFileSync(claudeJsonPath, JSON.stringify({
       hasCompletedOnboarding: true,
       lastOnboardingVersion: '0.2.99',
+      bypassPermissionsModeAccepted: true,
       projects: {
         '/foo/bar': {
           hasTrustDialogAccepted: true,
