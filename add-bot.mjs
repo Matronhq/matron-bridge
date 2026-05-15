@@ -170,7 +170,7 @@ async function ensureUserIdentityKnown(cryptoApi, userId, accessToken) {
   for (let attempt = 1; attempt <= 5; attempt++) {
     await cryptoApi.userHasCrossSigningKeys(userId, true);
     let identity = await cryptoApi.olmMachine.getIdentity(new UserId(userId));
-    if (identity) return;
+    if (identity) return identity;
 
     const queryResp = await fetch(`${HOMESERVER}/_matrix/client/v3/keys/query`, {
       method: 'POST',
@@ -179,11 +179,42 @@ async function ensureUserIdentityKnown(cryptoApi, userId, accessToken) {
     });
     await cryptoApi.olmMachine.markRequestAsSent('keys-query', attempt, JSON.stringify(await queryResp.json()));
     identity = await cryptoApi.olmMachine.getIdentity(new UserId(userId));
-    if (identity) return;
+    if (identity) return identity;
 
     await new Promise(r => setTimeout(r, 1000));
   }
   throw new Error(`Could not find cross-signing identity for ${userId}`);
+}
+
+// After SAS verification the bot has the user's master key marked as
+// verified locally, but the matching signature (bot's user-signing key
+// over the user's master key) only reaches the server if the rust SDK
+// happens to flush its outgoing-request queue before we log out. In
+// practice the queue is racy and the signature often gets dropped, so
+// Element on the user's side reports "verification failed" even though
+// the user has already signed the bot. Explicitly force-sign the user
+// here and POST the signature ourselves so the result is deterministic.
+async function crossSignUserFromBot(cryptoApi, userId, accessToken) {
+  // Re-fetch identity (don't reuse the one from before SAS — it now has
+  // the user's master key in a verified state which lets verify() emit
+  // a self-signing signature request).
+  await cryptoApi.userHasCrossSigningKeys(userId, true);
+  const identity = await cryptoApi.olmMachine.getIdentity(new UserId(userId));
+  if (!identity) {
+    throw new Error(`No cross-signing identity for ${userId} after SAS`);
+  }
+
+  const request = await identity.verify();
+  const uploadResp = await fetch(`${HOMESERVER}/_matrix/client/v3/keys/signatures/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: request.body,
+  });
+  const result = await uploadResp.json();
+  const failures = result.failures || {};
+  if (Object.keys(failures).length > 0) {
+    throw new Error('signatures/upload failures: ' + JSON.stringify(failures));
+  }
 }
 
 async function sendVerificationAndAwait(client, cryptoApi, userId, accessToken) {
@@ -290,18 +321,14 @@ async function main() {
       log('Sending verification request');
       await sendVerificationAndAwait(session.client, session.cryptoApi, user, session.loginData.access_token);
       log('  verification done — bot master key signed by user');
-    }
 
-    if (!skipVerification) {
-      log('  verification done — checking cross-signing status');
-      try {
-        const status = await session.cryptoApi.getUserVerificationStatus(user);
-        if (!status.isCrossSigningVerified()) {
-          log('  ⚠ SAS completed but bot has not cross-verified the user — proceeding anyway');
-          // Don't throw — the bridge will still function, just without the green-shield UX.
-        }
-      } catch (e) {
-        log('  ⚠ could not check cross-signing status: ' + e.message);
+      log('Cross-signing user from bot side');
+      await crossSignUserFromBot(session.cryptoApi, user, session.loginData.access_token);
+      log(`  ${user} master key signed by bot user-signing key`);
+
+      const status = await session.cryptoApi.getUserVerificationStatus(user);
+      if (!status.isCrossSigningVerified()) {
+        throw new Error(`Bot still does not see ${user} as cross-verified after explicit signature upload`);
       }
     }
 
