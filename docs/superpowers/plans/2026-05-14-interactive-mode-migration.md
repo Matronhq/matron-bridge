@@ -39,9 +39,33 @@
 
 ---
 
-## Phase 0 — Pre-flight verification
+## Phase 0 — Pre-flight verification (COMPLETED 2026-05-14)
 
-These tasks gate the plan. If any fails, stop and reassess before continuing.
+These tasks gated the plan. All passed. Key findings recorded below; tasks kept for reference / re-run if assumptions change.
+
+### Findings summary
+
+- **0.1 ✓** `Stop` hook fires in `--print` mode. Payload shape: `{ session_id, transcript_path, cwd, permission_mode, effort, hook_event_name: "Stop", stop_hook_active, last_assistant_message }`. The `hook_event_name` field is snake_case (the plan originally assumed CamelCase) — `hooks/stop-notify.sh` doesn't need to read it but downstream payloads in the bridge HTTP handler may want to verify it.
+- **0.2 ✓** `--session-id <uuid>` works in interactive (non-`--print`) mode. Transcript file appears at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` exactly as predicted.
+- **0.3 ✓** User-confirmed: interactive `claude` sessions bill against the bundled Pro/Max plan, not the API.
+- **0.4 ✓** Bracketed-paste injection works against a real `claude` PTY — **but with one critical wrinkle**: the trailing Enter (`\r`) must be sent as a *separate write*, **~500ms after** the bracketed-paste close sequence. If `\r` is concatenated immediately after `\x1b[201~`, it is silently ignored. (Tested variants: immediate `\r`, `\n`, kitty `\x1b[13u` — all failed. Delayed `\r` after 500ms succeeded.) Likely because the TUI uses extended keyboard protocols (`modifyOtherKeys`, kitty keyboard protocol) and buffers paste content for one tick before accepting submit keystrokes.
+- **Bonus:** Transcript event types observed go beyond `user`/`assistant`/`result` — also seen: `permission-mode`, `file-history-snapshot`, `attachment`, `system`, `ai-title`. The bridge's `handleClaudeEvent` should safely ignore unknown types (it already does for stream-json — verify behaviour is the same when consuming from JSONL tail).
+
+### Design implications
+
+These findings change two task definitions later in the plan:
+
+- **Task 1.3 (`lib/pty-input.js`)** — `bracketedPaste(text)` MUST NOT include a trailing Enter. The submit is a *separate* keystroke. The InteractiveSession's `sendText(text)` method schedules a `setTimeout(() => pty.write('\r'), 500)` after the paste write. Helper API:
+
+  ```javascript
+  bracketedPaste(text)        // → '\x1b[200~' + text + '\x1b[201~'   (NO trailing \r)
+  keystroke('enter')          // → '\r'
+  // Caller pattern:
+  pty.write(bracketedPaste(text));
+  setTimeout(() => pty.write(keystroke('enter')), 500);
+  ```
+
+- **Task 0.1 / Task 2.1** — hook payload field is `session_id` (snake_case) as expected. No change.
 
 ### Task 0.1: Verify `Stop` hook exists and fires
 
