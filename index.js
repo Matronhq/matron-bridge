@@ -13,6 +13,7 @@ import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
+import { createInteractiveSession } from './lib/interactive-session.js';
 import { macifyMcpServers } from './lib/mcp-config-mac.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -34,6 +35,7 @@ const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical li
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
 const MATRIX_EVENT_NAMESPACE = 'chat.matron';
+const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
@@ -200,6 +202,9 @@ function getPersistedSession(roomId) {
 const sessions = new Map(); // roomId -> session
 
 function createSession(roomId, workdir, resumeSessionId) {
+  if (INTERACTIVE_MODE) {
+    return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId);
+  }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
   // showBashOutput is persisted via persistSession on toggle and re-read here at
@@ -377,6 +382,301 @@ function createSession(roomId, workdir, resumeSessionId) {
   return session;
 }
 
+// --- Interactive-mode session (MATRON_INTERACTIVE_MODE=1) ---
+//
+// Spawns claude in a PTY instead of --print. Events come from the on-disk
+// JSONL transcript (via TranscriptTail), turn-end comes from the Stop hook,
+// plan approval comes from the PreToolUse:ExitPlanMode hook. Returns a
+// session object with the same shape as createSession() so downstream code
+// (Matrix posting, queue management, restart) is unchanged.
+function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
+  const cwd = expandHome(workdir || DEFAULT_WORKDIR);
+  const persistedForRoom = getPersistedSession(roomId);
+  const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
+  const sessionId = resumeSessionId || randomUUID();
+
+  const settings = {
+    hooks: {
+      PreCompact: [{
+        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
+      }],
+      // ExitPlanMode is NOT intercepted in iv-mode. Claude's own in-TUI
+      // confirmation prompt ("Yes / Yes, manually / Refine / Tell Claude
+      // what to change") is caught by lib/prompt-detector.js and routed
+      // through Matrix as a numbered question — that's the single approval
+      // round. The hook+/plan-decision flow remains in print-mode only.
+      PreToolUse: [
+        { matcher: 'Bash', hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh') }] },
+      ],
+      Stop: [{
+        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'stop-notify.sh'), timeout: 10 }],
+      }],
+    },
+  };
+
+  // The CLI rejects --session-id + --resume together unless --fork-session
+  // is also passed. For fresh sessions we pre-assign --session-id so we know
+  // the transcript path before spawn; for resumes we pass --resume only and
+  // rely on the already-known sessionId for the transcript path.
+  const claudeArgs = [];
+  if (resumeSessionId) {
+    claudeArgs.push('--resume', resumeSessionId);
+  } else {
+    claudeArgs.push('--session-id', sessionId);
+  }
+  claudeArgs.push(
+    '--dangerously-skip-permissions',
+    // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
+    // (lib/prompt-detector.js) catches it and routes the question through
+    // Matrix. Print-mode kept it disallowed because there was no way to
+    // surface the TUI prompt; that constraint no longer applies.
+    '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
+    '--mcp-config', MCP_CONFIG_PATH,
+    '--settings', JSON.stringify(settings),
+  );
+
+  const nodeBinDir = path.dirname(process.execPath);
+  const existingPath = process.env.PATH || '';
+  const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
+
+  debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
+
+  const iv = createInteractiveSession({
+    roomId,
+    workdir: cwd,
+    sessionId,
+    claudeArgs,
+    env: {
+      ...process.env,
+      PATH: pathWithNode,
+      CLAUDECODE: '',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+      BRIDGE_ROOM_ID: roomId,
+      MATRIX_BRIDGE_API_PORT: String(API_PORT),
+      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    },
+  });
+
+  // Same shape as the --print session object. `proc` is null in iv mode;
+  // call sites that need raw input go via session.iv.sendText / sendKeystroke
+  // (wired up in Task 4.2).
+  const session = {
+    proc: null,
+    iv,
+    roomId,
+    workdir: cwd,
+    responseBuffer: '',
+    sendCallback: null,
+    pendingPlan: null,
+    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
+    sendHtml: null,
+    sendButtonMessage: null,
+    showWorking: false,
+    showBashOutput: showBashOutputAtSpawn,
+    alive: true,
+    startedAt: Date.now(),
+    restartCount: 0,
+    claudeSessionId: sessionId,
+    busy: false,
+    lineBuf: '',
+    toolCalls: [],
+    waitingForAnswer: null,
+    originRoomId: null,
+    firstMessageCaptured: false,
+    initData: null,
+    totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
+    turnCount: 0,
+    chatHistory: [],
+    pinnedSummaryEventId: null,
+    pinnedSummaryText: '',
+    pendingWelcome: true,
+    pendingInteractivePrompt: null,
+  };
+
+  iv.on('event', event => {
+    debug('IV event:', event.type);
+    handleClaudeEvent(session, event);
+  });
+
+  iv.on('prompt', prompt => {
+    debug('IV prompt:', prompt.kind, prompt.question);
+    session.pendingInteractivePrompt = prompt;
+    handleInteractivePrompt(session, prompt);
+  });
+
+  iv.on('parseError', err => {
+    debug('IV transcript parse error:', err.line?.slice(0, 80));
+  });
+
+  iv.on('exit', exitCode => {
+    session.alive = false;
+    debug(`Interactive claude session ${sessionId} exited code=${exitCode}`);
+    flushResponse(session);
+    if (sessions.get(roomId) === session) {
+      if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        const restarted = createSession(roomId, cwd, session.claudeSessionId);
+        restarted.restartCount = session.restartCount + 1;
+        restarted.sendCallback = session.sendCallback;
+        restarted.sendHtml = session.sendHtml;
+        restarted.sendButtonMessage = session.sendButtonMessage;
+        restarted.originRoomId = session.originRoomId;
+        restarted.firstMessageCaptured = session.firstMessageCaptured;
+        sessions.set(roomId, restarted);
+        if (restarted.sendHtml) {
+          const n = notice('warning',
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+          restarted.sendHtml(n.plain, n.html);
+        } else if (restarted.sendCallback) {
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
+        }
+      } else {
+        sessions.delete(roomId);
+        if (session.sendHtml) {
+          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
+          session.sendCallback(`[Session ended (exit ${exitCode})]`);
+        }
+      }
+    }
+  });
+
+  session.resetTimeout = () => {};
+
+  // iv-mode turn-end handler. Print-mode does most of this work in
+  // case 'result' inside handleClaudeEvent; the transcript file in iv-mode
+  // has no result event, so the Stop hook (→ /turn-end → this) replaces it.
+  session.onTurnEnd = () => {
+    console.log(`[IV-DEBUG] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
+    // Flush the accumulated assistant text to Matrix.
+    if (session.responseBuffer.trim() && !session.waitingForAnswer) {
+      flushResponse(session);
+    }
+    // Emit collected tool-call summary if the user has !show_working on.
+    if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
+      const toolSummary = session.toolCalls.join('\n');
+      const chunks = splitMessage(toolSummary);
+      for (const chunk of chunks) session.sendCallback(chunk);
+    }
+    session.toolCalls = [];
+    session.turnCount++;
+    session.busy = false;
+    stripQueueNotificationLinks(session);
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+    // Flush any queued messages now that claude is free.
+    if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
+      const queued = session.queuedMessages;
+      session.queuedMessages = null;
+      const summary = formatQueueSummary(queued);
+      if (session.sendHtml) {
+        session.sendHtml(
+          `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
+          `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
+        );
+      } else if (session.sendCallback) {
+        session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
+      }
+      flushQueue(session, queued);
+    }
+  };
+
+  // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
+  // fires. We post the plan to Matrix and stash the tool_use_id so that
+  // the "build" handler in the message loop can call
+  // pendingPlanDecisions.get(toolUseId).resolve(...) when the user replies.
+  session.requestPlanDecision = (toolUseId, planText) => {
+    session.ivPendingPlanToolUseId = toolUseId;
+    session.pendingPlan = planText || '';
+    const preview = (planText || '').length > 500
+      ? (planText || '').slice(0, 500) + '…'
+      : (planText || '');
+    const plainPlan = `--- Plan Ready ---\n\n${preview}\n\nReply "build" to execute, or send feedback.`;
+    if (session.sendHtml) {
+      const htmlPlan =
+        `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(preview)}</blockquote>` +
+        `Reply <code>build</code> to execute, or send feedback.`;
+      session.sendHtml(plainPlan, htmlPlan);
+    } else if (session.sendCallback) {
+      session.sendCallback(plainPlan);
+    } else {
+      // No Matrix output channel yet — auto-deny so the hook unblocks.
+      const pending = pendingPlanDecisions.get(toolUseId);
+      if (pending) pending.resolve({ decision: 'deny', reason: 'no Matrix output channel for session' });
+    }
+  };
+
+  sessions.set(roomId, session);
+  return session;
+}
+
+// Surface a detected TUI prompt to Matrix as a multiple-choice question.
+function handleInteractivePrompt(session, prompt) {
+  if (!session.sendHtml && !session.sendCallback) return;
+  const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
+  const plain = [
+    'Claude is asking:',
+    prompt.question || '',
+    '',
+    ...optionLines,
+    '',
+    `Reply with the option number (1–${prompt.options.length})${prompt.kind === 'yes-no' ? ' or "y" / "n"' : ''}.`,
+  ].filter(Boolean).join('\n');
+  if (session.sendHtml) {
+    const htmlOptions = prompt.options.map((opt, i) =>
+      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}`
+    ).join('<br/>');
+    const html =
+      `<b>🟡 Claude is asking:</b><br/>` +
+      (prompt.question ? `<i>${escapeHtml(prompt.question)}</i><br/><br/>` : '') +
+      htmlOptions +
+      `<br/><br/>Reply with the option number (1–${prompt.options.length})` +
+      (prompt.kind === 'yes-no' ? ' or <code>y</code> / <code>n</code>' : '') + '.';
+    session.sendHtml(plain, html);
+  } else {
+    session.sendCallback(plain);
+  }
+}
+
+// If the session has a pending TUI prompt and the user's message looks like
+// a valid response, send the keystroke and return true (so the message isn't
+// also forwarded to claude as a regular user message).
+function maybeResolveInteractivePrompt(session, userText) {
+  const p = session.pendingInteractivePrompt;
+  if (!p) return false;
+  const trimmed = (userText || '').trim().toLowerCase();
+  let response = null;
+  if (p.kind === 'yes-no') {
+    if (/^(y|yes|1)$/.test(trimmed)) response = { kind: 'yes-no', key: 'y' };
+    else if (/^(n|no|2)$/.test(trimmed)) response = { kind: 'yes-no', key: 'n' };
+  } else {
+    const n = parseInt(trimmed, 10);
+    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
+      const opt = p.options[n - 1];
+      if (p.kind === 'arrow-menu') {
+        response = { kind: 'arrow-menu', key: String(n - 1) };
+      } else {
+        response = { kind: p.kind, key: opt.key };
+      }
+    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
+      response = { kind: 'lettered', key: trimmed };
+    }
+  }
+  if (!response) {
+    const help = `Reply not understood. Please answer with the option number (1–${p.options.length}).`;
+    if (session.sendHtml) session.sendHtml(help, null);
+    else if (session.sendCallback) session.sendCallback(help);
+    return true; // consumed — invalid format, but don't forward to claude
+  }
+  session.pendingInteractivePrompt = null;
+  session.iv.respondToPrompt(response);
+  return true;
+}
+
 // --- Structured Question Handling ---
 
 function parseAskUserQuestion(input) {
@@ -525,7 +825,14 @@ function submitAnswer(session, answerText) {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
     sendTextToSession(session, answerText);
   } else {
-    // Normal tool_result flow
+    // Normal tool_result flow. This path only applies to print-mode stream-
+    // json input; in iv-mode the ask-user MCP server returns answers over
+    // its own stdio transport and this branch is unreachable. Log if it ever
+    // fires under iv-mode so we notice an unexpected code path.
+    if (session.iv) {
+      debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
+      return;
+    }
     session.busy = true;
     const jsonMsg = JSON.stringify({
       type: 'user',
@@ -601,6 +908,14 @@ function handleClaudeEvent(session, event) {
       const messageId = event.message?.id;
 
       const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
+      // Suppress claude's "No response requested." filler. It's emitted in
+      // response to internal synthetic prompts (e.g. resume-time nudges)
+      // and is just noise on Matrix.
+      if (textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0])) {
+        debug('Suppressing "No response requested." filler');
+        break;
+      }
+
       if (textParts.length > 0) {
         if (isPartial && messageId && session._lastAssistantMsgId === messageId) {
           session.responseBuffer = textParts.join('');
@@ -613,6 +928,18 @@ function handleClaudeEvent(session, event) {
           session.responseBuffer = session.waitingForAnswer ? '' : textParts.join('');
         }
         session._lastAssistantMsgId = messageId;
+
+        // iv-mode: flush this assistant chunk NOW rather than waiting for
+        // /turn-end. Two reasons: (1) the Stop hook races the transcript
+        // flush so onTurnEnd is unreliable as a flush trigger; (2) claude
+        // emits intermediate commentary with stop_reason=tool_use while
+        // chaining tool calls — those messages would otherwise sit in the
+        // buffer forever, giving the user a stuck "typing…" indicator and
+        // no visible progress. Print-mode keeps its existing accumulate-
+        // and-flush-on-result flow.
+        if (session.iv && !isPartial && session.responseBuffer.trim() && !session.waitingForAnswer) {
+          flushResponse(session);
+        }
       }
 
       for (const block of content) {
@@ -625,9 +952,11 @@ function handleClaudeEvent(session, event) {
         const toolName = block.name;
         const input = block.input || {};
 
-        if (toolName === 'ExitPlanMode') {
+        if (toolName === 'ExitPlanMode' && !session.iv) {
+          // Print-mode only: stash the tool_use_id so a "build" reply can
+          // emit the matching tool_result later. iv-mode handles approval
+          // through claude's own TUI confirmation prompt instead.
           console.log(`[PLAN-DEBUG] Tool call: ExitPlanMode | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
-          // Persist the tool_use_id so "build" can send a tool_result even after bridge restart
           session.pendingPlanDenialId = block.id;
           if (session.claudeSessionId) {
             persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: block.id });
@@ -664,6 +993,10 @@ function handleClaudeEvent(session, event) {
           let indicator = `🔧 ${toolName}`;
           let indicatorHtml = null;
           let isKeyEvent = false;
+          // Set when sendLiveOutputEvent has been invoked — the live-output
+          // message already carries the command in its body/formatted_body
+          // fallback, so we skip the duplicate `🔧 <cmd>` indicator below.
+          let liveOutputSent = false;
 
           if (toolName === 'Bash' && input.command) {
             // Claude Code's `tool_use` event reports the ORIGINAL command, not
@@ -707,6 +1040,7 @@ function handleClaudeEvent(session, event) {
                   viewer_url: liveUrl.toString(),
                   expires_at: expiresAt,
                 });
+                liveOutputSent = true;
               }
             }
           } else if (toolName === 'Read' && input.file_path) {
@@ -767,12 +1101,18 @@ function handleClaudeEvent(session, event) {
             isKeyEvent = true;
           }
 
-          session.toolCalls.push(indicator);
-
-          if (isKeyEvent && session.sendHtml && indicatorHtml) {
-            session.sendHtml(indicator, indicatorHtml);
-          } else if (isKeyEvent && session.sendCallback) {
-            session.sendCallback(indicator);
+          // When sendLiveOutputEvent already posted a Matrix message for
+          // this Bash call, skip the regular `🔧 <command>` indicator —
+          // the live-output message contains the same command in its
+          // fallback body/formatted_body, so non-matron-web clients still
+          // see it, and matron-web clients see the rendered viewer tile.
+          if (!liveOutputSent) {
+            session.toolCalls.push(indicator);
+            if (isKeyEvent && session.sendHtml && indicatorHtml) {
+              session.sendHtml(indicator, indicatorHtml);
+            } else if (isKeyEvent && session.sendCallback) {
+              session.sendCallback(indicator);
+            }
           }
         }
       }
@@ -1016,6 +1356,22 @@ function sendToSession(session, contentBlocks) {
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
+
+  if (session.iv) {
+    // Interactive mode: type text blocks into the PTY. Non-text content
+    // (images, encoded attachments) is not currently supportable via PTY
+    // input — log and drop. Phase 6 (post-cutover) will add image handling
+    // via a separate channel (probably writing the image bytes to a tmp
+    // path and typing a /file reference).
+    const nonText = contentBlocks.filter(b => b.type !== 'text');
+    if (nonText.length > 0) {
+      debug(`iv-mode: dropping ${nonText.length} non-text block(s): ${nonText.map(b => b.type).join(',')}`);
+    }
+    const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
+    if (text) session.iv.sendText(text);
+    if (session.resetTimeout) session.resetTimeout();
+    return true;
+  }
 
   const jsonMsg = JSON.stringify({
     type: 'user',
@@ -1372,6 +1728,13 @@ async function sendToRoom(roomId, text, html) {
 }
 
 async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, expires_at }) {
+  // Sent as a regular m.room.message with a custom content key:
+  // - matron-web-aware clients pick up `chat.matron.live_output` and render
+  //   the live viewer tile.
+  // - Every other Matrix client just shows the body/formatted_body which
+  //   already contains the command and a link to view live output. That
+  //   makes the regular `🔧 <command>` indicator redundant, so the caller
+  //   in the assistant-event handler skips it when this event is sent.
   const body = `$ ${command}\n[live output: ${viewer_url}]`;
   const formatted_body = `<a href="${escapeHtml(viewer_url)}"><code>$ ${escapeHtml(command)}</code> · view live output</a>`;
   const content = {
@@ -1382,9 +1745,11 @@ async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, 
     [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command, viewer_url, expires_at },
   };
   try {
-    await client.sendEvent(session.roomId, `${MATRIX_EVENT_NAMESPACE}.live_output.v1`, content);
+    await client.sendMessage(session.roomId, content);
+    return true;
   } catch (e) {
     console.error('Failed to send live_output event:', e.message);
+    return false;
   }
 }
 
@@ -2468,6 +2833,12 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
+  // iv-mode: route reply to a pending TUI prompt before treating it as a
+  // normal message. If we consumed it as a prompt response, return.
+  if (session.iv && maybeResolveInteractivePrompt(session, text)) {
+    return;
+  }
+
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
   const buttonResponse = event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
   if (buttonResponse) {
@@ -2539,7 +2910,7 @@ client.on('room.message', async (roomId, event) => {
 
   // Handle text "build" for plan approval
   console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
-  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId)) {
+  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId)) {
     const toolUseId = session.pendingPlanDenialId;
     console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
 
@@ -2551,7 +2922,28 @@ client.on('room.message', async (roomId, event) => {
       : false;
     console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
 
-    if (!toolUseId || alreadyAnswered) {
+    if (session.iv) {
+      // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
+      // it with allow so the hook returns and claude proceeds naturally.
+      // No stdin.write or follow-up text needed — the hook's allow decision
+      // unblocks the original tool call and claude continues its turn.
+      const pending = session.ivPendingPlanToolUseId
+        ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
+        : null;
+      session.pendingPlan = null;
+      session.pendingPlanDenialId = null;
+      session.ivPendingPlanToolUseId = null;
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+      }
+      if (pending) {
+        console.log(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
+        pending.resolve({ decision: 'allow', reason: 'approved by user' });
+      } else {
+        console.log(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
+        sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+      }
+    } else if (!toolUseId || alreadyAnswered) {
       // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
       session.pendingPlan = null;
       session.pendingPlanDenialId = null;
@@ -2839,6 +3231,13 @@ const pendingMcpQuestions = new Map();
 let mcpQuestionCounter = 0;
 const pendingSecrets = new Map();
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
+
+// Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
+// requests waiting for a user decision in interactive mode. The hook script
+// (hooks/exit-plan-decision.sh) holds an HTTP request open against
+// /plan-decision; the bridge resolves it once the user replies on Matrix.
+// Phase 4 wires the session-side handler that actually surfaces the plan.
+const pendingPlanDecisions = new Map();
 
 // --- Local HTTP API ---
 
@@ -3248,6 +3647,87 @@ const apiServer = createServer(async (req, res) => {
         }
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
+
+      } else if (url.pathname === '/turn-end') {
+        // Stop hook (hooks/stop-notify.sh) — fires when an assistant turn
+        // completes. Used in interactive mode to clear typing indicators and
+        // flush response state in lieu of the stream-json `result` event.
+        const { session_id } = data;
+        console.log(`[IV-DEBUG] /turn-end hit, session_id=${session_id}`);
+        let target = null;
+        if (session_id) {
+          for (const [, s] of sessions) {
+            if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
+          }
+        }
+        console.log(`[IV-DEBUG] /turn-end target found=${!!target} buf="${target?.responseBuffer?.slice(0,60) || ''}"`);
+        if (target) {
+          // Drain the transcript tail synchronously so any assistant event
+          // written just before the Stop hook is processed (and the
+          // response buffer populated) before onTurnEnd flushes.
+          if (target.iv && typeof target.iv.drainTranscript === 'function') {
+            try { target.iv.drainTranscript(); } catch (e) { debug('drainTranscript threw:', e?.message); }
+          }
+          if (typeof target.onTurnEnd === 'function') {
+            try { target.onTurnEnd(); } catch (e) { debug('onTurnEnd handler threw:', e?.message); }
+          }
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+
+      } else if (url.pathname === '/plan-decision') {
+        // PreToolUse hook (hooks/exit-plan-decision.sh) — fires when claude
+        // calls ExitPlanMode. Blocks until the user decides via Matrix.
+        const { session_id, tool_use_id, plan } = data;
+        if (!tool_use_id) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ decision: 'deny', reason: 'tool_use_id required' }));
+          return;
+        }
+        let target = null;
+        if (session_id) {
+          for (const [, s] of sessions) {
+            if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
+          }
+        }
+        if (!target) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ decision: 'deny', reason: 'unknown session' }));
+          return;
+        }
+        if (typeof target.requestPlanDecision !== 'function') {
+          // Session has no plan-decision handler — this is the print-mode path
+          // (Phase 4 adds the iv-mode handler). Deny so we never silently
+          // execute an unreviewed plan.
+          res.writeHead(503);
+          res.end(JSON.stringify({ decision: 'deny', reason: 'no plan-decision handler for session' }));
+          return;
+        }
+        // Hold the response. Timer caps the wait under curl's 1800s ceiling
+        // in exit-plan-decision.sh so we always reply before curl times out.
+        const PLAN_DECISION_TIMEOUT_MS = 1740 * 1000;
+        const timer = setTimeout(() => {
+          if (!pendingPlanDecisions.has(tool_use_id)) return;
+          pendingPlanDecisions.delete(tool_use_id);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ decision: 'deny', reason: 'timeout waiting for user' }));
+        }, PLAN_DECISION_TIMEOUT_MS);
+        pendingPlanDecisions.set(tool_use_id, {
+          resolve: ({ decision, reason }) => {
+            clearTimeout(timer);
+            pendingPlanDecisions.delete(tool_use_id);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ decision: decision || 'deny', reason: reason || '' }));
+          },
+          plan,
+        });
+        try {
+          target.requestPlanDecision(tool_use_id, plan);
+        } catch (e) {
+          // If the handler throws, resolve with deny so the hook unblocks.
+          const pending = pendingPlanDecisions.get(tool_use_id);
+          if (pending) pending.resolve({ decision: 'deny', reason: `session handler threw: ${e?.message || e}` });
+        }
 
       } else if (url.pathname === '/sessions') {
         const list = [];

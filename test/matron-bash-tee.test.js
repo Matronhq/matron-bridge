@@ -6,9 +6,16 @@ const HOOK = path.resolve('hooks/matron-bash-tee.sh');
 const TEE = path.resolve('hooks/matron-tee');
 
 function runHook(input, env = {}) {
+  // Strip MATRON_* vars from the parent env so the test result is determined
+  // entirely by the `env` arg. Without this, tests run inside a bridge-spawned
+  // claude (where MATRON_BASH_TEE_ENABLED=1 is set) see leaked state in the
+  // "unset" / "non-Bash" cases.
+  const parentEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.startsWith('MATRON_'))
+  );
   return new Promise((resolve, reject) => {
     const child = execFile(HOOK, [], {
-      env: { ...process.env, ...env },
+      env: { ...parentEnv, ...env },
     }, (err, stdout, stderr) => {
       if (err) return reject(err);
       resolve({ stdout, stderr });

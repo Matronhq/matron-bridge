@@ -12,7 +12,7 @@
     "test": "vitest run",
     "bootstrap-crosssigning": "node bootstrap-crosssigning.mjs",
     "lint": "eslint . --max-warnings=0",
-    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check setup-user.mjs && node --check verify-bots.mjs && node --check bootstrap-crosssigning.mjs && node --check add-bot.mjs && node --check lib/transcribe.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js",
+    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check setup-user.mjs && node --check verify-bots.mjs && node --check bootstrap-crosssigning.mjs && node --check add-bot.mjs && node --check lib/transcribe.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js && node --check lib/pre-trust.js && node --check lib/pty-input.js && node --check lib/transcript-tail.js && node --check lib/prompt-detector.js && node --check lib/interactive-session.js && node --check test/stub-claude.mjs",
     "audit:high": "npm audit --audit-level=high",
     "ci": "npm run lint && npm run check && npm test && npm run audit:high"
   },
@@ -24,6 +24,7 @@
     "express": "^5.2.1",
     "matrix-bot-sdk": "^0.8.0",
     "matrix-js-sdk": "^41.4.0",
+    "node-pty": "^1.0.0",
     "ws": "^8.20.0",
     "zod": "^4.4.3"
   },
