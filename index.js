@@ -993,6 +993,10 @@ function handleClaudeEvent(session, event) {
           let indicator = `🔧 ${toolName}`;
           let indicatorHtml = null;
           let isKeyEvent = false;
+          // Set when sendLiveOutputEvent has been invoked — the live-output
+          // message already carries the command in its body/formatted_body
+          // fallback, so we skip the duplicate `🔧 <cmd>` indicator below.
+          let liveOutputSent = false;
 
           if (toolName === 'Bash' && input.command) {
             // Claude Code's `tool_use` event reports the ORIGINAL command, not
@@ -1036,6 +1040,7 @@ function handleClaudeEvent(session, event) {
                   viewer_url: liveUrl.toString(),
                   expires_at: expiresAt,
                 });
+                liveOutputSent = true;
               }
             }
           } else if (toolName === 'Read' && input.file_path) {
@@ -1096,12 +1101,18 @@ function handleClaudeEvent(session, event) {
             isKeyEvent = true;
           }
 
-          session.toolCalls.push(indicator);
-
-          if (isKeyEvent && session.sendHtml && indicatorHtml) {
-            session.sendHtml(indicator, indicatorHtml);
-          } else if (isKeyEvent && session.sendCallback) {
-            session.sendCallback(indicator);
+          // When sendLiveOutputEvent already posted a Matrix message for
+          // this Bash call, skip the regular `🔧 <command>` indicator —
+          // the live-output message contains the same command in its
+          // fallback body/formatted_body, so non-matron-web clients still
+          // see it, and matron-web clients see the rendered viewer tile.
+          if (!liveOutputSent) {
+            session.toolCalls.push(indicator);
+            if (isKeyEvent && session.sendHtml && indicatorHtml) {
+              session.sendHtml(indicator, indicatorHtml);
+            } else if (isKeyEvent && session.sendCallback) {
+              session.sendCallback(indicator);
+            }
           }
         }
       }
@@ -1717,6 +1728,13 @@ async function sendToRoom(roomId, text, html) {
 }
 
 async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, expires_at }) {
+  // Sent as a regular m.room.message with a custom content key:
+  // - matron-web-aware clients pick up `chat.matron.live_output` and render
+  //   the live viewer tile.
+  // - Every other Matrix client just shows the body/formatted_body which
+  //   already contains the command and a link to view live output. That
+  //   makes the regular `🔧 <command>` indicator redundant, so the caller
+  //   in the assistant-event handler skips it when this event is sent.
   const body = `$ ${command}\n[live output: ${viewer_url}]`;
   const formatted_body = `<a href="${escapeHtml(viewer_url)}"><code>$ ${escapeHtml(command)}</code> · view live output</a>`;
   const content = {
@@ -1727,9 +1745,11 @@ async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, 
     [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command, viewer_url, expires_at },
   };
   try {
-    await client.sendEvent(session.roomId, `${MATRIX_EVENT_NAMESPACE}.live_output.v1`, content);
+    await client.sendMessage(session.roomId, content);
+    return true;
   } catch (e) {
     console.error('Failed to send live_output event:', e.message);
+    return false;
   }
 }
 
