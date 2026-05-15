@@ -134,6 +134,25 @@ describe('classifyScreen — null cases', () => {
     expect(classifyScreen(screen)).toBeNull();
   });
 
+  it('handles cursor-positioning-stripped output where marker + number + label have no spaces', () => {
+    // After ANSI/CSI strip of a TUI that positions characters via cursor
+    // moves, the lines look like "❯1.Yes,andbypasspermissions" — no space
+    // between the marker, the number, or the label. The classifier must
+    // still recognise this as a numbered menu.
+    const screen = [
+      'Claude has written up a plan and is ready to execute. Would you like to proceed?',
+      '❯1.Yes,andbypasspermissions',
+      '2.Yes,manuallyapproveedits',
+      '3.No,refinewithUltraplanonClaudeCodeontheweb',
+      '4.TellClaudewhattochange',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(4);
+    expect(r.options[0].key).toBe('1');
+  });
+
   it('still returns arrow-menu when there IS a real question above the marker', () => {
     const screen = [
       'Which model would you like to use?',
