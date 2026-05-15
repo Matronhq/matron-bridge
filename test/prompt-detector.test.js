@@ -147,6 +147,51 @@ describe('classifyScreen — numbered list inside prose', () => {
   });
 });
 
+describe('classifyScreen — multiple numbered runs', () => {
+  it('picks the run that passes the menu guard, not the longest run', () => {
+    // Real screen from iv-mode testing: a "Verification" numbered list
+    // inside plan prose (5 items, no question header) followed by the
+    // bypass-permissions confirmation menu (4 items, question above,
+    // ❯ marker on first item). Old code took the longest run (verification),
+    // failed its guard, and fell through to a bad arrow-menu match.
+    const screen = [
+      'Verification',
+      '1. cd ~/claude-matrix-bridge && git pull',
+      '2. sudo systemctl restart',
+      '3. send !version',
+      '4. try /version',
+      '5. confirm !help',
+      '',
+      '────────────────────────',
+      'Claude has written up a plan and is ready to execute. Would you like to proceed?',
+      '❯ 1. Yes, and bypass permissions',
+      '  2. Yes, manually approve edits',
+      '  3. No, refine with Ultraplan',
+      '  4. Tell Claude what to change',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(4);
+    expect(r.options[0].label).toMatch(/Yes, and bypass permissions/);
+  });
+});
+
+describe('classifyScreen — keyboard hint filtering', () => {
+  it('does not include keyboard hint lines as menu options', () => {
+    const screen = [
+      'Would you like to proceed?',
+      '❯ Yes',
+      '  No',
+      '  shift+tab to approve with this feedback',
+      '  ctrl-g to edit in VS Code',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.options.map(o => o.label)).toEqual(['Yes', 'No']);
+  });
+});
+
 describe('classifyScreen — null cases', () => {
   it('returns null on plain assistant output', () => {
     expect(classifyScreen('Working on it…\nDone.\n> ')).toBeNull();
