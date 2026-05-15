@@ -400,9 +400,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
       PreCompact: [{
         hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
       }],
+      // ExitPlanMode is NOT intercepted in iv-mode. Claude's own in-TUI
+      // confirmation prompt ("Yes / Yes, manually / Refine / Tell Claude
+      // what to change") is caught by lib/prompt-detector.js and routed
+      // through Matrix as a numbered question — that's the single approval
+      // round. The hook+/plan-decision flow remains in print-mode only.
       PreToolUse: [
         { matcher: 'Bash', hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh') }] },
-        { matcher: 'ExitPlanMode', hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'exit-plan-decision.sh'), timeout: 1800 }] },
       ],
       Stop: [{
         hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'stop-notify.sh'), timeout: 10 }],
@@ -948,9 +952,11 @@ function handleClaudeEvent(session, event) {
         const toolName = block.name;
         const input = block.input || {};
 
-        if (toolName === 'ExitPlanMode') {
+        if (toolName === 'ExitPlanMode' && !session.iv) {
+          // Print-mode only: stash the tool_use_id so a "build" reply can
+          // emit the matching tool_result later. iv-mode handles approval
+          // through claude's own TUI confirmation prompt instead.
           console.log(`[PLAN-DEBUG] Tool call: ExitPlanMode | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
-          // Persist the tool_use_id so "build" can send a tool_result even after bridge restart
           session.pendingPlanDenialId = block.id;
           if (session.claudeSessionId) {
             persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: block.id });
