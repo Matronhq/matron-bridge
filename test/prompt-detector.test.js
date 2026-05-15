@@ -109,6 +109,44 @@ describe('classifyScreen — arrow-menu', () => {
   });
 });
 
+describe('classifyScreen — numbered list inside prose', () => {
+  it('returns null on a numbered list with a non-question header (no menu context)', () => {
+    // Real bug: claude's plan content contained a "Verification" section
+    // with numbered steps. The detector misread those steps as menu options.
+    const screen = [
+      'Verification',
+      '',
+      '1. cd ~/claude-matrix-bridge && git pull',
+      '2. sudo systemctl restart claude-matrix-bridge.service',
+      '3. In Matrix, send !version',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('still detects numbered when header ends with a colon (instructive)', () => {
+    const screen = [
+      'Choose a model:',
+      '1. Sonnet',
+      '2. Opus',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+  });
+
+  it('still detects numbered when first item has a selection marker', () => {
+    const screen = [
+      'Verification',
+      '',
+      '❯ 1. Run tests',
+      '  2. Skip tests',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+  });
+});
+
 describe('classifyScreen — null cases', () => {
   it('returns null on plain assistant output', () => {
     expect(classifyScreen('Working on it…\nDone.\n> ')).toBeNull();
