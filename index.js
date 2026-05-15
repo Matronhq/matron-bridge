@@ -672,8 +672,41 @@ function maybeResolveInteractivePrompt(session, userText) {
     else if (session.sendCallback) session.sendCallback(help);
     return true; // consumed — invalid format, but don't forward to claude
   }
+  // Resolve the human-readable label so the Matrix confirmation tells the
+  // user *what* we sent to claude — without this, the bridge silently
+  // consumed the reply and the user thought it had been ignored.
+  let pickedLabel = null;
+  let pickedNumber = null;
+  if (p.kind === 'yes-no') {
+    pickedLabel = response.key === 'y' ? 'Yes' : 'No';
+  } else {
+    const n = parseInt(trimmed, 10);
+    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
+      pickedNumber = n;
+      pickedLabel = p.options[n - 1].label;
+    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
+      const opt = p.options.find(o => o.key === trimmed);
+      pickedLabel = opt ? opt.label : trimmed.toUpperCase();
+    }
+  }
   session.pendingInteractivePrompt = null;
+  console.log(
+    `[IV-DEBUG] Resolving TUI prompt with reply="${userText}" → ` +
+    `kind=${response.kind} key=${response.key}` +
+    (pickedLabel ? ` label="${pickedLabel}"` : '')
+  );
   session.iv.respondToPrompt(response);
+  // Tell the Matrix user we received their reply and what we sent on
+  // their behalf. Without this the consumption is invisible.
+  const numberPrefix = pickedNumber !== null ? `${pickedNumber}. ` : '';
+  const ackPlain = `→ Sent "${numberPrefix}${pickedLabel || response.key}" to Claude`;
+  const ackHtml = `<i>→ Sent <b>${escapeHtml(numberPrefix + (pickedLabel || response.key))}</b> to Claude</i>`;
+  if (session.sendHtml) session.sendHtml(ackPlain, ackHtml);
+  else if (session.sendCallback) session.sendCallback(ackPlain);
+  // Start typing while we wait for claude's next render — without this
+  // the user sees no activity until the next prompt or text fires.
+  if (session.typingInterval) clearInterval(session.typingInterval);
+  session.typingInterval = startTyping(session.roomId);
   return true;
 }
 

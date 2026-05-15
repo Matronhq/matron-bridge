@@ -157,6 +157,58 @@ describe('classifyScreen — numbered list inside prose', () => {
   });
 });
 
+describe('classifyScreen — full question text for multi-line modals', () => {
+  // Real reproduction from the bypass-permissions warning modal that the
+  // bridge surfaces over Matrix. Old detector took only 2 lines above the
+  // menu, so the question shown in Matrix was just the URL line, leaving
+  // the user with no idea what they were agreeing to.
+  it('includes the WARNING + explanation paragraphs from the bypass-permissions modal', () => {
+    const screen = [
+      '────────────────────────────────────────',
+      'WARNING: Claude Code running in Bypass Permissions mode',
+      '',
+      'In Bypass Permissions mode, Claude Code will not ask for your approval',
+      'before running potentially dangerous commands.',
+      'This mode should only be used in a sandboxed container/VM that has',
+      'restricted internet access and can easily be restored if damaged.',
+      '',
+      'By proceeding, you accept all responsibility for actions taken while',
+      'running in Bypass Permissions mode.',
+      '',
+      'https://code.claude.com/docs/en/security',
+      '',
+      '❯ 1. No, exit',
+      '  2. Yes, I accept',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.label)).toEqual(['No, exit', 'Yes, I accept']);
+    // The WARNING line and at least one explanation line must be in the
+    // question — that's the whole point of this regression test.
+    expect(r.question).toMatch(/WARNING.*Bypass Permissions mode/);
+    expect(r.question).toMatch(/sandbox|responsibility|approval/);
+    expect(r.question).toMatch(/https:\/\/code\.claude\.com/);
+  });
+
+  it('stops walking up at a separator line so prior screens do not leak in', () => {
+    // The screen above the modal (status bar, previous prompt) is
+    // separated from the modal by a row of ─ chars. We must not absorb
+    // it into the question.
+    const screen = [
+      'Some unrelated previous text that should NOT appear',
+      '────────────────────────────────────────',
+      'Pick one:',
+      '1. Foo',
+      '2. Bar',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.question).toMatch(/Pick one/);
+    expect(r.question).not.toMatch(/unrelated previous text/);
+  });
+});
+
 describe('classifyScreen — first option glued onto heading line', () => {
   // Real reproduction from claude's theme picker on a fresh box: claude's TUI
   // renders option 1 ("Auto (match terminal)") on the same visual line as
