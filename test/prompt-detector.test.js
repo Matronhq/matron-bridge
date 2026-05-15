@@ -157,6 +157,51 @@ describe('classifyScreen — numbered list inside prose', () => {
   });
 });
 
+describe('classifyScreen — first option glued onto heading line', () => {
+  // Real reproduction from claude's theme picker on a fresh box: claude's TUI
+  // renders option 1 ("Auto (match terminal)") on the same visual line as
+  // the heading "To change this later, run /theme", with options 2..N on
+  // their own lines. Naive detection sees a numbered run starting at 2
+  // and absorbs "1. Auto" into the question text. The user then picks "1"
+  // expecting Auto but the bridge sends keystroke "2" (Dark mode).
+  it('recovers the first numbered option when it is glued onto the heading', () => {
+    const screen = [
+      'To change this later, run /theme  1. Auto (match terminal)',
+      '2. Dark mode ✔ (current)',
+      '3. Light mode',
+      '4. Dark mode (colorblind-friendly)',
+      '5. Light mode (colorblind-friendly)',
+      '6. Dark mode (ANSI colors only)',
+      '7. Light mode (ANSI colors only)',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.key)).toEqual(['1', '2', '3', '4', '5', '6', '7']);
+    expect(r.options[0].label).toMatch(/^Auto \(match terminal\)/);
+    expect(r.options[1].label).toMatch(/^Dark mode/);
+    // Question should NOT contain the absorbed first option.
+    expect(r.question).not.toMatch(/Auto \(match terminal\)/);
+    expect(r.question).toMatch(/\/theme/);
+  });
+
+  it('does not invent a phantom first option when nothing precedes the run', () => {
+    // Guard: a clean numbered run starting at 2 with no glued heading
+    // shouldn't suddenly grow a fake option 1 from unrelated text above.
+    const screen = [
+      'Some unrelated paragraph with no numbered tail.',
+      '2. Foo',
+      '3. Bar',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    if (r) {
+      // If we still classify, options must reflect what was actually on
+      // screen; we should not synthesise a "1." from the heading.
+      expect(r.options.map(o => o.key)).not.toContain('1');
+    }
+  });
+});
+
 describe('classifyScreen — multiple numbered runs', () => {
   it('picks the run that passes the menu guard, not the longest run', () => {
     // Real screen from iv-mode testing: a "Verification" numbered list
