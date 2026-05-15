@@ -541,6 +541,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
   // case 'result' inside handleClaudeEvent; the transcript file in iv-mode
   // has no result event, so the Stop hook (→ /turn-end → this) replaces it.
   session.onTurnEnd = () => {
+    console.log(`[IV-DEBUG] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
     // Flush the accumulated assistant text to Matrix.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
       flushResponse(session);
@@ -912,6 +913,18 @@ function handleClaudeEvent(session, event) {
           session.responseBuffer = session.waitingForAnswer ? '' : textParts.join('');
         }
         session._lastAssistantMsgId = messageId;
+
+        // iv-mode: flush this assistant chunk NOW rather than waiting for
+        // /turn-end. Two reasons: (1) the Stop hook races the transcript
+        // flush so onTurnEnd is unreliable as a flush trigger; (2) claude
+        // emits intermediate commentary with stop_reason=tool_use while
+        // chaining tool calls — those messages would otherwise sit in the
+        // buffer forever, giving the user a stuck "typing…" indicator and
+        // no visible progress. Print-mode keeps its existing accumulate-
+        // and-flush-on-result flow.
+        if (session.iv && !isPartial && session.responseBuffer.trim() && !session.waitingForAnswer) {
+          flushResponse(session);
+        }
       }
 
       for (const block of content) {
@@ -3603,12 +3616,14 @@ const apiServer = createServer(async (req, res) => {
         // completes. Used in interactive mode to clear typing indicators and
         // flush response state in lieu of the stream-json `result` event.
         const { session_id } = data;
+        console.log(`[IV-DEBUG] /turn-end hit, session_id=${session_id}`);
         let target = null;
         if (session_id) {
           for (const [, s] of sessions) {
             if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
           }
         }
+        console.log(`[IV-DEBUG] /turn-end target found=${!!target} buf="${target?.responseBuffer?.slice(0,60) || ''}"`);
         if (target) {
           // Drain the transcript tail synchronously so any assistant event
           // written just before the Stop hook is processed (and the
