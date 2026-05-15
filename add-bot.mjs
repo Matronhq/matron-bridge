@@ -34,6 +34,7 @@ import { writeFileSync } from 'fs';
 
 const HOMESERVER = process.env.MATRIX_HOMESERVER_URL || 'http://localhost:6167';
 const VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
+const JOIN_TIMEOUT_MS = 2 * 60 * 1000;
 
 // Mirror setup-user.mjs's noise suppression so the operator only sees flow steps.
 const origLog = console.log;
@@ -166,6 +167,32 @@ async function findOrCreateDM(client, userId) {
   return created.room_id;
 }
 
+// Wait for the target user to actually join the DM before we send any
+// verification request into it. If the user is still in "invite" state
+// when we send m.key.verification.request, their client will only see
+// the request when it later joins the room — at which point it arrives
+// as a backfilled historical event and Element (web/desktop, X, and
+// matrix-rust-sdk-based clients) silently ignore it for verification UI
+// purposes. Without this wait, the prompt never surfaces.
+async function waitForUserToJoinRoom(client, roomId, userId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    // Force a fresh fetch rather than relying on client.getRoom(),
+    // which lags behind initial sync on a brand-new room.
+    let members;
+    try {
+      members = await client.getJoinedRoomMembers(roomId);
+    } catch {
+      members = { joined: {} };
+    }
+    if (members.joined && Object.prototype.hasOwnProperty.call(members.joined, userId)) {
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error(`Timed out after ${timeoutMs / 1000}s waiting for ${userId} to join the verification DM. Open the invite in Element first.`);
+}
+
 async function ensureUserIdentityKnown(cryptoApi, userId, accessToken) {
   for (let attempt = 1; attempt <= 5; attempt++) {
     await cryptoApi.userHasCrossSigningKeys(userId, true);
@@ -231,6 +258,10 @@ async function crossSignUserFromBot(cryptoApi, userId, accessToken) {
 async function sendVerificationAndAwait(client, cryptoApi, userId, accessToken) {
   const dmRoomId = await findOrCreateDM(client, userId);
   await ensureUserIdentityKnown(cryptoApi, userId, accessToken);
+  log(`  -> DM ${dmRoomId} ready; waiting for ${userId} to join before sending verification request`);
+  log(`     (Element won't render the verification prompt if the request lands before the user joins.)`);
+  await waitForUserToJoinRoom(client, dmRoomId, userId, JOIN_TIMEOUT_MS);
+  log(`  -> ${userId} joined; sending verification request`);
   const request = await cryptoApi.requestVerificationDM(userId, dmRoomId);
   log(`  -> Verification request sent to ${userId}`);
   log(`     Open Element and accept the verification request, then confirm the emoji match.`);
