@@ -422,7 +422,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
   }
   claudeArgs.push(
     '--dangerously-skip-permissions',
-    '--disallowed-tools', 'AskUserQuestion',
+    // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
+    // (lib/prompt-detector.js) catches it and routes the question through
+    // Matrix. Print-mode kept it disallowed because there was no way to
+    // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify(settings),
