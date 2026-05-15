@@ -688,7 +688,14 @@ function submitAnswer(session, answerText) {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
     sendTextToSession(session, answerText);
   } else {
-    // Normal tool_result flow
+    // Normal tool_result flow. This path only applies to print-mode stream-
+    // json input; in iv-mode the ask-user MCP server returns answers over
+    // its own stdio transport and this branch is unreachable. Log if it ever
+    // fires under iv-mode so we notice an unexpected code path.
+    if (session.iv) {
+      debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
+      return;
+    }
     session.busy = true;
     const jsonMsg = JSON.stringify({
       type: 'user',
@@ -1179,6 +1186,22 @@ function sendToSession(session, contentBlocks) {
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
+
+  if (session.iv) {
+    // Interactive mode: type text blocks into the PTY. Non-text content
+    // (images, encoded attachments) is not currently supportable via PTY
+    // input — log and drop. Phase 6 (post-cutover) will add image handling
+    // via a separate channel (probably writing the image bytes to a tmp
+    // path and typing a /file reference).
+    const nonText = contentBlocks.filter(b => b.type !== 'text');
+    if (nonText.length > 0) {
+      debug(`iv-mode: dropping ${nonText.length} non-text block(s): ${nonText.map(b => b.type).join(',')}`);
+    }
+    const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
+    if (text) session.iv.sendText(text);
+    if (session.resetTimeout) session.resetTimeout();
+    return true;
+  }
 
   const jsonMsg = JSON.stringify({
     type: 'user',
@@ -2714,7 +2737,28 @@ client.on('room.message', async (roomId, event) => {
       : false;
     console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
 
-    if (!toolUseId || alreadyAnswered) {
+    if (session.iv) {
+      // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
+      // it with allow so the hook returns and claude proceeds naturally.
+      // No stdin.write or follow-up text needed — the hook's allow decision
+      // unblocks the original tool call and claude continues its turn.
+      const pending = session.ivPendingPlanToolUseId
+        ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
+        : null;
+      session.pendingPlan = null;
+      session.pendingPlanDenialId = null;
+      session.ivPendingPlanToolUseId = null;
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+      }
+      if (pending) {
+        console.log(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
+        pending.resolve({ decision: 'allow', reason: 'approved by user' });
+      } else {
+        console.log(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
+        sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+      }
+    } else if (!toolUseId || alreadyAnswered) {
       // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
       session.pendingPlan = null;
       session.pendingPlanDenialId = null;
