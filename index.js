@@ -904,6 +904,14 @@ function handleClaudeEvent(session, event) {
       const messageId = event.message?.id;
 
       const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
+      // Suppress claude's "No response requested." filler. It's emitted in
+      // response to internal synthetic prompts (e.g. resume-time nudges)
+      // and is just noise on Matrix.
+      if (textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0])) {
+        debug('Suppressing "No response requested." filler');
+        break;
+      }
+
       if (textParts.length > 0) {
         if (isPartial && messageId && session._lastAssistantMsgId === messageId) {
           session.responseBuffer = textParts.join('');
