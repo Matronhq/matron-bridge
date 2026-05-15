@@ -537,9 +537,44 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
 
   session.resetTimeout = () => {};
 
+  // iv-mode turn-end handler. Print-mode does most of this work in
+  // case 'result' inside handleClaudeEvent; the transcript file in iv-mode
+  // has no result event, so the Stop hook (→ /turn-end → this) replaces it.
   session.onTurnEnd = () => {
+    // Flush the accumulated assistant text to Matrix.
+    if (session.responseBuffer.trim() && !session.waitingForAnswer) {
+      flushResponse(session);
+    }
+    // Emit collected tool-call summary if the user has !show_working on.
+    if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
+      const toolSummary = session.toolCalls.join('\n');
+      const chunks = splitMessage(toolSummary);
+      for (const chunk of chunks) session.sendCallback(chunk);
+    }
+    session.toolCalls = [];
+    session.turnCount++;
     session.busy = false;
-    if (session.typingInterval) { clearInterval(session.typingInterval); session.typingInterval = null; }
+    stripQueueNotificationLinks(session);
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+    // Flush any queued messages now that claude is free.
+    if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
+      const queued = session.queuedMessages;
+      session.queuedMessages = null;
+      const summary = formatQueueSummary(queued);
+      if (session.sendHtml) {
+        session.sendHtml(
+          `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
+          `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
+        );
+      } else if (session.sendCallback) {
+        session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
+      }
+      flushQueue(session, queued);
+    }
   };
 
   // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
