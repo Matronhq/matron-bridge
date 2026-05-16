@@ -761,20 +761,20 @@ function handleInteractiveScreenUpdate(session, update) {
   const newUrls = urls.filter(u => !session.surfacedUrls.has(u));
   if (newUrls.length === 0 && !hasInputCue) return;
   for (const u of newUrls) session.surfacedUrls.add(u);
-  // Trim to the visible tail (last 30 non-blank lines) to avoid dumping
-  // the whole accumulated PTY buffer to Matrix, and un-wrap URLs that
-  // claude broke across lines at terminal width — without this the
-  // OAuth `/login` URL ends up split as `https://...redir\nect_uri=...`
-  // and Matrix renders only the first half as a clickable link, which
-  // makes the whole login flow unusable.
-  const tail = unwrapUrls(
-    screen
-      .split('\n')
-      .map(l => l.trim())
-      .filter(Boolean)
-      .slice(-30)
-      .join('\n')
-  );
+  // Trim to the visible tail and un-wrap URLs that claude broke across
+  // lines at terminal width. CRITICAL: we keep blank lines (just trim
+  // each line's whitespace and collapse 3+ blanks to 2) so unwrapUrls
+  // can distinguish a real URL-wrap break (`...redir\nect_uri=...`,
+  // no blank between) from a paragraph boundary (`...&state=9Y\n\nPaste
+  // code here`, blank between). Without the blank-line preservation,
+  // the un-wrapper happily merged "Paste" into the URL because "P" is
+  // a URL-safe char, producing a broken clickable link AND mangling
+  // the question text below it.
+  const trimmedLines = screen.split('\n').map(l => l.trim());
+  const collapsed = trimmedLines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n');
+  const tail = unwrapUrls(collapsed.split('\n').slice(-50).join('\n')).trim();
   let plain;
   let html;
   if (newUrls.length > 0) {
