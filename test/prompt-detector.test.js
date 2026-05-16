@@ -21,6 +21,18 @@ describe('stripAnsi', () => {
     // \x1b[C with no digits = 1
     expect(stripAnsi('a\x1b[Cb')).toBe('a b');
   });
+
+  it('replaces CSI cursor-down (\\x1b[<n>B / \\x1b[<n>E) with newlines', () => {
+    // claude renders the /login menu with `\r\x1b[1B<text>` between options
+    // — without converting cursor-down to newlines the whole menu collapses
+    // onto a single line and NUMBERED_LINE_RE never matches.
+    expect(stripAnsi('Login:\r\x1b[1B1. Pro\r\x1b[1B2. Console\r\x1b[1B3. Bedrock'))
+      .toBe('Login:\n1. Pro\n2. Console\n3. Bedrock');
+    // CSI E (next line) is equivalent.
+    expect(stripAnsi('a\x1b[1Eb\x1b[1Ec')).toBe('a\nb\nc');
+    // No digits = 1 line.
+    expect(stripAnsi('a\x1b[Bb')).toBe('a\nb');
+  });
 });
 
 describe('classifyScreen — yes/no', () => {
@@ -154,6 +166,33 @@ describe('classifyScreen — numbered list inside prose', () => {
     const r = classifyScreen(screen);
     expect(r).not.toBeNull();
     expect(r.kind).toBe('numbered');
+  });
+});
+
+describe('classifyScreen — /login menu rendered with cursor-down', () => {
+  // Real reproduction from claude's /login screen: every option is printed
+  // as `\r\x1b[1B<text>` rather than a literal newline, so without the
+  // cursor-down → newline conversion in stripAnsi the whole menu collapses
+  // to one line and the bridge never surfaces it over Matrix.
+  it('detects the 3-option login menu after stripAnsi inserts newlines', () => {
+    // Real byte sequence: claude moves between rendered rows with CR + CSI
+    // cursor-down (`\r\x1b[1B`) instead of literal `\n`. The screen below
+    // mimics that exactly for the question + options portion of the menu.
+    const screen =
+      'Login' +
+      '\r\x1b[1B  Claude Code can be used with your Claude subscription or billed based on API usage.' +
+      '\r\x1b[1B  Select login method:' +
+      '\r\x1b[1B❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise' +
+      '\r\x1b[1B  2. Anthropic Console account · API usage billing' +
+      '\r\x1b[1B  3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI';
+    const r = classifyScreen(stripAnsi(screen));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(3);
+    expect(r.options[0].label).toMatch(/Claude account with subscription/);
+    expect(r.options[1].label).toMatch(/Anthropic Console/);
+    expect(r.options[2].label).toMatch(/3rd-party/);
+    expect(r.question).toMatch(/Select login method/);
   });
 });
 
