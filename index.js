@@ -797,7 +797,33 @@ function handleInteractiveScreenUpdate(session, update) {
     session.typingInterval = null;
     client.setTyping(session.roomId, false, 1000).catch(() => {});
   }
+  // Auto-press Enter for pure acknowledgment cues ("Press Enter to
+  // continue…" after /login success, "Press Enter to dismiss" notices,
+  // etc). These are just waiting for any keystroke before claude moves
+  // on — without this the user has to send a dummy message to unblock
+  // claude, which is confusing UX. We surface the screen content FIRST
+  // (so the user sees "Login successful" etc) then send Enter and a
+  // small confirmation note.
+  if (AUTO_ENTER_CUE_RE.test(tail)) {
+    console.log('[IV-DEBUG] Auto-pressing Enter for "Press Enter to continue" cue');
+    try {
+      session.iv.sendKeystroke('enter');
+    } catch (err) {
+      console.error('[IV-DEBUG] Auto-Enter failed:', err.message);
+      return;
+    }
+    const note = '↵ (auto-pressed Enter to continue)';
+    if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
+    else if (session.sendCallback) session.sendCallback(note);
+  }
 }
+
+// Cues for which the bridge auto-sends Enter on the user's behalf.
+// Kept narrow on purpose — only matches phrasing where claude is
+// explicitly waiting for an acknowledgment keystroke ("press enter to
+// continue" / "press enter to dismiss"). Does NOT match "paste code
+// here" or other prompts that need real input.
+const AUTO_ENTER_CUE_RE = /press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i;
 
 // --- Structured Question Handling ---
 
