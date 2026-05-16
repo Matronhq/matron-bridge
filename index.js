@@ -3199,20 +3199,48 @@ client.on('room.message', async (roomId, event) => {
   // and the user can't recover without manually flushing.
   const isClaudeSlashCommand =
     session.iv && text.startsWith('/') && !text.startsWith('//');
-  // Rescue command for iv-mode sessions that got stuck with text in
-  // the input box but no Enter applied (race: bridge sent Enter while
-  // claude was still rendering the resume context after a heavy
-  // session resume, so Enter landed in nowhere). The user types
-  // `!enter` and we send a bare Enter keystroke into the PTY. Works
-  // regardless of busy state since it's a pure recovery action.
-  if (session.iv && session.iv.alive && text.trim().toLowerCase() === '!enter') {
-    try {
-      session.iv.sendKeystroke('enter');
-      await sendReply('↵ Sent Enter to claude. If you had text queued in the input box, it should submit now.');
-    } catch (err) {
-      await sendReply(`Could not send Enter: ${err.message}`);
+  // Raw-keystroke rescue commands for iv-mode sessions. These work
+  // regardless of busy state because they're pure recovery actions
+  // (the user can always need to interrupt claude or nudge a stuck
+  // input box, even when the bridge thinks claude is mid-turn).
+  //
+  //   !enter — send Enter into the PTY. Use when a heavy session
+  //            resume + race left text sitting unsent in claude's
+  //            input box.
+  //   !esc   — send Esc into the PTY. Same effect as pressing Esc
+  //            in the TUI: cancels the current generation/turn,
+  //            dismisses the OAuth wait, exits a menu, etc.
+  if (session.iv && session.iv.alive) {
+    const lower = text.trim().toLowerCase();
+    if (lower === '!enter') {
+      try {
+        session.iv.sendKeystroke('enter');
+        await sendReply('↵ Sent Enter to claude. If you had text queued in the input box, it should submit now.');
+      } catch (err) {
+        await sendReply(`Could not send Enter: ${err.message}`);
+      }
+      return;
     }
-    return;
+    if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
+      try {
+        session.iv.sendKeystroke('esc');
+        // Clear bridge-side busy state since claude won't fire a Stop
+        // hook after a user-cancelled turn — leaving busy=true would
+        // queue every subsequent message.
+        if (session.busy) {
+          session.busy = false;
+          if (session.typingInterval) {
+            clearInterval(session.typingInterval);
+            session.typingInterval = null;
+            client.setTyping(session.roomId, false, 1000).catch(() => {});
+          }
+        }
+        await sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
+      } catch (err) {
+        await sendReply(`Could not send Esc: ${err.message}`);
+      }
+      return;
+    }
   }
   if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
