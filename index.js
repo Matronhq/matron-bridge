@@ -721,6 +721,81 @@ function maybeResolveInteractivePrompt(session, userText) {
   // the user sees no activity until the next prompt or text fires.
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
+  // Schedule a post-response screen capture to surface any free-text
+  // TUI output (e.g. the /login OAuth URL screen) that doesn't fire
+  // a transcript event and doesn't classify as a follow-up menu.
+  schedulePostResponseScreenCapture(session);
+  return true;
+}
+
+// Two seconds after the user resolves an interactive prompt, peek at the
+// PTY screen and surface any new URLs / "press enter / paste here" prompts
+// to Matrix. Without this, claude's free-text TUI screens (the OAuth URL
+// after picking a /login option, "press enter to continue" notices, etc)
+// are completely invisible to Matrix users — neither the transcript
+// JSONL nor the menu detector covers them.
+const POST_RESPONSE_SCREEN_CAPTURE_MS = 2500;
+function schedulePostResponseScreenCapture(session) {
+  if (!session.iv) return;
+  if (session.postResponseScreenTimer) clearTimeout(session.postResponseScreenTimer);
+  session.surfacedScreenSignatures = session.surfacedScreenSignatures || new Set();
+  session.surfacedUrls = session.surfacedUrls || new Set();
+  session.postResponseScreenTimer = setTimeout(() => {
+    session.postResponseScreenTimer = null;
+    if (!session.iv) return;
+    // If a new TUI prompt fired in the meantime, the prompt event handler
+    // already sent it to Matrix — don't double-surface.
+    if (session.pendingInteractivePrompt) return;
+    const screen = session.iv.getCurrentScreenText();
+    const surfaced = surfaceFreeTextScreen(session, screen);
+    if (surfaced && session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+  }, POST_RESPONSE_SCREEN_CAPTURE_MS);
+}
+
+// Inspect a settled PTY screen for content the user needs to see — URLs
+// and obvious input cues — and forward it to Matrix. Returns true if
+// anything was sent.
+function surfaceFreeTextScreen(session, screen) {
+  if (!screen) return false;
+  const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  const tail = lines.slice(-30);
+  const tailText = tail.join('\n');
+  // Find URLs we haven't already surfaced this session.
+  const urlMatches = tailText.match(/\bhttps?:\/\/\S+/g) || [];
+  const newUrls = urlMatches.filter(u => !session.surfacedUrls.has(u));
+  // Look for obvious "claude wants typed input" cues so we don't
+  // silently swallow OAuth code prompts, Enter-to-continue notices etc.
+  const hasInputCue = /paste\s+code|press\s+enter|enter\s+to\s+continue|copy\s+the\s+url|use\s+the\s+url/i.test(tailText);
+  if (newUrls.length === 0 && !hasInputCue) return false;
+  // Avoid emitting the same screen twice in a row (deduped on the
+  // tail content).
+  const sig = tailText;
+  if (session.surfacedScreenSignatures.has(sig)) return false;
+  session.surfacedScreenSignatures.add(sig);
+  for (const u of newUrls) session.surfacedUrls.add(u);
+  // Build the message: question text + URLs prominently.
+  let plain;
+  let html;
+  if (newUrls.length > 0) {
+    plain = `Claude is showing:\n${tailText}`;
+    const escaped = escapeHtml(tailText);
+    const linkified = escaped.replace(
+      /(https?:\/\/[^\s<]+)/g,
+      '<a href="$1">$1</a>'
+    );
+    html = `<b>Claude is showing:</b><br/><pre>${linkified}</pre>`;
+  } else {
+    plain = `Claude is asking:\n${tailText}\n\n(Reply with the requested text)`;
+    html = `<b>🟡 Claude is asking:</b><br/><pre>${escapeHtml(tailText)}</pre><br/><i>(Reply with the requested text)</i>`;
+  }
+  console.log(`[IV-DEBUG] Surfacing free-text TUI screen (${newUrls.length} URL(s), inputCue=${hasInputCue})`);
+  if (session.sendHtml) session.sendHtml(plain, html);
+  else if (session.sendCallback) session.sendCallback(plain);
   return true;
 }
 
