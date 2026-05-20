@@ -1318,18 +1318,10 @@ function handleClaudeEvent(session, event) {
     }
 
     case 'result': {
-      // iv-mode handles turn end via the Stop hook → onTurnEnd; the iv-mode
-      // transcript should not emit result events in normal operation. If
-      // one does appear (defensive: claude CLI changes, new transcript
-      // shape), skip the duplicating work to avoid double-count
-      // turnCount, double-flush responseBuffer, double tool-summary,
-      // double busy/typing clear, and double queue drain — all of which
-      // onTurnEnd already does.
-      if (session.iv) {
-        debug('Unexpected result event for iv-mode session — onTurnEnd is authoritative; ignoring duplicate.');
-        break;
-      }
       // Handle fatal errors (e.g. failed resume with invalid session ID)
+      // first, regardless of mode — iv-mode resumes can also fail and need
+      // the crash-restart loop short-circuited (otherwise the exit handler
+      // would retry the same invalid session up to 3 times).
       if (event.is_error && event.errors?.length) {
         const noSession = event.errors.some(e => /no conversation found/i.test(e));
         if (noSession) {
@@ -1353,6 +1345,16 @@ function handleClaudeEvent(session, event) {
           }
           break;
         }
+      }
+      // Past the error path: in iv-mode `onTurnEnd` is the authoritative
+      // turn-end signal (fired by the Stop hook → /turn-end → onTurnEnd).
+      // iv-mode transcripts don't emit result events in normal operation;
+      // if one slips through it would double-count turnCount, re-flush
+      // responseBuffer, re-post tool summaries, re-clear busy/typing, and
+      // re-drain queued messages on top of what onTurnEnd already did.
+      if (session.iv) {
+        debug('Result event arrived for iv-mode session past error path — onTurnEnd handles turn-end; skipping duplicate work.');
+        break;
       }
 
       // Accumulate usage stats
