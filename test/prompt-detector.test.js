@@ -21,6 +21,18 @@ describe('stripAnsi', () => {
     // \x1b[C with no digits = 1
     expect(stripAnsi('a\x1b[Cb')).toBe('a b');
   });
+
+  it('replaces CSI cursor-down (\\x1b[<n>B / \\x1b[<n>E) with newlines', () => {
+    // claude renders the /login menu with `\r\x1b[1B<text>` between options
+    // — without converting cursor-down to newlines the whole menu collapses
+    // onto a single line and NUMBERED_LINE_RE never matches.
+    expect(stripAnsi('Login:\r\x1b[1B1. Pro\r\x1b[1B2. Console\r\x1b[1B3. Bedrock'))
+      .toBe('Login:\n1. Pro\n2. Console\n3. Bedrock');
+    // CSI E (next line) is equivalent.
+    expect(stripAnsi('a\x1b[1Eb\x1b[1Ec')).toBe('a\nb\nc');
+    // No digits = 1 line.
+    expect(stripAnsi('a\x1b[Bb')).toBe('a\nb');
+  });
 });
 
 describe('classifyScreen — yes/no', () => {
@@ -154,6 +166,147 @@ describe('classifyScreen — numbered list inside prose', () => {
     const r = classifyScreen(screen);
     expect(r).not.toBeNull();
     expect(r.kind).toBe('numbered');
+  });
+});
+
+describe('classifyScreen — /login menu rendered with cursor-down', () => {
+  // Real reproduction from claude's /login screen: every option is printed
+  // as `\r\x1b[1B<text>` rather than a literal newline, so without the
+  // cursor-down → newline conversion in stripAnsi the whole menu collapses
+  // to one line and the bridge never surfaces it over Matrix.
+  it('detects the 3-option login menu after stripAnsi inserts newlines', () => {
+    // Real byte sequence: claude moves between rendered rows with CR + CSI
+    // cursor-down (`\r\x1b[1B`) instead of literal `\n`. The screen below
+    // mimics that exactly for the question + options portion of the menu.
+    const screen =
+      'Login' +
+      '\r\x1b[1B  Claude Code can be used with your Claude subscription or billed based on API usage.' +
+      '\r\x1b[1B  Select login method:' +
+      '\r\x1b[1B❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise' +
+      '\r\x1b[1B  2. Anthropic Console account · API usage billing' +
+      '\r\x1b[1B  3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI';
+    const r = classifyScreen(stripAnsi(screen));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(3);
+    expect(r.options[0].label).toMatch(/Claude account with subscription/);
+    expect(r.options[1].label).toMatch(/Anthropic Console/);
+    expect(r.options[2].label).toMatch(/3rd-party/);
+    expect(r.question).toMatch(/Select login method/);
+  });
+});
+
+describe('classifyScreen — full question text for multi-line modals', () => {
+  // Real reproduction from the bypass-permissions warning modal that the
+  // bridge surfaces over Matrix. Old detector took only 2 lines above the
+  // menu, so the question shown in Matrix was just the URL line, leaving
+  // the user with no idea what they were agreeing to.
+  it('includes the WARNING + explanation paragraphs from the bypass-permissions modal', () => {
+    const screen = [
+      '────────────────────────────────────────',
+      'WARNING: Claude Code running in Bypass Permissions mode',
+      '',
+      'In Bypass Permissions mode, Claude Code will not ask for your approval',
+      'before running potentially dangerous commands.',
+      'This mode should only be used in a sandboxed container/VM that has',
+      'restricted internet access and can easily be restored if damaged.',
+      '',
+      'By proceeding, you accept all responsibility for actions taken while',
+      'running in Bypass Permissions mode.',
+      '',
+      'https://code.claude.com/docs/en/security',
+      '',
+      '❯ 1. No, exit',
+      '  2. Yes, I accept',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.label)).toEqual(['No, exit', 'Yes, I accept']);
+    // The WARNING line and at least one explanation line must be in the
+    // question — that's the whole point of this regression test.
+    expect(r.question).toMatch(/WARNING.*Bypass Permissions mode/);
+    expect(r.question).toMatch(/sandbox|responsibility|approval/);
+    expect(r.question).toMatch(/https:\/\/code\.claude\.com/);
+  });
+
+  it('stops walking up at a separator line so prior screens do not leak in', () => {
+    // The screen above the modal (status bar, previous prompt) is
+    // separated from the modal by a row of ─ chars. We must not absorb
+    // it into the question.
+    const screen = [
+      'Some unrelated previous text that should NOT appear',
+      '────────────────────────────────────────',
+      'Pick one:',
+      '1. Foo',
+      '2. Bar',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.question).toMatch(/Pick one/);
+    expect(r.question).not.toMatch(/unrelated previous text/);
+  });
+});
+
+describe('classifyScreen — first option glued onto heading line', () => {
+  // Real reproduction from claude's theme picker on a fresh box: claude's TUI
+  // renders option 1 ("Auto (match terminal)") on the same visual line as
+  // the heading "To change this later, run /theme", with options 2..N on
+  // their own lines. Naive detection sees a numbered run starting at 2
+  // and absorbs "1. Auto" into the question text. The user then picks "1"
+  // expecting Auto but the bridge sends keystroke "2" (Dark mode).
+  it('recovers the first numbered option when it is glued onto the heading', () => {
+    const screen = [
+      'To change this later, run /theme  1. Auto (match terminal)',
+      '2. Dark mode ✔ (current)',
+      '3. Light mode',
+      '4. Dark mode (colorblind-friendly)',
+      '5. Light mode (colorblind-friendly)',
+      '6. Dark mode (ANSI colors only)',
+      '7. Light mode (ANSI colors only)',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.key)).toEqual(['1', '2', '3', '4', '5', '6', '7']);
+    expect(r.options[0].label).toMatch(/^Auto \(match terminal\)/);
+    expect(r.options[1].label).toMatch(/^Dark mode/);
+    // Question should NOT contain the absorbed first option.
+    expect(r.question).not.toMatch(/Auto \(match terminal\)/);
+    expect(r.question).toMatch(/\/theme/);
+  });
+
+  it('anchors on the LAST "1." in the heading line when it has stray earlier numerals', () => {
+    // If the heading text legitimately contains "1." or "1)" before the
+    // glued first option, a non-greedy match would absorb the heading tail
+    // into the option label. Greedy match anchors on the last "1.".
+    const screen = [
+      'Step 1. Pick a theme  1. Auto (match terminal)',
+      '2. Dark mode ✔ (current)',
+      '3. Light mode',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.key)).toEqual(['1', '2', '3']);
+    expect(r.options[0].label).toBe('Auto (match terminal)');
+    expect(r.question).toMatch(/Step 1\. Pick a theme$/);
+  });
+
+  it('does not invent a phantom first option when nothing precedes the run', () => {
+    // Guard: a clean numbered run starting at 2 with no glued heading
+    // shouldn't suddenly grow a fake option 1 from unrelated text above.
+    const screen = [
+      'Some unrelated paragraph with no numbered tail.',
+      '2. Foo',
+      '3. Bar',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    if (r) {
+      // If we still classify, options must reflect what was actually on
+      // screen; we should not synthesise a "1." from the heading.
+      expect(r.options.map(o => o.key)).not.toContain('1');
+    }
   });
 });
 

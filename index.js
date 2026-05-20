@@ -14,6 +14,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
+import { extractUrls } from './lib/prompt-detector.js';
 import { macifyMcpServers } from './lib/mcp-config-mac.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -498,9 +499,28 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
     handleClaudeEvent(session, event);
   });
 
+  iv.on('screen-update', update => {
+    debug('IV screen-update:', update.urls.length, 'url(s)', 'cue=' + update.hasInputCue);
+    handleInteractiveScreenUpdate(session, update);
+  });
+
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
     session.pendingInteractivePrompt = prompt;
+    // A TUI prompt means claude has stopped processing and is awaiting
+    // user input. The Stop hook is unreliable for these states (e.g.
+    // first-run modals, /login, unauthenticated "please run /login"
+    // pseudo-turns) — without this the bridge's `busy` flag gets stuck
+    // and every subsequent user message hits the queue path.
+    if (session.busy) {
+      console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+    }
     handleInteractivePrompt(session, prompt);
   });
 
@@ -709,10 +729,184 @@ function maybeResolveInteractivePrompt(session, userText) {
     else if (session.sendCallback) session.sendCallback(help);
     return true; // consumed — invalid format, but don't forward to claude
   }
+  // Resolve the human-readable label so the Matrix confirmation tells the
+  // user *what* we sent to claude — without this, the bridge silently
+  // consumed the reply and the user thought it had been ignored.
+  let pickedLabel = null;
+  let pickedNumber = null;
+  if (p.kind === 'yes-no') {
+    pickedLabel = response.key === 'y' ? 'Yes' : 'No';
+  } else {
+    const n = parseInt(trimmed, 10);
+    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
+      pickedNumber = n;
+      pickedLabel = p.options[n - 1].label;
+    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
+      const opt = p.options.find(o => o.key === trimmed);
+      pickedLabel = opt ? opt.label : trimmed.toUpperCase();
+    }
+  }
   session.pendingInteractivePrompt = null;
+  console.log(
+    `[IV-DEBUG] Resolving TUI prompt with reply="${userText}" → ` +
+    `kind=${response.kind} key=${response.key}` +
+    (pickedLabel ? ` label="${pickedLabel}"` : '')
+  );
   session.iv.respondToPrompt(response);
+  // Tell the Matrix user we received their reply and what we sent on
+  // their behalf. Without this the consumption is invisible.
+  const numberPrefix = pickedNumber !== null ? `${pickedNumber}. ` : '';
+  const ackPlain = `→ Sent "${numberPrefix}${pickedLabel || response.key}" to Claude`;
+  const ackHtml = `<i>→ Sent <b>${escapeHtml(numberPrefix + (pickedLabel || response.key))}</b> to Claude</i>`;
+  if (session.sendHtml) session.sendHtml(ackPlain, ackHtml);
+  else if (session.sendCallback) session.sendCallback(ackPlain);
+  // Start typing while we wait for claude's next render — without this
+  // the user sees no activity until the next prompt or text fires.
+  if (session.typingInterval) clearInterval(session.typingInterval);
+  session.typingInterval = startTyping(session.roomId);
   return true;
 }
+
+// Iteratively rejoin URLs that claude wrapped at terminal width. We only
+// merge a `\n` into a URL when the next line begins with characters that
+// can only be URL continuation (no spaces, only URL-safe chars), so prose
+// that happens to follow a URL stays on its own line.
+function unwrapUrls(text) {
+  const URL_HEAD = /(https?:\/\/[A-Za-z0-9=&/%+\-._~?#:@!*'(),;$]+)\n([A-Za-z0-9=&/%+\-._~?#]+)/g;
+  let prev;
+  let out = text;
+  do {
+    prev = out;
+    out = out.replace(URL_HEAD, '$1$2');
+  } while (out !== prev);
+  return out;
+}
+
+// Build a clean, purpose-built Matrix message from a settled free-text
+// TUI screen instead of dumping the raw PTY content. Each cue type
+// (OAuth flow, press-enter ack, etc) gets its own formatter so the user
+// sees a focused message — no separator bars, status chrome, OSC title
+// leaks, spinner ticks, task lists, etc. Returns null when nothing
+// useful can be extracted (caller should not send anything in that
+// case rather than dumping the raw screen).
+function formatTuiCueMessage(screen, urls) {
+  // OAuth / "open this URL to sign in" flow. Triggered by /login.
+  // Screen layout: "Browser didn't open? Use the url below to sign in
+  // (c to copy)" + URL + "Paste code here if prompted >".
+  const isOauth = /browser\s+didn'?t\s+open|use\s+the\s+url|copy\s+the\s+url|paste\s+code\s+here/i.test(screen);
+  if (isOauth && urls.length > 0) {
+    const url = urls[0];
+    const plain =
+      `🔗 Claude needs you to sign in.\n\n` +
+      `Open this URL in your browser:\n${url}\n\n` +
+      `After authorising, paste the code (the long string after \`#\` in the callback URL) back here.`;
+    const html =
+      `<b>🔗 Claude needs you to sign in.</b><br/><br/>` +
+      `Open this URL in your browser:<br/>` +
+      `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a><br/><br/>` +
+      `After authorising, paste the code (the long string after <code>#</code> in the callback URL) back here.`;
+    return { plain, html };
+  }
+  // Press-Enter acknowledgment (e.g. post-login "Login successful.
+  // Press Enter to continue…"). Extract the result line above the cue.
+  if (/press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i.test(screen)) {
+    const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
+    const resultLine =
+      lines.find(l => /logged\s+in\s+as|login\s+successful|complete[d]?|finished|✅/i.test(l)) ||
+      lines.find(l => l.length > 5 && !/press\s+enter|esc\s+to/i.test(l)) ||
+      'Claude is continuing…';
+    const plain = `✅ ${resultLine}`;
+    const html = `<b>✅ ${escapeHtml(resultLine)}</b>`;
+    return { plain, html };
+  }
+  // Generic input cue we couldn't parse — surface a one-liner pointing
+  // at the cue with any URLs, but don't dump the whole screen.
+  if (urls.length > 0) {
+    const plain = `Claude is asking you to act on this URL:\n${urls.join('\n')}`;
+    const html =
+      `<b>Claude is asking you to act on this URL:</b><br/>` +
+      urls.map(u => `<a href="${escapeHtml(u)}">${escapeHtml(u)}</a>`).join('<br/>');
+    return { plain, html };
+  }
+  return null;
+}
+
+// Surface free-text TUI output (e.g. the /login OAuth URL screen, "press
+// enter to continue" notices) to Matrix. Triggered by the prompt-detector's
+// `screen-update` event whenever the screen settles with URLs or input
+// cues that don't classify as a structured menu — those are the only PTY
+// states the user MUST see but that don't fire transcript events and
+// aren't covered by the menu detector.
+function handleInteractiveScreenUpdate(session, update) {
+  const { screen, urls, hasInputCue } = update;
+  if (!screen) return;
+  if (urls.length === 0 && !hasInputCue) return;
+  // Per-session URL dedup so the same OAuth URL isn't pushed twice if
+  // claude redraws (e.g. spinner ticks). The detector also dedups but
+  // only within one session run — we want lifetime dedup across restarts.
+  session.surfacedUrls = session.surfacedUrls || new Set();
+  const newUrls = urls.filter(u => !session.surfacedUrls.has(u));
+  if (newUrls.length === 0 && !hasInputCue) return;
+  for (const u of newUrls) session.surfacedUrls.add(u);
+  // Un-wrap URLs that claude broke across lines at terminal width so
+  // the parsed URL set is correct (`...redir\nect_uri=...` → joined).
+  const unwrappedScreen = unwrapUrls(
+    screen.split('\n').map(l => l.trim()).join('\n')
+  );
+  // Build a clean cue-specific message instead of dumping the raw
+  // screen. If the formatter can't make sense of the cue, skip rather
+  // than spam a screen-dump full of status chrome.
+  const allUrls = extractUrls(unwrappedScreen);
+  const message = formatTuiCueMessage(unwrappedScreen, allUrls);
+  if (!message) {
+    console.log(`[IV-DEBUG] Free-text TUI cue not parseable, skipping (urls=${newUrls.length}, inputCue=${hasInputCue})`);
+    return;
+  }
+  console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
+  if (session.sendHtml) session.sendHtml(message.plain, message.html);
+  else if (session.sendCallback) session.sendCallback(message.plain);
+  // A free-text TUI cue means claude is waiting on the user just like a
+  // structured prompt does — clear busy so the user's response (OAuth
+  // code, "paste code here" content, etc.) gets typed straight into the
+  // PTY instead of dropping into the queue. Mirrors the iv-prompt
+  // handler at iv.on('prompt') in createInteractiveSessionForRoom.
+  if (session.busy) {
+    console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
+    session.busy = false;
+  }
+  // Cancel typing — the user now has something to act on.
+  if (session.typingInterval) {
+    clearInterval(session.typingInterval);
+    session.typingInterval = null;
+    client.setTyping(session.roomId, false, 1000).catch(() => {});
+  }
+  // Auto-press Enter for pure acknowledgment cues ("Press Enter to
+  // continue…" after /login success, "Press Enter to dismiss" notices,
+  // etc). These are just waiting for any keystroke before claude moves
+  // on — without this the user has to send a dummy message to unblock
+  // claude, which is confusing UX. We surface the screen content FIRST
+  // (so the user sees "Login successful" etc) then send Enter and a
+  // small confirmation note.
+  if (AUTO_ENTER_CUE_RE.test(unwrappedScreen)) {
+    console.log('[IV-DEBUG] Auto-pressing Enter for "Press Enter to continue" cue');
+    try {
+      session.iv.sendKeystroke('enter');
+    } catch (err) {
+      console.error('[IV-DEBUG] Auto-Enter failed:', err.message);
+      return;
+    }
+    const note = '↵ (auto-pressed Enter to continue)';
+    if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
+    else if (session.sendCallback) session.sendCallback(note);
+  }
+}
+
+// Cues for which the bridge auto-sends Enter on the user's behalf.
+// Kept narrow on purpose — only matches phrasing where claude is
+// explicitly waiting for an acknowledgment keystroke ("press enter to
+// continue" / "press enter to dismiss"). Does NOT match "paste code
+// here" or other prompts that need real input.
+const AUTO_ENTER_CUE_RE = /press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i;
 
 // --- Structured Question Handling ---
 
@@ -3058,8 +3252,59 @@ client.on('room.message', async (roomId, event) => {
     // Falls through to normal message handling below
   }
 
-  // Queue/interrupt logic when Claude is busy
-  if (session.busy) {
+  // In iv-mode, claude-side slash commands (/login, /mcp, /commit, etc)
+  // are TUI control commands — they belong in claude's input buffer, not
+  // in the bridge's "next user prompt" queue. Bypass the busy/queue path
+  // so they flow straight through to the PTY. Without this, /login
+  // sits in the queue forever if the previous turn's Stop hook didn't
+  // fire (e.g. for unauthenticated "Please run /login" pseudo-turns)
+  // and the user can't recover without manually flushing.
+  const isClaudeSlashCommand =
+    session.iv && text.startsWith('/') && !text.startsWith('//');
+  // Raw-keystroke rescue commands for iv-mode sessions. These work
+  // regardless of busy state because they're pure recovery actions
+  // (the user can always need to interrupt claude or nudge a stuck
+  // input box, even when the bridge thinks claude is mid-turn).
+  //
+  //   !enter — send Enter into the PTY. Use when a heavy session
+  //            resume + race left text sitting unsent in claude's
+  //            input box.
+  //   !esc   — send Esc into the PTY. Same effect as pressing Esc
+  //            in the TUI: cancels the current generation/turn,
+  //            dismisses the OAuth wait, exits a menu, etc.
+  if (session.iv && session.iv.alive) {
+    const lower = text.trim().toLowerCase();
+    if (lower === '!enter') {
+      try {
+        session.iv.sendKeystroke('enter');
+        await sendReply('↵ Sent Enter to claude. If you had text queued in the input box, it should submit now.');
+      } catch (err) {
+        await sendReply(`Could not send Enter: ${err.message}`);
+      }
+      return;
+    }
+    if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
+      try {
+        session.iv.sendKeystroke('esc');
+        // Clear bridge-side busy state since claude won't fire a Stop
+        // hook after a user-cancelled turn — leaving busy=true would
+        // queue every subsequent message.
+        if (session.busy) {
+          session.busy = false;
+          if (session.typingInterval) {
+            clearInterval(session.typingInterval);
+            session.typingInterval = null;
+            client.setTyping(session.roomId, false, 1000).catch(() => {});
+          }
+        }
+        await sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
+      } catch (err) {
+        await sendReply(`Could not send Esc: ${err.message}`);
+      }
+      return;
+    }
+  }
+  if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
     if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
@@ -3153,7 +3398,12 @@ client.on('room.message', async (roomId, event) => {
     return;
   }
 
-  session.queuedMessages = null;
+  // Slash-command bypass keeps the queue intact: the command is for claude's
+  // PTY input, not a new turn start, so any messages queued during the
+  // still-running prior turn should still flush when that turn ends.
+  if (!isClaudeSlashCommand) {
+    session.queuedMessages = null;
+  }
 
   if (hasMedia) {
     try {
@@ -3869,22 +4119,35 @@ main().catch(err => {
   process.exit(1);
 });
 
-// Graceful shutdown
+// Graceful shutdown — covers both --print stream mode (session.proc is
+// a child_process) and interactive mode (session.iv is an
+// InteractiveSession whose `.kill()` tears down the PTY). The previous
+// implementation read `session.proc.kill()` unconditionally, which
+// crashed on SIGTERM whenever an iv session was alive because
+// session.proc is null in iv-mode.
+function shutdownSessions() {
+  for (const [, session] of sessions) {
+    if (!session.alive) continue;
+    try {
+      if (session.iv && typeof session.iv.kill === 'function') session.iv.kill();
+      else if (session.proc && typeof session.proc.kill === 'function') session.proc.kill();
+    } catch (err) {
+      console.error('Error killing session during shutdown:', err.message);
+    }
+  }
+}
+
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
   saveLastEventTsMap();
-  for (const [, session] of sessions) {
-    if (session.alive) session.proc.kill();
-  }
+  shutdownSessions();
   client.stop();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   saveLastEventTsMap();
-  for (const [, session] of sessions) {
-    if (session.alive) session.proc.kill();
-  }
+  shutdownSessions();
   client.stop();
   process.exit(0);
 });
