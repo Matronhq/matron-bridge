@@ -11,8 +11,9 @@
  * Environment:
  *   MATRIX_HOMESERVER_URL  — Homeserver URL (default: from .env)
  *   MATRIX_ACCESS_TOKEN    — Bot access token (used to find user ID; default: from .env)
- *   BOT_PASSWORD           — Bot's password (required for UIA auth)
- *   MATRIX_BOT_RECOVERY_KEY or BOT_RECOVERY_KEY
+ *   BOT_PASSWORD or MATRIX_BOT_PASSWORD
+ *                          — Bot's password (required for UIA auth)
+ *   BOT_RECOVERY_KEY or MATRIX_BOT_RECOVERY_KEY
  *                          — Bot recovery key for restoring cross-signing secrets
  *
  * Options:
@@ -55,16 +56,33 @@ for (let i = 0; i < args.length; i++) {
 // --- Config ---
 
 const HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL;
-const ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN;
-const BOT_PASSWORD = process.env.BOT_PASSWORD;
+// Prefer the access token the long-running bridge minted on first start
+// (sidecar at ~/.claude-matrix-bot-crypto/access-token), since the
+// MATRIX_ACCESS_TOKEN field in .env is often empty/stale on a fresh box.
+const ACCESS_TOKEN =
+  readSidecarTokenSafe() ||
+  process.env.MATRIX_ACCESS_TOKEN;
+// Bridge convention is MATRIX_BOT_*; accept the unprefixed names too so older
+// invocations that only set BOT_PASSWORD / BOT_RECOVERY_KEY still work.
+const BOT_PASSWORD = process.env.BOT_PASSWORD || process.env.MATRIX_BOT_PASSWORD;
 const BOT_RECOVERY_KEY = process.env.BOT_RECOVERY_KEY || process.env.MATRIX_BOT_RECOVERY_KEY;
+
+function readSidecarTokenSafe() {
+  try {
+    const sidecar = path.join(os.homedir(), '.claude-matrix-bot-crypto', 'access-token');
+    if (!existsSync(sidecar)) return null;
+    return readFileSync(sidecar, 'utf-8').trim() || null;
+  } catch {
+    return null;
+  }
+}
 
 if (!HOMESERVER_URL) {
   console.error('MATRIX_HOMESERVER_URL is required (set in .env or environment)');
   process.exit(1);
 }
 if (!BOT_PASSWORD) {
-  console.error('BOT_PASSWORD is required');
+  console.error('BOT_PASSWORD (or MATRIX_BOT_PASSWORD) is required');
   process.exit(1);
 }
 
