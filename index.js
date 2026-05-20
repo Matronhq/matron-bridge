@@ -1382,7 +1382,14 @@ function sendToSession(session, contentBlocks) {
       session.typingInterval = null;
       client.setTyping(session.roomId, false, 1000).catch(() => {});
     }
-    return false;
+    // Tell the user what happened directly. Returning true so the caller's
+    // generic "Session is not available" fallback doesn't fire — the
+    // session IS alive, we just can't forward non-text content through the
+    // PTY yet (Phase 6 will add image handling via a side channel).
+    const msg = `Can't send ${nonText.length} non-text attachment(s) in interactive mode yet — PTY input is text-only. Send a text message or switch the session out of iv-mode.`;
+    if (session.sendHtml) session.sendHtml(msg, escapeHtml(msg));
+    else if (session.sendCallback) session.sendCallback(msg);
+    return true;
   }
 
   const jsonMsg = JSON.stringify({
