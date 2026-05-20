@@ -36,7 +36,13 @@ const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || p
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
 // --resume. Set to 0 to disable.
-const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '86400000', 10);
+// Default 1h. Reaping is silent and the next user message auto-resumes the
+// session via the existing path, so the only cost is a few-second resume on
+// re-entry — well worth it on memory-constrained hosts where idle sessions
+// previously piled up for a full day (~1G each with default extras). Override
+// via SESSION_IDLE_TIMEOUT_MS (set to 86400000 to restore the old 24h
+// behaviour, or 0 to disable the reaper entirely).
+const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';

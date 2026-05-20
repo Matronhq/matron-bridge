@@ -135,7 +135,8 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `BRIDGE_ROOM_ID` | Imported bridge room ID from an add-bot blob, used by helper tools | — |
 | `ALLOWED_USER_IDS` | Comma-separated Matrix user IDs (e.g. `@alice:matron.chat`) | `""` (any user) |
 | `DEFAULT_WORKDIR` | Default working directory for Claude Code sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
-| `SESSION_TIMEOUT` | Session timeout in ms | `3600000` (1 hour) |
+| `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
+| `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
 | `ENCRYPT_SESSION_ROOMS` | Set to `0` to create unencrypted per-session rooms. Unset or `1` creates encrypted per-session rooms. | enabled |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `DEBUG` | Set to `1` to log raw JSON events from Claude Code | `0` |
@@ -153,11 +154,12 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 |---|---|
 | `!start [workdir]` | Start a Claude Code session (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
+| `!start --browser [workdir]` | Also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
 | `!stop` | Stop the current session |
-| `!restart` | Stop and immediately resume the session |
-| `!resume [n\|id]` | Resume a previous session |
+| `!restart [--browser]` | Stop and immediately resume the session (toggle browser tools on without losing context) |
+| `!resume [n\|id] [--browser]` | Resume a previous session |
 | `!sessions` | List all past sessions |
-| `!workdir <path>` | Change working directory (restarts session) |
+| `!workdir <path> [--browser]` | Change working directory (restarts session) |
 | `!status` | Show session info (uptime, workdir, restarts) |
 | `!working` | Toggle tool call visibility |
 | `!mcp` | Show MCP server status |
