@@ -1086,13 +1086,15 @@ function handleClaudeEvent(session, event) {
       const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
       // Suppress claude's "No response requested." filler. It's emitted in
       // response to internal synthetic prompts (e.g. resume-time nudges)
-      // and is just noise on Matrix.
-      if (textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0])) {
+      // and is just noise on Matrix. Suppress only the text — fall
+      // through to the tool_use loop below so any concurrent tool calls
+      // (Task/AskUserQuestion/etc.) still get handled.
+      const isFiller = textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0]);
+      if (isFiller) {
         debug('Suppressing "No response requested." filler');
-        break;
       }
 
-      if (textParts.length > 0) {
+      if (!isFiller && textParts.length > 0) {
         if (isPartial && messageId && session._lastAssistantMsgId === messageId) {
           session.responseBuffer = textParts.join('');
         } else if (!isPartial && messageId && session._lastAssistantMsgId === messageId) {
