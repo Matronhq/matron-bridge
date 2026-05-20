@@ -60,8 +60,8 @@ const HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL;
 // (sidecar at ~/.claude-matrix-bot-crypto/access-token), since the
 // MATRIX_ACCESS_TOKEN field in .env is often empty/stale on a fresh box.
 const ACCESS_TOKEN =
-  process.env.MATRIX_ACCESS_TOKEN ||
-  readSidecarTokenSafe();
+  readSidecarTokenSafe() ||
+  process.env.MATRIX_ACCESS_TOKEN;
 // Bridge convention is MATRIX_BOT_*; accept the unprefixed names too so older
 // invocations that only set BOT_PASSWORD / BOT_RECOVERY_KEY still work.
 const BOT_PASSWORD = process.env.BOT_PASSWORD || process.env.MATRIX_BOT_PASSWORD;
