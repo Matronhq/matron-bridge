@@ -18,6 +18,9 @@ const REQUIRED_KEYS = [
   'bot_recovery_key',
   'bridge_room_id',
 ];
+// `hmac_secret` is optional for back-compat with older blobs; when
+// present it's written to HMAC_SECRET so the file viewer's signed
+// link generation has a key without an extra manual step.
 
 function usage() {
   console.error(`Usage: node setup/import-bot-blob.mjs [--env .env] <db1:blob>
@@ -122,13 +125,17 @@ function main() {
   const { envPath, blob } = parseArgs(process.argv.slice(2));
   const payload = decodeBlob(blob);
 
-  updateEnv(envPath, {
+  const values = {
     MATRIX_HOMESERVER_URL: payload.homeserver_url,
     MATRIX_BOT_USER_ID: payload.bot_user_id,
     MATRIX_BOT_PASSWORD: payload.bot_password,
     MATRIX_BOT_RECOVERY_KEY: payload.bot_recovery_key,
     BRIDGE_ROOM_ID: payload.bridge_room_id,
-  });
+  };
+  if (payload.hmac_secret) {
+    values.HMAC_SECRET = payload.hmac_secret;
+  }
+  updateEnv(envPath, values);
 
   console.log(`Imported bot credentials for ${payload.bot_user_id}`);
   console.log(`Updated ${envPath}`);
