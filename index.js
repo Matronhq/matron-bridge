@@ -421,7 +421,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
-        const restarted = createSession(roomId, cwd, session.claudeSessionId);
+        // Pass mcpExtras explicitly: createSession can fall back to persisted
+        // state, but a print-mode session that crashes before its session_id
+        // is delivered hasn't been persisted yet, and would silently respawn
+        // without the user's --browser opt-in.
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -640,7 +644,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
-        const restarted = createSession(roomId, cwd, session.claudeSessionId);
+        // Pass mcpExtras explicitly (see the matching block in print-mode
+        // createSession): the persistence-fallback in createSession can miss
+        // a fresh session that crashed before its first persist.
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
