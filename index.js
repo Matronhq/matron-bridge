@@ -602,7 +602,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
   // case 'result' inside handleClaudeEvent; the transcript file in iv-mode
   // has no result event, so the Stop hook (→ /turn-end → this) replaces it.
   session.onTurnEnd = () => {
-    console.log(`[IV-DEBUG] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
+    debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
     // Flush the accumulated assistant text to Matrix.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
       flushResponse(session);
@@ -1210,11 +1210,23 @@ function handleClaudeEvent(session, event) {
                 );
                 const liveUrl = new URL(viewerUrl);
                 liveUrl.pathname = liveUrl.pathname.replace(/\/view$/, '/live');
+                // Optimistically suppress the synchronous indicator post
+                // below; if the async send fails we re-post the regular
+                // indicator so the user isn't left looking at nothing.
+                const fallbackPlain = indicator;
+                const fallbackHtml = indicatorHtml;
                 sendLiveOutputEvent(session, {
                   tool_use_id: liveToolUseId,
                   command: displayCommand,
                   viewer_url: liveUrl.toString(),
                   expires_at: expiresAt,
+                }).then(ok => {
+                  if (ok) return;
+                  if (session.sendHtml && fallbackHtml) {
+                    session.sendHtml(fallbackPlain, fallbackHtml);
+                  } else if (session.sendCallback) {
+                    session.sendCallback(fallbackPlain);
+                  }
                 });
                 liveOutputSent = true;
               }
@@ -3854,14 +3866,14 @@ const apiServer = createServer(async (req, res) => {
         // completes. Used in interactive mode to clear typing indicators and
         // flush response state in lieu of the stream-json `result` event.
         const { session_id } = data;
-        console.log(`[IV-DEBUG] /turn-end hit, session_id=${session_id}`);
+        debug(`[IV] /turn-end hit, session_id=${session_id}`);
         let target = null;
         if (session_id) {
           for (const [, s] of sessions) {
             if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
           }
         }
-        console.log(`[IV-DEBUG] /turn-end target found=${!!target} buf="${target?.responseBuffer?.slice(0,60) || ''}"`);
+        debug(`[IV] /turn-end target found=${!!target} buf="${target?.responseBuffer?.slice(0,60) || ''}"`);
         if (target) {
           // Drain the transcript tail synchronously so any assistant event
           // written just before the Stop hook is processed (and the
