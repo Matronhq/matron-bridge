@@ -697,24 +697,39 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
 function handleInteractivePrompt(session, prompt) {
   if (!session.sendHtml && !session.sendCallback) return;
   const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
+  // When the prompt has a detected free-text slot (e.g. "Tell Claude what
+  // to change"), tell the user they can reply with text directly. We'll
+  // route the reply to that option and pipe their text into the TUI.
+  const ftIdx = prompt.freeTextIdx;
+  const ftLabel = (typeof ftIdx === 'number') ? (prompt.options[ftIdx]?.label || '') : '';
+  const helpPlain = [
+    `Reply with the option number (1–${prompt.options.length})`,
+    prompt.kind === 'yes-no' ? ' or "y" / "n"' : '',
+    ftLabel ? `, or send any other text to ${JSON.stringify(ftLabel)}` : '',
+    '.',
+  ].join('');
   const plain = [
     'Claude is asking:',
     prompt.question || '',
     '',
     ...optionLines,
     '',
-    `Reply with the option number (1–${prompt.options.length})${prompt.kind === 'yes-no' ? ' or "y" / "n"' : ''}.`,
+    helpPlain,
   ].filter(Boolean).join('\n');
   if (session.sendHtml) {
     const htmlOptions = prompt.options.map((opt, i) =>
       `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}`
     ).join('<br/>');
+    const helpHtml =
+      `Reply with the option number (1–${prompt.options.length})` +
+      (prompt.kind === 'yes-no' ? ' or <code>y</code> / <code>n</code>' : '') +
+      (ftLabel ? `, or send any other text to <i>${escapeHtml(ftLabel)}</i>` : '') +
+      '.';
     const html =
       `<b>🟡 Claude is asking:</b><br/>` +
       (prompt.question ? `<i>${escapeHtml(prompt.question)}</i><br/><br/>` : '') +
       htmlOptions +
-      `<br/><br/>Reply with the option number (1–${prompt.options.length})` +
-      (prompt.kind === 'yes-no' ? ' or <code>y</code> / <code>n</code>' : '') + '.';
+      `<br/><br/>${helpHtml}`;
     session.sendHtml(plain, html);
   } else {
     session.sendCallback(plain);
@@ -746,6 +761,28 @@ function maybeResolveInteractivePrompt(session, userText) {
     }
   }
   if (!response) {
+    // No numeric/letter match. If the prompt has a free-text slot (e.g.
+    // "Tell Claude what to change"), select that option and pipe the
+    // user's text into the TUI's text input. Otherwise, ask the user to
+    // retry with a valid option.
+    if (typeof p.freeTextIdx === 'number' && p.freeTextIdx >= 0 && p.freeTextIdx < p.options.length) {
+      const idx = p.freeTextIdx;
+      const opt = p.options[idx];
+      const ftResponse = p.kind === 'arrow-menu'
+        ? { kind: 'arrow-menu', key: String(idx) }
+        : { kind: p.kind, key: opt.key };
+      session.pendingInteractivePrompt = null;
+      session.iv.respondToPrompt(ftResponse);
+      // Give the TUI a beat to transition from the menu into the text
+      // input area, then paste the user's reply (sendText handles the
+      // bracketed-paste + delayed Enter dance).
+      setTimeout(() => {
+        if (session.iv && session.iv.alive) {
+          session.iv.sendText(userText);
+        }
+      }, 250);
+      return true;
+    }
     const help = `Reply not understood. Please answer with the option number (1–${p.options.length}).`;
     if (session.sendHtml) session.sendHtml(help, null);
     else if (session.sendCallback) session.sendCallback(help);
