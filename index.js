@@ -16,6 +16,7 @@ import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls } from './lib/prompt-detector.js';
 import { macifyMcpServers } from './lib/mcp-config-mac.js';
+import { SubagentWatcher } from './lib/subagent-watcher.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
@@ -31,7 +32,12 @@ const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .filter(Boolean);
 
 const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || process.cwd()));
-const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
+// Idle reaping: a session is killed if no activity (incoming user message OR
+// outgoing assistant text posted to Matrix) is observed within this window.
+// Sessions are resumable, so the next user message will respawn claude with
+// --resume. Set to 0 to disable.
+const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '86400000', 10);
+const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
@@ -288,6 +294,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     showBashOutput: showBashOutputAtSpawn,
     alive: true,
     startedAt: Date.now(),
+    lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: resumeSessionId || null,
     busy: false,
@@ -342,11 +349,24 @@ function createSession(roomId, workdir, resumeSessionId) {
     session.alive = false;
     debug(`Claude process exited with code ${exitCode}`);
 
+    if (session.subagentWatcher) {
+      session.subagentWatcher.stop().catch(() => {});
+      session.subagentWatcher = null;
+    }
+    // Drop any pending MCP questions tied to this room — the ask-user MCP
+    // server died with the child, so the polling loop is gone.
+    for (const [qid, entry] of pendingMcpQuestions) {
+      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
+    }
+
     // Flush any remaining response
     flushResponse(session);
 
     if (sessions.get(roomId) === session) {
-      if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+      if (session._autoStopped) {
+        // Idle reaper already posted its own notice; just clean up.
+        sessions.delete(roomId);
+      } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         const restarted = createSession(roomId, cwd, session.claudeSessionId);
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -354,6 +374,12 @@ function createSession(roomId, workdir, resumeSessionId) {
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
+        // Carry user-visible state across the restart so the user doesn't
+        // silently lose queued messages or per-room toggles.
+        restarted.queuedMessages = session.queuedMessages;
+        restarted.queueNotifications = session.queueNotifications;
+        restarted.showWorking = session.showWorking;
+        restarted.showBashOutput = session.showBashOutput;
         sessions.set(roomId, restarted);
         if (restarted.sendHtml) {
           const n = notice('warning',
@@ -378,6 +404,15 @@ function createSession(roomId, workdir, resumeSessionId) {
   });
 
   session.resetTimeout = () => {}; // no-op, kept for call-site compatibility
+
+  // Subagent activity is surfaced on demand: notifyTaskStarted() runs when
+  // the parent's stream emits a Task tool_use. The watcher object is cheap
+  // to construct; it doesn't poll until the first Task fires.
+  if (session.claudeSessionId) {
+    session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId: session.claudeSessionId });
+    session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
+    session.subagentWatcher.snapshot();
+  }
 
   sessions.set(roomId, session);
   return session;
@@ -476,6 +511,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
     showBashOutput: showBashOutputAtSpawn,
     alive: true,
     startedAt: Date.now(),
+    lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: sessionId,
     busy: false,
@@ -531,9 +567,21 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
   iv.on('exit', exitCode => {
     session.alive = false;
     debug(`Interactive claude session ${sessionId} exited code=${exitCode}`);
+    if (session.subagentWatcher) {
+      session.subagentWatcher.stop().catch(() => {});
+      session.subagentWatcher = null;
+    }
+    // Drop any pending MCP questions tied to this room — see createSession()
+    // for rationale.
+    for (const [qid, entry] of pendingMcpQuestions) {
+      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
+    }
     flushResponse(session);
     if (sessions.get(roomId) === session) {
-      if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+      if (session._autoStopped) {
+        // Idle reaper already posted its own notice; just clean up.
+        sessions.delete(roomId);
+      } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         const restarted = createSession(roomId, cwd, session.claudeSessionId);
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -541,6 +589,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
+        // Carry user-visible state across the restart so the user doesn't
+        // silently lose queued messages or per-room toggles.
+        restarted.queuedMessages = session.queuedMessages;
+        restarted.queueNotifications = session.queueNotifications;
+        restarted.showWorking = session.showWorking;
+        restarted.showBashOutput = session.showBashOutput;
         sessions.set(roomId, restarted);
         if (restarted.sendHtml) {
           const n = notice('warning',
@@ -568,7 +622,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
   // case 'result' inside handleClaudeEvent; the transcript file in iv-mode
   // has no result event, so the Stop hook (→ /turn-end → this) replaces it.
   session.onTurnEnd = () => {
-    console.log(`[IV-DEBUG] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
+    debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
     // Flush the accumulated assistant text to Matrix.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
       flushResponse(session);
@@ -629,6 +683,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
       if (pending) pending.resolve({ decision: 'deny', reason: 'no Matrix output channel for session' });
     }
   };
+
+  // Subagent activity watcher — see createSession() for the rationale.
+  session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId });
+  session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
+  session.subagentWatcher.snapshot();
 
   sessions.set(roomId, session);
   return session;
@@ -1114,12 +1173,132 @@ function resolveQuestionAnswer(session, text) {
 
 // --- Claude Event Handler ---
 
+// Format a subagent tool_use block as a Matrix indicator. Returns null for
+// tools we don't surface (Read/Glob/Grep/Bash/etc.) to keep the room
+// usable — mirrors the parent's "key event" gating without the
+// liveOutput/showWorking machinery.
+function formatSubagentToolIndicator(label, toolName, input) {
+  const safeLabel = `<i>${escapeHtml(label)}</i>`;
+  if ((toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit') && input.file_path) {
+    const verb = toolName === 'Write' ? 'Writing' : 'Editing';
+    return {
+      plain: `🔀[${label}] ✏️ ${verb} ${input.file_path}`,
+      html: `🔀[${safeLabel}] ✏️ ${verb} <code>${escapeHtml(input.file_path)}</code>`,
+    };
+  }
+  if (toolName === 'WebSearch' && input.query) {
+    return {
+      plain: `🔀[${label}] 🌐 ${input.query}`,
+      html: `🔀[${safeLabel}] 🌐 <i>${escapeHtml(input.query)}</i>`,
+    };
+  }
+  if (toolName === 'WebFetch' && input.url) {
+    return {
+      plain: `🔀[${label}] 🌐 ${input.url}`,
+      html: `🔀[${safeLabel}] 🌐 <a href="${escapeHtml(input.url)}">${escapeHtml(input.url)}</a>`,
+    };
+  }
+  if (toolName === 'Task' || toolName === 'Agent') {
+    const desc = (input.description || input.prompt || '').slice(0, 80);
+    return {
+      plain: `🔀[${label}] 🔀 Nested subtask: ${desc}`,
+      html: `🔀[${safeLabel}] 🔀 Nested subtask: <i>${escapeHtml(desc)}</i>`,
+    };
+  }
+  if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
+    const lines = input.todos.map(t => {
+      const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
+      return `${icon} ${t.content || t.text || ''}`;
+    });
+    const htmlItems = input.todos.map(t => {
+      const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
+      return `<li>${icon} ${escapeHtml(t.content || t.text || '')}</li>`;
+    }).join('');
+    return {
+      plain: `🔀[${label}] 📋 Todos:\n${lines.join('\n')}`,
+      html: `🔀[${safeLabel}] 📋 <b>Todos:</b><ul>${htmlItems}</ul>`,
+    };
+  }
+  return null;
+}
+
+function handleSubagentEvent(session, { label, event }) {
+  if (!session || !session.alive) return;
+  if (!event || !event.message) return;
+  const content = event.message.content;
+  if (!Array.isArray(content)) return;
+
+  if (event.type === 'assistant') {
+    // Subagent transcripts on disk write each reasoning message as its
+    // own event with its own messageId. Intermediate "let me check X"
+    // narration between tool calls comes with stop_reason=null; only the
+    // final answer gets stop_reason=end_turn. We post all of them —
+    // skipping null would silence most subagent activity, and short
+    // subagents sometimes never emit an end_turn at all.
+
+    const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
+    if (textParts.length > 0) {
+      const text = textParts.join('').trim();
+      const isFiller = textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0]);
+      if (text && !isFiller) {
+        const prefix = `🔀[${label}] `;
+        const htmlPrefix = `🔀[<i>${escapeHtml(label)}</i>] `;
+        // Subagents can produce long output (analysis, code dumps). Split
+        // before posting so we don't blow past MAX_MSG_LENGTH.
+        const chunks = splitMessage(prefix + text);
+        for (const chunk of chunks) {
+          if (session.sendHtml) {
+            // Strip the plain prefix off the chunk before re-rendering as
+            // HTML so we don't double-prefix. First chunk always has it;
+            // subsequent chunks start at a wrap point and don't.
+            const chunkBody = chunk.startsWith(prefix) ? chunk.slice(prefix.length) : chunk;
+            session.sendHtml(chunk, htmlPrefix + markdownToHtml(chunkBody));
+          } else if (session.sendCallback) {
+            session.sendCallback(chunk);
+          }
+        }
+        session.lastActivityAt = Date.now();
+      }
+    }
+
+    for (const block of content) {
+      if (block.type !== 'tool_use') continue;
+      // If a subagent itself spawns another subagent, trigger another
+      // discovery burst so the nested agent-<id>.jsonl gets a tail.
+      if ((block.name === 'Task' || block.name === 'Agent') && session.subagentWatcher) {
+        session.subagentWatcher.notifyTaskStarted();
+      }
+      const formatted = formatSubagentToolIndicator(label, block.name, block.input || {});
+      if (!formatted) continue;
+      if (session.sendHtml) {
+        session.sendHtml(formatted.plain, formatted.html);
+      } else if (session.sendCallback) {
+        session.sendCallback(formatted.plain);
+      }
+      session.lastActivityAt = Date.now();
+    }
+  }
+}
+
 function handleClaudeEvent(session, event) {
-  // Capture session ID from any event that carries it
+  // Capture session ID from any event that carries it.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
     persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
+  }
+
+  // Lazy-construct subagent watcher once we know the session id. Print-mode
+  // resumed sessions get the watcher built eagerly in createSession() (since
+  // claudeSessionId is already populated at spawn); fresh print-mode
+  // sessions only learn their id when the first event with `session_id`
+  // arrives, so the watcher is constructed here. iv-mode constructs its
+  // watcher up front. Decoupled from the id-capture block above so future
+  // refactors can't silently lose the watcher on either spawn path.
+  if (session.claudeSessionId && !session.subagentWatcher) {
+    session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId });
+    session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
+    session.subagentWatcher.snapshot();
   }
 
   // Log all event types for plan mode debugging
@@ -1141,13 +1320,15 @@ function handleClaudeEvent(session, event) {
       const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
       // Suppress claude's "No response requested." filler. It's emitted in
       // response to internal synthetic prompts (e.g. resume-time nudges)
-      // and is just noise on Matrix.
-      if (textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0])) {
+      // and is just noise on Matrix. Suppress only the text — fall
+      // through to the tool_use loop below so any concurrent tool calls
+      // (Task/AskUserQuestion/etc.) still get handled.
+      const isFiller = textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0]);
+      if (isFiller) {
         debug('Suppressing "No response requested." filler');
-        break;
       }
 
-      if (textParts.length > 0) {
+      if (!isFiller && textParts.length > 0) {
         if (isPartial && messageId && session._lastAssistantMsgId === messageId) {
           session.responseBuffer = textParts.join('');
         } else if (!isPartial && messageId && session._lastAssistantMsgId === messageId) {
@@ -1265,11 +1446,23 @@ function handleClaudeEvent(session, event) {
                 );
                 const liveUrl = new URL(viewerUrl);
                 liveUrl.pathname = liveUrl.pathname.replace(/\/view$/, '/live');
+                // Optimistically suppress the synchronous indicator post
+                // below; if the async send fails we re-post the regular
+                // indicator so the user isn't left looking at nothing.
+                const fallbackPlain = indicator;
+                const fallbackHtml = indicatorHtml;
                 sendLiveOutputEvent(session, {
                   tool_use_id: liveToolUseId,
                   command: displayCommand,
                   viewer_url: liveUrl.toString(),
                   expires_at: expiresAt,
+                }).then(ok => {
+                  if (ok) return;
+                  if (session.sendHtml && fallbackHtml) {
+                    session.sendHtml(fallbackPlain, fallbackHtml);
+                  } else if (session.sendCallback) {
+                    session.sendCallback(fallbackPlain);
+                  }
                 });
                 liveOutputSent = true;
               }
@@ -1313,11 +1506,16 @@ function handleClaudeEvent(session, event) {
           } else if (toolName === 'WebFetch' && input.url) {
             indicator = `🌐 ${input.url}`;
             indicatorHtml = `🌐 <a href="${escapeHtml(input.url)}">${escapeHtml(input.url)}</a>`;
-          } else if (toolName === 'Task') {
+          } else if (toolName === 'Task' || toolName === 'Agent') {
             const desc = (input.description || input.prompt || '').slice(0, 80);
             indicator = `🔀 Subtask: ${desc}`;
             indicatorHtml = `🔀 Subtask: <i>${escapeHtml(desc)}</i>`;
             isKeyEvent = true;
+            // Trigger the subagent watcher's discovery burst — the new
+            // agent-<id>.jsonl file appears within ~100ms of this event.
+            if (session.subagentWatcher) {
+              session.subagentWatcher.notifyTaskStarted();
+            }
           } else if (toolName === 'TodoWrite') {
             const todos = (input.todos || []).map(t => {
               const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
@@ -1352,6 +1550,9 @@ function handleClaudeEvent(session, event) {
 
     case 'result': {
       // Handle fatal errors (e.g. failed resume with invalid session ID)
+      // first, regardless of mode — iv-mode resumes can also fail and need
+      // the crash-restart loop short-circuited (otherwise the exit handler
+      // would retry the same invalid session up to 3 times).
       if (event.is_error && event.errors?.length) {
         const noSession = event.errors.some(e => /no conversation found/i.test(e));
         if (noSession) {
@@ -1365,8 +1566,26 @@ function handleClaudeEvent(session, event) {
           if (session.sendCallback) {
             session.sendCallback('Previous session not found (expired or deleted). Send !start to begin a new session.');
           }
+          // Reset busy/typing so the session isn't stuck if claude exits 0
+          // without our normal result-handling path running.
+          session.busy = false;
+          if (session.typingInterval) {
+            clearInterval(session.typingInterval);
+            session.typingInterval = null;
+            client.setTyping(session.roomId, false, 1000).catch(() => {});
+          }
           break;
         }
+      }
+      // Past the error path: in iv-mode `onTurnEnd` is the authoritative
+      // turn-end signal (fired by the Stop hook → /turn-end → onTurnEnd).
+      // iv-mode transcripts don't emit result events in normal operation;
+      // if one slips through it would double-count turnCount, re-flush
+      // responseBuffer, re-post tool summaries, re-clear busy/typing, and
+      // re-drain queued messages on top of what onTurnEnd already did.
+      if (session.iv) {
+        debug('Result event arrived for iv-mode session past error path — onTurnEnd handles turn-end; skipping duplicate work.');
+        break;
       }
 
       // Accumulate usage stats
@@ -1576,11 +1795,16 @@ function flushResponse(session) {
       session.sendCallback(chunk);
     }
   }
+  // Bump idle clock whenever we have assistant text to flush, regardless
+  // of whether a callback is wired. The guard above is about output
+  // delivery; the activity timestamp is about session liveness.
+  session.lastActivityAt = Date.now();
 }
 
 function sendToSession(session, contentBlocks) {
-  if (!session.alive) return false;
+  if (!session.alive || session._autoStopped) return false;
 
+  session.lastActivityAt = Date.now();
   session.responseBuffer = '';
   session.toolCalls = [];
   session.busy = true;
@@ -1669,7 +1893,9 @@ function flushQueue(session, queued) {
   flushText();
 
   if (merged.length > 0) {
-    sendToSession(session, merged);
+    if (!sendToSession(session, merged)) {
+      console.log(`[QUEUE] dropped ${queued.length} queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
+    }
   }
 }
 
@@ -1988,8 +2214,13 @@ async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, 
   //   already contains the command and a link to view live output. That
   //   makes the regular `🔧 <command>` indicator redundant, so the caller
   //   in the assistant-event handler skips it when this event is sent.
-  const body = `$ ${command}\n[live output: ${viewer_url}]`;
-  const formatted_body = `<a href="${escapeHtml(viewer_url)}"><code>$ ${escapeHtml(command)}</code> · view live output</a>`;
+  // Match the truncation/icon style of the regular `🔧 <cmd>` indicator so
+  // clients that can't render the custom event (most mobile clients) still
+  // get a tight, readable fallback instead of a full untruncated command
+  // and a viewer URL they can't follow.
+  const truncated = command.length > 100 ? command.slice(0, 100) + '…' : command;
+  const body = `🔧 \`${truncated}\``;
+  const formatted_body = `🔧 <a href="${escapeHtml(viewer_url)}"><code>${escapeHtml(truncated)}</code></a>`;
   const content = {
     msgtype: 'm.text',
     body,
@@ -2426,7 +2657,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         return;
       }
-      session.proc.kill();
+      killSession(session);
       sessions.delete(roomId);
       // Append [done] to the session room name
       try {
@@ -2449,7 +2680,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
       sessions.delete(roomId);
-      existing.proc.kill();
+      killSession(existing);
       await sendReply('🔄 Restarting session...');
       const restarted = createSession(roomId, restartWorkdir, restartSessionId);
       restarted.sendCallback = sendReply;
@@ -3647,7 +3878,7 @@ const apiServer = createServer(async (req, res) => {
         const questionId = String(++mcpQuestionCounter);
 
         pendingMcpQuestions.set(questionId, {
-          question, header, options,
+          question, header, options, roomId,
           answered: false, answer: null,
         });
 
@@ -3962,14 +4193,14 @@ const apiServer = createServer(async (req, res) => {
         // completes. Used in interactive mode to clear typing indicators and
         // flush response state in lieu of the stream-json `result` event.
         const { session_id } = data;
-        console.log(`[IV-DEBUG] /turn-end hit, session_id=${session_id}`);
+        debug(`[IV] /turn-end hit, session_id=${session_id}`);
         let target = null;
         if (session_id) {
           for (const [, s] of sessions) {
             if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
           }
         }
-        console.log(`[IV-DEBUG] /turn-end target found=${!!target} buf="${target?.responseBuffer?.slice(0,60) || ''}"`);
+        debug(`[IV] /turn-end target found=${!!target} buf="${target?.responseBuffer?.slice(0,60) || ''}"`);
         if (target) {
           // Drain the transcript tail synchronously so any assistant event
           // written just before the Stop hook is processed (and the
@@ -4068,6 +4299,49 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
 });
 
+function killSession(session, signal = 'SIGTERM') {
+  if (!session) return;
+  // Stop the subagent watcher up-front so its tails and burst timer don't
+  // keep running if the child ignores SIGTERM. The close handler also
+  // stops it, but belt-and-braces.
+  if (session.subagentWatcher) {
+    session.subagentWatcher.stop().catch(() => {});
+    session.subagentWatcher = null;
+  }
+  // Drop any pending MCP questions for this room — the MCP server that
+  // owns them died with the session, so the entries would otherwise leak.
+  for (const [qid, entry] of pendingMcpQuestions) {
+    if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
+  }
+  if (!session.alive) return;
+  try {
+    if (session.iv) session.iv.kill(signal);
+    else if (session.proc) session.proc.kill(signal);
+  } catch (e) {
+    debug(`killSession error: ${e.message}`);
+  }
+}
+
+function startIdleReaper() {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [roomId, session] of sessions) {
+      if (!session.alive) continue;
+      if (session._autoStopped) continue;
+      const last = session.lastActivityAt || session.startedAt || 0;
+      if (now - last < SESSION_IDLE_TIMEOUT_MS) continue;
+
+      // Silent reap — posting a Matrix notice would bump the room to the top
+      // of the user's room list, defeating the purpose. The session is
+      // resumable on the next user message via the existing auto-resume path.
+      const idleHours = Math.round((now - last) / 3600000);
+      debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
+      session._autoStopped = true;
+      killSession(session, 'SIGTERM');
+    }
+  }, SESSION_IDLE_CHECK_MS).unref();
+}
+
 // --- Startup ---
 
 async function main() {
@@ -4081,7 +4355,12 @@ async function main() {
   console.log(`Homeserver: ${MATRIX_HOMESERVER_URL}`);
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
   console.log(`Default workdir: ${DEFAULT_WORKDIR}`);
-  console.log(`Session timeout: ${SESSION_TIMEOUT}ms`);
+  if (SESSION_IDLE_TIMEOUT_MS > 0) {
+    console.log(`Session idle timeout: ${SESSION_IDLE_TIMEOUT_MS}ms (check every ${SESSION_IDLE_CHECK_MS}ms)`);
+    startIdleReaper();
+  } else {
+    console.log('Session idle timeout: disabled');
+  }
   console.log(`Session room encryption: ${ENCRYPT_SESSION_ROOMS ? 'ON' : 'OFF'}`);
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
@@ -4119,35 +4398,21 @@ main().catch(err => {
   process.exit(1);
 });
 
-// Graceful shutdown — covers both --print stream mode (session.proc is
-// a child_process) and interactive mode (session.iv is an
-// InteractiveSession whose `.kill()` tears down the PTY). The previous
-// implementation read `session.proc.kill()` unconditionally, which
-// crashed on SIGTERM whenever an iv session was alive because
-// session.proc is null in iv-mode.
-function shutdownSessions() {
-  for (const [, session] of sessions) {
-    if (!session.alive) continue;
-    try {
-      if (session.iv && typeof session.iv.kill === 'function') session.iv.kill();
-      else if (session.proc && typeof session.proc.kill === 'function') session.proc.kill();
-    } catch (err) {
-      console.error('Error killing session during shutdown:', err.message);
-    }
-  }
-}
-
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
   saveLastEventTsMap();
-  shutdownSessions();
+  for (const [, session] of sessions) {
+    killSession(session);
+  }
   client.stop();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   saveLastEventTsMap();
-  shutdownSessions();
+  for (const [, session] of sessions) {
+    killSession(session);
+  }
   client.stop();
   process.exit(0);
 });
