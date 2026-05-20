@@ -276,6 +276,23 @@ describe('classifyScreen — first option glued onto heading line', () => {
     expect(r.question).toMatch(/\/theme/);
   });
 
+  it('anchors on the LAST "1." in the heading line when it has stray earlier numerals', () => {
+    // If the heading text legitimately contains "1." or "1)" before the
+    // glued first option, a non-greedy match would absorb the heading tail
+    // into the option label. Greedy match anchors on the last "1.".
+    const screen = [
+      'Step 1. Pick a theme  1. Auto (match terminal)',
+      '2. Dark mode ✔ (current)',
+      '3. Light mode',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.key)).toEqual(['1', '2', '3']);
+    expect(r.options[0].label).toBe('Auto (match terminal)');
+    expect(r.question).toMatch(/Step 1\. Pick a theme$/);
+  });
+
   it('does not invent a phantom first option when nothing precedes the run', () => {
     // Guard: a clean numbered run starting at 2 with no glued heading
     // shouldn't suddenly grow a fake option 1 from unrelated text above.

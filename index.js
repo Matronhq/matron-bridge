@@ -14,6 +14,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
+import { extractUrls } from './lib/prompt-detector.js';
 import { macifyMcpServers } from './lib/mcp-config-mac.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -729,13 +730,6 @@ function maybeResolveInteractivePrompt(session, userText) {
   return true;
 }
 
-// Extract all URLs from a piece of text. Used by the free-text TUI
-// surface logic to pull the OAuth URL out of an un-wrapped screen.
-const URL_GLOBAL_RE = /https?:\/\/[^\s<>"')\]}]+/g;
-function extractAllUrls(text) {
-  return [...new Set(text.match(URL_GLOBAL_RE) || [])];
-}
-
 // Iteratively rejoin URLs that claude wrapped at terminal width. We only
 // merge a `\n` into a URL when the next line begins with characters that
 // can only be URL continuation (no spaces, only URL-safe chars), so prose
@@ -825,7 +819,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // Build a clean cue-specific message instead of dumping the raw
   // screen. If the formatter can't make sense of the cue, skip rather
   // than spam a screen-dump full of status chrome.
-  const allUrls = extractAllUrls(unwrappedScreen);
+  const allUrls = extractUrls(unwrappedScreen);
   const message = formatTuiCueMessage(unwrappedScreen, allUrls);
   if (!message) {
     console.log(`[IV-DEBUG] Free-text TUI cue not parseable, skipping (urls=${newUrls.length}, inputCue=${hasInputCue})`);
@@ -3336,7 +3330,12 @@ client.on('room.message', async (roomId, event) => {
     return;
   }
 
-  session.queuedMessages = null;
+  // Slash-command bypass keeps the queue intact: the command is for claude's
+  // PTY input, not a new turn start, so any messages queued during the
+  // still-running prior turn should still flush when that turn ends.
+  if (!isClaudeSlashCommand) {
+    session.queuedMessages = null;
+  }
 
   if (hasMedia) {
     try {
