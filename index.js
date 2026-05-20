@@ -1823,8 +1823,27 @@ function sendToSession(session, contentBlocks) {
       debug(`iv-mode: dropping ${nonText.length} non-text block(s): ${nonText.map(b => b.type).join(',')}`);
     }
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
-    if (text) session.iv.sendText(text);
-    if (session.resetTimeout) session.resetTimeout();
+    if (text) {
+      session.iv.sendText(text);
+      if (session.resetTimeout) session.resetTimeout();
+      return true;
+    }
+    // Nothing to send (all blocks were non-text and got dropped). Don't
+    // leave the session in `busy=true` with a stuck typing indicator —
+    // no claude turn means no Stop hook to clear them.
+    session.busy = false;
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+    // Tell the user what happened directly. Returning true so the caller's
+    // generic "Session is not available" fallback doesn't fire — the
+    // session IS alive, we just can't forward non-text content through the
+    // PTY yet (Phase 6 will add image handling via a side channel).
+    const msg = `Can't send ${nonText.length} non-text attachment(s) in interactive mode yet — PTY input is text-only. Send a text message or switch the session out of iv-mode.`;
+    if (session.sendHtml) session.sendHtml(msg, escapeHtml(msg));
+    else if (session.sendCallback) session.sendCallback(msg);
     return true;
   }
 
