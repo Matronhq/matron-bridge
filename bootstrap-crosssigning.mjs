@@ -82,7 +82,7 @@ if (!HOMESERVER_URL) {
   process.exit(1);
 }
 if (!BOT_PASSWORD) {
-  console.error('BOT_PASSWORD is required');
+  console.error('BOT_PASSWORD (or MATRIX_BOT_PASSWORD) is required');
   process.exit(1);
 }
 
