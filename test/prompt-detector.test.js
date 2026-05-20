@@ -227,6 +227,37 @@ describe('classifyScreen — null cases', () => {
     expect(classifyScreen(screen)).toBeNull();
   });
 
+  it('returns null on tool-call status lines with ⎿ tree chrome (arrow-menu false positive)', () => {
+    // Reproduces a misdetection observed in iv-mode: claude's TUI shows a
+    // slash-command picker (❯ /compact) followed by tool-call status
+    // lines (`⎿ Read foo.md`, `⎿ Referenced file ...`). The arrow-menu
+    // detector read every ⎿ line as a sibling menu item, surfacing a
+    // 10-option "question" to Matrix.
+    const screen = [
+      'Should this be a separate ticket?',
+      '❯ /compact                              (current)',
+      '  ⎿ Compacted (ctrl+o to see full summary)',
+      '  PreCompact [/home/x/hooks/compact-notify.sh] completed successfully',
+      '  ⎿ Referenced file src/YM/HoodieBundle/Service/HoodieDesignService.php',
+      '  ⎿ Referenced file src/YM/AdminBundle/Command/RebakeHoodieBackDesignsCommand.php',
+      '  ⎿ Read ../.claude/plugins/cache/.../code-quality-reviewer-prompt.md (26 lines)',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('returns null on a numbered run whose items contain ⎿ tree chrome', () => {
+    // Defensive: the numbered/lettered detectors now also validate every
+    // option via looksLikeRealMenuItem so a tool-call status list under a
+    // question line can't be mistaken for a menu.
+    const screen = [
+      'Pick one:',
+      '1. ⎿ Read foo.md',
+      '2. ⎿ Read bar.md',
+      '3. ⎿ Read baz.md',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
   it('handles cursor-positioning-stripped output where marker + number + label have no spaces', () => {
     // After ANSI/CSI strip of a TUI that positions characters via cursor
     // moves, the lines look like "❯1.Yes,andbypasspermissions" — no space
