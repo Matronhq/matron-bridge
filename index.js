@@ -4361,24 +4361,6 @@ main().catch(err => {
   process.exit(1);
 });
 
-// Graceful shutdown — covers both --print stream mode (session.proc is
-// a child_process) and interactive mode (session.iv is an
-// InteractiveSession whose `.kill()` tears down the PTY). The previous
-// implementation read `session.proc.kill()` unconditionally, which
-// crashed on SIGTERM whenever an iv session was alive because
-// session.proc is null in iv-mode.
-function shutdownSessions() {
-  for (const [, session] of sessions) {
-    if (!session.alive) continue;
-    try {
-      if (session.iv && typeof session.iv.kill === 'function') session.iv.kill();
-      else if (session.proc && typeof session.proc.kill === 'function') session.proc.kill();
-    } catch (err) {
-      console.error('Error killing session during shutdown:', err.message);
-    }
-  }
-}
-
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
   saveLastEventTsMap();
