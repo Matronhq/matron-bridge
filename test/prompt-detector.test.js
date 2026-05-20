@@ -340,6 +340,51 @@ describe('classifyScreen — multiple numbered runs', () => {
   });
 });
 
+describe('classifyScreen — free-text slot detection', () => {
+  it('detects "Tell Claude what to change" as the free-text option in a numbered menu', () => {
+    const screen = [
+      'Claude has written up a plan and is ready to execute. Would you like to proceed?',
+      '❯ 1. Yes, and bypass permissions',
+      '  2. Yes, manually approve edits',
+      '  3. No, refine with Ultraplan',
+      '  4. Tell Claude what to change',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.freeTextIdx).toBe(3);
+  });
+
+  it('returns freeTextIdx null when the last option is not a free-text slot', () => {
+    const screen = [
+      'Choose a model:',
+      '  1) Sonnet',
+      '  2) Opus',
+      '  3) Haiku',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.freeTextIdx).toBeNull();
+  });
+
+  it('yes/no prompts always have freeTextIdx null', () => {
+    const r = classifyScreen('Continue? [y/N]');
+    expect(r.freeTextIdx).toBeNull();
+  });
+
+  it('detects free-text in arrow-menu prompts', () => {
+    const screen = [
+      'Pick a follow-up:',
+      '❯ Run tests',
+      '  Skip tests',
+      '  Edit the plan',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('arrow-menu');
+    expect(r.freeTextIdx).toBe(2);
+  });
+});
+
 describe('classifyScreen — keyboard hint filtering', () => {
   it('does not include keyboard hint lines as menu options', () => {
     const screen = [
