@@ -23,7 +23,7 @@
 import * as sdk from 'matrix-js-sdk';
 import { VerificationPhase, VerificationRequestEvent, VerifierEvent } from 'matrix-js-sdk/lib/crypto-api/verification.js';
 import { CryptoEvent } from 'matrix-js-sdk/lib/crypto-api/CryptoEvent.js';
-import { writeFileSync, chmodSync } from 'fs';
+import { writeFileSync } from 'fs';
 
 const HOMESERVER = process.env.HOMESERVER || process.env.MATRIX_HOMESERVER_URL;
 if (!HOMESERVER) {
@@ -55,6 +55,14 @@ function parseArgs() {
     console.error('Usage: node verify-respond.mjs <bot-username> --password <pw> [--rotate-and-sign <bridge-device-id> <recovery-key-out-file>] [--timeout-ms <ms>]');
     process.exit(2);
   }
+  // Both positional args after --rotate-and-sign are required: without the
+  // output path we'd still rotate (destroying the old SSSS key) but silently
+  // throw the new recovery key away, leaving secret storage permanently
+  // locked behind an unrecoverable key.
+  if (bridgeDeviceId && !recoveryKeyOut) {
+    console.error('--rotate-and-sign requires BOTH <bridge-device-id> and <recovery-key-out-file>. Refusing to rotate without somewhere to write the new key.');
+    process.exit(2);
+  }
   return { username, password, timeoutMs, bridgeDeviceId, recoveryKeyOut };
 }
 
@@ -80,11 +88,16 @@ async function loginAndSync(username, password) {
     userId: loginData.user_id,
     deviceId: loginData.device_id,
     cryptoCallbacks: {
+      // Fall back to `Object.keys(keys)[0]` when the cache hasn't been
+      // populated yet — the SDK can call getSecretStorageKey during
+      // bootstrapSecretStorage *before* cacheSecretStorageKey fires,
+      // and returning null there breaks the bootstrap. Matches the
+      // pattern in add-bot.mjs / setup-user.mjs / verify-bots.mjs.
       getSecretStorageKey: async ({ keys }) => {
-        if (ssssKeyCache.privateKey && ssssKeyCache.keyId && keys[ssssKeyCache.keyId]) {
-          return [ssssKeyCache.keyId, ssssKeyCache.privateKey];
-        }
-        return null;
+        if (!ssssKeyCache.privateKey) return null;
+        const keyId = ssssKeyCache.keyId || Object.keys(keys)[0];
+        if (!keyId || !keys[keyId]) return null;
+        return [keyId, ssssKeyCache.privateKey];
       },
       cacheSecretStorageKey: (keyId, _keyInfo, privateKey) => {
         ssssKeyCache.keyId = keyId;
@@ -227,8 +240,9 @@ async function rotateAndSignBridgeDevice(client, password, loginData, bridgeDevi
   console.log(`  Bridge device ${bridgeDeviceId} cross-signed.`);
 
   if (recoveryKey && recoveryKeyOut) {
-    writeFileSync(recoveryKeyOut, recoveryKey + '\n');
-    try { chmodSync(recoveryKeyOut, 0o600); } catch (_) { /* best effort */ }
+    // Atomically create with 0o600 so the key is never world-readable, even
+    // briefly. Matches add-bot.mjs.
+    writeFileSync(recoveryKeyOut, recoveryKey + '\n', { mode: 0o600 });
     console.log(`  New recovery key written to ${recoveryKeyOut} (mode 0600).`);
     console.log('  Update the Chef credentials data bag with this value.');
   }
