@@ -1476,6 +1476,28 @@ function isAllowed(userId) {
   return ALLOWED_USER_IDS.includes(String(userId));
 }
 
+// Track senders we've already warned about so a chatty disallowed user
+// doesn't flood the log, but a misconfigured allowlist still screams once
+// per restart per offender. Without this, ALLOWED_USER_IDS mismatches
+// (e.g. dbarker on Matrix vs danbarker on the VPS) look exactly like
+// "the bridge is dead" — bridge runs, sync runs, messages are decrypted,
+// then silently dropped. The previous behaviour cost about an hour of
+// debugging on the first external-mode box.
+const warnedDisallowedSenders = new Set();
+function warnIfDisallowed(sender, roomId) {
+  if (isAllowed(sender)) return false;
+  if (!warnedDisallowedSenders.has(sender)) {
+    warnedDisallowedSenders.add(sender);
+    console.warn(
+      `[allowlist] Dropping message from ${sender} in ${roomId} — ` +
+      `not in ALLOWED_USER_IDS (${ALLOWED_USER_IDS.join(', ') || '(empty — set to reject all)'}). ` +
+      `If this is you, fix ALLOWED_USER_IDS in .env (your full Matrix ID, e.g. @you:server) and restart the bridge. ` +
+      `Suppressing further warnings from this sender until restart.`
+    );
+  }
+  return true;
+}
+
 // --- Markdown to HTML ---
 
 function escapeHtml(text) {
@@ -2754,7 +2776,7 @@ client.on('room.message', async (roomId, event) => {
   }
 
   const sender = event.sender;
-  if (!isAllowed(sender)) return;
+  if (warnIfDisallowed(sender, roomId)) return;
 
   const msgtype = event.content.msgtype;
   let text = '';
