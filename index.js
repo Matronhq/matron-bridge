@@ -828,6 +828,15 @@ function handleInteractiveScreenUpdate(session, update) {
   console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
   if (session.sendHtml) session.sendHtml(message.plain, message.html);
   else if (session.sendCallback) session.sendCallback(message.plain);
+  // A free-text TUI cue means claude is waiting on the user just like a
+  // structured prompt does — clear busy so the user's response (OAuth
+  // code, "paste code here" content, etc.) gets typed straight into the
+  // PTY instead of dropping into the queue. Mirrors the iv-prompt
+  // handler at iv.on('prompt') in createInteractiveSessionForRoom.
+  if (session.busy) {
+    console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
+    session.busy = false;
+  }
   // Cancel typing — the user now has something to act on.
   if (session.typingInterval) {
     clearInterval(session.typingInterval);
