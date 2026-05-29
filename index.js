@@ -3709,7 +3709,7 @@ client.on('room.message', async (roomId, event) => {
   }
   if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
-    if (lowerText === '!esc' || lowerText === '!escape' || lowerText === 'escape') {
+    if (lowerText === '!esc' || lowerText === '!escape') {
       try {
         if (session.iv) {
           session.iv.sendKeystroke('esc');
