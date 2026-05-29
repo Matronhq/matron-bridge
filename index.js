@@ -2764,8 +2764,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       try {
-        if (session.iv) session.iv.sendKeystroke('esc');
-        else if (session.proc) session.proc.kill('SIGINT');
+        if (session.iv) {
+          session.iv.sendKeystroke('esc');
+        } else if (session.proc?.stdin?.writable) {
+          const msg = JSON.stringify({
+            type: 'control_request',
+            request_id: randomUUID(),
+            request: { subtype: 'interrupt' },
+          }) + '\n';
+          session.proc.stdin.write(msg);
+        }
       } catch { /* ignore */ }
       session._interrupted = true;
       await sendReply('⎋ Interrupt sent — waiting for current turn to cancel.');
@@ -3697,8 +3705,16 @@ client.on('room.message', async (roomId, event) => {
     const lowerText = text.toLowerCase().trim();
     if (lowerText === '!esc' || lowerText === '!escape' || lowerText === 'escape') {
       try {
-        if (session.iv) session.iv.sendKeystroke('esc');
-        else if (session.proc) session.proc.kill('SIGINT');
+        if (session.iv) {
+          session.iv.sendKeystroke('esc');
+        } else if (session.proc?.stdin?.writable) {
+          const msg = JSON.stringify({
+            type: 'control_request',
+            request_id: randomUUID(),
+            request: { subtype: 'interrupt' },
+          }) + '\n';
+          session.proc.stdin.write(msg);
+        }
       } catch { /* ignore */ }
       session._interrupted = true;
       await sendReply('⎋ Interrupt sent — waiting for current turn to cancel.');
