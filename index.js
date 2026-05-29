@@ -2257,10 +2257,11 @@ function plainTextFormat(text) {
 
 // --- File Helpers ---
 
-function sessionEffectiveCwd(session) {
+function sessionEffectiveCwd(session, { strict = false } = {}) {
   if (session.worktree) {
     const wtPath = path.join(session.workdir, '.claude', 'worktrees', session.worktree);
     if (fs.existsSync(wtPath)) return wtPath;
+    if (strict) return null;
   }
   return session.workdir;
 }
@@ -2707,7 +2708,9 @@ async function buildMediaContentBlocks(event, session) {
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
   } else if (content.msgtype === 'm.image') {
     // Save image to workdir
-    const imgPath = deduplicateFilename(sessionEffectiveCwd(session), fileName);
+    const cwd = sessionEffectiveCwd(session, { strict: true });
+    if (!cwd) { debug('[media] worktree path not ready, skipping image save'); return; }
+    const imgPath = deduplicateFilename(cwd, fileName);
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
@@ -2716,7 +2719,9 @@ async function buildMediaContentBlocks(event, session) {
     });
   } else {
     // Save file to workdir
-    const savePath = deduplicateFilename(sessionEffectiveCwd(session), fileName);
+    const cwd = sessionEffectiveCwd(session, { strict: true });
+    if (!cwd) { debug('[media] worktree path not ready, skipping file save'); return; }
+    const savePath = deduplicateFilename(cwd, fileName);
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
 
