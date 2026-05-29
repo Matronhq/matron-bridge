@@ -2742,7 +2742,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(parts.slice(1));
-      const { worktree, rest: positional } = extractWorktreeFlag(afterExtras);
+      const { worktree, error: worktreeError, rest: positional } = extractWorktreeFlag(afterExtras);
+      if (worktreeError) {
+        await sendReply(worktreeError);
+        return;
+      }
       const arg = positional[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
@@ -2832,7 +2836,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
       const { extras: restartFlagExtras, rest: restartRest } = extractMcpExtraFlags(parts.slice(1));
-      const { worktree: restartWorktree } = extractWorktreeFlag(restartRest);
+      const { worktree: restartWorktree, error: restartWtError } = extractWorktreeFlag(restartRest);
+      if (restartWtError) {
+        await sendReply(restartWtError);
+        return;
+      }
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
@@ -2884,11 +2892,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
       const encodedPath = resumeWorkdir.replace(/\//g, '-');
 
-      // Scan base workdir + worktree-derived dirs
+      // Scan base workdir + worktree-derived dirs (exact match or
+      // Claude's worktree naming: <encoded>--claude-worktrees-<name>)
+      const worktreeInfix = '--claude-worktrees-';
       const candidateDirs = [];
       try {
         for (const d of fs.readdirSync(projectsRoot)) {
-          if (d === encodedPath || d.startsWith(encodedPath)) candidateDirs.push(d);
+          if (d === encodedPath || d.startsWith(encodedPath + worktreeInfix)) candidateDirs.push(d);
         }
       } catch { /* projectsRoot doesn't exist */ }
 
@@ -2918,10 +2928,25 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
       if (!isNaN(num) && num >= 1 && num <= sortedFiles.length) {
         resumeSessionId = sortedFiles[num - 1];
+        // Derive workdir from the transcript directory if it's a worktree session
+        const srcDir = fileToDir.get(resumeSessionId);
+        if (srcDir) {
+          const srcEncoded = path.basename(srcDir);
+          if (srcEncoded.includes(worktreeInfix)) {
+            actualWorkdir = srcEncoded.split(worktreeInfix)[0].replace(/-/g, '/');
+          }
+        }
       } else {
         const match = sortedFiles.find(f => f.startsWith(resumeArg));
         if (match) {
           resumeSessionId = match;
+          const srcDir = fileToDir.get(resumeSessionId);
+          if (srcDir) {
+            const srcEncoded = path.basename(srcDir);
+            if (srcEncoded.includes(worktreeInfix)) {
+              actualWorkdir = srcEncoded.split(worktreeInfix)[0].replace(/-/g, '/');
+            }
+          }
         } else {
           // Session not found in current workdir — check persisted sessions for a different workdir
           const allPersisted = loadPersistedSessions();
@@ -3147,14 +3172,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const prev = getPersistedSession(roomId);
       const workdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
 
-      // Scan the base workdir project dir AND any worktree-derived dirs
-      // so that sessions started via --worktree are discoverable.
+      // Scan the base workdir project dir AND worktree-derived dirs.
+      // Only match dirs that are exactly the encoded workdir OR follow
+      // Claude's worktree naming: <encoded>--claude-worktrees-<name>
       const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
       const encodedPath = workdir.replace(/\//g, '-');
-      const candidateDirs = [encodedPath];
+      const worktreeInfix = '--claude-worktrees-';
+      const candidateDirs = [];
       try {
         for (const d of fs.readdirSync(projectsRoot)) {
-          if (d.startsWith(encodedPath) && d !== encodedPath) candidateDirs.push(d);
+          if (d === encodedPath || (d.startsWith(encodedPath + worktreeInfix))) candidateDirs.push(d);
         }
       } catch { /* projectsRoot doesn't exist */ }
 
@@ -3767,18 +3794,17 @@ client.on('room.message', async (roomId, event) => {
       return;
     }
     if (lowerText === 'interrupt' || lowerText === '!interrupt' || lowerText === 'escape') {
-      // Escape-like interrupt: send SIGINT to cancel the current turn,
-      // then flush any queued messages so the next user message goes through.
+      // Escape-like interrupt: send SIGINT/Escape to cancel the current
+      // turn. Don't clear busy — let the normal result/exit path do that
+      // so subsequent messages don't interleave with the cancelling turn.
+      // Queue is preserved; the user can send new messages once the
+      // cancellation completes and busy clears naturally.
       try {
         if (session.iv) session.iv.sendKeystroke('escape');
         else if (session.proc) session.proc.kill('SIGINT');
       } catch (e) { debug(`interrupt signal error: ${e.message}`); }
-      const queued = session.queuedMessages || [];
-      session.queuedMessages = null;
-      stripQueueNotificationLinks(session);
-      session.busy = false;
-      if (session.typingInterval) { clearInterval(session.typingInterval); session.typingInterval = null; }
-      await sendReply(`⚡ Interrupted.${queued.length > 0 ? ` ${queued.length} queued message${queued.length > 1 ? 's' : ''} dropped.` : ''}`);
+      session._interrupted = true;
+      await sendReply('⚡ Interrupt sent — waiting for current turn to cancel.');
       return;
     }
     if (lowerText === 'cancel') {
