@@ -291,7 +291,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--settings', JSON.stringify({
       permissions: {
         allow: [
-          'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'Glob(*)', 'Grep(*)',
+          'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)',
           'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'NotebookEdit(*)',
         ],
         deny: [],
@@ -2790,7 +2790,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // now — otherwise a bridge restart before the first transcript-driven
       // persist would lose the user's opt-in. Print-mode sessions get their
       // claudeSessionId asynchronously and pick this up on the first persist.
-      if (mcpExtras.length > 0 && session.claudeSessionId) {
+      if ((mcpExtras.length > 0 || worktree) && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
@@ -2908,7 +2908,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const files = [];
-      const fileToDir = new Map();
       for (const encoded of candidateDirs) {
         const dir = path.join(projectsRoot, encoded);
         try {
@@ -2916,7 +2915,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             const sid = f.replace('.jsonl', '');
             const stat = fs.statSync(path.join(dir, f));
             files.push({ sid, mtimeMs: stat.mtimeMs, dir });
-            fileToDir.set(sid, dir);
           }
         } catch { /* dir unreadable */ }
       }
@@ -2928,25 +2926,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
       if (!isNaN(num) && num >= 1 && num <= sortedFiles.length) {
         resumeSessionId = sortedFiles[num - 1];
-        // Derive workdir from the transcript directory if it's a worktree session
-        const srcDir = fileToDir.get(resumeSessionId);
-        if (srcDir) {
-          const srcEncoded = path.basename(srcDir);
-          if (srcEncoded.includes(worktreeInfix)) {
-            actualWorkdir = srcEncoded.split(worktreeInfix)[0].replace(/-/g, '/');
-          }
-        }
       } else {
         const match = sortedFiles.find(f => f.startsWith(resumeArg));
         if (match) {
           resumeSessionId = match;
-          const srcDir = fileToDir.get(resumeSessionId);
-          if (srcDir) {
-            const srcEncoded = path.basename(srcDir);
-            if (srcEncoded.includes(worktreeInfix)) {
-              actualWorkdir = srcEncoded.split(worktreeInfix)[0].replace(/-/g, '/');
-            }
-          }
         } else {
           // Session not found in current workdir — check persisted sessions for a different workdir
           const allPersisted = loadPersistedSessions();
@@ -3800,7 +3783,7 @@ client.on('room.message', async (roomId, event) => {
       // Queue is preserved; the user can send new messages once the
       // cancellation completes and busy clears naturally.
       try {
-        if (session.iv) session.iv.sendKeystroke('escape');
+        if (session.iv) session.iv.sendKeystroke('esc');
         else if (session.proc) session.proc.kill('SIGINT');
       } catch (e) { debug(`interrupt signal error: ${e.message}`); }
       session._interrupted = true;
