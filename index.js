@@ -2263,6 +2263,14 @@ function plainTextFormat(text) {
 
 // --- File Helpers ---
 
+function sessionEffectiveCwd(session) {
+  if (session.worktree) {
+    const wtPath = path.join(session.workdir, '.claude', 'worktrees', session.worktree);
+    if (fs.existsSync(wtPath)) return wtPath;
+  }
+  return session.workdir;
+}
+
 function deduplicateFilename(dir, filename) {
   let target = path.join(dir, filename);
   if (!fs.existsSync(target)) return target;
@@ -2703,7 +2711,7 @@ async function buildMediaContentBlocks(event, session) {
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
   } else if (content.msgtype === 'm.image') {
     // Save image to workdir
-    const imgPath = deduplicateFilename(session.workdir, fileName);
+    const imgPath = deduplicateFilename(sessionEffectiveCwd(session), fileName);
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
@@ -2712,7 +2720,7 @@ async function buildMediaContentBlocks(event, session) {
     });
   } else {
     // Save file to workdir
-    const savePath = deduplicateFilename(session.workdir, fileName);
+    const savePath = deduplicateFilename(sessionEffectiveCwd(session), fileName);
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
 
@@ -2860,11 +2868,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(restartWtError);
         return;
       }
+      const effectiveWorktree = restartWorktree || existing.worktree || null;
+      if (effectiveWorktree && INTERACTIVE_MODE) {
+        await sendReply('--worktree is not yet supported in interactive mode.');
+        return;
+      }
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
         : (carriedExtras || []);
-      const effectiveWorktree = restartWorktree || existing.worktree || null;
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
       sessions.delete(roomId);
