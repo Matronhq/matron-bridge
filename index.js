@@ -2755,6 +2755,31 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!esc':
+    case '!escape':
+    case '!interrupt': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session.');
+        break;
+      }
+      try {
+        if (session.iv) session.iv.sendKeystroke('esc');
+        else if (session.proc) session.proc.kill('SIGINT');
+      } catch (e) { /* ignore */ }
+      if (session.busy) {
+        session.busy = false;
+        if (session.typingInterval) {
+          clearInterval(session.typingInterval);
+          session.typingInterval = null;
+          client.setTyping(session.roomId, false, 1000).catch(() => {});
+        }
+      }
+      session._interrupted = true;
+      await sendReply('⎋ Interrupt sent — cancelling the current turn.');
+      break;
+    }
+
     case '!stop': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3399,6 +3424,7 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
+      'esc', 'escape', 'interrupt',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -3670,6 +3696,15 @@ client.on('room.message', async (roomId, event) => {
   }
   if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
+    if (lowerText === '!esc' || lowerText === '!escape' || lowerText === 'escape') {
+      try {
+        if (session.iv) session.iv.sendKeystroke('esc');
+        else if (session.proc) session.proc.kill('SIGINT');
+      } catch (e) { /* ignore */ }
+      session._interrupted = true;
+      await sendReply('⎋ Interrupt sent — waiting for current turn to cancel.');
+      return;
+    }
     if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
