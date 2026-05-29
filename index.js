@@ -2931,11 +2931,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (entry.workdir && entry.workdir !== resumeWorkdir) continue;
         const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
         const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
-        try {
-          const stat = fs.statSync(wtPath);
-          resumeFiles.push({ sid: entry.sessionId, mtimeMs: stat.mtimeMs });
-          seenResumeIds.add(entry.sessionId);
-        } catch { /* transcript gone */ }
+        let mtimeMs = entry.lastUsed || Date.now();
+        try { mtimeMs = fs.statSync(wtPath).mtimeMs; } catch { /* short session, no transcript yet */ }
+        resumeFiles.push({ sid: entry.sessionId, mtimeMs });
+        seenResumeIds.add(entry.sessionId);
       }
 
       if (resumeFiles.length === 0) {
@@ -3208,12 +3207,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // Find the transcript in the worktree project dir
         const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
         const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
+        let modified = entry.lastUsed || Date.now();
         try {
-          const stat = fs.statSync(wtPath);
-          const summary = getSessionSummary(entry.sessionId, workdir);
-          files.push({ sessionId: entry.sessionId, modified: stat.mtimeMs, summary, worktree: entry.worktree });
-          seenIds.add(entry.sessionId);
-        } catch { /* transcript gone */ }
+          modified = fs.statSync(wtPath).mtimeMs;
+        } catch { /* transcript may not exist yet for short sessions */ }
+        const summary = getSessionSummary(entry.sessionId, workdir) || `[worktree: ${entry.worktree}]`;
+        files.push({ sessionId: entry.sessionId, modified, summary, worktree: entry.worktree });
+        seenIds.add(entry.sessionId);
       }
       files.sort((a, b) => b.modified - a.modified);
 
