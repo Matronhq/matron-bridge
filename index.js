@@ -2755,6 +2755,31 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!esc':
+    case '!escape':
+    case '!interrupt': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session.');
+        break;
+      }
+      try {
+        if (session.iv) session.iv.sendKeystroke('esc');
+        else if (session.proc) session.proc.kill('SIGINT');
+      } catch { /* ignore */ }
+      if (session.busy) {
+        session.busy = false;
+        if (session.typingInterval) {
+          clearInterval(session.typingInterval);
+          session.typingInterval = null;
+          client.setTyping(session.roomId, false, 1000).catch(() => {});
+        }
+      }
+      session._interrupted = true;
+      await sendReply('⎋ Interrupt sent — cancelling the current turn.');
+      break;
+    }
+
     case '!stop': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3140,6 +3165,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !start — Start a new session (creates a new room)\n` +
         `  !start <workdir> — Start in a specific directory\n` +
         `  !start --browser [workdir] — Add chrome-devtools MCP (~400M)\n` +
+        `  !esc — Interrupt current turn (jumps the queue)\n` +
         `  !stop — Stop the current session\n` +
         `  !restart — Stop and resume (--browser accepted)\n` +
         `  !resume <n|id> — Resume session by number or ID (--browser accepted)\n` +
@@ -3174,6 +3200,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!start', 'Start a new session (creates a new room)'],
           ['!start &lt;workdir&gt;', 'Start in a specific directory'],
           ['!start --browser [workdir]', 'Also enable chrome-devtools MCP (~400M)'],
+          ['!esc', 'Interrupt current turn (jumps the queue)'],
           ['!stop', 'Stop the current session'],
           ['!restart', 'Stop and resume (--browser accepted)'],
           ['!resume &lt;n|id&gt;', 'Resume session by number or ID (--browser accepted)'],
@@ -3402,6 +3429,7 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
+      'esc', 'escape', 'interrupt',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -3673,6 +3701,15 @@ client.on('room.message', async (roomId, event) => {
   }
   if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
+    if (lowerText === '!esc' || lowerText === '!escape' || lowerText === 'escape') {
+      try {
+        if (session.iv) session.iv.sendKeystroke('esc');
+        else if (session.proc) session.proc.kill('SIGINT');
+      } catch { /* ignore */ }
+      session._interrupted = true;
+      await sendReply('⎋ Interrupt sent — waiting for current turn to cancel.');
+      return;
+    }
     if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
