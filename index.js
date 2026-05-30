@@ -76,8 +76,10 @@ function loadRoles() {
 function saveRoles() {
   try {
     fs.writeFileSync(ROLES_FILE, JSON.stringify(Object.fromEntries(roles), null, 2));
+    return true;
   } catch (e) {
     console.error('Failed to save roles file:', e.message);
+    return false;
   }
 }
 
@@ -3088,8 +3090,19 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           await sendReply('User must be a full Matrix ID (e.g. @user:server).');
           break;
         }
+        if (newRole === 'member' && getUserRole(targetUser) === 'admin') {
+          const adminCount = Array.from(roles.values()).filter(r => r === 'admin').length;
+          if (adminCount <= 1) {
+            await sendReply('Cannot demote the last admin.');
+            break;
+          }
+        }
         roles.set(targetUser, newRole);
-        saveRoles();
+        if (!saveRoles()) {
+          roles.delete(targetUser);
+          await sendReply('Failed to save role — change rolled back.');
+          break;
+        }
         await sendReply(`${targetUser} is now ${newRole}.`);
       } else {
         await sendReply('Usage: !role @user:server admin|member');
