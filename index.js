@@ -2030,11 +2030,20 @@ function sendToSession(session, contentBlocks) {
     }
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
+      // Gate on TUI readiness: the PTY swallows Enter keystrokes during
+      // the resume/init window (before the toolbar renders). Stash the
+      // content blocks and let markIvReady() call sendToSession() once
+      // the TUI is actually ready to accept input.
+      if (!session.ivReady) {
+        debug('[IV] TUI not ready — stashing input for deferred send');
+        session.ivPendingInput = contentBlocks;
+        if (session.resetTimeout) session.resetTimeout();
+        return true;
+      }
       session.iv.sendText(text);
       // Enter retry: after sending text, the 500ms delayed Enter may be
-      // swallowed if the TUI isn't fully ready (especially post-resume).
-      // Watch for transcript activity (assistant/tool event) — if none
-      // arrives within 3s, retry Enter. Up to 2 retries.
+      // swallowed if the TUI has a transient hiccup. Watch for transcript
+      // activity — if none arrives within 3s, retry Enter. Up to 2 retries.
       let retries = 0;
       const maxRetries = 2;
       const retryMs = 3000;
@@ -2044,8 +2053,6 @@ function sendToSession(session, contentBlocks) {
           session._enterRetryTimer = null;
           if (!session.alive || !session.iv?.alive) return;
           if (!session.busy) return;
-          // Check if claude has started responding (responseBuffer non-empty
-          // or turnCount increased since we sent)
           if (session.responseBuffer.trim()) return;
           retries++;
           debug(`[IV] Enter retry ${retries}/${maxRetries} — no response after ${retryMs}ms`);
