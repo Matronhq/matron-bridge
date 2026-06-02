@@ -54,6 +54,7 @@ describe('mergeMcpConfigs', () => {
   it('returns base unchanged when overlay is null/undefined', () => {
     expect(mergeMcpConfigs(base, null)).toEqual(base);
     expect(mergeMcpConfigs(base, undefined)).toEqual(base);
+    expect(mergeMcpConfigs(base, null)).not.toBe(base);
   });
 
   it('merges overlay mcpExtras into base by key', () => {
