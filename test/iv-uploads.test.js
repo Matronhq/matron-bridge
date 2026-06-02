@@ -81,6 +81,14 @@ describe('resolveUploadMeta', () => {
       caption: null,
     });
   });
+
+  it('falls back to "file" for "." and ".." which basename leaves intact', () => {
+    // path.basename('..') === '..' and path.basename('.') === '.', both of
+    // which resolve to a directory inside path.join — fold them into 'file'.
+    expect(resolveUploadMeta({ body: '..' })).toEqual({ filename: 'file', caption: null });
+    expect(resolveUploadMeta({ body: '.' })).toEqual({ filename: 'file', caption: null });
+    expect(resolveUploadMeta({ body: '../..' })).toEqual({ filename: 'file', caption: null });
+  });
 });
 
 describe('ivUploadAnnotation', () => {
