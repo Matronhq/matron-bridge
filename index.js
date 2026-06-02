@@ -124,6 +124,18 @@ for (const ex of DEFAULT_MCP_EXTRAS) {
     console.warn(`[mcp-config] MCP_DEFAULT_EXTRAS lists "${ex}" but no mcpExtras["${ex}"] block exists (in mcp-config.json or mcp-config.local.json); it will be ignored.`);
   }
 }
+
+// Plugin MCP servers (context7, serena, …) load from this dir. Default: a
+// bridge-owned EMPTY dir so sessions are lean (no plugin MCPs) while ~/.claude
+// — creds, transcripts, --resume — stays untouched. Point BRIDGE_PLUGIN_CACHE_DIR
+// at the real cache (~/.claude/plugins) or a curated subset to re-enable plugins.
+const PLUGIN_CACHE_DIR = process.env.BRIDGE_PLUGIN_CACHE_DIR
+  || path.join(os.homedir(), '.claude-matrix-bridge', 'empty-plugin-cache');
+try {
+  fs.mkdirSync(PLUGIN_CACHE_DIR, { recursive: true });
+} catch (e) {
+  console.warn(`[plugin-cache] Could not create ${PLUGIN_CACHE_DIR}: ${e.message}`);
+}
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
@@ -369,6 +381,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       // Env is fixed at spawn time; toggling the flag later requires
       // !restart to take effect.
       MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+      CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -593,6 +606,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       BRIDGE_ROOM_ID: roomId,
       MATRIX_BRIDGE_API_PORT: String(API_PORT),
       MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+      CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
     },
   });
 
