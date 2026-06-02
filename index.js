@@ -308,6 +308,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  // Machine default is always applied; mcpExtras (persisted/explicit) stacks on top.
+  const effectiveExtras = resolveExtras(DEFAULT_MCP_EXTRAS, mcpExtras);
   const args = [
     '--print',
     '--verbose',
@@ -317,7 +319,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--strict-mcp-config',
+    '--mcp-config', mcpConfigPathFor(effectiveExtras),
     '--settings', JSON.stringify({
       hooks: {
         PreCompact: [{
@@ -526,6 +529,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  // Machine default is always applied; mcpExtras (persisted/explicit) stacks on top.
+  const effectiveExtras = resolveExtras(DEFAULT_MCP_EXTRAS, mcpExtras);
   const sessionId = resumeSessionId || randomUUID();
 
   const settings = {
@@ -564,7 +569,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--strict-mcp-config',
+    '--mcp-config', mcpConfigPathFor(effectiveExtras),
     '--settings', JSON.stringify(settings),
   );
 
