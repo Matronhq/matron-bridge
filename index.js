@@ -130,7 +130,8 @@ for (const ex of DEFAULT_MCP_EXTRAS) {
 // — creds, transcripts, --resume — stays untouched. Point BRIDGE_PLUGIN_CACHE_DIR
 // at the real cache (~/.claude/plugins) or a curated subset to re-enable plugins.
 const PLUGIN_CACHE_DIR = process.env.BRIDGE_PLUGIN_CACHE_DIR
-  || path.join(os.homedir(), '.claude-matrix-bridge', 'empty-plugin-cache');
+  ? expandHome(process.env.BRIDGE_PLUGIN_CACHE_DIR)
+  : path.join(os.homedir(), '.claude-matrix-bridge', 'empty-plugin-cache');
 try {
   fs.mkdirSync(PLUGIN_CACHE_DIR, { recursive: true });
 } catch (e) {
