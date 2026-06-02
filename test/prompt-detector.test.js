@@ -736,4 +736,48 @@ describe('isIdleReadyScreen', () => {
     expect(isIdleReadyScreen('⏵⏵bypasspermissionson (shift+tabtocycle)')).toBe(true);
     expect(isIdleReadyScreen('⏵⏵bypasspermissionson·esctointerrupt')).toBe(false);
   });
+
+  it('is NOT ready while the resume-summary picker is showing', () => {
+    // The picker shows "Enter to confirm · Esc to cancel" — NOT the idle
+    // "bypass permissions" status line — so the resume hold must keep waiting
+    // and never type the held message into the menu.
+    const screen = [
+      'This session is 2h 35m old and 200.2k tokens.',
+      'We recommend resuming from a summary.',
+      '❯ 1. Resume from summary (recommended)',
+      '  2. Resume full session as-is',
+      "  3. Don't ask me again",
+      'Enter to confirm · Esc to cancel',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+});
+
+describe('classifyScreen — resume-from-summary picker', () => {
+  // Real modal claude shows when resuming a previously-compacted session. The
+  // bridge must surface this as a numbered question; if classifyScreen ever
+  // stops catching it, auto-resume of a compacted iv session silently stalls
+  // (the picker blocks input and is never answered).
+  it('classifies the resume-summary picker as a numbered prompt', () => {
+    const screen = [
+      'This session is 2h 35m old and 200.2k tokens.',
+      'Resuming the full session will consume a substantial portion of your usage',
+      'limits. We recommend resuming from a summary.',
+      '',
+      '❯ 1. Resume from summary (recommended)',
+      '  2. Resume full session as-is',
+      "  3. Don't ask me again",
+      '',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.label)).toEqual([
+      'Resume from summary (recommended)',
+      'Resume full session as-is',
+      "Don't ask me again",
+    ]);
+    expect(r.question).toMatch(/recommend resuming from a summary/);
+  });
 });

@@ -1972,30 +1972,32 @@ function enterResumeHold(session) {
   if (!session.iv) return;
   session._awaitingInputReady = true;
   session._resumeOutbox = [];
-  // Show a typing indicator so the room reflects that work is pending while
-  // claude loads. The real send (on flush) re-arms typing; an empty flush or
-  // a dead session clears it.
-  if (session.typingInterval) clearInterval(session.typingInterval);
-  session.typingInterval = startTyping(session.roomId);
+  // No typing indicator here: a resume may surface the "Resume from summary"
+  // picker, and showing "Claude is typing…" while we're actually asking the
+  // user a question reads wrong. The "Auto-resuming…" notice already conveys
+  // what's happening; the real send (on flush) starts typing normally.
   startResumeReadyWatcher(session);
 }
 
 // Watch a resuming iv session's PTY output; once it goes quiet AND the screen
 // shows the idle input box, flush any held messages (merged, in order) via the
 // normal send path. A hard cap guarantees the held message is eventually sent
-// even if readiness is never cleanly detected.
+// even if readiness is never cleanly detected — but it defers while a TUI
+// prompt (e.g. the resume-summary picker) is awaiting the user's answer, so
+// the held message is never typed into a menu.
 function startResumeReadyWatcher(session) {
   const iv = session.iv;
   if (!iv) return;
   let buf = '';
   let quietTimer = null;
+  let hardCap = null;
   let settled = false;
 
   const finish = (reason) => {
     if (settled) return;
     settled = true;
     if (quietTimer) clearTimeout(quietTimer);
-    clearTimeout(hardCap);
+    if (hardCap) clearTimeout(hardCap);
     iv.removeListener('pty-data', onData);
     session._awaitingInputReady = false;
     const outbox = session._resumeOutbox || [];
@@ -2019,9 +2021,10 @@ function startResumeReadyWatcher(session) {
 
   const evaluate = () => {
     if (settled || !session.alive) return finish('dead');
-    // A surfaced TUI prompt means claude wants a structured answer, not a
-    // free message — let the prompt flow handle it and keep holding; more
-    // PTY data (the user answering) will re-arm this check.
+    // A surfaced TUI prompt (e.g. the resume-summary picker) means claude
+    // wants a structured answer, not a free message — let the prompt flow
+    // handle it and keep holding; the user's answer produces more PTY data
+    // that re-arms this check.
     if (session.pendingInteractivePrompt) return;
     if (isIdleReadyScreen(buf)) finish('idle');
   };
@@ -2033,7 +2036,19 @@ function startResumeReadyWatcher(session) {
     quietTimer = setTimeout(evaluate, RESUME_READY_QUIET_MS);
   };
 
-  const hardCap = setTimeout(() => finish('timeout'), RESUME_READY_HARDCAP_MS);
+  const onHardCap = () => {
+    if (settled) return;
+    // If the user still hasn't answered a surfaced prompt, don't dump the
+    // held message into it — give them another window.
+    if (session.pendingInteractivePrompt) {
+      hardCap = setTimeout(onHardCap, RESUME_READY_HARDCAP_MS);
+      if (typeof hardCap.unref === 'function') hardCap.unref();
+      return;
+    }
+    finish('timeout');
+  };
+
+  hardCap = setTimeout(onHardCap, RESUME_READY_HARDCAP_MS);
   if (typeof hardCap.unref === 'function') hardCap.unref();
   iv.on('pty-data', onData);
 }
