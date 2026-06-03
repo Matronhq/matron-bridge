@@ -40,4 +40,6 @@ Browser-automation MCPs are off by default in bridge sessions because each one k
 
 Tell the user: "I need browser tools to do X. Please run `/restart --browser` — that keeps this exact session intact and just respawns the underlying claude process with chrome-devtools loaded. (`--browser` also works on `/start`, `/resume`, and `/workdir` if you'd rather create a new session.)"
 
+Other opt-in MCP extras use the same flag form (e.g. `/start --circleci`); which extras exist depends on this machine's `mcp-config.json` / `mcp-config.local.json`.
+
 Do not silently fall back to `Bash`-driven `curl`/`wget` for tasks that genuinely require a browser (interactive pages, JS rendering, screenshots) — surface the opt-in request to the user instead.

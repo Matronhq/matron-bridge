@@ -146,7 +146,27 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRIX_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
+| `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
+| `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `MATRIX_VIEWER_PORT` | Local file viewer port | `9803` |
+
+## Memory & MCP tuning
+
+Sessions are lean by default so the bridge runs on small VPS boxes. Only the
+bridge's own `ask-user` MCP loads per session; everything else is opt-in.
+
+- **Stdio MCP extras** — defined under `mcpExtras` in `mcp-config.json`
+  (committed; e.g. `browser`) or `mcp-config.local.json` (gitignored,
+  per-machine; e.g. `circleci`). Enable per session with `!start --<name>`
+  (e.g. `!start --browser --circleci`). Sessions run with `--strict-mcp-config`,
+  so servers from your personal `~/.claude.json` do NOT leak in.
+- **Per-machine default** — `MCP_DEFAULT_EXTRAS=circleci` turns an extra on for
+  every session on this machine. Explicit `--flags` stack on top (no per-session
+  opt-out; change the env and restart to go lean).
+- **Plugin MCP servers** (context7, serena, …) — disabled by default via an
+  empty `CLAUDE_CODE_PLUGIN_CACHE_DIR`. Set `BRIDGE_PLUGIN_CACHE_DIR` to
+  `~/.claude/plugins` (all plugins) or a curated dir to re-enable. Your
+  interactive `~/.claude` (creds, transcripts) is never modified.
 
 ## Commands
 
@@ -154,7 +174,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 |---|---|
 | `!start [workdir]` | Start a Claude Code session (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
-| `!start --browser [workdir]` | Also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
+| `!start --browser [workdir]` | Also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. Other extras (e.g. `--circleci`) use the same flag form; available extras depend on `mcp-config.json`/`mcp-config.local.json`. |
 | `!stop` | Stop the current session |
 | `!restart [--browser]` | Stop and immediately resume the session (toggle browser tools on without losing context) |
 | `!resume [n\|id] [--browser]` | Resume a previous session |
