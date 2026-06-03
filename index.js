@@ -95,7 +95,7 @@ const RAW_MCP_CONFIG = mergeMcpConfigs(
 );
 const KNOWN_MCP_EXTRAS = knownMcpExtras(RAW_MCP_CONFIG);
 // Per-machine baseline of extras applied to every session (e.g. "circleci").
-const DEFAULT_MCP_EXTRAS = parseDefaultExtras(process.env.MCP_DEFAULT_EXTRAS);
+const DEFAULT_MCP_EXTRAS_RAW = parseDefaultExtras(process.env.MCP_DEFAULT_EXTRAS);
 const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
 
 function mcpConfigPathFor(extras = []) {
@@ -118,12 +118,14 @@ function mcpConfigPathFor(extras = []) {
 // disk by the time any session spawns. Per-extras variants are generated
 // lazily on first use.
 mcpConfigPathFor([]);
-// Warn if a machine default names an extra that no config block defines.
-for (const ex of DEFAULT_MCP_EXTRAS) {
-  if (!KNOWN_MCP_EXTRAS.includes(ex)) {
-    console.warn(`[mcp-config] MCP_DEFAULT_EXTRAS lists "${ex}" but no mcpExtras["${ex}"] block exists (in mcp-config.json or mcp-config.local.json); it will be ignored.`);
-  }
-}
+// Drop (and warn about) any machine default that names an extra no config block
+// defines. buildMcpServers would silently ignore it at spawn time, so filtering
+// here keeps /start and /restart from advertising an extra that never loads.
+const DEFAULT_MCP_EXTRAS = DEFAULT_MCP_EXTRAS_RAW.filter((ex) => {
+  if (KNOWN_MCP_EXTRAS.includes(ex)) return true;
+  console.warn(`[mcp-config] MCP_DEFAULT_EXTRAS lists "${ex}" but no mcpExtras["${ex}"] block exists (in mcp-config.json or mcp-config.local.json); it will be ignored.`);
+  return false;
+});
 
 // Plugin MCP servers (context7, serena, …) load from this dir. Default: a
 // bridge-owned EMPTY dir so sessions are lean (no plugin MCPs) while ~/.claude
