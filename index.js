@@ -46,6 +46,82 @@ const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || p
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 
+// Model every bridge-spawned claude session runs on. The CLI defaults new
+// sessions to the standard 200k-context variant; pinning the `[1m]` variant
+// gives the full 1M context window (Opus 4.6/4.7/4.8 and Sonnet 4.6 support
+// 1M). Without this, /ctx readings and real headroom are capped at 200k.
+// Set at runtime via `!model <name> [1m]` (persisted below); env seeds the
+// initial default.
+// Model that NEW sessions spawn on. Opt-in: null means "don't pass --model",
+// so Claude Code uses its own account/provider-aware default (and whatever is
+// set in ~/.claude/settings.json). Override by setting BRIDGE_CLAUDE_MODEL, or
+// persist one at runtime with `!model <name>` — e.g. claude-opus-4-6[1m] for
+// the 1M context window. We never pin a model by default: hardcoding a
+// first-party variant would fail every spawn on installs where it's
+// unavailable (Bedrock/Vertex/custom gateways, or a different account tier).
+const DEFAULT_SPAWN_MODEL = process.env.BRIDGE_CLAUDE_MODEL || null;
+const SPAWN_MODEL_FILE = path.join(os.homedir(), '.claude-matrix-config.json');
+// Allowlist so a typo in `!model` can't silently break every future spawn.
+// Maps friendly input → full model id; ONE_M_CAPABLE gates the `[1m]` suffix.
+// For a model not listed, use the BRIDGE_CLAUDE_MODEL env var.
+const MODEL_ALIASES = {
+  opus: 'claude-opus-4-8', 'opus-4-8': 'claude-opus-4-8', 'opus-4-7': 'claude-opus-4-7', 'opus-4-6': 'claude-opus-4-6',
+  sonnet: 'claude-sonnet-4-6', 'sonnet-4-6': 'claude-sonnet-4-6',
+  haiku: 'claude-haiku-4-5', 'haiku-4-5': 'claude-haiku-4-5',
+};
+const ONE_M_CAPABLE = new Set(['claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6']);
+
+// Resolve `!model` args (alias or full id, optional `1m` / `[1m]` suffix) to a
+// validated model string, or { error }.
+function resolveSpawnModelInput(args) {
+  if (!args.length) return { error: 'usage: !model <name> [1m]   e.g. !model opus-4-6 1m' };
+  let token = args[0].toLowerCase();
+  let want1m = false;
+  if (token.endsWith('[1m]')) { want1m = true; token = token.slice(0, -4); }
+  // The only valid trailing arg is the 1m suffix. Reject anything else rather
+  // than silently dropping it — a typo'd `!model opus-4-6 lm` must NOT quietly
+  // persist the non-1M model as if the suffix had been honoured.
+  if (args.length > 2) return { error: 'too many arguments. usage: !model <name> [1m]' };
+  if (args[1] !== undefined) {
+    if (!/^\[?1m\]?$/i.test(args[1])) {
+      return { error: `unexpected "${args[1]}" — the only suffix is "1m". usage: !model <name> [1m]` };
+    }
+    want1m = true;
+  }
+  const known = new Set(Object.values(MODEL_ALIASES));
+  const base = MODEL_ALIASES[token] || (known.has(token) ? token : null);
+  if (!base) return { error: `unknown model "${args[0]}". options: ${[...new Set(Object.keys(MODEL_ALIASES))].join(', ')}` };
+  if (want1m && !ONE_M_CAPABLE.has(base)) return { error: `${base} has no 1M variant — drop "1m"` };
+  return { model: base + (want1m ? '[1m]' : '') };
+}
+
+function loadSpawnModel() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(SPAWN_MODEL_FILE, 'utf-8'));
+    if (cfg && typeof cfg.spawnModel === 'string' && cfg.spawnModel) return cfg.spawnModel;
+  } catch { /* no file / bad json — fall back to default */ }
+  return null;
+}
+function saveSpawnModel(model) {
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(SPAWN_MODEL_FILE, 'utf-8')) || {}; } catch { /* fresh file */ }
+  cfg.spawnModel = model;
+  fs.writeFileSync(SPAWN_MODEL_FILE, JSON.stringify(cfg, null, 2));
+}
+// Drop any persisted override so spawns fall back to Claude Code's own default
+// (no --model). The escape hatch from a bad pin — e.g. a 1M/first-party model
+// that a Bedrock/Vertex/custom-gateway install can't honour, which would
+// otherwise fail every future spawn until the config file is hand-edited.
+function clearSpawnModel() {
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(SPAWN_MODEL_FILE, 'utf-8')) || {}; } catch { /* fresh file */ }
+  delete cfg.spawnModel;
+  fs.writeFileSync(SPAWN_MODEL_FILE, JSON.stringify(cfg, null, 2));
+}
+const SPAWN_MODEL_RESET_WORDS = new Set(['default', 'auto', 'clear', 'none', 'off', 'reset']);
+// Live spawn model — read at every spawn; mutated by `!model`, seeded from disk.
+let spawnModel = loadSpawnModel() || DEFAULT_SPAWN_MODEL;
+
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
 // far longer than the 500ms paste→Enter window in sendText. Typing the first
@@ -293,6 +369,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const args = [
     '--print',
     '--verbose',
+    // Only pin a model when one is configured (BRIDGE_CLAUDE_MODEL / persisted
+    // !model); otherwise let Claude Code pick its account/provider default.
+    ...(spawnModel ? ['--model', spawnModel] : []),
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
@@ -541,6 +620,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   }
   claudeArgs.push(
     '--dangerously-skip-permissions',
+    // Only pin a model when one is configured (BRIDGE_CLAUDE_MODEL / persisted
+    // !model); otherwise let Claude Code pick its account/provider default. A
+    // pin applies to resumes too (switches the session's model).
+    ...(spawnModel ? ['--model', spawnModel] : []),
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
@@ -3362,14 +3445,52 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!model': {
       const session = sessions.get(roomId);
-      if (session?.initData) {
-        const model = session.initData.model || '(unknown)';
-        const version = session.initData.claude_code_version || '(unknown)';
-        const fast = session.initData.fast_mode_state || 'off';
-        await sendReply(`Model: ${model}\nClaude Code: v${version}\nFast mode: ${fast}`);
-      } else {
-        await sendReply('No active session. Start a session to see model info.');
+      // Reset to Claude Code's own default (drop the persisted override). The
+      // escape hatch when a pinned model can't be honoured on this install.
+      if (parts.length === 2 && SPAWN_MODEL_RESET_WORDS.has(parts[1].toLowerCase())) {
+        let wrote = true;
+        try { clearSpawnModel(); } catch (e) { wrote = false; debug('clearSpawnModel failed: %s', e?.message); }
+        spawnModel = null;
+        // Honest durability: an env-seeded pin (BRIDGE_CLAUDE_MODEL) re-applies
+        // on restart even after we delete the persisted value, so don't claim a
+        // durable reset in that case — point the operator at the env var.
+        let durability;
+        if (!wrote) {
+          durability = '⚠️ could not write config — cleared in this process only, the old value returns on restart';
+        } else if (process.env.BRIDGE_CLAUDE_MODEL) {
+          durability = `⚠️ cleared for now, but BRIDGE_CLAUDE_MODEL=${process.env.BRIDGE_CLAUDE_MODEL} is set in the environment and will re-pin on restart — unset it in the service config to make this stick`;
+        } else {
+          durability = 'persisted';
+        }
+        await sendReply(`✅ Spawn model override cleared (${durability}). New sessions will use Claude Code's own default (no --model).`);
+        break;
       }
+      // With an argument: set the spawn-default model for FUTURE sessions.
+      if (parts.length > 1) {
+        const { model, error } = resolveSpawnModelInput(parts.slice(1));
+        if (error) { await sendReply(`⚠️ ${error}`); break; }
+        // Persist first; only claim "persisted" if the write actually succeeds.
+        // On failure we still apply it in-process but tell the operator it will
+        // revert on restart, rather than silently lying about durability.
+        let persisted = true;
+        try { saveSpawnModel(model); } catch (e) { persisted = false; debug('saveSpawnModel failed: %s', e?.message); }
+        spawnModel = model;
+        const durability = persisted
+          ? 'persisted across restarts'
+          : '⚠️ could not write config — applies to new sessions in this process only, reverts on restart';
+        await sendReply(`✅ Spawn model set to ${model} (${durability}). Applies to new sessions, and to existing ones on their next restart/resume — not the current live turn.`);
+        break;
+      }
+      // No argument: show the spawn default + this room's live model + version.
+      const opts = [...new Set(Object.keys(MODEL_ALIASES))].join(', ');
+      let msg = `🔧 Spawn model (new sessions): ${spawnModel || 'Claude Code default (no override)'}`;
+      if (session?.initData) {
+        msg += `\nThis room's live model: ${session.initData.model || '(unknown)'}` +
+               `  ·  Claude Code v${session.initData.claude_code_version || '?'}` +
+               `  ·  Fast: ${session.initData.fast_mode_state || 'off'}`;
+      }
+      msg += `\nSet default with: !model <name> [1m]   ·   reset with: !model default\nOptions: ${opts}   (append 1m for the 1M window on opus/sonnet)`;
+      await sendReply(msg);
       break;
     }
 
