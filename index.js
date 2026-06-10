@@ -3664,6 +3664,16 @@ client.on('room.message', async (roomId, event) => {
         session.waitingForAnswer = null;
         session.pendingQuestions = null;
       }
+      // The ask_user turn is defunct (its poller is gone), so it will emit no
+      // more output and no Stop hook will clear `busy`. Clear it here so this
+      // message is delivered to Claude now instead of being queued behind the
+      // dead turn (which could otherwise stall until the poller's own deadline).
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
     }
   }
 
