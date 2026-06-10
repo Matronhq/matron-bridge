@@ -56,6 +56,21 @@ describe('switchModelInSession', () => {
     expect(sent.join(' ')).not.toMatch(/Switching to/);
     expect(sent.join(' ')).toMatch(/isn't accepting input|couldn't|could not/i);
   });
+
+  it('refuses (does not type) while the session is still resuming (input hold)', () => {
+    const sent = [];
+    const typed = [];
+    const session = {
+      currentModel: null,
+      _awaitingInputReady: true, // auto-resume hold is active
+      iv: { alive: true, sendText: (t) => { typed.push(t); return true; } },
+    };
+    const ok = switchModelInSession(session, 'sonnet', (m) => sent.push(m));
+    expect(ok).toBe(false);
+    expect(typed).toEqual([]); // never wrote to the PTY
+    expect(sent.join(' ')).not.toMatch(/Switching to/);
+    expect(sent.join(' ')).toMatch(/resuming/i);
+  });
 });
 
 describe('modelButtons', () => {
