@@ -16,6 +16,7 @@ import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import { releaseAbandonedMcpGate } from './lib/mcp-question-gate.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -3637,6 +3638,17 @@ client.on('room.message', async (roomId, event) => {
     // The value is already the button label, so resolveQuestionAnswer will use it as-is
   }
 
+  // Release a stale ask_user MCP answer-gate before it can swallow this
+  // message. The MCP server (ask-user.js) only polls for ~5 min then silently
+  // gives up without telling the bridge, so `waitingForAnswer = 'mcp:<id>'`
+  // would otherwise stay armed forever and consume the user's next unrelated
+  // message as a stale answer that no poller ever collects. If no poller is
+  // still waiting (timeout/crash/restart), this clears the gate so the message
+  // falls through to normal handling below.
+  if (releaseAbandonedMcpGate(session, pendingMcpQuestions, Date.now())) {
+    debug('Released abandoned MCP answer-gate (no poller waiting); message falls through to Claude');
+  }
+
   // If Claude Code asked a question, handle the answer
   if (session.waitingForAnswer) {
     const q = session.pendingQuestions?.[0];
@@ -4053,6 +4065,10 @@ const apiServer = createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Question not found' }));
       return;
     }
+    // Stamp each poll so the answer-gate can tell the MCP server is still
+    // waiting. When polling stops (timeout/crash), this goes stale and the
+    // message handler releases the gate instead of swallowing the next message.
+    q.lastPolledAt = Date.now();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ answered: q.answered, answer: q.answer || null }));
     if (q.answered) {
@@ -4138,6 +4154,9 @@ const apiServer = createServer(async (req, res) => {
         pendingMcpQuestions.set(questionId, {
           question, header, options, roomId,
           answered: false, answer: null,
+          // Seed the poll stamp so the gate counts the question as live during
+          // the ~500ms before the MCP server's first poll arrives.
+          lastPolledAt: Date.now(),
         });
 
         const activeSession = sessions.get(roomId);
