@@ -14,7 +14,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
@@ -795,6 +795,34 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 // Surface a detected TUI prompt to Matrix as a multiple-choice question.
 async function handleInteractivePrompt(session, prompt) {
   if (!session.sendHtml && !session.sendCallback) return;
+  // Surface claude's explanatory prose (rendered above the menu) BEFORE the
+  // question, so the user has the reasoning when choosing. In iv-mode that
+  // prose only reaches the transcript after the answer, but it's on the live
+  // screen now — recover it from the recent PTY output. Only when the capture
+  // is complete: then we also remember it to suppress the duplicate that flushes
+  // from the transcript post-answer (the user's "suppress only if full" choice).
+  // A partial/empty capture is skipped here and left to the transcript.
+  // Scope this to AskUserQuestion-style menus (option descriptions or a
+  // free-text slot). Other prompts (permission confirms, simple pickers) carry
+  // their own context in the question text and have no fresh prose above them —
+  // attempting a preamble there risks surfacing a stale paragraph from an
+  // earlier turn whose `●` marker sits above the menu.
+  const auqLike = prompt.freeTextIdx != null ||
+    (Array.isArray(prompt.options) && prompt.options.some(o => o && o.description));
+  if (auqLike && session.iv && typeof session.iv.recentOutput === 'function' && session.pendingInteractivePrompt === prompt) {
+    try {
+      const { preamble, complete } = extractPreamble(session.iv.recentOutput(), prompt);
+      if (complete && preamble) {
+        session._suppressPreambleText = preamble;
+        if (session.suppressPreambleTimer) clearTimeout(session.suppressPreambleTimer);
+        // Self-clear so a stale capture can't suppress an unrelated later message.
+        session.suppressPreambleTimer = setTimeout(() => { session._suppressPreambleText = null; }, 600_000);
+        if (typeof session.suppressPreambleTimer.unref === 'function') session.suppressPreambleTimer.unref();
+        if (session.sendHtml) session.sendHtml(preamble, markdownToHtml(preamble));
+        else session.sendCallback(preamble);
+      }
+    } catch (e) { debug('extractPreamble failed:', e?.message); }
+  }
   // Prefer native buttons when the prompt is a clean selection menu and a
   // button channel is wired. promptButtons returns null for free-text /
   // multi-select / unlabelable prompts, which fall through to the text
@@ -1530,7 +1558,25 @@ function handleClaudeEvent(session, event) {
         // no visible progress. Print-mode keeps its existing accumulate-
         // and-flush-on-result flow.
         if (session.iv && !isPartial && session.responseBuffer.trim() && !session.waitingForAnswer) {
-          flushResponse(session);
+          // If this assistant text is the prose we already surfaced as a
+          // preamble (before an AskUserQuestion), drop the post-answer
+          // duplicate instead of flushing it again. Only fires for a complete
+          // pre-answer capture (see handleInteractivePrompt).
+          const matchesPreamble = session._suppressPreambleText &&
+            preambleMatchesText(session._suppressPreambleText, session.responseBuffer);
+          // Either way, retire the suppression flag after this first post-set
+          // assistant flush — it's either the duplicate (drop it) or proof the
+          // duplicate isn't coming (don't leave it armed into later turns).
+          if (session._suppressPreambleText) {
+            session._suppressPreambleText = null;
+            if (session.suppressPreambleTimer) { clearTimeout(session.suppressPreambleTimer); session.suppressPreambleTimer = null; }
+          }
+          if (matchesPreamble) {
+            debug('Suppressing post-answer duplicate of surfaced preamble');
+            session.responseBuffer = '';
+          } else {
+            flushResponse(session);
+          }
           // Clear the prompt detector buffer after flushing an assistant
           // response so numbered lists in the response text don't trigger
           // false-positive prompt detections during the post-response idle.
