@@ -1219,9 +1219,10 @@ function submitAnswer(session, answerText) {
     sendTextToSession(session, answerText);
   } else {
     // Normal tool_result flow. This path only applies to print-mode stream-
-    // json input; in iv-mode the ask-user MCP server returns answers over
-    // its own stdio transport and this branch is unreachable. Log if it ever
-    // fires under iv-mode so we notice an unexpected code path.
+    // json input. In iv-mode, user questions are surfaced and answered via the
+    // PromptDetector → buttons/text path (handleInteractivePrompt +
+    // respondToPrompt), so this tool_result branch is unreachable there. Log if
+    // it ever fires under iv-mode so we notice an unexpected code path.
     if (session.iv) {
       debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
       return;
