@@ -19,12 +19,12 @@ import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
-import { isMcpQuestionAbandoned } from './lib/mcp-question-gate.js';
+import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
-const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
+const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
 
 // --- Config ---
 
@@ -430,11 +430,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       session.subagentWatcher.stop().catch(() => {});
       session.subagentWatcher = null;
     }
-    // Drop any pending MCP questions tied to this room — the ask-user MCP
-    // server died with the child, so the polling loop is gone.
-    for (const [qid, entry] of pendingMcpQuestions) {
-      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
-    }
 
     // Flush any remaining response
     flushResponse(session);
@@ -626,9 +621,17 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     handleInteractiveScreenUpdate(session, update);
   });
 
+  iv.on('unclassified-prompt', update => {
+    debug('IV unclassified-prompt: surfacing best-effort');
+    handleUnclassifiedPrompt(session, update);
+  });
+
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
     session.pendingInteractivePrompt = prompt;
+    // A real structured prompt supersedes any best-effort unclassified-prompt
+    // notice we may have surfaced for an earlier render of this screen.
+    session.pendingUnclassifiedPrompt = false;
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
     // first-run modals, /login, unauthenticated "please run /login"
@@ -656,11 +659,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.subagentWatcher) {
       session.subagentWatcher.stop().catch(() => {});
       session.subagentWatcher = null;
-    }
-    // Drop any pending MCP questions tied to this room — see createSession()
-    // for rationale.
-    for (const [qid, entry] of pendingMcpQuestions) {
-      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
     }
     flushResponse(session);
     if (sessions.get(roomId) === session) {
@@ -725,6 +723,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.toolCalls = [];
     session.turnCount++;
     session.busy = false;
+    // The turn ended, so any best-effort unclassified-prompt notice is stale.
+    session.pendingUnclassifiedPrompt = false;
     // A real turn-end supersedes any armed operator-compact fallback: disarm
     // it so a later (or stale) manual compact_boundary can't stand in as a
     // turn-end for a subsequent turn and clear busy out from under it.
@@ -793,8 +793,37 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 }
 
 // Surface a detected TUI prompt to Matrix as a multiple-choice question.
-function handleInteractivePrompt(session, prompt) {
+async function handleInteractivePrompt(session, prompt) {
   if (!session.sendHtml && !session.sendCallback) return;
+  // Prefer native buttons when the prompt is a clean selection menu and a
+  // button channel is wired. promptButtons returns null for free-text /
+  // multi-select / unlabelable prompts, which fall through to the text
+  // rendering below. pendingInteractivePrompt is set by the caller
+  // (iv.on('prompt')) regardless, so a tap routes via the prompt-opt handler.
+  if (session.sendButtonMessage) {
+    const b = promptButtons(prompt);
+    if (b) {
+      const header = prompt.question || 'Claude is asking';
+      const plain = ['Claude is asking:', prompt.question || '', '',
+        ...b.buttons.map((bt, i) => `${i + 1}. ${bt.label}`)].filter(Boolean).join('\n');
+      const htmlOpts = b.buttons.map(bt => `<b>${escapeHtml(bt.label)}</b>`).join(' · ');
+      const html = `<b>🟡 Claude is asking:</b>` +
+        (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
+        `<br/><br/>${htmlOpts}`;
+      // If a newer prompt superseded this one while we were composing, bail —
+      // don't post buttons for a stale prompt against the current TUI menu.
+      if (session.pendingInteractivePrompt !== prompt) return;
+      // sendButtonMessage returns null if the Matrix send fails. Fall through
+      // to the text rendering below in that case so the prompt is never
+      // silently dropped while the TUI waits for an answer.
+      const sent = await session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
+      if (sent != null) return;
+    }
+  }
+  // Bail if this prompt is no longer current — a newer prompt superseded it
+  // (e.g. arrived during the button send above) or it was already resolved.
+  // Don't post a stale text prompt against the current TUI menu.
+  if (session.pendingInteractivePrompt !== prompt) return;
   const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
   // When the prompt has a detected free-text slot (e.g. "Tell Claude what
   // to change"), tell the user they can reply with text directly. We'll
@@ -1060,6 +1089,43 @@ function handleInteractiveScreenUpdate(session, update) {
   }
 }
 
+// Safety net for iv-mode: the detector emits `unclassified-prompt` when the
+// settled screen looks like a selection menu it couldn't parse into buttons
+// (e.g. option labels too long). Without this the user would be blind while the
+// TUI waits. Surface a best-effort, cleaned screen dump so they can answer; a
+// later bare number/letter reply is sent as raw keystrokes (see the message
+// handler) to drive the open menu. Detector-side dedup prevents repeats.
+function handleUnclassifiedPrompt(session, { screen }) {
+  if (!session.sendHtml && !session.sendCallback) return;
+  // Clean the raw screen: drop blank lines, keep the tail (the menu sits at the
+  // bottom), and cap length so we don't dump the whole terminal.
+  const cleaned = String(screen || '')
+    .split('\n')
+    .map(l => l.replace(/\s+$/, ''))
+    .filter(l => l.trim().length > 0)
+    .slice(-20)
+    .join('\n')
+    .slice(0, 1500);
+  if (!cleaned) return;
+  const plain = `⚠️ Claude is waiting for input I couldn't turn into buttons. Reply with the option number shown (or send !esc to cancel):\n\n${cleaned}`;
+  const html =
+    `<b>⚠️ Claude is waiting for input I couldn't parse into buttons.</b><br/>` +
+    `Reply with the option number shown (or send <code>!esc</code> to cancel):<br/><pre>${escapeHtml(cleaned)}</pre>`;
+  if (session.sendHtml) session.sendHtml(plain, html);
+  else session.sendCallback(plain);
+  session.pendingUnclassifiedPrompt = true;
+  // Like a structured prompt, this means claude is awaiting the user — clear
+  // busy so the reply is typed into the PTY instead of dropping into the queue.
+  if (session.busy) {
+    session.busy = false;
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+  }
+}
+
 // Cues for which the bridge auto-sends Enter on the user's behalf.
 // Kept narrow on purpose — only matches phrasing where claude is
 // explicitly waiting for an acknowledgment keystroke ("press enter to
@@ -1205,37 +1271,15 @@ function submitAnswer(session, answerText) {
   session.currentQuestionIndex = 0;
   session.questionAnswers = [];
 
-  if (typeof mode === 'string' && mode.startsWith('mcp:')) {
-    // MCP tool question — store the answer so the MCP server can poll for it
-    const questionId = mode.slice(4);
-    const q = pendingMcpQuestions.get(questionId);
-    if (q) {
-      q.answered = true;
-      q.answer = answerText;
-      // Cancel the bridge-owned expiry timer — the answer beat the timeout, so
-      // expireMcpQuestion must not fire and tear down the session afterwards.
-      if (q.expiryTimer) clearTimeout(q.expiryTimer);
-      debug(`MCP question ${questionId} answered: ${answerText}`);
-      // Start typing — Claude will continue once the MCP tool returns.
-      if (session.typingInterval) clearInterval(session.typingInterval);
-      session.typingInterval = startTyping(session.roomId);
-    } else {
-      // The question is gone — the bridge already expired it (see
-      // expireMcpQuestion), which also cleared waitingForAnswer, so this is a
-      // belt-and-suspenders guard: route the reply as a normal message instead
-      // of arming a typing indicator that would spin forever (nothing will
-      // consume this answer).
-      debug(`MCP question ${questionId} already expired; routing reply as a normal message`);
-      sendTextToSession(session, answerText);
-    }
-  } else if (mode === 'text-reply') {
+  if (mode === 'text-reply') {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
     sendTextToSession(session, answerText);
   } else {
     // Normal tool_result flow. This path only applies to print-mode stream-
-    // json input; in iv-mode the ask-user MCP server returns answers over
-    // its own stdio transport and this branch is unreachable. Log if it ever
-    // fires under iv-mode so we notice an unexpected code path.
+    // json input. In iv-mode, user questions are surfaced and answered via the
+    // PromptDetector → buttons/text path (handleInteractivePrompt +
+    // respondToPrompt), so this tool_result branch is unreachable there. Log if
+    // it ever fires under iv-mode so we notice an unexpected code path.
     if (session.iv) {
       debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
       return;
@@ -1507,6 +1551,14 @@ function handleClaudeEvent(session, event) {
 
         if (toolName === 'AskUserQuestion') {
           debug(`AskUserQuestion tool_use block.id=${block.id}, waitingForAnswer=${session.waitingForAnswer}, input keys=${Object.keys(input).join(',')}`);
+          // iv-mode: the AskUserQuestion menu renders in the TUI and is surfaced
+          // + answered via the PromptDetector path (handleInteractivePrompt +
+          // respondToPrompt keystrokes). Surfacing it again here as buttons
+          // would duplicate the prompt, and the button answer would route via
+          // sendTextToSession (a regular message), which can't drive the open
+          // menu. So this transcript→buttons path is print-mode only — matching
+          // the sibling tool_result flow (see resolveQuestionAnswer).
+          if (session.iv) { debug('iv-mode: AskUserQuestion owned by PTY detector'); continue; }
           if (session.waitingForAnswer) { debug('Skipping AskUserQuestion — already waiting'); continue; }
 
           const parsed = parseAskUserQuestion(input);
@@ -3730,20 +3782,52 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
-  // iv-mode: route reply to a pending TUI prompt before treating it as a
-  // normal message. If we consumed it as a prompt response, return.
+  // iv-mode: route a typed reply to a pending TUI prompt before treating it as
+  // a normal message. If we consumed it as a prompt response, return.
   //
-  // Skip this for button responses: TUI prompts are only ever surfaced as text
-  // (handleInteractivePrompt never uses buttons), so a button tap is an
-  // explicit bridge action (effort:/model:/interrupt/cancel:), never a prompt
-  // answer. Without this guard, tapping an effort/model picker while a TUI
-  // prompt is pending — e.g. the "Change effort level?" confirm raised by a
-  // prior effort tap — hits maybeResolve's unmatched path, which nulls
-  // pendingInteractivePrompt WITHOUT answering the TUI and falls through, so
-  // the button value then types a stray /effort|/model into the still-open
-  // menu, desyncing the PTY and dropping the real confirmation.
+  // Skip this for button responses. A prompt surfaced as buttons (prompt-opt:)
+  // is answered by the dedicated dispatch below, not here; and other button
+  // actions (effort:/model:/interrupt/cancel:) are never prompt answers.
+  // Without this guard, tapping an effort/model picker while a TUI prompt is
+  // pending — e.g. the "Change effort level?" confirm raised by a prior effort
+  // tap — hits maybeResolve's unmatched path, which nulls pendingInteractivePrompt
+  // WITHOUT answering the TUI and falls through, so the button value then types
+  // a stray /effort|/model into the still-open menu, desyncing the PTY.
   const isButtonResponse = !!event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
   if (session.iv && !isButtonResponse && maybeResolveInteractivePrompt(session, text)) {
+    // Answering a classified prompt also retires any stale best-effort
+    // unclassified-prompt gate, so later messages aren't wrongly intercepted.
+    session.pendingUnclassifiedPrompt = false;
+    return;
+  }
+
+  // Reply to a detector-missed menu surfaced via handleUnclassifiedPrompt. A
+  // bare option number/letter is driven into the open TUI selection through
+  // respondToPrompt (sends the digits/letter then a delayed Enter, like a
+  // classified prompt — bracketed-paste sendText wouldn't select). Any OTHER
+  // reply is NOT typed into the menu (that would desync the PTY): we keep the
+  // prompt pending and tell the user how to answer or cancel.
+  // `!`-prefixed rescue commands (!esc/!enter/!stop/…) must pass through to
+  // their handlers below — the unclassified notice tells the user to send !esc
+  // to cancel, so we must not swallow it here.
+  if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !isButtonResponse
+      && !text.trim().startsWith('!')) {
+    const sel = text.trim();
+    if (/^\d{1,3}$/.test(sel)) {
+      session.pendingUnclassifiedPrompt = false;
+      // Don't reset the detector dedup — the just-answered screen may linger a
+      // moment, and resetting would let it re-emit unclassified-prompt.
+      session.iv.respondToPrompt({ kind: 'numbered', key: sel }, { resetDetector: false });
+      return;
+    }
+    if (/^[a-zA-Z]$/.test(sel)) {
+      session.pendingUnclassifiedPrompt = false;
+      session.iv.respondToPrompt({ kind: 'lettered', key: sel }, { resetDetector: false });
+      return;
+    }
+    const guide = "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.";
+    if (session.sendHtml) session.sendHtml(guide, escapeHtml(guide));
+    else if (session.sendCallback) session.sendCallback(guide);
     return;
   }
 
@@ -3813,36 +3897,25 @@ client.on('room.message', async (roomId, event) => {
       return;
     }
 
+    // Detected-prompt button — value is `prompt-opt:<index>`. Drive the open
+    // TUI menu via keystrokes (the only correct iv-mode answer channel). The
+    // fix/effort-command guard already skips maybeResolveInteractivePrompt for
+    // button responses, so this won't be mis-consumed as a typed reply.
+    const promptOptMatch = value.match(/^prompt-opt:(\d+)$/);
+    if (promptOptMatch) {
+      const p = session.pendingInteractivePrompt;
+      const resp = p ? promptResponseForButton(p, Number(promptOptMatch[1])) : null;
+      if (p && resp && session.iv && session.iv.alive) {
+        session.pendingInteractivePrompt = null;
+        // Answering also retires any stale unclassified-prompt gate.
+        session.pendingUnclassifiedPrompt = false;
+        session.iv.respondToPrompt(resp);
+      }
+      return;
+    }
+
     // Otherwise treat as a question answer — fall through to waitingForAnswer handling
     // The value is already the button label, so resolveQuestionAnswer will use it as-is
-  }
-
-  // Liveness guard: if this is an ask_user MCP gate whose poller has gone
-  // (crashed/disconnected) before the bridge's expiry timer fires, expire it
-  // now so this message falls through to Claude instead of being swallowed as
-  // a stale answer no poller will collect. The on-time path stays owned by the
-  // POST /ask expiry timer; this only covers early poller death.
-  if (typeof session.waitingForAnswer === 'string' && session.waitingForAnswer.startsWith('mcp:')) {
-    const qid = session.waitingForAnswer.slice(4);
-    if (isMcpQuestionAbandoned(pendingMcpQuestions.get(qid), Date.now())) {
-      if (pendingMcpQuestions.has(qid)) {
-        // expireMcpQuestion clears the gate, posts the "moved on" notice, and —
-        // because the poller is abandoned here — clears the defunct turn's busy
-        // + typing too, so this message reaches Claude instead of queuing.
-        expireMcpQuestion(qid);
-      } else {
-        // Defensive: gate armed but the question is already gone — release it
-        // and clear the defunct turn's busy/typing directly.
-        session.waitingForAnswer = null;
-        session.pendingQuestions = null;
-        session.busy = false;
-        if (session.typingInterval) {
-          clearInterval(session.typingInterval);
-          session.typingInterval = null;
-          client.setTyping(session.roomId, false, 1000).catch(() => {});
-        }
-      }
-    }
   }
 
   // If Claude Code asked a question, handle the answer
@@ -3983,6 +4056,9 @@ client.on('room.message', async (roomId, event) => {
     if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
       try {
         session.iv.sendKeystroke('esc');
+        // Esc dismisses any open menu, so a best-effort unclassified-prompt is
+        // no longer pending.
+        session.pendingUnclassifiedPrompt = false;
         // Clear bridge-side busy state since claude won't fire a Stop
         // hook after a user-cancelled turn — leaving busy=true would
         // queue every subsequent message.
@@ -4259,60 +4335,7 @@ client.on('room.event', async (roomId, event) => {
   }
 });
 
-// --- MCP Question Store ---
-
-const pendingMcpQuestions = new Map();
-let mcpQuestionCounter = 0;
 const pendingSecrets = new Map();
-
-// How long an MCP ask_user question waits for an answer before the bridge
-// expires it. The bridge owns this timer (set in POST /ask) so it is
-// authoritative for the timeout — the MCP poller just reports the outcome.
-// 30 min: humane for an operator juggling sessions, well under the ~27.8h
-// Claude Code stdio MCP tool-call ceiling and the bridge's 1h idle reaper.
-const ASK_USER_TIMEOUT_MS = parseInt(process.env.ASK_USER_TIMEOUT_MS || '1800000', 10);
-
-// Bridge-owned expiry for an MCP ask_user question. Fired by the timer set in
-// POST /ask when the answer window elapses with no reply. Clears the session's
-// waiting state, stops the typing indicator, and tells the user the question
-// expired (a later reply then routes as a normal message). The pending entry
-// is kept (marked expired) so the MCP poller's next GET learns the outcome and
-// returns the timeout text; that GET deletes the entry.
-function expireMcpQuestion(questionId) {
-  const q = pendingMcpQuestions.get(questionId);
-  if (!q || q.answered || q.expired) return;
-  q.expired = true;
-  const session = sessions.get(q.roomId);
-  if (session && session.waitingForAnswer === `mcp:${questionId}`) {
-    session.waitingForAnswer = null;
-    session.pendingQuestions = null;
-    session.currentQuestionIndex = 0;
-    session.questionAnswers = [];
-    // If the poller is gone (early death, or it stopped before this timer
-    // fired), the turn is defunct and no Stop hook will clear `busy` — clear it
-    // so the user's next message reaches Claude instead of queuing behind a dead
-    // turn. When the poller is still alive (normal on-time timeout), leave
-    // `busy` set: the turn unwinds naturally once the poller observes `expired`,
-    // and clearing it here would race that legitimate continuation.
-    if (isMcpQuestionAbandoned(q, Date.now())) {
-      session.busy = false;
-    }
-    if (session.typingInterval) {
-      clearInterval(session.typingInterval);
-      session.typingInterval = null;
-      client.setTyping(session.roomId, false, 1000).catch(() => {});
-    }
-    const notice = '⏳ That question timed out, so I moved on. Reply any time and I will pick up your answer as a new message.';
-    if (session.sendHtml) session.sendHtml(notice, escapeHtml(notice));
-    else if (session.sendCallback) session.sendCallback(notice);
-  }
-  // Tombstone: the entry is normally dropped by the poller's next GET (which
-  // observes `expired`). If that GET never arrives — poller crashed, was
-  // cancelled, or lost its connection — delete it after a short window so
-  // expired entries can't accumulate in pendingMcpQuestions.
-  const tombstone = setTimeout(() => pendingMcpQuestions.delete(questionId), 60000);
-  if (tombstone.unref) tombstone.unref();
-}
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
 // Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
@@ -4328,31 +4351,6 @@ const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || '9802', 10);
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
-
-  // GET /ask/:id — MCP server polls for answer
-  if (req.method === 'GET' && url.pathname.startsWith('/ask/')) {
-    const questionId = url.pathname.split('/')[2];
-    const q = pendingMcpQuestions.get(questionId);
-    if (!q) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: 'Question not found' }));
-      return;
-    }
-    // Stamp each poll so the liveness guard can tell the MCP server is still
-    // waiting. When polling stops early (crash/disconnect), this goes stale and
-    // the message handler expires the gate instead of swallowing the next
-    // message — before the bridge's own expiry timer would fire.
-    q.lastPolledAt = Date.now();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ answered: q.answered, answer: q.answer || null, expired: q.expired || false }));
-    // Terminal states (answered or bridge-expired): cancel the expiry timer
-    // and drop the entry now that the poller has observed the outcome.
-    if (q.answered || q.expired) {
-      if (q.expiryTimer) clearTimeout(q.expiryTimer);
-      pendingMcpQuestions.delete(questionId);
-    }
-    return;
-  }
 
   // GET /secret/:id — MCP server polls for secret submission
   if (req.method === 'GET' && url.pathname.startsWith('/secret/')) {
@@ -4416,61 +4414,6 @@ const apiServer = createServer(async (req, res) => {
   req.on('end', async () => {
     try {
       const data = JSON.parse(body);
-
-      // POST /ask — MCP server posts a question
-      if (url.pathname === '/ask') {
-        const { question, header, options, multiSelect, roomId } = data;
-        if (!question || !roomId) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'question and roomId are required' }));
-          return;
-        }
-
-        const questionId = String(++mcpQuestionCounter);
-
-        const expiryTimer = setTimeout(() => expireMcpQuestion(questionId), ASK_USER_TIMEOUT_MS);
-        if (expiryTimer.unref) expiryTimer.unref();
-        pendingMcpQuestions.set(questionId, {
-          question, header, options, roomId,
-          answered: false, answer: null,
-          expired: false, expiryTimer,
-          // Seed the poll stamp so the liveness guard counts the question as
-          // live during the ~500ms before the MCP server's first poll arrives.
-          lastPolledAt: Date.now(),
-        });
-
-        const activeSession = sessions.get(roomId);
-
-        if (activeSession) {
-          const parsed = {
-            questions: [{
-              question,
-              header: header || null,
-              options: options || [],
-              multiSelect: multiSelect || false,
-            }]
-          };
-
-          if (activeSession.typingInterval) {
-            clearInterval(activeSession.typingInterval);
-            activeSession.typingInterval = null;
-          }
-
-          activeSession.waitingForAnswer = `mcp:${questionId}`;
-          activeSession.pendingQuestions = parsed.questions;
-          activeSession.currentQuestionIndex = 0;
-          activeSession.questionAnswers = [];
-          activeSession.responseBuffer = '';
-
-          if (activeSession.sendCallback) {
-            sendAllQuestions(activeSession);
-          }
-        }
-
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ questionId, timeoutMs: ASK_USER_TIMEOUT_MS }));
-        return;
-      }
 
       if (url.pathname === '/secret') {
         const { label, roomId } = data;
@@ -4864,11 +4807,6 @@ function killSession(session, signal = 'SIGTERM') {
   if (session.subagentWatcher) {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
-  }
-  // Drop any pending MCP questions for this room — the MCP server that
-  // owns them died with the session, so the entries would otherwise leak.
-  for (const [qid, entry] of pendingMcpQuestions) {
-    if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
   }
   if (!session.alive) return;
   try {

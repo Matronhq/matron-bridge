@@ -1,5 +1,5 @@
 import { describe, it, test, expect } from 'vitest';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu } from '../lib/prompt-detector.js';
 
 describe('stripAnsi', () => {
   it('removes color codes', () => {
@@ -933,6 +933,65 @@ describe('PromptDetector', () => {
     await new Promise(r => setTimeout(r, 100));
     expect(events).toHaveLength(1);
     expect(events[0].kind).toBe('yes-no');
+  });
+
+  it('emits unclassified-prompt (not prompt) for a menu it cannot classify', async () => {
+    const LONG = 'this is an intentionally very long option label that exceeds the ninety character menu guard so the classifier rejects it as wrapped prose';
+    const screen = [
+      'What would you like to do?',
+      `❯ 1. ${LONG}`,
+      `  2. ${LONG} (second)`,
+    ].join('\n');
+    // Precondition: this is exactly the gap — the classifier rejects it.
+    expect(classifyScreen(screen)).toBeNull();
+    const det = new PromptDetector({ idleMs: 40 });
+    const prompts = [], unclassified = [];
+    det.on('prompt', p => prompts.push(p));
+    det.on('unclassified-prompt', u => unclassified.push(u));
+    det.feed(screen);
+    await new Promise(r => setTimeout(r, 120));
+    expect(prompts).toHaveLength(0);
+    expect(unclassified).toHaveLength(1);
+    expect(unclassified[0].screen).toContain('What would you like to do?');
+  });
+
+  it('does not emit unclassified-prompt for a normal classifiable menu', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const prompts = [], unclassified = [];
+    det.on('prompt', p => prompts.push(p));
+    det.on('unclassified-prompt', u => unclassified.push(u));
+    det.feed('Continue? [y/N]');
+    await new Promise(r => setTimeout(r, 120));
+    expect(prompts).toHaveLength(1);
+    expect(unclassified).toHaveLength(0);
+  });
+});
+
+describe('looksLikeUnclassifiedMenu', () => {
+  const LONG = 'a'.repeat(120);
+
+  it('flags a ❯ numbered menu the classifier rejected (overlong labels)', () => {
+    const screen = `What would you like to do?\n❯ 1. ${LONG}\n  2. ${LONG}`;
+    expect(classifyScreen(screen)).toBeNull();           // the gap
+    expect(looksLikeUnclassifiedMenu(screen)).toBe(true);
+  });
+
+  it('ignores a prose numbered list with no selection cursor', () => {
+    expect(looksLikeUnclassifiedMenu('Here are the steps:\n1. First do this\n2. Then do that')).toBe(false);
+  });
+
+  it('ignores a bare ❯ slash-command suggestion (no numbered/lettered option)', () => {
+    expect(looksLikeUnclassifiedMenu('❯ /compact\n⎿ summary line')).toBe(false);
+  });
+
+  it('ignores a folded-paste placeholder under the cursor', () => {
+    expect(looksLikeUnclassifiedMenu('❯ [Pasted text #1 +9 lines]')).toBe(false);
+  });
+
+  it('ignores plain output and empty input', () => {
+    expect(looksLikeUnclassifiedMenu('All done. Nothing to pick here.')).toBe(false);
+    expect(looksLikeUnclassifiedMenu('')).toBe(false);
+    expect(looksLikeUnclassifiedMenu(null)).toBe(false);
   });
 });
 
