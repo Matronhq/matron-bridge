@@ -56,7 +56,7 @@ describe('switchEffortInSession', () => {
     };
     const ok = switchEffortInSession(session, 'high', (m) => sent.push(m));
     expect(ok).toBe(false);
-    expect(sent.join(' ')).not.toMatch(/Setting effort/);
+    expect(sent.join(' ')).not.toMatch(/Switching effort/);
     expect(sent.join(' ')).toMatch(/isn't accepting input|couldn't|could not/i);
   });
 
@@ -70,7 +70,7 @@ describe('switchEffortInSession', () => {
     const ok = switchEffortInSession(session, 'high', (m) => sent.push(m));
     expect(ok).toBe(false);
     expect(typed).toEqual([]); // never wrote to the PTY
-    expect(sent.join(' ')).not.toMatch(/Setting effort/);
+    expect(sent.join(' ')).not.toMatch(/Switching effort/);
     expect(sent.join(' ')).toMatch(/resuming/i);
   });
 

@@ -162,6 +162,26 @@ describe('stripAnsi — CHA (Cursor Horizontal Absolute) word-boundary fixtures'
     expect(r.freeTextIdx).toBe(3);
   });
 
+  test('effort-change confirmation fixture: classifyScreen surfaces it as a prompt', () => {
+    // Changing effort mid-conversation invalidates the prompt cache, so the
+    // TUI shows this confirmation before applying. The bridge relies on the
+    // detector catching it (same shape as the bypass-permissions menu) to
+    // surface it to Matrix — see lib/effort-command.js. Guard that here.
+    const raw = [
+      'Change\x1b[8Geffort\x1b[15Glevel?',
+      'This\x1b[6Gconversation\x1b[19Gis\x1b[22Gcached.\x1b[31GSwitching\x1b[41Gto\x1b[44Gultracode\x1b[54Gre-reads\x1b[63Ghistory.',
+      '❯ 1.\x1b[6GYes,\x1b[11Gswitch\x1b[18Gto\x1b[21Gultracode',
+      '  2.\x1b[6GNo,\x1b[10Ggo\x1b[13Gback',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('Change effort level?');
+    expect(r.options).toHaveLength(2);
+    expect(r.options[0].label).toContain('Yes, switch to ultracode');
+    expect(r.options[1].label).toContain('No, go back');
+  });
+
   test('AskUserQuestion menu fixture: CHA-positioned labels reconstruct with spaces', () => {
     // Mirrors an AskUserQuestion-style numbered menu where each option label
     // is built with CHA moves between individual words.
