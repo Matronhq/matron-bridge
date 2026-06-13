@@ -20,7 +20,6 @@ import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
-import { isMcpQuestionAbandoned } from './lib/mcp-question-gate.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -431,11 +430,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       session.subagentWatcher.stop().catch(() => {});
       session.subagentWatcher = null;
     }
-    // Drop any pending MCP questions tied to this room — the ask-user MCP
-    // server died with the child, so the polling loop is gone.
-    for (const [qid, entry] of pendingMcpQuestions) {
-      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
-    }
 
     // Flush any remaining response
     flushResponse(session);
@@ -657,11 +651,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.subagentWatcher) {
       session.subagentWatcher.stop().catch(() => {});
       session.subagentWatcher = null;
-    }
-    // Drop any pending MCP questions tied to this room — see createSession()
-    // for rationale.
-    for (const [qid, entry] of pendingMcpQuestions) {
-      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
     }
     flushResponse(session);
     if (sessions.get(roomId) === session) {
@@ -1225,30 +1214,7 @@ function submitAnswer(session, answerText) {
   session.currentQuestionIndex = 0;
   session.questionAnswers = [];
 
-  if (typeof mode === 'string' && mode.startsWith('mcp:')) {
-    // MCP tool question — store the answer so the MCP server can poll for it
-    const questionId = mode.slice(4);
-    const q = pendingMcpQuestions.get(questionId);
-    if (q) {
-      q.answered = true;
-      q.answer = answerText;
-      // Cancel the bridge-owned expiry timer — the answer beat the timeout, so
-      // expireMcpQuestion must not fire and tear down the session afterwards.
-      if (q.expiryTimer) clearTimeout(q.expiryTimer);
-      debug(`MCP question ${questionId} answered: ${answerText}`);
-      // Start typing — Claude will continue once the MCP tool returns.
-      if (session.typingInterval) clearInterval(session.typingInterval);
-      session.typingInterval = startTyping(session.roomId);
-    } else {
-      // The question is gone — the bridge already expired it (see
-      // expireMcpQuestion), which also cleared waitingForAnswer, so this is a
-      // belt-and-suspenders guard: route the reply as a normal message instead
-      // of arming a typing indicator that would spin forever (nothing will
-      // consume this answer).
-      debug(`MCP question ${questionId} already expired; routing reply as a normal message`);
-      sendTextToSession(session, answerText);
-    }
-  } else if (mode === 'text-reply') {
+  if (mode === 'text-reply') {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
     sendTextToSession(session, answerText);
   } else {
@@ -3860,34 +3826,6 @@ client.on('room.message', async (roomId, event) => {
     // The value is already the button label, so resolveQuestionAnswer will use it as-is
   }
 
-  // Liveness guard: if this is an ask_user MCP gate whose poller has gone
-  // (crashed/disconnected) before the bridge's expiry timer fires, expire it
-  // now so this message falls through to Claude instead of being swallowed as
-  // a stale answer no poller will collect. The on-time path stays owned by the
-  // POST /ask expiry timer; this only covers early poller death.
-  if (typeof session.waitingForAnswer === 'string' && session.waitingForAnswer.startsWith('mcp:')) {
-    const qid = session.waitingForAnswer.slice(4);
-    if (isMcpQuestionAbandoned(pendingMcpQuestions.get(qid), Date.now())) {
-      if (pendingMcpQuestions.has(qid)) {
-        // expireMcpQuestion clears the gate, posts the "moved on" notice, and —
-        // because the poller is abandoned here — clears the defunct turn's busy
-        // + typing too, so this message reaches Claude instead of queuing.
-        expireMcpQuestion(qid);
-      } else {
-        // Defensive: gate armed but the question is already gone — release it
-        // and clear the defunct turn's busy/typing directly.
-        session.waitingForAnswer = null;
-        session.pendingQuestions = null;
-        session.busy = false;
-        if (session.typingInterval) {
-          clearInterval(session.typingInterval);
-          session.typingInterval = null;
-          client.setTyping(session.roomId, false, 1000).catch(() => {});
-        }
-      }
-    }
-  }
-
   // If Claude Code asked a question, handle the answer
   if (session.waitingForAnswer) {
     const q = session.pendingQuestions?.[0];
@@ -4302,60 +4240,7 @@ client.on('room.event', async (roomId, event) => {
   }
 });
 
-// --- MCP Question Store ---
-
-const pendingMcpQuestions = new Map();
-let mcpQuestionCounter = 0;
 const pendingSecrets = new Map();
-
-// How long an MCP ask_user question waits for an answer before the bridge
-// expires it. The bridge owns this timer (set in POST /ask) so it is
-// authoritative for the timeout — the MCP poller just reports the outcome.
-// 30 min: humane for an operator juggling sessions, well under the ~27.8h
-// Claude Code stdio MCP tool-call ceiling and the bridge's 1h idle reaper.
-const ASK_USER_TIMEOUT_MS = parseInt(process.env.ASK_USER_TIMEOUT_MS || '1800000', 10);
-
-// Bridge-owned expiry for an MCP ask_user question. Fired by the timer set in
-// POST /ask when the answer window elapses with no reply. Clears the session's
-// waiting state, stops the typing indicator, and tells the user the question
-// expired (a later reply then routes as a normal message). The pending entry
-// is kept (marked expired) so the MCP poller's next GET learns the outcome and
-// returns the timeout text; that GET deletes the entry.
-function expireMcpQuestion(questionId) {
-  const q = pendingMcpQuestions.get(questionId);
-  if (!q || q.answered || q.expired) return;
-  q.expired = true;
-  const session = sessions.get(q.roomId);
-  if (session && session.waitingForAnswer === `mcp:${questionId}`) {
-    session.waitingForAnswer = null;
-    session.pendingQuestions = null;
-    session.currentQuestionIndex = 0;
-    session.questionAnswers = [];
-    // If the poller is gone (early death, or it stopped before this timer
-    // fired), the turn is defunct and no Stop hook will clear `busy` — clear it
-    // so the user's next message reaches Claude instead of queuing behind a dead
-    // turn. When the poller is still alive (normal on-time timeout), leave
-    // `busy` set: the turn unwinds naturally once the poller observes `expired`,
-    // and clearing it here would race that legitimate continuation.
-    if (isMcpQuestionAbandoned(q, Date.now())) {
-      session.busy = false;
-    }
-    if (session.typingInterval) {
-      clearInterval(session.typingInterval);
-      session.typingInterval = null;
-      client.setTyping(session.roomId, false, 1000).catch(() => {});
-    }
-    const notice = '⏳ That question timed out, so I moved on. Reply any time and I will pick up your answer as a new message.';
-    if (session.sendHtml) session.sendHtml(notice, escapeHtml(notice));
-    else if (session.sendCallback) session.sendCallback(notice);
-  }
-  // Tombstone: the entry is normally dropped by the poller's next GET (which
-  // observes `expired`). If that GET never arrives — poller crashed, was
-  // cancelled, or lost its connection — delete it after a short window so
-  // expired entries can't accumulate in pendingMcpQuestions.
-  const tombstone = setTimeout(() => pendingMcpQuestions.delete(questionId), 60000);
-  if (tombstone.unref) tombstone.unref();
-}
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
 // Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
@@ -4371,31 +4256,6 @@ const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || '9802', 10);
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
-
-  // GET /ask/:id — MCP server polls for answer
-  if (req.method === 'GET' && url.pathname.startsWith('/ask/')) {
-    const questionId = url.pathname.split('/')[2];
-    const q = pendingMcpQuestions.get(questionId);
-    if (!q) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: 'Question not found' }));
-      return;
-    }
-    // Stamp each poll so the liveness guard can tell the MCP server is still
-    // waiting. When polling stops early (crash/disconnect), this goes stale and
-    // the message handler expires the gate instead of swallowing the next
-    // message — before the bridge's own expiry timer would fire.
-    q.lastPolledAt = Date.now();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ answered: q.answered, answer: q.answer || null, expired: q.expired || false }));
-    // Terminal states (answered or bridge-expired): cancel the expiry timer
-    // and drop the entry now that the poller has observed the outcome.
-    if (q.answered || q.expired) {
-      if (q.expiryTimer) clearTimeout(q.expiryTimer);
-      pendingMcpQuestions.delete(questionId);
-    }
-    return;
-  }
 
   // GET /secret/:id — MCP server polls for secret submission
   if (req.method === 'GET' && url.pathname.startsWith('/secret/')) {
@@ -4459,61 +4319,6 @@ const apiServer = createServer(async (req, res) => {
   req.on('end', async () => {
     try {
       const data = JSON.parse(body);
-
-      // POST /ask — MCP server posts a question
-      if (url.pathname === '/ask') {
-        const { question, header, options, multiSelect, roomId } = data;
-        if (!question || !roomId) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'question and roomId are required' }));
-          return;
-        }
-
-        const questionId = String(++mcpQuestionCounter);
-
-        const expiryTimer = setTimeout(() => expireMcpQuestion(questionId), ASK_USER_TIMEOUT_MS);
-        if (expiryTimer.unref) expiryTimer.unref();
-        pendingMcpQuestions.set(questionId, {
-          question, header, options, roomId,
-          answered: false, answer: null,
-          expired: false, expiryTimer,
-          // Seed the poll stamp so the liveness guard counts the question as
-          // live during the ~500ms before the MCP server's first poll arrives.
-          lastPolledAt: Date.now(),
-        });
-
-        const activeSession = sessions.get(roomId);
-
-        if (activeSession) {
-          const parsed = {
-            questions: [{
-              question,
-              header: header || null,
-              options: options || [],
-              multiSelect: multiSelect || false,
-            }]
-          };
-
-          if (activeSession.typingInterval) {
-            clearInterval(activeSession.typingInterval);
-            activeSession.typingInterval = null;
-          }
-
-          activeSession.waitingForAnswer = `mcp:${questionId}`;
-          activeSession.pendingQuestions = parsed.questions;
-          activeSession.currentQuestionIndex = 0;
-          activeSession.questionAnswers = [];
-          activeSession.responseBuffer = '';
-
-          if (activeSession.sendCallback) {
-            sendAllQuestions(activeSession);
-          }
-        }
-
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ questionId, timeoutMs: ASK_USER_TIMEOUT_MS }));
-        return;
-      }
 
       if (url.pathname === '/secret') {
         const { label, roomId } = data;
@@ -4907,11 +4712,6 @@ function killSession(session, signal = 'SIGTERM') {
   if (session.subagentWatcher) {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
-  }
-  // Drop any pending MCP questions for this room — the MCP server that
-  // owns them died with the session, so the entries would otherwise leak.
-  for (const [qid, entry] of pendingMcpQuestions) {
-    if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
   }
   if (!session.alive) return;
   try {
