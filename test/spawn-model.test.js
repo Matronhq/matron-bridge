@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -57,11 +57,19 @@ describe('resolveSpawnModel', () => {
 });
 
 describe('readSpawnModel / writeSpawnModel', () => {
-  const tmp = path.join(os.tmpdir(), `bridge-cfg-test-${process.pid}.json`);
-  afterEach(() => { try { fs.unlinkSync(tmp); } catch { /* ignore */ } });
+  // A unique, securely-permissioned temp dir per test (mkdtempSync) rather than a
+  // predictable name in the shared /tmp root — avoids the symlink/predictable-path
+  // class CodeQL flags as "insecure temporary file".
+  let dir;
+  let tmp;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-cfg-test-'));
+    tmp = path.join(dir, 'config.json');
+  });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('returns null when the file is missing or malformed', () => {
-    expect(readSpawnModel(path.join(os.tmpdir(), 'definitely-not-here.json'))).toBe(null);
+    expect(readSpawnModel(path.join(dir, 'definitely-not-here.json'))).toBe(null);
     fs.writeFileSync(tmp, 'not json');
     expect(readSpawnModel(tmp)).toBe(null);
   });
