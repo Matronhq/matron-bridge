@@ -796,6 +796,25 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 // Surface a detected TUI prompt to Matrix as a multiple-choice question.
 function handleInteractivePrompt(session, prompt) {
   if (!session.sendHtml && !session.sendCallback) return;
+  // Prefer native buttons when the prompt is a clean selection menu and a
+  // button channel is wired. promptButtons returns null for free-text /
+  // multi-select / unlabelable prompts, which fall through to the text
+  // rendering below. pendingInteractivePrompt is set by the caller
+  // (iv.on('prompt')) regardless, so a tap routes via the prompt-opt handler.
+  if (session.sendButtonMessage) {
+    const b = promptButtons(prompt);
+    if (b) {
+      const header = prompt.question || 'Claude is asking';
+      const plain = ['Claude is asking:', prompt.question || '', '',
+        ...b.buttons.map((bt, i) => `${i + 1}. ${bt.label}`)].filter(Boolean).join('\n');
+      const htmlOpts = b.buttons.map(bt => `<b>${escapeHtml(bt.label)}</b>`).join(' · ');
+      const html = `<b>🟡 Claude is asking:</b>` +
+        (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
+        `<br/><br/>${htmlOpts}`;
+      session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
+      return;
+    }
+  }
   const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
   // When the prompt has a detected free-text slot (e.g. "Tell Claude what
   // to change"), tell the user they can reply with text directly. We'll
