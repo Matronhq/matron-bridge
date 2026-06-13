@@ -3732,7 +3732,18 @@ client.on('room.message', async (roomId, event) => {
 
   // iv-mode: route reply to a pending TUI prompt before treating it as a
   // normal message. If we consumed it as a prompt response, return.
-  if (session.iv && maybeResolveInteractivePrompt(session, text)) {
+  //
+  // Skip this for button responses: TUI prompts are only ever surfaced as text
+  // (handleInteractivePrompt never uses buttons), so a button tap is an
+  // explicit bridge action (effort:/model:/interrupt/cancel:), never a prompt
+  // answer. Without this guard, tapping an effort/model picker while a TUI
+  // prompt is pending — e.g. the "Change effort level?" confirm raised by a
+  // prior effort tap — hits maybeResolve's unmatched path, which nulls
+  // pendingInteractivePrompt WITHOUT answering the TUI and falls through, so
+  // the button value then types a stray /effort|/model into the still-open
+  // menu, desyncing the PTY and dropping the real confirmation.
+  const isButtonResponse = !!event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
+  if (session.iv && !isButtonResponse && maybeResolveInteractivePrompt(session, text)) {
     return;
   }
 
