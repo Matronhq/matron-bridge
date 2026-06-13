@@ -19,6 +19,7 @@ import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
+import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { isMcpQuestionAbandoned } from './lib/mcp-question-gate.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -3810,6 +3811,21 @@ client.on('room.message', async (roomId, event) => {
     const effortMatch = value.match(/^effort:(.+)$/);
     if (effortMatch) {
       switchEffortInSession(session, effortMatch[1], sendReply);
+      return;
+    }
+
+    // Detected-prompt button — value is `prompt-opt:<index>`. Drive the open
+    // TUI menu via keystrokes (the only correct iv-mode answer channel). The
+    // fix/effort-command guard already skips maybeResolveInteractivePrompt for
+    // button responses, so this won't be mis-consumed as a typed reply.
+    const promptOptMatch = value.match(/^prompt-opt:(\d+)$/);
+    if (promptOptMatch) {
+      const p = session.pendingInteractivePrompt;
+      const resp = p ? promptResponseForButton(p, Number(promptOptMatch[1])) : null;
+      if (p && resp && session.iv && session.iv.alive) {
+        session.pendingInteractivePrompt = null;
+        session.iv.respondToPrompt(resp);
+      }
       return;
     }
 
