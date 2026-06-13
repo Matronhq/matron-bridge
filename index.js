@@ -1100,10 +1100,10 @@ function handleUnclassifiedPrompt(session, { screen }) {
     .join('\n')
     .slice(0, 1500);
   if (!cleaned) return;
-  const plain = `⚠️ Claude is waiting for input I couldn't turn into buttons. Reply with the option number (or text) to answer:\n\n${cleaned}`;
+  const plain = `⚠️ Claude is waiting for input I couldn't turn into buttons. Reply with the option number shown (or send !esc to cancel):\n\n${cleaned}`;
   const html =
     `<b>⚠️ Claude is waiting for input I couldn't parse into buttons.</b><br/>` +
-    `Reply with the option number (or text) to answer:<br/><pre>${escapeHtml(cleaned)}</pre>`;
+    `Reply with the option number shown (or send <code>!esc</code> to cancel):<br/><pre>${escapeHtml(cleaned)}</pre>`;
   if (session.sendHtml) session.sendHtml(plain, html);
   else session.sendCallback(plain);
   session.pendingUnclassifiedPrompt = true;
@@ -3791,18 +3791,28 @@ client.on('room.message', async (roomId, event) => {
     return;
   }
 
-  // Best-effort reply to a detector-missed menu surfaced via
-  // handleUnclassifiedPrompt: a bare number/letter is sent as raw keystrokes
-  // (sendText's bracketed paste wouldn't drive an open TUI selection). Anything
-  // else clears the flag and routes as a normal message.
+  // Reply to a detector-missed menu surfaced via handleUnclassifiedPrompt. A
+  // bare option number/letter is driven into the open TUI selection through
+  // respondToPrompt (sends the digits/letter then a delayed Enter, like a
+  // classified prompt — bracketed-paste sendText wouldn't select). Any OTHER
+  // reply is NOT typed into the menu (that would desync the PTY): we keep the
+  // prompt pending and tell the user how to answer or cancel.
   if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !isButtonResponse) {
-    session.pendingUnclassifiedPrompt = false;
     const sel = text.trim();
-    if (/^\d{1,3}$/.test(sel) || /^[a-zA-Z]$/.test(sel)) {
-      for (const ch of sel) session.iv.sendKeystroke(ch);
-      session.iv.sendKeystroke('enter');
+    if (/^\d{1,3}$/.test(sel)) {
+      session.pendingUnclassifiedPrompt = false;
+      session.iv.respondToPrompt({ kind: 'numbered', key: sel });
       return;
     }
+    if (/^[a-zA-Z]$/.test(sel)) {
+      session.pendingUnclassifiedPrompt = false;
+      session.iv.respondToPrompt({ kind: 'lettered', key: sel });
+      return;
+    }
+    const guide = "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.";
+    if (session.sendHtml) session.sendHtml(guide, escapeHtml(guide));
+    else if (session.sendCallback) session.sendCallback(guide);
+    return;
   }
 
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
@@ -4028,6 +4038,9 @@ client.on('room.message', async (roomId, event) => {
     if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
       try {
         session.iv.sendKeystroke('esc');
+        // Esc dismisses any open menu, so a best-effort unclassified-prompt is
+        // no longer pending.
+        session.pendingUnclassifiedPrompt = false;
         // Clear bridge-side busy state since claude won't fire a Stop
         // hook after a user-cancelled turn — leaving busy=true would
         // queue every subsequent message.
