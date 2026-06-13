@@ -18,6 +18,7 @@ import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
+import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { isMcpQuestionAbandoned } from './lib/mcp-question-gate.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -2549,6 +2550,7 @@ const MATRON_COMMANDS = [
   { command: 'working', description: 'Toggle tool call visibility' },
   { command: 'mcp', description: 'Show MCP server status' },
   { command: 'model', description: 'Show current model' },
+  { command: 'effort', args: '[level]', description: 'Show or set effort level' },
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
   { command: 'tools', description: 'List available tools' },
@@ -3341,6 +3343,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/working — Toggle tool call visibility\n` +
         `/mcp — Show MCP server status\n` +
         `/model — Show current model\n` +
+        `/effort [level] — Show or set effort level\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/tools — List available tools\n` +
@@ -3375,6 +3378,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/working', 'Toggle tool call visibility'],
           ['/mcp', 'Show MCP server status'],
           ['/model', 'Show current model'],
+          ['/effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/tools', 'List available tools'],
@@ -3475,6 +3479,38 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
       } else {
         await sendReply(`${currentLine}${extra}\n\nSwitching models needs interactive mode.`);
+      }
+      break;
+    }
+
+    case '!effort': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session to set the effort level.');
+        break;
+      }
+      const arg = parts[1];
+      if (arg) {
+        switchEffortInSession(session, arg, sendReply);
+        break;
+      }
+      // No-arg: offer buttons. Bare /effort in the TUI opens a "Change effort
+      // level?" arrow-menu the bridge can't drive (paste+Enter just opens it
+      // and leaves it hanging), so present the levels as Matrix buttons and
+      // dispatch the pick back through switchEffortInSession (which sends
+      // `/effort <level>` inline — no picker).
+      if (session.iv) {
+        if (session.sendButtonMessage) {
+          const buttons = effortButtons();
+          const plain = `Effort level\n\nTap a level to set it, or type /effort <level>.`;
+          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+          const html = `<b>🎚️ Effort level</b><br/><br/>Tap a level to set it for this session, or type <code>/effort &lt;level&gt;</code>.<br/>${htmlButtons}`;
+          session.sendButtonMessage('Effort level', buttons, 'pick_one', plain, html);
+        } else {
+          await sendReply(`Type /effort <level> to set the effort level. Options: ${VALID_EFFORT_HINT}.`);
+        }
+      } else {
+        await sendReply(`Changing effort needs interactive mode. Options: ${VALID_EFFORT_HINT}.`);
       }
       break;
     }
@@ -3632,7 +3668,7 @@ client.on('room.message', async (roomId, event) => {
     const bridgeCommandNames = new Set([
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'cost', 'usage', 'tools',
+      'mcp', 'model', 'effort', 'cost', 'usage', 'tools',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -3756,6 +3792,13 @@ client.on('room.message', async (roomId, event) => {
     const modelMatch = value.match(/^model:(.+)$/);
     if (modelMatch) {
       switchModelInSession(session, modelMatch[1], sendReply);
+      return;
+    }
+
+    // Effort picker button (no-arg /effort) — value is `effort:<level>`.
+    const effortMatch = value.match(/^effort:(.+)$/);
+    if (effortMatch) {
+      switchEffortInSession(session, effortMatch[1], sendReply);
       return;
     }
 
