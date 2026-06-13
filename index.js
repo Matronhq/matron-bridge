@@ -810,6 +810,9 @@ async function handleInteractivePrompt(session, prompt) {
       const html = `<b>🟡 Claude is asking:</b>` +
         (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
         `<br/><br/>${htmlOpts}`;
+      // If a newer prompt superseded this one while we were composing, bail —
+      // don't post buttons for a stale prompt against the current TUI menu.
+      if (session.pendingInteractivePrompt !== prompt) return;
       // sendButtonMessage returns null if the Matrix send fails. Fall through
       // to the text rendering below in that case so the prompt is never
       // silently dropped while the TUI waits for an answer.
@@ -817,6 +820,10 @@ async function handleInteractivePrompt(session, prompt) {
       if (sent != null) return;
     }
   }
+  // Bail if this prompt is no longer current — a newer prompt superseded it
+  // (e.g. arrived during the button send above) or it was already resolved.
+  // Don't post a stale text prompt against the current TUI menu.
+  if (session.pendingInteractivePrompt !== prompt) return;
   const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
   // When the prompt has a detected free-text slot (e.g. "Tell Claude what
   // to change"), tell the user they can reply with text directly. We'll
@@ -3797,7 +3804,11 @@ client.on('room.message', async (roomId, event) => {
   // classified prompt — bracketed-paste sendText wouldn't select). Any OTHER
   // reply is NOT typed into the menu (that would desync the PTY): we keep the
   // prompt pending and tell the user how to answer or cancel.
-  if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !isButtonResponse) {
+  // `!`-prefixed rescue commands (!esc/!enter/!stop/…) must pass through to
+  // their handlers below — the unclassified notice tells the user to send !esc
+  // to cancel, so we must not swallow it here.
+  if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !isButtonResponse
+      && !text.trim().startsWith('!')) {
     const sel = text.trim();
     if (/^\d{1,3}$/.test(sel)) {
       session.pendingUnclassifiedPrompt = false;
