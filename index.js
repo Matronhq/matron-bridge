@@ -1508,6 +1508,14 @@ function handleClaudeEvent(session, event) {
 
         if (toolName === 'AskUserQuestion') {
           debug(`AskUserQuestion tool_use block.id=${block.id}, waitingForAnswer=${session.waitingForAnswer}, input keys=${Object.keys(input).join(',')}`);
+          // iv-mode: the AskUserQuestion menu renders in the TUI and is surfaced
+          // + answered via the PromptDetector path (handleInteractivePrompt +
+          // respondToPrompt keystrokes). Surfacing it again here as buttons
+          // would duplicate the prompt, and the button answer would route via
+          // sendTextToSession (a regular message), which can't drive the open
+          // menu. So this transcript→buttons path is print-mode only — matching
+          // the sibling tool_result flow (see resolveQuestionAnswer).
+          if (session.iv) { debug('iv-mode: AskUserQuestion owned by PTY detector'); continue; }
           if (session.waitingForAnswer) { debug('Skipping AskUserQuestion — already waiting'); continue; }
 
           const parsed = parseAskUserQuestion(input);
