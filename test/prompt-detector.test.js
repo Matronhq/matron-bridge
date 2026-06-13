@@ -1,5 +1,10 @@
 import { describe, it, test, expect } from 'vitest';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu } from '../lib/prompt-detector.js';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText } from '../lib/prompt-detector.js';
+
+const __dir = path.dirname(fileURLToPath(import.meta.url));
 
 describe('stripAnsi', () => {
   it('removes color codes', () => {
@@ -1019,6 +1024,61 @@ describe('classifyScreen — option descriptions (AskUserQuestion-style)', () =>
     expect(r.options[2].description).toBeUndefined();
     // "Type something." is detected as the free-text slot.
     expect(r.freeTextIdx).toBe(2);
+  });
+});
+
+describe('extractPreamble', () => {
+  // Real AskUserQuestion render captured from a live PTY session (stripped +
+  // blank-collapsed), saved as a fixture. The detector must recover the prose
+  // claude wrote above the menu, without the question/options/chrome.
+  const render = fs.readFileSync(path.join(__dir, 'fixtures', 'auq-preamble-render.txt'), 'utf-8');
+  const question = "Once I extract Claude's explanatory paragraph from the live screen and show it before the question, what should happen to the clean copy that still arrives from the transcript after you answer?";
+
+  it('recovers the prose above the menu from a real render', () => {
+    const { preamble, complete } = extractPreamble(render, { question });
+    expect(complete).toBe(true);
+    expect(preamble).toContain('controlled capture');
+    expect(preamble).toContain('live-demonstrates the bug');
+    // Must NOT include the question text or the option labels.
+    expect(preamble).not.toContain('what should happen to the clean copy');
+    expect(preamble).not.toContain('Suppress the duplicate');
+    expect(preamble).not.toContain('Keep it');
+  });
+
+  it('returns incomplete for input with no menu/question widget', () => {
+    expect(extractPreamble('just some plain output, nothing to pick', { question })).toEqual({ preamble: '', complete: false });
+    expect(extractPreamble('', { question })).toEqual({ preamble: '', complete: false });
+    expect(extractPreamble(render, null)).toEqual({ preamble: '', complete: false });
+  });
+
+  it('strips ANSI and collapses blank runs before extracting', () => {
+    const raw = [
+      '\x1b[2m●\x1b[0m Here is my reasoning about the choice.',
+      '', '', '', '',  // blank run (spinner artifact)
+      'What would you like?',
+      '1. Alpha',
+      '   does A',
+      '2. Beta',
+    ].join('\n');
+    const { preamble, complete } = extractPreamble(raw, { question: 'What would you like?' });
+    expect(complete).toBe(true);
+    expect(preamble).toContain('Here is my reasoning about the choice');
+    expect(preamble).not.toContain('Alpha');
+  });
+});
+
+describe('preambleMatchesText', () => {
+  it('matches the same prose despite minor glyph glitches', () => {
+    const captured = 'I reviewed the batch and found eight issues across CI and the editor navigator';
+    const transcript = 'I reviewed the batch and found eight issues across CI and the editor navigator pipeline.';
+    expect(preambleMatchesText(captured, transcript)).toBe(true);
+  });
+  it('does not match unrelated text', () => {
+    expect(preambleMatchesText('the quick brown fox jumps over lazy dogs today', 'completely different sentence about weather and rain')).toBe(false);
+  });
+  it('returns false for empty or tiny inputs', () => {
+    expect(preambleMatchesText('', 'anything here at all')).toBe(false);
+    expect(preambleMatchesText('two words', 'two words')).toBe(false);
   });
 });
 
