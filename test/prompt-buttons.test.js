@@ -38,6 +38,7 @@ describe('promptButtons', () => {
 
   it('returns null (→ text fallback) for a free-text slot', () => {
     expect(promptButtons({ ...numbered, freeTextIdx: 1 })).toBeNull();
+    expect(promptButtons({ ...numbered, freeTextIdx: 0 })).toBeNull();
   });
 
   it('returns null for multiSelect, no options, or empty labels', () => {
@@ -63,5 +64,6 @@ describe('promptResponseForButton', () => {
     expect(promptResponseForButton(numbered, 5)).toBeNull();
     expect(promptResponseForButton(numbered, -1)).toBeNull();
     expect(promptResponseForButton(null, 0)).toBeNull();
+    expect(promptResponseForButton({ kind: 'numbered', options: [{ label: 'Foo' }], freeTextIdx: null }, 0)).toBeNull();
   });
 });
