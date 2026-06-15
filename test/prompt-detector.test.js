@@ -1067,6 +1067,51 @@ describe('extractPreamble', () => {
   });
 });
 
+describe('extractPreamble — noisy real capture (todo widget + spinner + queued msg)', () => {
+  // Real @compiled-scope AskUserQuestion render captured live. Between claude's
+  // prose and the menu the raw PTY buffer interleaves: a TodoWrite widget
+  // (repainted ~4×, some frames garbled by redraw), a spinner status line, and
+  // a *queued user message* echoed in scrollback. The greedy extractor swept
+  // all of that into the surfaced preamble; the tightened one must not.
+  const noisy = fs.readFileSync(path.join(__dir, 'fixtures', 'auq-preamble-noisy.txt'), 'utf-8');
+  const prompt = {
+    kind: 'numbered',
+    question: 'How far should the @compiled migration go in this work?',
+    options: [
+      { key: '1', label: 'New + components we replace' },
+      { key: '2', label: 'New components only' },
+      { key: '3', label: 'Migrate the whole editor now' },
+      { key: '4', label: 'Type something.' },
+    ],
+  };
+
+  it('recovers the real prose', () => {
+    const { preamble, complete } = extractPreamble(noisy, prompt);
+    expect(complete).toBe(true);
+    expect(preamble).toContain('Good news on feasibility');
+    expect(preamble).toContain('The only real decision is how much to migrate now');
+  });
+
+  it('drops the TodoWrite widget chrome', () => {
+    const { preamble } = extractPreamble(noisy, prompt);
+    expect(preamble).not.toMatch(/\d+\s+tasks?\s+\(\d+\s+done/i); // "7 tasks (2 done, …)"
+    expect(preamble).not.toContain('+2 completed');
+    // garbled todo items leaked through the old looksLikeProse filter
+    expect(preamble).not.toContain('opose 2-3 integrat');
+  });
+
+  it('drops the spinner status line', () => {
+    const { preamble } = extractPreamble(noisy, prompt);
+    expect(preamble).not.toContain('Asking clarifying questions');
+    expect(preamble).not.toMatch(/[↑↓]\s*[\d.]+k?\s+tokens/i); // "↓ 39.6k tokens"
+  });
+
+  it('drops the queued user message echoed in scrollback', () => {
+    const { preamble } = extractPreamble(noisy, prompt);
+    expect(preamble).not.toContain('should we bring the editor out of vite');
+  });
+});
+
 describe('preambleMatchesText', () => {
   it('matches the same prose despite minor glyph glitches', () => {
     const captured = 'I reviewed the batch and found eight issues across CI and the editor navigator';

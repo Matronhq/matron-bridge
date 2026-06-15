@@ -20,6 +20,7 @@ import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
+import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -912,88 +913,109 @@ function maybeResolveInteractivePrompt(session, userText) {
   const p = session.pendingInteractivePrompt;
   if (!p) return false;
   const trimmed = (userText || '').trim().toLowerCase();
-  let response = null;
+
+  // Confirm to the Matrix user what we sent on their behalf (without this the
+  // consumption is invisible) and start a typing indicator for the next render.
+  const ack = (label, { numberPrefix = '', note = '' } = {}) => {
+    const tail = note ? ` ${note}` : '';
+    const plain = `→ Sent "${numberPrefix}${label}" to Claude${tail}`;
+    const html = `<i>→ Sent <b>${escapeHtml(numberPrefix + label)}</b> to Claude${escapeHtml(tail)}</i>`;
+    if (session.sendHtml) session.sendHtml(plain, html);
+    else if (session.sendCallback) session.sendCallback(plain);
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
+  };
+
+  // Select the free-text slot ("Tell Claude what to change" / "Type something"),
+  // then — after the TUI transitions from the menu into the text input — paste
+  // the user's reply (sendText does the bracketed-paste + delayed Enter dance).
+  const routeFreeText = (replyText) => {
+    const idx = p.freeTextIdx;
+    const opt = p.options[idx];
+    const ftResponse = p.kind === 'arrow-menu'
+      ? { kind: 'arrow-menu', key: String(idx) }
+      : { kind: p.kind, key: opt.key };
+    session.pendingInteractivePrompt = null;
+    session.iv.respondToPrompt(ftResponse);
+    setTimeout(() => {
+      if (session.iv && session.iv.alive) session.iv.sendText(replyText);
+    }, 250);
+  };
+
+  // yes-no: a binary confirm with no option list or free-text slot.
   if (p.kind === 'yes-no') {
-    if (/^(y|yes|1)$/.test(trimmed)) response = { kind: 'yes-no', key: 'y' };
-    else if (/^(n|no|2)$/.test(trimmed)) response = { kind: 'yes-no', key: 'n' };
-  } else {
-    const n = parseInt(trimmed, 10);
-    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
-      const opt = p.options[n - 1];
-      if (p.kind === 'arrow-menu') {
-        response = { kind: 'arrow-menu', key: String(n - 1) };
-      } else {
-        response = { kind: p.kind, key: opt.key };
-      }
-    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
-      response = { kind: 'lettered', key: trimmed };
+    let response = null, label = null;
+    if (/^(y|yes|1)$/.test(trimmed)) { response = { kind: 'yes-no', key: 'y' }; label = 'Yes'; }
+    else if (/^(n|no|2)$/.test(trimmed)) { response = { kind: 'yes-no', key: 'n' }; label = 'No'; }
+    if (!response) { session.pendingInteractivePrompt = null; return false; }
+    session.pendingInteractivePrompt = null;
+    console.log(`[IV-DEBUG] Resolving yes-no prompt reply="${userText}" → key=${response.key}`);
+    session.iv.respondToPrompt(response);
+    ack(label);
+    return true;
+  }
+
+  // numbered / lettered / arrow-menu. Split the reply into a leading option
+  // token and any appended remark ("1. also use compiled css …"). The old code
+  // ran parseInt() and dropped everything after the number (#82).
+  const hasFreeText = typeof p.freeTextIdx === 'number'
+    && p.freeTextIdx >= 0 && p.freeTextIdx < p.options.length;
+  const { token, extra } = parseOptionReply(userText);
+  let optIdx = -1;
+  if (token != null) {
+    if (/^\d+$/.test(token)) {
+      const n = parseInt(token, 10);
+      if (n >= 1 && n <= p.options.length) optIdx = n - 1;
+    } else if (p.kind === 'lettered') {
+      optIdx = p.options.findIndex(o => (o.key || '').toLowerCase() === token.toLowerCase());
     }
   }
-  if (!response) {
-    // No numeric/letter match. If the prompt has a free-text slot (e.g.
-    // "Tell Claude what to change"), select that option and pipe the
-    // user's text into the TUI's text input. Otherwise, ask the user to
-    // retry with a valid option.
-    if (typeof p.freeTextIdx === 'number' && p.freeTextIdx >= 0 && p.freeTextIdx < p.options.length) {
-      const idx = p.freeTextIdx;
-      const opt = p.options[idx];
-      const ftResponse = p.kind === 'arrow-menu'
-        ? { kind: 'arrow-menu', key: String(idx) }
+
+  if (optIdx >= 0) {
+    const opt = p.options[optIdx];
+    const numberPrefix = `${optIdx + 1}. `;
+    if (extra) {
+      // Option pick WITH an appended remark. Route through the free-text slot
+      // so BOTH the choice and the remark reach claude — the user's literal
+      // reply ("1. also use compiled css…") already names the option.
+      if (hasFreeText) {
+        console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} + remark via free-text slot`);
+        routeFreeText(userText);
+        ack(opt.label, { numberPrefix, note: '(with your note)' });
+        return true;
+      }
+      // No free-text channel on this menu — the choice goes through but the
+      // remark can't ride along. Send the pick and tell the user.
+      const response = p.kind === 'arrow-menu'
+        ? { kind: 'arrow-menu', key: String(optIdx) }
         : { kind: p.kind, key: opt.key };
       session.pendingInteractivePrompt = null;
-      session.iv.respondToPrompt(ftResponse);
-      // Give the TUI a beat to transition from the menu into the text
-      // input area, then paste the user's reply (sendText handles the
-      // bracketed-paste + delayed Enter dance).
-      setTimeout(() => {
-        if (session.iv && session.iv.alive) {
-          session.iv.sendText(userText);
-        }
-      }, 250);
+      console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} (remark dropped: no free-text slot)`);
+      session.iv.respondToPrompt(response);
+      ack(opt.label, { numberPrefix, note: "— couldn't attach your note to this menu; send it as a separate message" });
       return true;
     }
-    // Unmatched reply: dismiss the prompt and let the message through to
-    // Claude as normal input. This prevents false-positive detections from
-    // blocking the user's free-form messages.
+    // Bare option pick.
+    const response = p.kind === 'arrow-menu'
+      ? { kind: 'arrow-menu', key: String(optIdx) }
+      : { kind: p.kind, key: opt.key };
     session.pendingInteractivePrompt = null;
-    return false;
+    console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → kind=${response.kind} key=${response.key} label="${opt.label}"`);
+    session.iv.respondToPrompt(response);
+    ack(opt.label, { numberPrefix });
+    return true;
   }
-  // Resolve the human-readable label so the Matrix confirmation tells the
-  // user *what* we sent to claude — without this, the bridge silently
-  // consumed the reply and the user thought it had been ignored.
-  let pickedLabel = null;
-  let pickedNumber = null;
-  if (p.kind === 'yes-no') {
-    pickedLabel = response.key === 'y' ? 'Yes' : 'No';
-  } else {
-    const n = parseInt(trimmed, 10);
-    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
-      pickedNumber = n;
-      pickedLabel = p.options[n - 1].label;
-    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
-      const opt = p.options.find(o => o.key === trimmed);
-      pickedLabel = opt ? opt.label : trimmed.toUpperCase();
-    }
+
+  // No valid option named. Route to the free-text slot if present; otherwise
+  // dismiss the prompt and let the message through to claude as a normal turn
+  // (prevents false-positive detections from blocking free-form messages).
+  if (hasFreeText) {
+    console.log(`[IV-DEBUG] Routing unmatched reply="${userText}" to free-text slot`);
+    routeFreeText(userText);
+    return true;
   }
   session.pendingInteractivePrompt = null;
-  console.log(
-    `[IV-DEBUG] Resolving TUI prompt with reply="${userText}" → ` +
-    `kind=${response.kind} key=${response.key}` +
-    (pickedLabel ? ` label="${pickedLabel}"` : '')
-  );
-  session.iv.respondToPrompt(response);
-  // Tell the Matrix user we received their reply and what we sent on
-  // their behalf. Without this the consumption is invisible.
-  const numberPrefix = pickedNumber !== null ? `${pickedNumber}. ` : '';
-  const ackPlain = `→ Sent "${numberPrefix}${pickedLabel || response.key}" to Claude`;
-  const ackHtml = `<i>→ Sent <b>${escapeHtml(numberPrefix + (pickedLabel || response.key))}</b> to Claude</i>`;
-  if (session.sendHtml) session.sendHtml(ackPlain, ackHtml);
-  else if (session.sendCallback) session.sendCallback(ackPlain);
-  // Start typing while we wait for claude's next render — without this
-  // the user sees no activity until the next prompt or text fires.
-  if (session.typingInterval) clearInterval(session.typingInterval);
-  session.typingInterval = startTyping(session.roomId);
-  return true;
+  return false;
 }
 
 // Iteratively rejoin URLs that claude wrapped at terminal width. We only
