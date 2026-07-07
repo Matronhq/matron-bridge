@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { switchModelInSession, modelButtons } from '../lib/model-command.js';
+import { switchModelInSession, modelButtons, planPrintModelSwitch } from '../lib/model-command.js';
 
 function fakeSession({ iv = null, currentModel = null } = {}) {
   const sent = [];
@@ -81,5 +81,24 @@ describe('modelButtons', () => {
     expect(buttons.find(b => b.label === 'Opus 1M')).toEqual({
       id: 'model-opus[1m]', label: 'Opus 1M', value: 'model:opus[1m]',
     });
+  });
+});
+
+describe('planPrintModelSwitch', () => {
+  it('approves a valid alias and returns the normalized value', () => {
+    const d = planPrintModelSwitch({ busy: false }, '  SONNET ');
+    expect(d.ok).toBe(true);
+    expect(d.normalized).toBe('sonnet');
+    expect(d.message).toMatch(/Sonnet/);
+  });
+  it('rejects an unknown alias', () => {
+    const d = planPrintModelSwitch({ busy: false }, 'banana');
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/Unknown model/);
+  });
+  it('refuses while the session is busy', () => {
+    const d = planPrintModelSwitch({ busy: true }, 'sonnet');
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/turn/i);
   });
 });
