@@ -18,6 +18,7 @@ import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } 
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons } from './lib/model-command.js';
+import { resolveInteractive, resolveModel } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
@@ -278,7 +279,13 @@ function getPersistedSession(roomId) {
 const sessions = new Map(); // roomId -> session
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
-  if (INTERACTIVE_MODE) {
+  const persistedMode = getPersistedSession(roomId);
+  const interactive = resolveInteractive({
+    option: options.interactive,
+    persisted: persistedMode?.interactiveMode,
+    fallback: INTERACTIVE_MODE,
+  });
+  if (interactive) {
     return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
@@ -324,6 +331,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       },
     }),
   ];
+  const printModel = resolveModel({ option: options.model, persisted: persistedMode?.model });
+  if (printModel) {
+    args.push('--model', printModel);
+  }
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId);
   }
@@ -510,6 +521,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const sessionId = resumeSessionId || randomUUID();
+  const model = resolveModel({ option: options.model, persisted: persistedForRoom?.model });
 
   const settings = {
     hooks: {
@@ -550,6 +562,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify(settings),
   );
+  if (model) {
+    claudeArgs.push('--model', model);
+  }
 
   const nodeBinDir = path.dirname(process.execPath);
   const existingPath = process.env.PATH || '';
