@@ -80,7 +80,7 @@ describe('planModeSwitch', () => {
     expect(d.message).toMatch(/turn/i);
   });
   it('refuses interactive->print while a TUI prompt is pending', () => {
-    const d = planModeSwitch({ iv: { alive: true }, pendingInteractivePrompt: {} }, false);
+    const d = planModeSwitch({ iv: { alive: true }, claudeSessionId: 'abc', pendingInteractivePrompt: {} }, false);
     expect(d.ok).toBe(false);
     expect(d.message).toMatch(/question/i);
   });
@@ -89,8 +89,13 @@ describe('planModeSwitch', () => {
     expect(d.ok).toBe(false);
     expect(d.message).toMatch(/resuming/i);
   });
+  it('refuses while the session has no id yet (fresh print session)', () => {
+    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: null }, true);
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/starting up/i);
+  });
   it('approves a clean switch', () => {
-    const d = planModeSwitch({ iv: null, busy: false }, true);
+    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc' }, true);
     expect(d.ok).toBe(true);
     expect(d.message).toMatch(/interactive/i);
   });
