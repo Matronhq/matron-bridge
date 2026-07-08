@@ -31,6 +31,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -2708,6 +2709,7 @@ const MATRON_COMMANDS = [
   { command: 'effort', args: '[level]', description: 'Show or set effort level' },
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
+  { command: 'limits', description: 'Show subscription usage limits' },
   { command: 'tools', description: 'List available tools' },
   { command: 'help', description: 'Show all commands' },
 ];
@@ -3035,6 +3037,33 @@ async function buildMediaContentBlocks(event, session) {
 }
 
 // --- Command Handler ---
+
+// Run `claude -p "/usage"` as a one-shot and return its stdout. stdin is
+// ignored (not a pipe) so Claude Code doesn't wait ~3s for stdin data. Rejects
+// on spawn error, non-zero exit, or a 30s timeout. Used by the /limits command.
+function fetchUsageLimitsText(cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('claude', ['-p', '/usage', '--output-format', 'text'], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (fn, arg) => { if (!settled) { settled = true; clearTimeout(timer); fn(arg); } };
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+      finish(reject, new Error('timed out'));
+    }, 30000);
+    proc.stdout.on('data', (d) => { stdout += d; });
+    proc.stderr.on('data', (d) => { stderr += d; });
+    proc.on('error', (e) => finish(reject, e));
+    proc.on('close', (code) => {
+      if (code === 0) finish(resolve, stdout);
+      else finish(reject, new Error(stderr.trim() || `claude exited with code ${code}`));
+    });
+  });
+}
 
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const parts = text.split(/\s+/);
@@ -3490,6 +3519,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/mode [interactive|print] — Show or switch interactive vs non-interactive\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
+        `/limits — Show subscription usage limits (session & weekly)\n` +
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room for the session.\n` +
@@ -3526,6 +3556,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
+          ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
           ['/tools', 'List available tools'],
           ['/help', 'Show this help message'],
         ]) +
@@ -3745,6 +3776,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!limits': {
+      // Subscription rate limits (5-hour session + weekly) aren't in the
+      // stream-json the bridge parses and there's no `claude usage` subcommand,
+      // so shell out to `claude -p "/usage"` and let Claude Code report them.
+      // This is a global query — no active session required.
+      try {
+        const cwd = sessions.get(roomId)?.workdir || DEFAULT_WORKDIR;
+        const raw = await fetchUsageLimitsText(cwd);
+        const parsed = parseUsageLimits(raw);
+        const { plain, html } = formatLimits(parsed, raw);
+        await sendHtml(plain, html);
+      } catch (e) {
+        await sendReply(`Couldn't fetch usage limits: ${e.message}`);
+      }
+      break;
+    }
+
     case '!tools': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3851,7 +3899,7 @@ client.on('room.message', async (roomId, event) => {
     const bridgeCommandNames = new Set([
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'mode', 'effort', 'cost', 'usage', 'tools',
+      'mcp', 'model', 'mode', 'effort', 'cost', 'usage', 'limits', 'tools',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
