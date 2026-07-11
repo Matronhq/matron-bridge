@@ -32,6 +32,7 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
+import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -182,11 +183,41 @@ function resolveJournalToken() {
   return (process.env.JOURNAL_TOKEN || '').trim();
 }
 const _journalToken = resolveJournalToken();
-const journalPublisher = createJournalPublisher({ url: JOURNAL_WS_URL, token: _journalToken, log: console });
+// Return path (Matron -> bridge input, this PR): where the inbound cursor is
+// persisted (survives a bridge restart — see lib/journal-publisher.js) and
+// the stable conversation Matron sends session-start/list/help commands
+// into. Both are wired regardless of JOURNAL_ENABLED; they're inert when the
+// publisher is disabled (onEvent never fires on a noop publisher).
+const JOURNAL_CURSOR_FILE = process.env.JOURNAL_CURSOR_FILE
+  ? path.resolve(expandHome(process.env.JOURNAL_CURSOR_FILE))
+  : path.join(__dirname, 'journal-cursor.json');
+const JOURNAL_CONTROL_CONVO_ID = process.env.JOURNAL_CONTROL_CONVO_ID || `bridge-${os.hostname()}`;
+// onEvent is wired to journalHandleInboundEvent, defined later in this file
+// (function declarations are fully hoisted, so the forward reference is
+// safe — onEvent is only ever CALLED once the socket is live, long after the
+// whole module, including `sessions` and the routing functions below, has
+// finished evaluating).
+const journalPublisher = createJournalPublisher({
+  url: JOURNAL_WS_URL, token: _journalToken, log: console,
+  cursorFile: JOURNAL_CURSOR_FILE,
+  onEvent: journalHandleInboundEvent,
+});
 // Used to skip the per-session buffering/bookkeeping entirely when the
 // publisher is a disabled no-op (its methods are already safe no-ops; this
 // just avoids pointless buffers and spurious overflow warnings).
 const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
+
+if (JOURNAL_ENABLED) {
+  // Boot the control convo eagerly — safe even before the WS is connected
+  // (journalPublisher queues FIFO and flushes on connect, same as every
+  // other publish here). No Matrix dependency: this convo has no Matrix
+  // room, only a journal conversation.
+  journalPublisher.upsertConvo(JOURNAL_CONTROL_CONVO_ID, { title: `${os.hostname()} bridge`, sessionState: 'running' });
+  journalPublisher.publishText(JOURNAL_CONTROL_CONVO_ID, {
+    body: 'Bridge online. Commands: "new [directory]" — start a session; "list" — active sessions; "help" — this text.',
+    from: 'assistant',
+  });
+}
 
 function expandHome(p) {
   if (p === '~') return os.homedir();
@@ -310,6 +341,19 @@ function getPersistedSession(roomId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
+
+// Reverse lookup for the journal return path: a journal frame's convo_id is
+// session.claudeSessionId, but `sessions` is keyed by roomId. The session
+// count is small (a handful of concurrent rooms per box), so a linear scan
+// on each inbound event is simpler than maintaining a second map in sync
+// with every place a session is created/restarted/deleted.
+function findSessionByClaudeSessionId(claudeSessionId) {
+  if (!claudeSessionId) return null;
+  for (const session of sessions.values()) {
+    if (session.claudeSessionId === claudeSessionId) return session;
+  }
+  return null;
+}
 
 // --- Journal dual-post mirroring ---
 //
@@ -1117,10 +1161,17 @@ async function handleInteractivePrompt(session, prompt) {
 // If the session has a pending TUI prompt and the user's message looks like
 // a valid response, send the keystroke and return true (so the message isn't
 // also forwarded to claude as a regular user message).
-function maybeResolveInteractivePrompt(session, userText) {
+//
+// mirrorToJournal defaults true (the Matrix path — the journal has no other
+// way of learning the user's answer). The journal input consumer passes
+// false: an answer that arrived AS a journal event (a plain text reply
+// routed here while a TUI prompt happened to be open) must not be
+// re-published — the journal already has the user's own `send` row for it.
+function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = true } = {}) {
   const p = session.pendingInteractivePrompt;
   if (!p) return false;
   const trimmed = (userText || '').trim().toLowerCase();
+  const mirrorAnswer = (text) => { if (mirrorToJournal) journalMirrorUserAnswer(session, text); };
 
   // Confirm to the Matrix user what we sent on their behalf (without this the
   // consumption is invisible) and start a typing indicator for the next render.
@@ -1147,7 +1198,7 @@ function maybeResolveInteractivePrompt(session, userText) {
     session.iv.respondToPrompt(ftResponse);
     // The reply goes in via iv.sendText below (not sendToSession), so mirror
     // the user's answer here — this covers both routeFreeText call sites.
-    journalMirrorUserAnswer(session, replyText);
+    mirrorAnswer(replyText);
     setTimeout(() => {
       if (session.iv && session.iv.alive) session.iv.sendText(replyText);
     }, 250);
@@ -1162,7 +1213,7 @@ function maybeResolveInteractivePrompt(session, userText) {
     session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving yes-no prompt reply="${userText}" → key=${response.key}`);
     session.iv.respondToPrompt(response);
-    journalMirrorUserAnswer(session, label);
+    mirrorAnswer(label);
     ack(label);
     return true;
   }
@@ -1204,7 +1255,7 @@ function maybeResolveInteractivePrompt(session, userText) {
       session.pendingInteractivePrompt = null;
       console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} (remark dropped: no free-text slot)`);
       session.iv.respondToPrompt(response);
-      journalMirrorUserAnswer(session, `${numberPrefix}${opt.label}`);
+      mirrorAnswer(`${numberPrefix}${opt.label}`);
       ack(opt.label, { numberPrefix, note: "— couldn't attach your note to this menu; send it as a separate message" });
       return true;
     }
@@ -1215,7 +1266,7 @@ function maybeResolveInteractivePrompt(session, userText) {
     session.pendingInteractivePrompt = null;
     console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → kind=${response.kind} key=${response.key} label="${opt.label}"`);
     session.iv.respondToPrompt(response);
-    journalMirrorUserAnswer(session, `${numberPrefix}${opt.label}`);
+    mirrorAnswer(`${numberPrefix}${opt.label}`);
     ack(opt.label, { numberPrefix });
     return true;
   }
@@ -1545,7 +1596,12 @@ function sendAllQuestions(session) {
   }
 }
 
-function submitAnswer(session, answerText) {
+// mirrorToJournal defaults true (Matrix path). The journal input consumer
+// passes false when the answer arrived as a journal prompt_reply or plain
+// text event — the journal already has the user's own row for it (the
+// prompt_reply payload, or the text `send` row), so mirroring again here
+// would duplicate it.
+function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
   const mode = session.waitingForAnswer;
   session.waitingForAnswer = null;
   session.pendingQuestions = null;
@@ -1554,7 +1610,7 @@ function submitAnswer(session, answerText) {
 
   if (mode === 'text-reply') {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
-    sendTextToSession(session, answerText);
+    sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal });
   } else {
     // Normal tool_result flow. This path only applies to print-mode stream-
     // json input. In iv-mode, user questions are surfaced and answered via the
@@ -1569,7 +1625,7 @@ function submitAnswer(session, answerText) {
     journalSessionState(session, 'running');
     // This answer goes in via a raw tool_result stdin write (not
     // sendToSession), so mirror the user's side of it here.
-    journalMirrorUserAnswer(session, answerText);
+    if (mirrorToJournal) journalMirrorUserAnswer(session, answerText);
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -2320,7 +2376,12 @@ function flushResponse(session) {
   session.lastActivityAt = Date.now();
 }
 
-function sendToSession(session, contentBlocks) {
+// skipJournalMirror: the journal input consumer's routed text has already
+// been recorded in the journal (the client's own `send` row) — publishing it
+// again here as an agent-sourced echo would duplicate it. Every other caller
+// (Matrix messages, which have no other route into the journal) leaves this
+// false, unchanged from before.
+function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
   if (!session.alive || session._autoStopped) return false;
 
   // Resume-hold gate: while a just-resumed iv session isn't input-ready yet,
@@ -2342,8 +2403,10 @@ function sendToSession(session, contentBlocks) {
   // single choke point every real inbound message flows through (directly for
   // media, via sendTextToSession for plain text), so a message is mirrored
   // exactly once here regardless of caller.
-  const journalText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
-  if (journalText) journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
+  if (!skipJournalMirror) {
+    const journalText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
+    if (journalText) journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
+  }
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
@@ -2398,8 +2461,8 @@ function sendToSession(session, contentBlocks) {
   return true;
 }
 
-function sendTextToSession(session, text) {
-  return sendToSession(session, [{ type: 'text', text }]);
+function sendTextToSession(session, text, opts) {
+  return sendToSession(session, [{ type: 'text', text }], opts);
 }
 
 // Begin holding outgoing messages for a freshly-resumed iv session and start
@@ -2832,12 +2895,20 @@ let botUserId;
 
 // --- Send to Matrix Room ---
 
-async function sendToRoom(roomId, text, html) {
+// skipJournalMirror: set by the journal input consumer's Matrix echoes
+// (e.g. "📱 dan (Matron): <body>") and resolved-answer notices — those exist
+// only so the Matrix room shows what arrived via the journal; mirroring them
+// BACK into the journal as a fresh from:'assistant' text event would be
+// exactly the re-publish loop the return path must avoid (the journal
+// already has the user's own row for that content).
+async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
   // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
   // no active session (control-room chatter) are silently skipped.
-  const journalSession = sessions.get(roomId);
-  if (journalSession) journalPublish(journalSession, 'publishText', { body: text, from: 'assistant' });
+  if (!skipJournalMirror) {
+    const journalSession = sessions.get(roomId);
+    if (journalSession) journalPublish(journalSession, 'publishText', { body: text, from: 'assistant' });
+  }
   const content = {
     msgtype: 'm.text',
     body: text,
@@ -4032,6 +4103,321 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     default:
       break;
   }
+}
+
+// --- Journal Input Consumer (Matron -> bridge; the return path) ---
+//
+// lib/journal-input-router.js owns the filter/dispatch skeleton: the
+// sender-based loop-prevention filter (only user:* is input — agent:*
+// echoes of our own publishes, the common case, are ignored silently),
+// control-convo-vs-session dispatch, and the liberal prompt-choice resolver.
+// It's unit-tested in isolation against fakes; everything below is
+// index.js-specific glue wired in as its injectable interfaces.
+
+// Publish a short assistant-flavored notice directly into a journal convo,
+// bypassing the session-keyed journalPublish buffering — used when there may
+// be no live session object for the target convo (e.g. a reply for a
+// session that no longer exists) or for control-convo replies (which have no
+// Matrix room / session at all). Fails open like every other journal call.
+function journalPublishNotice(convoId, body) {
+  if (!JOURNAL_ENABLED || !convoId) return;
+  try {
+    journalPublisher.publishText(convoId, { body, from: 'assistant' });
+  } catch (e) {
+    try { console.warn(`[journal-input] notice publish failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
+// Echo something into a session's Matrix room WITHOUT re-mirroring it into
+// the journal (sendToRoom's default behavior publishes a from:'assistant'
+// text event for everything it sends — see its own comment — which for an
+// echo of content the journal already has would be exactly the re-publish
+// loop this return path exists to avoid). Fire-and-forget: Matrix delivery
+// failures here must never affect journal-side processing.
+function journalEchoToRoom(session, plain, html) {
+  if (!session || !session.roomId) return;
+  sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
+}
+
+// text -> session. Mirrors the ordering a Matrix reply goes through —
+// pending-TUI-prompt resolution (maybeResolveInteractivePrompt, same
+// parseOptionReply-driven logic a typed Matrix reply uses), the
+// detector-missed "unclassified prompt" menu guard, print-mode
+// AskUserQuestion resolution, THEN busy-queueing, THEN a normal turn — using
+// the exact same session state (queuedMessages, pendingInteractivePrompt,
+// pendingUnclassifiedPrompt) a Matrix message would, rather than a second
+// parallel queue. Every downstream call passes the mirror-bypass flag: the
+// journal already has this text as the client's own `send` row, so nothing
+// here may publish a duplicate agent-sourced echo of it.
+//
+// Scope note (v1): the Matrix handler's plan-mode "build" keyword and
+// !enter/!esc PTY rescue keystrokes are NOT reproduced here — both remain
+// reachable from the session's still-fully-synced Matrix room. Everything
+// else a plain typed reply can do, a Matron text message can do too.
+function journalRouteTextToSession(session, body) {
+  const trimmed = (body || '').trim();
+  if (!trimmed) return;
+
+  if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
+    session.pendingUnclassifiedPrompt = false;
+    return;
+  }
+
+  if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !trimmed.startsWith('!')) {
+    if (/^\d{1,3}$/.test(trimmed)) {
+      session.pendingUnclassifiedPrompt = false;
+      session.iv.respondToPrompt({ kind: 'numbered', key: trimmed }, { resetDetector: false });
+      return;
+    }
+    if (/^[a-zA-Z]$/.test(trimmed)) {
+      session.pendingUnclassifiedPrompt = false;
+      session.iv.respondToPrompt({ kind: 'lettered', key: trimmed }, { resetDetector: false });
+      return;
+    }
+    // Not a valid selector — do NOT type it into the still-open menu (same
+    // PTY-desync risk the Matrix path guards against). Notice instead of
+    // silently dropping it.
+    journalPublishNotice(session.claudeSessionId,
+      "That doesn't look like one of the options. Reply with the option number shown, or use the session's Matrix room to send !esc and cancel the menu.");
+    return;
+  }
+
+  if (session.waitingForAnswer) {
+    const q = session.pendingQuestions?.[0];
+    if (q?.options?.length > 0) {
+      const answer = resolveQuestionAnswer(session, trimmed);
+      const header = q.header ? `${q.header}: ` : '';
+      submitAnswer(session, `${header}${answer}`, { mirrorToJournal: false });
+    } else {
+      submitAnswer(session, trimmed, { mirrorToJournal: false });
+    }
+    return;
+  }
+
+  if (session.busy) {
+    if (!session.queuedMessages) session.queuedMessages = [];
+    session.queuedMessages.push([{ type: 'text', text: trimmed }]);
+    return;
+  }
+
+  sendTextToSession(session, trimmed, { skipJournalMirror: true });
+}
+
+// prompt_reply -> pending prompt. Resolves `choice`/`text` against whichever
+// pending-prompt shape the session currently has, then answers through the
+// SAME primitives a Matrix button tap or typed reply uses
+// (session.iv.respondToPrompt / submitAnswer) — never journalMirrorUserAnswer
+// or submitAnswer's own mirroring path: the prompt_reply journal row already
+// records the user's answer, so mirroring it again would duplicate it.
+// Returns the resolved answer's label (for the Matrix echo), or null if
+// nothing could be resolved (no pending prompt, or an unmatched choice with
+// no usable free text).
+function journalRoutePromptReply(session, { choice, text }) {
+  // iv-mode: a structured, button-shaped pending prompt. promptButtons(p)
+  // reproduces the exact `options` shape journaled for the `prompt` event
+  // (see lib/prompt-buttons.js) — matching against it is matching against
+  // what Matron was actually shown.
+  if (session.iv && session.pendingInteractivePrompt) {
+    const p = session.pendingInteractivePrompt;
+    const built = promptButtons(p);
+    if (built) {
+      const resolved = resolvePromptChoice(built.buttons, choice);
+      if (resolved) {
+        const resp = promptResponseForButton(p, resolved.index);
+        if (resp) {
+          session.pendingInteractivePrompt = null;
+          session.pendingUnclassifiedPrompt = false;
+          session.iv.respondToPrompt(resp);
+          return resolved.option.label;
+        }
+      }
+    }
+    // No option match (or promptButtons() returned null — a free-text-only /
+    // multi-select prompt that was never journaled as structured `prompt`
+    // options in the first place). Fall back to the prompt's own free-text
+    // slot when it has one and Matron sent usable free text.
+    const hasFreeText = typeof p.freeTextIdx === 'number' && p.freeTextIdx >= 0 && p.freeTextIdx < p.options.length;
+    if (hasFreeText && typeof text === 'string' && text.trim()) {
+      const idx = p.freeTextIdx;
+      const opt = p.options[idx];
+      const ftResponse = p.kind === 'arrow-menu' ? { kind: 'arrow-menu', key: String(idx) } : { kind: p.kind, key: opt.key };
+      const freeText = text.trim();
+      session.pendingInteractivePrompt = null;
+      session.iv.respondToPrompt(ftResponse);
+      setTimeout(() => { if (session.iv && session.iv.alive) session.iv.sendText(freeText); }, 250);
+      return freeText;
+    }
+    return null;
+  }
+
+  // print-mode: AskUserQuestion pending. Same option-id convention
+  // sendAllQuestions uses when building Matrix buttons (opt_a, opt_b, …) so a
+  // choice sent by id round-trips correctly.
+  if (session.waitingForAnswer && session.pendingQuestions?.length) {
+    const q = session.pendingQuestions[session.currentQuestionIndex] || session.pendingQuestions[0];
+    const options = (q.options || []).map((opt, idx) => ({
+      id: `opt_${String.fromCharCode(97 + idx)}`,
+      label: typeof opt.label === 'string' ? opt.label : String(opt),
+    }));
+    let answerText;
+    if (options.length > 0) {
+      const resolved = resolvePromptChoice(options, choice);
+      answerText = resolved ? resolved.option.label : (typeof text === 'string' && text.trim() ? text.trim() : null);
+    } else {
+      answerText = typeof text === 'string' && text.trim() ? text.trim() : null;
+    }
+    if (!answerText) return null;
+    const header = q.header ? `${q.header}: ` : '';
+    submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false });
+    return answerText;
+  }
+
+  return null;
+}
+
+// Adapts journalRouteTextToSession to the router's routeTextToSession(session,
+// body, {username}) interface: echoes the incoming message into the
+// session's Matrix room (so the room stays a complete transcript regardless
+// of which client sent a given message), then routes it in.
+function journalOnText(session, body, { username }) {
+  journalEchoToRoom(session, `📱 ${username} (Matron): ${body}`, `📱 <b>${escapeHtml(username)} (Matron):</b> ${escapeHtml(body)}`);
+  try {
+    journalRouteTextToSession(session, body);
+  } catch (e) {
+    console.warn(`[journal-input] routing text to session failed: ${e.message}`);
+    journalPublishNotice(session.claudeSessionId, `⚠️ Could not deliver your message: ${e.message}`);
+  }
+}
+
+// Adapts journalRoutePromptReply to the router's routePromptReply(session,
+// {target_seq, choice, text}, {username}) interface.
+function journalOnPromptReply(session, answer, { username }) {
+  let label;
+  try {
+    label = journalRoutePromptReply(session, answer);
+  } catch (e) {
+    console.warn(`[journal-input] routing prompt_reply failed: ${e.message}`);
+    journalPublishNotice(session.claudeSessionId, `⚠️ Could not deliver your answer: ${e.message}`);
+    return;
+  }
+  if (label == null) {
+    console.warn(`[journal-input] prompt_reply with no resolvable pending prompt for convo=${session.claudeSessionId}`);
+    journalPublishNotice(session.claudeSessionId, "Nothing to answer right now — there's no open prompt in this session.");
+    return;
+  }
+  journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
+}
+
+function journalIsControlConvo(convoId) {
+  return convoId === JOURNAL_CONTROL_CONVO_ID;
+}
+
+const JOURNAL_CONTROL_HELP = 'Commands: "new [directory]" — start a session; "list" — active sessions; "help" — this text.';
+
+// Control-convo commands (Deliverable 3): start/list sessions from Matron.
+// `new` reuses the SAME session-creation primitives the Matrix `!start`
+// command uses (createSessionRoom + createSession) rather than forking a
+// parallel path, so a journal-started session gets its own Matrix room and
+// the full existing dual-post pipeline (journalPublish/journalFlushForSession
+// etc.) exactly like any other session.
+async function journalHandleControlCommand(body) {
+  const parts = body.trim().split(/\s+/);
+  const cmd = (parts[0] || '').toLowerCase();
+  const reply = (text) => journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
+
+  if (cmd === 'new') {
+    const dirArg = parts.slice(1).join(' ').trim();
+    let workdir = DEFAULT_WORKDIR;
+    if (dirArg) {
+      const resolved = path.resolve(expandHome(dirArg));
+      try {
+        const stat = fs.statSync(resolved);
+        if (!stat.isDirectory()) { reply(`Not a directory: ${resolved}`); return; }
+      } catch {
+        reply(`Directory not accessible: ${resolved}`);
+        return;
+      }
+      workdir = resolved;
+    }
+    const inviteUserId = ALLOWED_USER_IDS[0];
+    if (!inviteUserId) {
+      reply('Cannot start a session: ALLOWED_USER_IDS is empty on this bridge, so there is no Matrix user to invite into the new room.');
+      return;
+    }
+    let sessionRoomId;
+    try {
+      sessionRoomId = await createSessionRoom(inviteUserId);
+    } catch (e) {
+      reply(`Failed to create session room: ${e.message}`);
+      return;
+    }
+    let session;
+    try {
+      session = createSession(sessionRoomId, workdir, undefined, {});
+    } catch (e) {
+      reply(`Failed to start session: ${e.message}`);
+      return;
+    }
+    // Same wiring !start uses — the session's replies flow to its new room,
+    // including buttons, exactly like every other session-creation path.
+    session.sendCallback = (r) => sendToRoom(sessionRoomId, plainTextFormat(r), markdownToHtml(r));
+    session.sendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+    session.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+      sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+    const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+    const idNote = session.claudeSessionId
+      ? ` Convo: ${session.claudeSessionId}`
+      : ' The convo will appear here once the session sends its first message.';
+    reply(`Session started in ${workdir}. Matrix room: ${roomLink}.${idNote}`);
+    return;
+  }
+
+  if (cmd === 'list') {
+    const lines = [];
+    for (const s of sessions.values()) {
+      if (!s.alive) continue;
+      const label = s.claudeSessionId ? s.claudeSessionId.slice(0, 8) : '(starting)';
+      const state = s.busy ? 'running' : (s._journalState || 'waiting');
+      lines.push(`- ${label} — ${s.workdir} — ${state}`);
+    }
+    reply(lines.length ? lines.join('\n') : 'No active sessions.');
+    return;
+  }
+
+  // help / unrecognized.
+  reply(JOURNAL_CONTROL_HELP);
+}
+
+// Assembled once, after every dependency above is defined, and invoked from
+// journalHandleInboundEvent (the `function` declaration wired into
+// createJournalPublisher near the top of this file — hoisted, so that
+// forward reference is safe; only ACTUALLY called once the socket is live,
+// long after this assignment has run).
+const journalInputConsumer = createJournalInputConsumer({
+  isControlConvo: journalIsControlConvo,
+  handleControlCommand: (body) => {
+    journalHandleControlCommand(body).catch((e) => {
+      try { console.warn(`[journal-input] control command failed: ${e.message}`); } catch { /* logging must never throw */ }
+    });
+  },
+  findSessionByConvoId: findSessionByClaudeSessionId,
+  routeTextToSession: journalOnText,
+  routePromptReply: journalOnPromptReply,
+  noticeUnknownConvo: (convoId, { type }) => {
+    journalPublishNotice(convoId, type === 'prompt_reply'
+      ? "This session is no longer active on this bridge — your answer wasn't delivered."
+      : "This session is no longer active on this bridge — your message wasn't delivered.");
+  },
+  log: console,
+});
+
+// The actual function passed as createJournalPublisher's `onEvent` (wired
+// near the top of this file, before journalInputConsumer exists — safe
+// because `function` declarations are fully hoisted, and this is only ever
+// CALLED once the socket is live, long after journalInputConsumer above has
+// been assigned).
+function journalHandleInboundEvent(frame) {
+  journalInputConsumer(frame);
 }
 
 // --- Matrix Message Handler ---
