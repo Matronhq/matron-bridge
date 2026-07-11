@@ -247,6 +247,23 @@ describe('createJournalPublisher', () => {
     expect(warnings.length).toBe(1);
   });
 
+  it('upsertConvo never throws even for malformed opts (null, missing, non-object)', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    expect(() => {
+      pub.upsertConvo('c1');
+      pub.upsertConvo('c1', null);
+      pub.upsertConvo('c1', undefined);
+      pub.upsertConvo('c1', 'not-an-object');
+      pub.upsertConvo('c1', { title: 'ok' });
+    }).not.toThrow();
+
+    await waitFor(() => fake.received.filter(f => f.op === 'convo_upsert').length >= 1);
+    pub.close();
+    await fake.close();
+  });
+
   it('disabled mode when only the token is missing', () => {
     const log = { warn: () => {}, error: () => {} };
     expect(() => {
