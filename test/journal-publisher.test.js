@@ -609,6 +609,43 @@ describe('createJournalPublisher', () => {
     await httpServer.close();
   });
 
+  it('uploadMedia: a 2xx response missing a string media_id resolves null (not a blob_ref: undefined event), warns once', async () => {
+    const httpServer = await startFakeHttpServer((_entry, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // Malformed/unexpected success body — no media_id at all.
+      res.end(JSON.stringify({ size: 3, content_type: 'text/plain', sha256: 'deadbeef' }));
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log, ...FAST_BACKOFF });
+
+    warnings.length = 0; // drop any reconnect-attempt warnings from the WS side
+    const result = await pub.uploadMedia({ bytes: Buffer.from('abc'), contentType: 'text/plain', name: 'f.txt' });
+    expect(result).toBeNull();
+
+    const uploadWarnings = warnings.filter(w => /uploadMedia/.test(w));
+    expect(uploadWarnings.length).toBe(1);
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('uploadMedia: a media_id that is not a string (e.g. null, number) also resolves null', async () => {
+    const httpServer = await startFakeHttpServer((_entry, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ media_id: 12345, size: 3 }));
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    const result = await pub.uploadMedia({ bytes: Buffer.from('abc'), contentType: 'text/plain', name: 'f.txt' });
+    expect(result).toBeNull();
+
+    pub.close();
+    await httpServer.close();
+  });
+
   it('uploadMedia: a non-2xx HTTP response resolves null, never throws', async () => {
     const httpServer = await startFakeHttpServer((_entry, res) => {
       res.writeHead(413, { 'content-type': 'application/json' });
