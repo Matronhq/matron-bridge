@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import WebSocket, { WebSocketServer } from 'ws';
 import net from 'net';
+import http from 'node:http';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 // Quiet logger for tests that don't care about warnings.
@@ -32,8 +33,12 @@ async function getFreePort() {
 }
 
 // Minimal in-process fake journal server: accepts `hello`, replies `hello_ok`,
-// and records every other frame it receives (in arrival order).
-function startFakeServer({ onHello } = {}, port = 0) {
+// and records every other frame it receives (in arrival order). `onFrame`,
+// when given, is called with each non-hello frame and may return a reply
+// frame to send back (e.g. a control error frame), or a falsy value to send
+// nothing — used to simulate a server that rejects an op (e.g. read_marker
+// from an agent connection) after having already accepted the socket.
+function startFakeServer({ onHello, onFrame } = {}, port = 0) {
   const wss = new WebSocketServer({ port });
   const received = [];
   const connections = [];
@@ -51,6 +56,10 @@ function startFakeServer({ onHello } = {}, port = 0) {
       }
       conn.frames.push(msg);
       received.push(msg);
+      if (onFrame) {
+        const reply = onFrame(msg, conn);
+        if (reply) ws.send(JSON.stringify(reply));
+      }
     });
   });
   return new Promise((resolve, reject) => {
@@ -68,6 +77,44 @@ function startFakeServer({ onHello } = {}, port = 0) {
       });
     });
     wss.on('error', reject);
+  });
+}
+
+// Minimal in-process fake HTTP server for uploadMedia tests. Records every
+// request (method, url, headers, raw body bytes) and replies with whatever
+// `handler` returns, or a default 200 media-upload response if omitted.
+function startFakeHttpServer(handler) {
+  const received = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const entry = { method: req.method, url: req.url, headers: req.headers, body };
+      received.push(entry);
+      if (handler) {
+        handler(entry, res);
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          media_id: 'fake-media-id',
+          size: body.length,
+          content_type: req.headers['content-type'] || 'application/octet-stream',
+          sha256: 'fakesha256',
+        }));
+      }
+    });
+  });
+  return new Promise((resolve, reject) => {
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolve({
+        port,
+        received,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+    server.on('error', reject);
   });
 }
 
@@ -230,7 +277,7 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
-  it('disabled mode (no url/token): every method is a safe no-op, nothing throws', () => {
+  it('disabled mode (no url/token): every method is a safe no-op, nothing throws', async () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
     const pub = createJournalPublisher({ url: '', token: '', log });
@@ -240,9 +287,15 @@ describe('createJournalPublisher', () => {
       pub.publishText('c1', { body: 'hi', from: 'user' });
       pub.publishPrompt('c1', { question: 'q?', options: [] });
       pub.publishToolOutput('c1', { command: 'ls' });
+      pub.publishFile('c1', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 1, from: 'user' });
+      pub.publishImage('c1', { blob_ref: 'm2', content_type: 'image/png', name: 'pic.png', size: 1, from: 'user' });
+      pub.markRead('c1');
       pub.close();
       pub.close(); // idempotent
     }).not.toThrow();
+
+    const uploadResult = await pub.uploadMedia({ bytes: Buffer.from('x'), contentType: 'text/plain', name: 'f.txt' });
+    expect(uploadResult == null).toBe(true);
 
     expect(warnings.length).toBe(1);
   });
@@ -302,5 +355,202 @@ describe('createJournalPublisher', () => {
     expect(helloMsg).toMatchObject({ op: 'hello', token: 'secret-tok', cursor: null });
     pub.close();
     await fake.close();
+  });
+
+  it('publishFile and publishImage send the right publish type, with payload passthrough and idem keys', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.upsertConvo('convo-3', {});
+    pub.publishFile('convo-3', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 42, from: 'user' });
+    pub.publishImage('convo-3', { blob_ref: 'm2', content_type: 'image/png', name: 'pic.png', size: 99, from: 'assistant', dims: { w: 10, h: 20 } });
+
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 2);
+    const [file, image] = fake.received.filter(f => f.op === 'publish');
+
+    expect(file.type).toBe('file');
+    expect(file.payload).toEqual({ blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 42, from: 'user' });
+    expect(typeof file.idem_key).toBe('string');
+
+    expect(image.type).toBe('image');
+    expect(image.payload).toEqual({ blob_ref: 'm2', content_type: 'image/png', name: 'pic.png', size: 99, from: 'assistant', dims: { w: 10, h: 20 } });
+    expect(typeof image.idem_key).toBe('string');
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('markRead enqueues a read_marker frame with no idem_key, FIFO right after the preceding publish', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.upsertConvo('convo-4', {});
+    pub.publishText('convo-4', { body: 'hi', from: 'user' });
+    pub.markRead('convo-4');
+
+    await waitFor(() => fake.received.length >= 3);
+    expect(fake.received.map(f => f.op)).toEqual(['convo_upsert', 'publish', 'read_marker']);
+
+    const marker = fake.received[2];
+    expect(marker).toEqual({ op: 'read_marker', convo_id: 'convo-4', up_to_seq: null });
+    expect(marker.idem_key).toBeUndefined();
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('markRead is re-sent after a reconnect, same as any other frame', async () => {
+    const port = await getFreePort(); // nothing listening yet
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const pub = createJournalPublisher({ url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.upsertConvo('c1', { title: 'A' });
+    pub.markRead('c1');
+
+    await delay(80); // let a couple of failed connection attempts happen
+
+    const fake = await startFakeServer({}, port);
+    await waitFor(() => fake.received.length >= 2);
+
+    expect(fake.received.map(f => f.op)).toEqual(['convo_upsert', 'read_marker']);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('an error frame from the server (e.g. forbidden for read_marker against an old server) is logged once per code and never wedges the queue', async () => {
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    // Simulates today's matron-journal, which rejects agent read_marker with
+    // a 'forbidden' control error frame — every single time, since it isn't
+    // stateful. The publisher calls markRead after every user-mirrored
+    // publish, so without per-code dedup this would warn once per user
+    // message forever.
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'read_marker' ? { kind: 'control', op: 'error', code: 'forbidden', ref: 'read_marker' } : null),
+    });
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log, ...FAST_BACKOFF });
+
+    pub.upsertConvo('c1', {});
+    pub.publishText('c1', { body: 'one', from: 'user' });
+    pub.markRead('c1');
+    pub.publishText('c1', { body: 'two', from: 'user' });
+    pub.markRead('c1');
+    pub.publishText('c1', { body: 'three', from: 'user' });
+    pub.markRead('c1');
+
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 3);
+    await delay(80); // let the rejected read_marker error frames round-trip back
+
+    // Every publish still flowed despite every read_marker being rejected —
+    // the queue never wedged.
+    expect(fake.received.filter(f => f.op === 'publish').map(f => f.payload.body)).toEqual(['one', 'two', 'three']);
+    expect(fake.received.filter(f => f.op === 'read_marker').length).toBe(3);
+
+    // Only one warning for the repeated 'forbidden' code, not one per frame.
+    const forbiddenWarnings = warnings.filter(w => /forbidden/.test(w));
+    expect(forbiddenWarnings.length).toBe(1);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('error-code dedup is per connection epoch: warns again after a reconnect, still deduped within each epoch', async () => {
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'read_marker' ? { kind: 'control', op: 'error', code: 'forbidden', ref: 'read_marker' } : null),
+    });
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log, ...FAST_BACKOFF });
+
+    // Epoch 1: two rejected read_markers -> exactly one warning.
+    pub.upsertConvo('c1', {});
+    pub.markRead('c1');
+    pub.markRead('c1');
+    await waitFor(() => fake.received.filter(f => f.op === 'read_marker').length >= 2);
+    await waitFor(() => warnings.filter(w => /forbidden/.test(w)).length >= 1);
+    await delay(60); // let the second rejection's error frame round-trip too
+    expect(warnings.filter(w => /forbidden/.test(w)).length).toBe(1);
+
+    // Server drops the connection; the publisher reconnects (new epoch).
+    fake.connections[0].ws.terminate();
+    await waitFor(() => fake.connections.length >= 2, 4000);
+
+    // Epoch 2: the same 'forbidden' code must be logged once more — a fresh
+    // connection is a fresh observability window, so a later, unrelated
+    // problem that happens to reuse a previously-seen code doesn't stay
+    // permanently invisible. Still deduped within the epoch.
+    pub.markRead('c1');
+    pub.markRead('c1');
+    await waitFor(() => warnings.filter(w => /forbidden/.test(w)).length >= 2, 4000);
+    await delay(60); // let the fourth rejection's error frame round-trip too
+    expect(warnings.filter(w => /forbidden/.test(w)).length).toBe(2);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('uploadMedia: happy path POSTs raw bytes to the derived HTTP base URL with Bearer auth and Content-Type', async () => {
+    const httpServer = await startFakeHttpServer();
+    // ws:// -> http://, strip trailing /ws, per the fixed contract.
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok-123', log: silentLog, ...FAST_BACKOFF });
+
+    const bytes = Buffer.from('hello media bytes');
+    const result = await pub.uploadMedia({ bytes, contentType: 'image/png', name: 'photo.png' });
+
+    expect(result).toEqual({
+      media_id: 'fake-media-id',
+      size: bytes.length,
+      content_type: 'image/png',
+      sha256: 'fakesha256',
+    });
+
+    // The publisher's own WS connection attempt also lands on this HTTP
+    // server (it's a plain http.createServer, so the WS upgrade request
+    // just arrives as an ordinary GET /ws) — filter down to the actual
+    // /media POST rather than asserting on every request this server saw.
+    const mediaRequests = httpServer.received.filter(r => r.url === '/media');
+    expect(mediaRequests.length).toBe(1);
+    const req = mediaRequests[0];
+    expect(req.method).toBe('POST');
+    expect(req.headers['authorization']).toBe('Bearer tok-123');
+    expect(req.headers['content-type']).toBe('image/png');
+    expect(req.body.equals(bytes)).toBe(true);
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('uploadMedia: a non-2xx HTTP response resolves null, never throws', async () => {
+    const httpServer = await startFakeHttpServer((_entry, res) => {
+      res.writeHead(413, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'too_large' }));
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    const result = await pub.uploadMedia({ bytes: Buffer.alloc(10), contentType: 'application/octet-stream', name: 'big.bin' });
+    expect(result == null).toBe(true);
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('uploadMedia: a network failure (nothing listening) resolves null, never throws, and warns exactly once', async () => {
+    const port = await getFreePort(); // nothing listening
+    const wsUrl = `ws://127.0.0.1:${port}/ws`;
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log, ...FAST_BACKOFF });
+
+    warnings.length = 0; // drop any reconnect-attempt warnings from the WS side
+    const result = await pub.uploadMedia({ bytes: Buffer.from('x'), contentType: 'text/plain', name: 'f.txt' });
+    expect(result == null).toBe(true);
+
+    const uploadWarnings = warnings.filter(w => /uploadMedia/.test(w));
+    expect(uploadWarnings.length).toBe(1);
+
+    pub.close();
   });
 });

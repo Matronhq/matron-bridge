@@ -106,4 +106,88 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
 
     expect(after).toBeGreaterThanOrEqual(before + 4);
   }, 15000);
+
+  // The matron-journal checkout this suite spawns may or may not yet have
+  // landed agent read_marker support (matron-journal PR #2, landing in
+  // parallel with this branch). Today's server treats read_marker as
+  // client-only and rejects agent connections with a 'forbidden' control
+  // error frame (src/ws.js: `case 'read_marker': if (conn.kind !== 'client')
+  // return fail('forbidden')`). Rather than hard-code which behavior to
+  // expect, this test attempts the real op against whatever server is
+  // actually running and asserts on the observed outcome — so it stays green
+  // whichever side of that server-side change dev-2's checkout is on.
+  it('markRead: works against both today\'s server (agent read_marker rejected) and a future one that supports it, without ever wedging the queue', async () => {
+    const before = totalEvents();
+    expect(before).not.toBeNull();
+
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log,
+    });
+
+    pub.upsertConvo('itest-convo-readmarker', { title: 'Read marker probe', sessionState: 'running' });
+    pub.publishText('itest-convo-readmarker', { body: 'hello', from: 'user' });
+    pub.markRead('itest-convo-readmarker');
+    // Regardless of read_marker support, the queue must keep flowing: publish
+    // something after the (possibly-rejected) markRead and confirm it still
+    // lands rather than getting stuck behind it.
+    pub.publishText('itest-convo-readmarker', { body: 'still flowing after markRead', from: 'user' });
+
+    // Poll until at least the two publishes have definitely landed (a
+    // supported read_marker adds a 3rd row on top of that).
+    const deadline = Date.now() + 5000;
+    let after = before;
+    while (Date.now() < deadline) {
+      after = totalEvents();
+      if (after !== null && after >= before + 2) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    // Give a rejected read_marker's error frame (or an accepted one's journal
+    // row) a moment to fully round-trip before inspecting which leg fired.
+    await new Promise((r) => setTimeout(r, 200));
+
+    pub.close();
+
+    const forbiddenWarning = warnings.find((w) => /forbidden/.test(w));
+    if (forbiddenWarning) {
+      // Leg 1 (today's server): agent read_marker is rejected — the queue
+      // must have kept flowing regardless, so both publishes still landed.
+      expect(after).toBeGreaterThanOrEqual(before + 2);
+    } else {
+      // Leg 2 (a future server with agent read_marker landed): the marker
+      // itself becomes a 3rd journal row, and no error was logged.
+      expect(after).toBeGreaterThanOrEqual(before + 3);
+    }
+  }, 15000);
+
+  // Same "may or may not have landed yet" situation for POST /media (also
+  // part of matron-journal PR #2) — but uploadMedia's own fail-open contract
+  // means attempting the op IS the probe: a 404 (no /media route yet) is just
+  // another non-2xx response it already resolves to null for, so no separate
+  // capability probe is needed the way markRead's fire-and-forget queue
+  // needed one above.
+  it('uploadMedia: works against both today\'s server (no /media route) and a future one that has it', async () => {
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${serverPort}/ws`,
+      token: agentToken,
+      log: { warn: () => {}, error: () => {} },
+    });
+
+    const bytes = Buffer.from('itest media bytes');
+    const result = await pub.uploadMedia({ bytes, contentType: 'text/plain', name: 'itest.txt' });
+
+    pub.close();
+
+    if (result) {
+      // Leg 2 (a future server with /media landed).
+      expect(result.media_id).toBeTruthy();
+      expect(result.size).toBe(bytes.length);
+    } else {
+      // Leg 1 (today's server: no /media route yet) — fails open to null.
+      expect(result).toBeNull();
+    }
+  }, 15000);
 });

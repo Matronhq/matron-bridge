@@ -362,6 +362,21 @@ function journalUpsertConvo(session, opts) {
   journalPublish(session, 'upsertConvo', opts);
 }
 
+// Single choke point for mirroring anything USER-authored into the journal:
+// publishes the item, then advances the user's read marker so mirrored user
+// messages don't inflate unread badges on the user's other devices. Every
+// seam that mirrors something the user said/did (text replies, prompt
+// answers, media uploads) MUST route through this rather than calling
+// journalPublish directly, so the markRead pairing can't be forgotten by a
+// future seam. journalPublish already handles the pre-session-id buffering
+// case (session.claudeSessionId not yet known) for both calls, so a buffered
+// markRead replays right after its paired publish, in order, once the
+// session id shows up (see journalFlushForSession).
+function journalPublishUserItem(session, method, payload) {
+  journalPublish(session, method, payload);
+  journalPublish(session, 'markRead', undefined);
+}
+
 // Mirror a session_state transition, but only on actual change — busy/prompt/
 // turn-end events fire far more often than the state actually flips.
 function journalSessionState(session, state) {
@@ -381,7 +396,39 @@ function journalSessionState(session, state) {
 function journalMirrorUserAnswer(session, text) {
   const body = typeof text === 'string' ? text.trim() : '';
   if (!body) return;
-  journalPublish(session, 'publishText', { body, from: 'user' });
+  journalPublishUserItem(session, 'publishText', { body, from: 'user' });
+}
+
+// Mirror a Matrix media upload the user just sent into the journal, once it
+// has been downloaded and materialized locally (see buildMediaContentBlocks).
+// Best-effort and fire-and-forget: the HTTP media upload is awaited inside
+// this async IIFE, but the call site never awaits journalMirrorUserMedia
+// itself, so a slow or dead journal server never delays the Matrix/Claude
+// media flow. uploadMedia already fails open (null on any failure); a null
+// here just means the file/image event is skipped — a journal event without
+// a blob to point at is useless. image vs file is chosen by content-type
+// prefix (not Matrix msgtype), since a PDF or a picture sent as a generic
+// m.file still has an image/* or application/pdf mime either way.
+function journalMirrorUserMedia(session, { buffer, mime, name, dims }) {
+  if (!JOURNAL_ENABLED) return;
+  (async () => {
+    try {
+      const media = await journalPublisher.uploadMedia({ bytes: buffer, contentType: mime, name });
+      if (!media) return;
+      const isImage = typeof mime === 'string' && mime.startsWith('image/');
+      const payload = {
+        blob_ref: media.media_id,
+        content_type: media.content_type,
+        name,
+        size: media.size,
+        from: 'user',
+      };
+      if (isImage && dims) payload.dims = dims;
+      journalPublishUserItem(session, isImage ? 'publishImage' : 'publishFile', payload);
+    } catch (e) {
+      try { console.warn(`[journal] media mirror failed: ${e.message}`); } catch { /* logging must never throw */ }
+    }
+  })();
 }
 
 // Called once claudeSessionId becomes known: establishes the conversation
@@ -2296,7 +2343,7 @@ function sendToSession(session, contentBlocks) {
   // media, via sendTextToSession for plain text), so a message is mirrored
   // exactly once here regardless of caller.
   const journalText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
-  if (journalText) journalPublish(session, 'publishText', { body: journalText, from: 'user' });
+  if (journalText) journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
@@ -3159,6 +3206,11 @@ async function buildMediaContentBlocks(event, session) {
   const buffer = await downloadMatrixFile(mxcUrl, content.file);
   const fileName = content.body || 'file';
   const mime = content.info?.mimetype || 'application/octet-stream';
+  // Matrix image events commonly carry width/height in `info` — cheap to
+  // reuse for the journal's optional image dims, no image lib needed.
+  const dims = (Number.isFinite(content.info?.w) && Number.isFinite(content.info?.h))
+    ? { w: content.info.w, h: content.info.h }
+    : undefined;
 
   if (content.msgtype === 'm.audio') {
     const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
@@ -3171,12 +3223,14 @@ async function buildMediaContentBlocks(event, session) {
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, filename);
     fs.writeFileSync(savePath, buffer);
+    journalMirrorUserMedia(session, { buffer, mime, name: filename, dims });
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: content.msgtype, savePath, caption }) });
     return blocks; // caption already folded in; skip the SDK caption append below
   } else if (content.msgtype === 'm.image') {
     // Save image to workdir
     const imgPath = deduplicateFilename(session.workdir, fileName);
     fs.writeFileSync(imgPath, buffer);
+    journalMirrorUserMedia(session, { buffer, mime, name: fileName, dims });
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
       type: 'image',
@@ -3186,6 +3240,7 @@ async function buildMediaContentBlocks(event, session) {
     // Save file to workdir
     const savePath = deduplicateFilename(session.workdir, fileName);
     fs.writeFileSync(savePath, buffer);
+    journalMirrorUserMedia(session, { buffer, mime, name: fileName, dims });
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
 
     if (mime === 'application/pdf') {
