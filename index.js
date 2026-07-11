@@ -32,6 +32,7 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
+import { BRIDGE_COMMAND_NAMES, classifyBridgeCommand, classifyRescueKeystroke, isIvSlashPassthrough } from './lib/command-dispatch.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
@@ -4280,24 +4281,64 @@ function journalEchoToRoom(session, plain, html) {
   sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
 }
 
+// ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
+// replies go through the NORMAL sendToRoom for the session's Matrix room —
+// which already mirrors to the journal, so both surfaces see the command's
+// output — and the command text itself was already echoed into the room by
+// journalOnText (the "📱 dan (Matron): ..." line) before this ever runs, so
+// the room reads as a complete transcript of what was asked. `sender` is who
+// a command like !start/!resume/!workdir invites into any NEW room it
+// creates; the bridge is single-user, so ALLOWED_USER_IDS[0] is the only
+// sane choice — the same assumption journalHandleControlCommand's
+// control-convo dispatch makes below.
+function journalSessionCommandCtx(session) {
+  return {
+    sendReply: (reply) => sendToRoom(session.roomId, plainTextFormat(reply), markdownToHtml(reply)),
+    sendHtml: (plainText, html) => sendToRoom(session.roomId, plainText, html),
+    sender: ALLOWED_USER_IDS[0],
+  };
+}
+
 // text -> session. Mirrors the ordering a Matrix reply goes through —
+// bridge-intercepted !/ command dispatch (classifyBridgeCommand +
+// handleCommand — Deliverable 1/2, see lib/command-dispatch.js),
 // pending-TUI-prompt resolution (maybeResolveInteractivePrompt, same
 // parseOptionReply-driven logic a typed Matrix reply uses), the
 // detector-missed "unclassified prompt" menu guard, print-mode
-// AskUserQuestion resolution, THEN busy-queueing, THEN a normal turn — using
-// the exact same session state (queuedMessages, pendingInteractivePrompt,
+// AskUserQuestion resolution, iv-mode PTY rescue keystrokes
+// (classifyRescueKeystroke), THEN busy-queueing (with the same
+// TUI-slash-passthrough bypass Matrix uses), THEN a normal turn — using the
+// exact same session state (queuedMessages, pendingInteractivePrompt,
 // pendingUnclassifiedPrompt) a Matrix message would, rather than a second
 // parallel queue. Every downstream call passes the mirror-bypass flag: the
 // journal already has this text as the client's own `send` row, so nothing
 // here may publish a duplicate agent-sourced echo of it.
 //
-// Scope note (v1): the Matrix handler's plan-mode "build" keyword and
-// !enter/!esc PTY rescue keystrokes are NOT reproduced here — both remain
-// reachable from the session's still-fully-synced Matrix room. Everything
-// else a plain typed reply can do, a Matron text message can do too.
-function journalRouteTextToSession(session, body) {
+// Scope note (v1): the Matrix handler's plan-mode "build" keyword and the
+// busy-queue magic words (bare "send"/"interrupt"/"cancel", which edit a
+// Matrix notification message by event ID) are NOT reproduced here — both
+// remain reachable from the session's still-fully-synced Matrix room.
+// Everything else a plain typed reply — or a bridge command — can do, a
+// Matron text message can do too.
+async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
+
+  // Bridge-intercepted !/ commands run FIRST, before any prompt/menu
+  // resolution below — exactly where Matrix's room.message handler checks
+  // them (before the message is even routed to a session at all) — so e.g.
+  // /stop always stops the session even while a TUI menu is open. Replay
+  // guard: flushCursor synchronously before dispatch, so a crash inside the
+  // cursor's debounce window can't replay an already-dispatched destructive
+  // command (!restart, !stop) on bridge restart — same guard
+  // journalOnPromptReply and the control-convo route already have.
+  const normalizedCommand = classifyBridgeCommand(trimmed);
+  if (normalizedCommand) {
+    journalPublisher.flushCursor();
+    const ctx = journalSessionCommandCtx(session);
+    await handleCommand(session.roomId, normalizedCommand, ctx.sendReply, ctx.sendHtml, ctx.sender);
+    return;
+  }
 
   if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
     session.pendingUnclassifiedPrompt = false;
@@ -4335,7 +4376,56 @@ function journalRouteTextToSession(session, body) {
     return;
   }
 
+  // iv-mode PTY rescue keystrokes (!enter/!esc/!escape/!stop) — same
+  // classifier and same session.iv.sendKeystroke calls the Matrix handler
+  // uses, checked at the same point in the order (after prompt/menu/question
+  // resolution, before busy-queueing), so e.g. the unclassified-menu
+  // guidance to "send !esc to cancel" works identically from Matron. Same
+  // replay guard as the bridge-command dispatch above: !esc/!enter have
+  // real side effects (keystrokes into the TUI, clearing busy state).
+  if (session.iv && session.iv.alive) {
+    const rescue = classifyRescueKeystroke(trimmed);
+    if (rescue) {
+      journalPublisher.flushCursor();
+      const ctx = journalSessionCommandCtx(session);
+      if (rescue === 'enter') {
+        try {
+          session.iv.sendKeystroke('enter');
+          ctx.sendReply('↵ Sent Enter to claude. If you had text queued in the input box, it should submit now.');
+        } catch (err) {
+          ctx.sendReply(`Could not send Enter: ${err.message}`);
+        }
+      } else {
+        try {
+          session.iv.sendKeystroke('esc');
+          session.pendingUnclassifiedPrompt = false;
+          if (session.busy) {
+            session.busy = false;
+            if (session.typingInterval) {
+              clearInterval(session.typingInterval);
+              session.typingInterval = null;
+              client.setTyping(session.roomId, false, 1000).catch(() => {});
+            }
+          }
+          ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
+        } catch (err) {
+          ctx.sendReply(`Could not send Esc: ${err.message}`);
+        }
+      }
+      return;
+    }
+  }
+
   if (session.busy) {
+    // TUI-native slash commands bypass queueing exactly like Matrix's
+    // isClaudeSlashCommand check: it's PTY input for claude's own command
+    // palette, not a new chat turn, so it must reach claude immediately even
+    // mid-turn. `//` escapes this (queues like ordinary text) — same rule
+    // Matrix uses (isIvSlashPassthrough, lib/command-dispatch.js).
+    if (session.iv && isIvSlashPassthrough(trimmed)) {
+      sendTextToSession(session, trimmed, { skipJournalMirror: true });
+      return;
+    }
     // Queue like a Matrix message would, but marked journal-origin so the
     // eventual flushQueue send skips the journal mirror — the journal
     // already has this text as the client's own send row, and re-mirroring
@@ -4426,12 +4516,14 @@ function journalRoutePromptReply(session, { choice, text }) {
 // of which client sent a given message), then routes it in.
 function journalOnText(session, body, { username }) {
   journalEchoToRoom(session, `📱 ${username} (Matron): ${body}`, `📱 <b>${escapeHtml(username)} (Matron):</b> ${escapeHtml(body)}`);
-  try {
-    journalRouteTextToSession(session, body);
-  } catch (e) {
+  // journalRouteTextToSession is async (command dispatch awaits
+  // handleCommand) — not awaited here, matching the router's fire-and-forget
+  // contract for routeTextToSession, but errors must still be caught so a
+  // thrown/rejected dispatch can never crash the consumer.
+  journalRouteTextToSession(session, body).catch((e) => {
     console.warn(`[journal-input] routing text to session failed: ${e.message}`);
     journalPublishNotice(session.claudeSessionId, `⚠️ Could not deliver your message: ${e.message}`);
-  }
+  });
 }
 
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
@@ -4462,80 +4554,84 @@ function journalIsControlConvo(convoId) {
   return convoId === JOURNAL_CONTROL_CONVO_ID;
 }
 
-const JOURNAL_CONTROL_HELP = 'Commands: "new [directory]" — start a session; "list" — active sessions; "help" — this text.';
+// Short nudge shown for empty/unrecognized control-convo input — kept
+// intentionally brief (the full command list is one "/help" away) so a typo
+// doesn't dump the whole command reference.
+const JOURNAL_CONTROL_HELP =
+  'Commands: "/start [dir]" (alias "new") — start a session; "/sessions" (alias "list") — list sessions; "/help" — full command list.';
 
-// Control-convo commands (Deliverable 3): start/list sessions from Matron.
-// `new` reuses the SAME session-creation primitives the Matrix `!start`
-// command uses (createSessionRoom + createSession) rather than forking a
-// parallel path, so a journal-started session gets its own Matrix room and
-// the full existing dual-post pipeline (journalPublish/journalFlushForSession
-// etc.) exactly like any other session.
+// Matron-specific addendum appended to the REAL control-room /help text
+// (Deliverable 3) — handleCommand's '!help' case is reused verbatim for the
+// command reference itself; this just notes the aliases and which listed
+// commands don't apply with no session tied to this convo.
+const JOURNAL_CONTROL_HELP_NOTE =
+  '\n\nMatron control convo notes:\n' +
+  '- Aliases: "new" = /start, "list" = /sessions.\n' +
+  '- /start, /resume, and /workdir create a new session + room here, same as in Matrix.\n' +
+  '- Session-scoped commands (/status, /stop, /restart, /show, /working, /mcp, /model, /mode, /effort, /cost, /usage, /tools) ' +
+  'have no session in this convo — use them from inside a session\'s own Matron convo instead.\n' +
+  '- /limits works here too — it isn\'t session-scoped.';
+
+// Aliases the control convo accepts in addition to each bridge command's
+// canonical spelling. Historically this convo only understood bare
+// "new"/"list"/"help" — those keep working unchanged now that /start,
+// /sessions, and /help are the canonical, Matrix-shared spellings.
+const JOURNAL_CONTROL_ALIASES = { new: 'start', list: 'sessions' };
+
+// body -> { cmd, rest }. `cmd` is the bridge's canonical (unprefixed,
+// lowercased) command name, e.g. 'start' for "/start", "!start", "new", or
+// bare "start" — Matrix's own bridgeCommandNames gate treats ! and /
+// interchangeably too (see classifyBridgeCommand), so this does the same
+// plus the two legacy bare-word aliases. `cmd` is '' for empty input.
+function journalNormalizeControlCommand(body) {
+  const parts = (body || '').trim().split(/\s+/).filter(Boolean);
+  const first = parts[0] || '';
+  const stripped = (first.startsWith('/') || first.startsWith('!')) ? first.slice(1) : first;
+  const lower = stripped.toLowerCase();
+  return { cmd: JOURNAL_CONTROL_ALIASES[lower] || lower, rest: parts.slice(1) };
+}
+
+// Control-convo commands (Deliverable 3). Reuses the SAME shared dispatcher
+// (handleCommand) and command surface (BRIDGE_COMMAND_NAMES,
+// lib/command-dispatch.js) the Matrix control room's !start/!sessions/!help
+// etc. use, via a synthetic "room" — JOURNAL_CONTROL_CONVO_ID, a string
+// that can never collide with a real Matrix room ID (those are always
+// `!opaque:server`). handleCommand's own `sessions.get(roomId)` naturally
+// resolves to undefined for that synthetic ID, which reproduces exactly the
+// behavior a fresh, session-less Matrix room already has: /start, /resume,
+// and /workdir create a brand new session + room (same
+// createSessionRoom/createSession primitives, same argument handling
+// including default workdir and --browser extras); every session-scoped
+// command (/status, /stop, /mcp, /model, …) correctly reports "No active
+// session" rather than doing something wrong; /limits (not session-scoped)
+// works for real. This is what makes /resume and the rest "free" per the
+// brief — nothing journal-specific had to be written for any of them.
 async function journalHandleControlCommand(body) {
-  const parts = body.trim().split(/\s+/);
-  const cmd = (parts[0] || '').toLowerCase();
   const reply = (text) => journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
+  const { cmd, rest } = journalNormalizeControlCommand(body);
 
-  if (cmd === 'new') {
-    const dirArg = parts.slice(1).join(' ').trim();
-    let workdir = DEFAULT_WORKDIR;
-    if (dirArg) {
-      const resolved = path.resolve(expandHome(dirArg));
-      try {
-        const stat = fs.statSync(resolved);
-        if (!stat.isDirectory()) { reply(`Not a directory: ${resolved}`); return; }
-      } catch {
-        reply(`Directory not accessible: ${resolved}`);
-        return;
-      }
-      workdir = resolved;
-    }
-    const inviteUserId = ALLOWED_USER_IDS[0];
-    if (!inviteUserId) {
-      reply('Cannot start a session: ALLOWED_USER_IDS is empty on this bridge, so there is no Matrix user to invite into the new room.');
-      return;
-    }
-    let sessionRoomId;
-    try {
-      sessionRoomId = await createSessionRoom(inviteUserId);
-    } catch (e) {
-      reply(`Failed to create session room: ${e.message}`);
-      return;
-    }
-    let session;
-    try {
-      session = createSession(sessionRoomId, workdir, undefined, {});
-    } catch (e) {
-      reply(`Failed to start session: ${e.message}`);
-      return;
-    }
-    // Same wiring !start uses — the session's replies flow to its new room,
-    // including buttons, exactly like every other session-creation path.
-    session.sendCallback = (r) => sendToRoom(sessionRoomId, plainTextFormat(r), markdownToHtml(r));
-    session.sendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-    session.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-      sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
-    const roomLink = `https://matrix.to/#/${sessionRoomId}`;
-    const idNote = session.claudeSessionId
-      ? ` Convo: ${session.claudeSessionId}`
-      : ' The convo will appear here once the session sends its first message.';
-    reply(`Session started in ${workdir}. Matrix room: ${roomLink}.${idNote}`);
+  if (!cmd || !BRIDGE_COMMAND_NAMES.has(cmd)) {
+    reply(JOURNAL_CONTROL_HELP);
     return;
   }
 
-  if (cmd === 'list') {
-    const lines = [];
-    for (const s of sessions.values()) {
-      if (!s.alive) continue;
-      const label = s.claudeSessionId ? s.claudeSessionId.slice(0, 8) : '(starting)';
-      const state = s.busy ? 'running' : (s._journalState || 'waiting');
-      lines.push(`- ${label} — ${s.workdir} — ${state}`);
-    }
-    reply(lines.length ? lines.join('\n') : 'No active sessions.');
+  const normalizedText = '!' + [cmd, ...rest].join(' ');
+  const sender = ALLOWED_USER_IDS[0];
+
+  if (cmd === 'help') {
+    // handleCommand's '!help' calls sendHtml(plain, html) — intercept so we
+    // can append the Matron-specific note to the SAME real help text
+    // instead of re-deriving/duplicating it.
+    await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
+      (plainText) => reply(plainText + JOURNAL_CONTROL_HELP_NOTE), sender);
     return;
   }
 
-  // help / unrecognized.
-  reply(JOURNAL_CONTROL_HELP);
+  // Every other command: plain-text reply sink for both sendReply and
+  // sendHtml (the control convo has no HTML rendering — same choice
+  // journalPublishNotice/journalEchoToRoom's callers make elsewhere).
+  await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
+    (plainText) => reply(plainText), sender);
 }
 
 // Assembled once, after every dependency above is defined, and invoked from
@@ -4627,18 +4723,13 @@ client.on('room.message', async (roomId, event) => {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
 
-  // Bridge commands use / or ! prefix
+  // Bridge commands use / or ! prefix. Classification is shared with the
+  // journal session-text route (lib/command-dispatch.js, see
+  // journalRouteTextToSession) so the two transports can't silently
+  // diverge on which commands get intercepted.
   if (text.startsWith('!') || text.startsWith('/')) {
-    const bridgeCommandNames = new Set([
-      'start', 'stop', 'restart', 'resume', 'workdir', 'status',
-      'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'mode', 'effort', 'cost', 'usage', 'limits', 'tools',
-    ]);
-    const firstWord = text.split(/\s+/)[0].toLowerCase();
-    const cmdName = firstWord.slice(1); // strip ! or /
-    if (bridgeCommandNames.has(cmdName)) {
-      // Normalize to ! prefix for the handler
-      const normalizedText = '!' + text.slice(1);
+    const normalizedText = classifyBridgeCommand(text);
+    if (normalizedText) {
       await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
       return;
     }
@@ -4960,8 +5051,7 @@ client.on('room.message', async (roomId, event) => {
   // sits in the queue forever if the previous turn's Stop hook didn't
   // fire (e.g. for unauthenticated "Please run /login" pseudo-turns)
   // and the user can't recover without manually flushing.
-  const isClaudeSlashCommand =
-    session.iv && text.startsWith('/') && !text.startsWith('//');
+  const isClaudeSlashCommand = session.iv && isIvSlashPassthrough(text);
   // Raw-keystroke rescue commands for iv-mode sessions. These work
   // regardless of busy state because they're pure recovery actions
   // (the user can always need to interrupt claude or nudge a stuck
@@ -4973,9 +5063,13 @@ client.on('room.message', async (roomId, event) => {
   //   !esc   — send Esc into the PTY. Same effect as pressing Esc
   //            in the TUI: cancels the current generation/turn,
   //            dismisses the OAuth wait, exits a menu, etc.
+  //
+  // Classification is shared with the journal session-text route via
+  // classifyRescueKeystroke (lib/command-dispatch.js) — see
+  // journalRouteTextToSession.
   if (session.iv && session.iv.alive) {
-    const lower = text.trim().toLowerCase();
-    if (lower === '!enter') {
+    const rescue = classifyRescueKeystroke(text);
+    if (rescue === 'enter') {
       try {
         session.iv.sendKeystroke('enter');
         await sendReply('↵ Sent Enter to claude. If you had text queued in the input box, it should submit now.');
@@ -4984,7 +5078,7 @@ client.on('room.message', async (roomId, event) => {
       }
       return;
     }
-    if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
+    if (rescue === 'esc') {
       try {
         session.iv.sendKeystroke('esc');
         // Esc dismisses any open menu, so a best-effort unclassified-prompt is
