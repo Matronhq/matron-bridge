@@ -7,6 +7,7 @@ import {
   dispatchJournalBridgeCommand,
   dispatchJournalRescueKeystroke,
   normalizeJournalControlCommand,
+  classifyJournalControlCommand,
   JOURNAL_CONTROL_ALIASES,
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
@@ -371,5 +372,25 @@ describe('control-convo help text sanity', () => {
 
   it('the /help addendum calls out that session-scoped commands need an actual session convo', () => {
     expect(JOURNAL_CONTROL_HELP_NOTE.toLowerCase()).toMatch(/session-scoped/);
+  });
+});
+
+describe('classifyJournalControlCommand', () => {
+  it('applies the JOURNAL_UNAVAILABLE_COMMANDS denylist to the control-convo path too (review fast-follow)', () => {
+    // With the (test-injected) denylist populated, a denied command routes
+    // to a refusal — never to dispatch — from the control convo, exactly as
+    // dispatchJournalBridgeCommand enforces for session convos. Alias
+    // resolution happens BEFORE the check, so an alias can't sidestep it.
+    const unavailableCommands = new Set(['sessions']);
+    expect(classifyJournalControlCommand('/sessions', { unavailableCommands }))
+      .toEqual({ kind: 'unavailable', cmd: 'sessions' });
+    expect(classifyJournalControlCommand('list', { unavailableCommands }))
+      .toEqual({ kind: 'unavailable', cmd: 'sessions' });
+    // Non-denied commands still dispatch; unknown words still route to help.
+    expect(classifyJournalControlCommand('/start /tmp/proj', { unavailableCommands }))
+      .toEqual({ kind: 'dispatch', cmd: 'start', normalizedText: '!start /tmp/proj' });
+    expect(classifyJournalControlCommand('gibberish', { unavailableCommands })).toEqual({ kind: 'help' });
+    // And with the real (empty) default denylist, nothing is denied today.
+    expect(classifyJournalControlCommand('/sessions')).toEqual({ kind: 'dispatch', cmd: 'sessions', normalizedText: '!sessions' });
   });
 });

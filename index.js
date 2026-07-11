@@ -32,14 +32,14 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
+import { readSessionSummary, listSessionSummaries } from './lib/session-summary.js';
 import {
-  BRIDGE_COMMAND_NAMES,
   classifyBridgeCommand,
   classifyRescueKeystroke,
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
   dispatchJournalRescueKeystroke,
-  normalizeJournalControlCommand,
+  classifyJournalControlCommand,
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
@@ -3277,29 +3277,21 @@ async function maybeUpdatePinnedSummary(session) {
   }
 }
 
-function getSessionSummary(sessionId, workdir) {
+// Path of a session's on-disk transcript. Extraction + bounded reading live
+// in lib/session-summary.js (see its header for why the old synchronous
+// whole-file getSessionSummary was replaced); this stays here because it
+// depends on DEFAULT_WORKDIR.
+function sessionTranscriptPath(sessionId, workdir) {
   const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
-  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
-  try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue;
-      const record = JSON.parse(line);
-      if (record.type === 'user' && record.message) {
-        const msg = record.message;
-        const text = typeof msg.content === 'string'
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.find(b => b.type === 'text')?.text || ''
-            : '';
-        if (text && !text.startsWith('<local-command') && !text.startsWith('<command-name>')) {
-          const clean = text.replace(/<[^>]+>/g, '').trim();
-          return clean.slice(0, 80) + (clean.length > 80 ? '…' : '');
-        }
-      }
-    }
-  } catch {}
-  return '';
+  return path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+}
+
+// Async, bounded replacement for the old sync getSessionSummary — same
+// (sessionId, workdir) signature and same output, but reads only a bounded
+// head chunk of the transcript via fs.promises. Callers await it (both call
+// sites are inside handleCommand's async cases).
+function getSessionSummary(sessionId, workdir) {
+  return readSessionSummary(sessionTranscriptPath(sessionId, workdir));
 }
 
 /**
@@ -3681,7 +3673,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const shortId = resumeSessionId.slice(0, 8);
-      const summary = getSessionSummary(resumeSessionId, actualWorkdir);
+      const summary = await getSessionSummary(resumeSessionId, actualWorkdir);
       const roomName = summary
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
@@ -3864,24 +3856,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
 
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => {
-          const sessionId = f.replace('.jsonl', '');
-          const filePath = path.join(projectDir, f);
-          const stat = fs.statSync(filePath);
-          const summary = getSessionSummary(sessionId, workdir);
-          return { sessionId, modified: stat.mtimeMs, summary };
-        })
-        .sort((a, b) => b.modified - a.modified);
+      // Bounded listing (lib/session-summary.js): stat + sort by mtime
+      // first, then read summaries — bounded head chunks, via fs.promises —
+      // for ONLY the 15 newest, instead of the old synchronous whole-file
+      // read of every transcript in the dir.
+      const items = await listSessionSummaries(projectDir, { limit: 15 });
 
-      if (files.length === 0) {
+      if (items.length === 0) {
         await sendReply('No sessions found.');
         break;
       }
 
       const activeId = currentSession?.claudeSessionId;
-      const items = files.slice(0, 15);
 
       // Plain text fallback
       const plainList = items.map((s, i) => {
@@ -4590,14 +4576,22 @@ function journalIsControlConvo(convoId) {
 // brief — nothing journal-specific had to be written for any of them.
 async function journalHandleControlCommand(body) {
   const reply = (text) => journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
-  const { cmd, rest } = normalizeJournalControlCommand(body);
+  const decision = classifyJournalControlCommand(body);
 
-  if (!cmd || !BRIDGE_COMMAND_NAMES.has(cmd)) {
+  if (decision.kind === 'help') {
     reply(JOURNAL_CONTROL_HELP);
     return;
   }
 
-  const normalizedText = '!' + [cmd, ...rest].join(' ');
+  // Same JOURNAL_UNAVAILABLE_COMMANDS safety net the session-command path
+  // has (currently empty — see the constant's comment): a future
+  // Matrix-only command must be refused from BOTH journal paths.
+  if (decision.kind === 'unavailable') {
+    reply(`/${decision.cmd} isn't available from Matron.`);
+    return;
+  }
+
+  const { cmd, normalizedText } = decision;
   const sender = ALLOWED_USER_IDS[0];
 
   if (cmd === 'help') {
