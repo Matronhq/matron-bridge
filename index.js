@@ -32,7 +32,17 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
-import { BRIDGE_COMMAND_NAMES, classifyBridgeCommand, classifyRescueKeystroke, isIvSlashPassthrough } from './lib/command-dispatch.js';
+import {
+  BRIDGE_COMMAND_NAMES,
+  classifyBridgeCommand,
+  classifyRescueKeystroke,
+  isIvSlashPassthrough,
+  dispatchJournalBridgeCommand,
+  dispatchJournalRescueKeystroke,
+  normalizeJournalControlCommand,
+  JOURNAL_CONTROL_HELP,
+  JOURNAL_CONTROL_HELP_NOTE,
+} from './lib/command-dispatch.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
@@ -4328,17 +4338,26 @@ async function journalRouteTextToSession(session, body) {
   // resolution below — exactly where Matrix's room.message handler checks
   // them (before the message is even routed to a session at all) — so e.g.
   // /stop always stops the session even while a TUI menu is open. Replay
-  // guard: flushCursor synchronously before dispatch, so a crash inside the
-  // cursor's debounce window can't replay an already-dispatched destructive
-  // command (!restart, !stop) on bridge restart — same guard
-  // journalOnPromptReply and the control-convo route already have.
-  const normalizedCommand = classifyBridgeCommand(trimmed);
-  if (normalizedCommand) {
-    journalPublisher.flushCursor();
-    const ctx = journalSessionCommandCtx(session);
-    await handleCommand(session.roomId, normalizedCommand, ctx.sendReply, ctx.sendHtml, ctx.sender);
-    return;
-  }
+  // guard: flushCursor synchronously before dispatch (inside
+  // dispatchJournalBridgeCommand), so a crash inside the cursor's debounce
+  // window can't replay an already-dispatched destructive command
+  // (!restart, !stop) on bridge restart — same guard journalOnPromptReply
+  // and the control-convo route already have.
+  const dispatchedCommand = await dispatchJournalBridgeCommand(trimmed, {
+    flushCursor: () => journalPublisher.flushCursor(),
+    runBridgeCommand: (normalizedCommand) => {
+      const ctx = journalSessionCommandCtx(session);
+      return handleCommand(session.roomId, normalizedCommand, ctx.sendReply, ctx.sendHtml, ctx.sender);
+    },
+    // Safety net for JOURNAL_UNAVAILABLE_COMMANDS (currently empty — see
+    // that constant's comment in lib/command-dispatch.js for the mapping):
+    // never silently fall through to Claude as text, never crash.
+    notAvailable: (cmdName) => {
+      const ctx = journalSessionCommandCtx(session);
+      return ctx.sendReply(`/${cmdName} isn't available from Matron — use this session's Matrix room for that one.`);
+    },
+  });
+  if (dispatchedCommand) return;
 
   if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
     session.pendingUnclassifiedPrompt = false;
@@ -4381,12 +4400,12 @@ async function journalRouteTextToSession(session, body) {
   // uses, checked at the same point in the order (after prompt/menu/question
   // resolution, before busy-queueing), so e.g. the unclassified-menu
   // guidance to "send !esc to cancel" works identically from Matron. Same
-  // replay guard as the bridge-command dispatch above: !esc/!enter have
-  // real side effects (keystrokes into the TUI, clearing busy state).
-  if (session.iv && session.iv.alive) {
-    const rescue = classifyRescueKeystroke(trimmed);
-    if (rescue) {
-      journalPublisher.flushCursor();
+  // replay guard as the bridge-command dispatch above (inside
+  // dispatchJournalRescueKeystroke): !esc/!enter have real side effects
+  // (keystrokes into the TUI, clearing busy state).
+  const dispatchedRescue = await dispatchJournalRescueKeystroke(trimmed, !!(session.iv && session.iv.alive), {
+    flushCursor: () => journalPublisher.flushCursor(),
+    sendRescueKeystroke: async (rescue) => {
       const ctx = journalSessionCommandCtx(session);
       if (rescue === 'enter') {
         try {
@@ -4395,26 +4414,26 @@ async function journalRouteTextToSession(session, body) {
         } catch (err) {
           ctx.sendReply(`Could not send Enter: ${err.message}`);
         }
-      } else {
-        try {
-          session.iv.sendKeystroke('esc');
-          session.pendingUnclassifiedPrompt = false;
-          if (session.busy) {
-            session.busy = false;
-            if (session.typingInterval) {
-              clearInterval(session.typingInterval);
-              session.typingInterval = null;
-              client.setTyping(session.roomId, false, 1000).catch(() => {});
-            }
-          }
-          ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
-        } catch (err) {
-          ctx.sendReply(`Could not send Esc: ${err.message}`);
-        }
+        return;
       }
-      return;
-    }
-  }
+      try {
+        session.iv.sendKeystroke('esc');
+        session.pendingUnclassifiedPrompt = false;
+        if (session.busy) {
+          session.busy = false;
+          if (session.typingInterval) {
+            clearInterval(session.typingInterval);
+            session.typingInterval = null;
+            client.setTyping(session.roomId, false, 1000).catch(() => {});
+          }
+        }
+        ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
+      } catch (err) {
+        ctx.sendReply(`Could not send Esc: ${err.message}`);
+      }
+    },
+  });
+  if (dispatchedRescue) return;
 
   if (session.busy) {
     // TUI-native slash commands bypass queueing exactly like Matrix's
@@ -4554,43 +4573,6 @@ function journalIsControlConvo(convoId) {
   return convoId === JOURNAL_CONTROL_CONVO_ID;
 }
 
-// Short nudge shown for empty/unrecognized control-convo input — kept
-// intentionally brief (the full command list is one "/help" away) so a typo
-// doesn't dump the whole command reference.
-const JOURNAL_CONTROL_HELP =
-  'Commands: "/start [dir]" (alias "new") — start a session; "/sessions" (alias "list") — list sessions; "/help" — full command list.';
-
-// Matron-specific addendum appended to the REAL control-room /help text
-// (Deliverable 3) — handleCommand's '!help' case is reused verbatim for the
-// command reference itself; this just notes the aliases and which listed
-// commands don't apply with no session tied to this convo.
-const JOURNAL_CONTROL_HELP_NOTE =
-  '\n\nMatron control convo notes:\n' +
-  '- Aliases: "new" = /start, "list" = /sessions.\n' +
-  '- /start, /resume, and /workdir create a new session + room here, same as in Matrix.\n' +
-  '- Session-scoped commands (/status, /stop, /restart, /show, /working, /mcp, /model, /mode, /effort, /cost, /usage, /tools) ' +
-  'have no session in this convo — use them from inside a session\'s own Matron convo instead.\n' +
-  '- /limits works here too — it isn\'t session-scoped.';
-
-// Aliases the control convo accepts in addition to each bridge command's
-// canonical spelling. Historically this convo only understood bare
-// "new"/"list"/"help" — those keep working unchanged now that /start,
-// /sessions, and /help are the canonical, Matrix-shared spellings.
-const JOURNAL_CONTROL_ALIASES = { new: 'start', list: 'sessions' };
-
-// body -> { cmd, rest }. `cmd` is the bridge's canonical (unprefixed,
-// lowercased) command name, e.g. 'start' for "/start", "!start", "new", or
-// bare "start" — Matrix's own bridgeCommandNames gate treats ! and /
-// interchangeably too (see classifyBridgeCommand), so this does the same
-// plus the two legacy bare-word aliases. `cmd` is '' for empty input.
-function journalNormalizeControlCommand(body) {
-  const parts = (body || '').trim().split(/\s+/).filter(Boolean);
-  const first = parts[0] || '';
-  const stripped = (first.startsWith('/') || first.startsWith('!')) ? first.slice(1) : first;
-  const lower = stripped.toLowerCase();
-  return { cmd: JOURNAL_CONTROL_ALIASES[lower] || lower, rest: parts.slice(1) };
-}
-
 // Control-convo commands (Deliverable 3). Reuses the SAME shared dispatcher
 // (handleCommand) and command surface (BRIDGE_COMMAND_NAMES,
 // lib/command-dispatch.js) the Matrix control room's !start/!sessions/!help
@@ -4608,7 +4590,7 @@ function journalNormalizeControlCommand(body) {
 // brief — nothing journal-specific had to be written for any of them.
 async function journalHandleControlCommand(body) {
   const reply = (text) => journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
-  const { cmd, rest } = journalNormalizeControlCommand(body);
+  const { cmd, rest } = normalizeJournalControlCommand(body);
 
   if (!cmd || !BRIDGE_COMMAND_NAMES.has(cmd)) {
     reply(JOURNAL_CONTROL_HELP);
