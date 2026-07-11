@@ -779,4 +779,45 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
     pub.close();
     await fake.close();
   });
+
+  it('flushCursor() persists the cursor synchronously, bypassing the debounce (command-replay guard)', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    let flushedInsideHandler = null;
+    // Deliberately a LONG debounce so a passing test proves the flush path,
+    // not the timer. The onEvent handler force-flushes and inspects the file
+    // synchronously — exactly what index.js does after a control-convo
+    // command or a prompt_reply, so an ungraceful crash inside the debounce
+    // window can't replay an already-executed command.
+    let pub;
+    pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      cursorDebounceMs: 60_000,
+      cursorFile,
+      onEvent: (frame) => {
+        pub.flushCursor();
+        flushedInsideHandler = existsSync(cursorFile)
+          && JSON.parse(readFileSync(cursorFile, 'utf-8')).cursor === frame.seq;
+      },
+    });
+
+    await waitFor(() => fake.connections.length >= 1);
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(9)));
+    await waitFor(() => flushedInsideHandler !== null);
+    expect(flushedInsideHandler).toBe(true);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('flushCursor() is a safe no-op on the disabled publisher and without a cursorFile', async () => {
+    const disabled = createJournalPublisher({ url: '', token: '', log: silentLog });
+    expect(() => disabled.flushCursor()).not.toThrow();
+
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, onEvent: () => {} });
+    expect(() => pub.flushCursor()).not.toThrow();
+    pub.close();
+    await fake.close();
+  });
 });

@@ -203,3 +203,109 @@ describe('createJournalInputConsumer', () => {
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
   });
 });
+
+// Staleness guard: prompt_reply.target_seq must reference the LATEST prompt
+// the bridge published into that convo, or the reply is refused — a delayed
+// reply must never mis-answer a newer prompt that superseded the one the
+// user was looking at. Prompt seqs are recorded from the bridge's own
+// published `prompt` frames echoing back on the socket (sender agent:*),
+// BEFORE the user:* input filter.
+describe('createJournalInputConsumer — prompt_reply staleness (target_seq)', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => ({ claudeSessionId: 'convo-1' })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const promptFrame = (seq, convoId = 'convo-1') => baseFrame({
+    seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+    payload: { question: 'Continue?', options: [{ id: 'opt-0', label: 'Yes' }] },
+  });
+
+  const replyFrame = (targetSeq, convoId = 'convo-1') => baseFrame({
+    seq: 100, convo_id: convoId, type: 'prompt_reply',
+    payload: { target_seq: targetSeq, choice: 'Yes', text: null },
+  });
+
+  it('a reply whose target_seq matches the latest recorded prompt seq is routed', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(promptFrame(10));
+    consumer(replyFrame(10));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('a stale target_seq (an older prompt was superseded) is refused with a notice, never routed', () => {
+    const deps = makeDeps();
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    consumer(promptFrame(10));
+    consumer(promptFrame(15)); // newer prompt supersedes seq 10
+    consumer(replyFrame(10));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
+      username: 'dan', targetSeq: 10, latestSeq: 15,
+    });
+    expect(warnings.some(w => /stale/i.test(w))).toBe(true);
+  });
+
+  it('no recorded prompt seq for the convo (e.g. bridge restarted live-only): reply is accepted as before', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(replyFrame(10));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('a reply with no target_seq set is accepted (nothing to check against)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(promptFrame(10));
+    consumer(baseFrame({ type: 'prompt_reply', payload: { target_seq: null, choice: 'Yes', text: null } }));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('prompt seqs are tracked per convo — a newer prompt in convo B does not staleness-refuse convo A', () => {
+    const deps = makeDeps({ findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(promptFrame(10, 'convo-a'));
+    consumer(promptFrame(50, 'convo-b'));
+    consumer(replyFrame(10, 'convo-a'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('recording happens before the user:* filter — an agent-sender prompt frame is still recorded', () => {
+    // (This is the normal case: the bridge's own published prompts come back
+    // as agent:<device>. The previous tests already exercise it implicitly;
+    // this one pins it explicitly against a future "filter first" refactor.)
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ seq: 7, sender: 'agent:some-other-box', type: 'prompt', payload: { question: 'q' } }));
+    consumer(replyFrame(3)); // stale vs the recorded 7
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalled();
+  });
+
+  it('works without a noticeStalePromptReply callback (optional dep): still refuses, still logs, never throws', () => {
+    const deps = makeDeps({ noticeStalePromptReply: undefined });
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    consumer(promptFrame(10));
+    expect(() => consumer(replyFrame(5))).not.toThrow();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(warnings.some(w => /stale/i.test(w))).toBe(true);
+  });
+});

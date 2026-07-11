@@ -33,6 +33,7 @@ import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -2389,7 +2390,12 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   // TUI. The readiness watcher (startResumeReadyWatcher) flushes them, merged
   // and in order, once claude is idle. See RESUME_READY_* above.
   if (session._awaitingInputReady) {
-    (session._resumeOutbox ||= []).push(contentBlocks);
+    // Carry the journal-origin marker WITH the held blocks: the flush in
+    // startResumeReadyWatcher re-enters sendToSession long after this call
+    // site's skipJournalMirror flag is gone, and journal-originated text must
+    // not be re-mirrored on flush (the journal already has the client's own
+    // send row for it).
+    (session._resumeOutbox ||= []).push(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks);
     session.lastActivityAt = Date.now();
     return true;
   }
@@ -2505,9 +2511,15 @@ function startResumeReadyWatcher(session) {
     session._resumeOutbox = null;
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
     if (session.alive && outbox.length > 0) {
-      // Merge everything the user sent during the hold into a single turn.
-      // The gate is now disarmed, so this reaches the real send path.
-      sendToSession(session, outbox.flat());
+      // Merge everything the user sent during the hold — the gate is now
+      // disarmed, so this reaches the real send path. Grouped by origin
+      // (planQueueFlush): held messages of mixed origin (Matrix-typed +
+      // Matron-sent) flush as separate sends so only the Matrix-originated
+      // content is mirrored into the journal; Matron-originated content
+      // already has its own journal row and must not be duplicated.
+      for (const { blocks, journalOrigin } of planQueueFlush(outbox)) {
+        sendToSession(session, blocks, { skipJournalMirror: journalOrigin });
+      }
     } else {
       // Nothing to send (or session died) — don't leave a typing indicator
       // spinning with no turn behind it.
@@ -2575,33 +2587,16 @@ function formatQueueSummary(queued) {
   return { plain, html: `<ol>${html}</ol>` };
 }
 
+// Merge/grouping rules live in lib/queue-flush.js (pure, unit-tested): one
+// send per contiguous same-origin run. For an all-Matrix queue that's the
+// original single merged send; a queue containing journal-originated
+// messages (Matron text routed in while busy) flushes those as separate
+// sends flagged skipJournalMirror, so already-journaled content is never
+// re-mirrored while Matrix-originated content still is.
 function flushQueue(session, queued) {
-  const merged = [];
-  let textAccum = [];
-
-  function flushText() {
-    if (textAccum.length === 0) return;
-    const combined = textAccum.map(blocks =>
-      blocks.map(b => b.text).join('\n')
-    ).join('\n\n');
-    merged.push({ type: 'text', text: combined });
-    textAccum = [];
-  }
-
-  for (const blocks of queued) {
-    const isTextOnly = blocks.every(b => b.type === 'text');
-    if (isTextOnly) {
-      textAccum.push(blocks);
-    } else {
-      flushText();
-      merged.push(...blocks);
-    }
-  }
-  flushText();
-
-  if (merged.length > 0) {
-    if (!sendToSession(session, merged)) {
-      console.log(`[QUEUE] dropped ${queued.length} queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
+  for (const { blocks, journalOrigin } of planQueueFlush(queued)) {
+    if (!sendToSession(session, blocks, { skipJournalMirror: journalOrigin })) {
+      console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
     }
   }
 }
@@ -4195,8 +4190,12 @@ function journalRouteTextToSession(session, body) {
   }
 
   if (session.busy) {
+    // Queue like a Matrix message would, but marked journal-origin so the
+    // eventual flushQueue send skips the journal mirror — the journal
+    // already has this text as the client's own send row, and re-mirroring
+    // on flush would show a duplicate in Matron (see lib/queue-flush.js).
     if (!session.queuedMessages) session.queuedMessages = [];
-    session.queuedMessages.push([{ type: 'text', text: trimmed }]);
+    session.queuedMessages.push(markJournalOrigin([{ type: 'text', text: trimmed }]));
     return;
   }
 
@@ -4292,6 +4291,11 @@ function journalOnText(session, body, { username }) {
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
 // {target_seq, choice, text}, {username}) interface.
 function journalOnPromptReply(session, answer, { username }) {
+  // Command-replay guard: a prompt answer has side effects (keystrokes into
+  // the TUI / a tool_result write), so an ungraceful crash inside the
+  // cursor's ~1s debounce window must not replay it on restart. The frame's
+  // seq was recorded before onEvent fired; force it to disk now.
+  journalPublisher.flushCursor();
   let label;
   try {
     label = journalRoutePromptReply(session, answer);
@@ -4396,6 +4400,11 @@ async function journalHandleControlCommand(body) {
 const journalInputConsumer = createJournalInputConsumer({
   isControlConvo: journalIsControlConvo,
   handleControlCommand: (body) => {
+    // Command-replay guard (same as journalOnPromptReply): flush the cursor
+    // synchronously before dispatching, so a crash inside the debounce
+    // window can't replay an already-dispatched `new` into a duplicate
+    // session on restart.
+    journalPublisher.flushCursor();
     journalHandleControlCommand(body).catch((e) => {
       try { console.warn(`[journal-input] control command failed: ${e.message}`); } catch { /* logging must never throw */ }
     });
@@ -4407,6 +4416,10 @@ const journalInputConsumer = createJournalInputConsumer({
     journalPublishNotice(convoId, type === 'prompt_reply'
       ? "This session is no longer active on this bridge — your answer wasn't delivered."
       : "This session is no longer active on this bridge — your message wasn't delivered.");
+  },
+  noticeStalePromptReply: (convoId) => {
+    journalPublishNotice(convoId,
+      "That prompt has been superseded by a newer one — your answer wasn't delivered. Check the latest prompt and answer that instead.");
   },
   log: console,
 });
