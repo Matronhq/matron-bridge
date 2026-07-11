@@ -293,6 +293,7 @@ describe('createJournalPublisher', () => {
       pub.publishToolOutput('c1', { command: 'ls' });
       pub.publishFile('c1', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 1, from: 'user' });
       pub.publishImage('c1', { blob_ref: 'm2', content_type: 'image/png', name: 'pic.png', size: 1, from: 'user' });
+      pub.publishActivity('c1', 'thinking');
       pub.markRead('c1');
       pub.close();
       pub.close(); // idempotent
@@ -317,6 +318,88 @@ describe('createJournalPublisher', () => {
     }).not.toThrow();
 
     await waitFor(() => fake.received.filter(f => f.op === 'convo_upsert').length >= 1);
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishActivity: sends {op, convo_id, state, detail?} once connected, with no idem_key', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    // Prove the connection is really up (hello_ok received, pump ran) via a
+    // queued frame before touching the never-queued publishActivity path.
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    pub.publishActivity('c1', 'thinking');
+    pub.publishActivity('c1', 'tool', 'rake test:run');
+    await waitFor(() => fake.received.filter(f => f.op === 'activity').length >= 2);
+
+    const [f1, f2] = fake.received.filter(f => f.op === 'activity');
+    expect(f1).toEqual({ op: 'activity', convo_id: 'c1', state: 'thinking' });
+    expect(f2).toEqual({ op: 'activity', convo_id: 'c1', state: 'tool', detail: 'rake test:run' });
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishActivity is NOT queued: a call while disconnected is dropped, not replayed after a later reconnect', async () => {
+    const port = await getFreePort(); // nothing listening yet
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const pub = createJournalPublisher({ url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.publishActivity('c1', 'thinking'); // must be dropped: no connection yet
+    await delay(80); // let a couple of failed connection attempts happen
+
+    const fake = await startFakeServer({}, port);
+    // Prove the connection did come up (hello_ok round-trip) via a queued
+    // frame, then give a wrongly-replayed activity frame a full window to
+    // show up before asserting its absence.
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+    await delay(80);
+
+    expect(fake.received.some(f => f.op === 'activity')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('publishActivity is a safe no-op when disabled (no url/token) and never throws', () => {
+    const pub = createJournalPublisher({ url: '', token: '', log: silentLog });
+    expect(() => {
+      pub.publishActivity('c1', 'thinking');
+      pub.publishActivity('c1', 'tool', 'ls');
+    }).not.toThrow();
+  });
+
+  it('publishActivity: an error frame from an older server without the op flows through the existing per-code warn, not a separate mechanism', async () => {
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'activity' ? { kind: 'control', op: 'error', code: 'bad_request', ref: 'activity' } : null),
+    });
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log, ...FAST_BACKOFF });
+
+    pub.upsertConvo('c1', {});
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert'));
+
+    pub.publishActivity('c1', 'thinking');
+    pub.publishActivity('c1', 'tool', 'ls');
+    pub.publishActivity('c1', 'idle');
+    await waitFor(() => fake.received.filter(f => f.op === 'activity').length >= 3);
+    await delay(80); // let the rejected error frames round-trip back
+
+    // Exactly one warning for the repeated 'bad_request' code across three
+    // rejected activity sends — the shared per-connection-epoch dedup
+    // (warnedErrorCodes), not a second per-method mechanism.
+    const badRequestWarnings = warnings.filter(w => /bad_request/.test(w));
+    expect(badRequestWarnings.length).toBe(1);
+
+    // Nothing wedged: a normal (queued) publish made afterward still lands.
+    pub.publishText('c1', { body: 'still alive', from: 'user' });
+    await waitFor(() => fake.received.some(f => f.op === 'publish'));
+
     pub.close();
     await fake.close();
   });
