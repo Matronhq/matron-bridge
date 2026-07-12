@@ -2822,8 +2822,14 @@ function markdownToHtml(text) {
     // Markdown links: [text](url)
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
 
-    // Linkify remaining bare URLs (not already inside tags)
-    html = html.replace(/(?<!href="|">)(https?:\/\/[^\s<>"']+)/g, '<a href="$1">$1</a>');
+    // Linkify remaining bare URLs (not already inside tags). The text is
+    // already escapeHtml'd, so a quote right after a URL appears as
+    // &quot;/&#39; — stop the match at those entities or they get absorbed
+    // into the href. (&lt;/&gt; are deliberately NOT terminators: a literal
+    // > inside a URL has always been absorbed as &gt; and decodes back to >
+    // when the client parses the attribute, so stopping there would change
+    // currently-correct rendering.)
+    html = html.replace(/(?<!href="|">)(https?:\/\/(?:(?!&quot;|&#39;)[^\s<>"'])+)/g, '<a href="$1">$1</a>');
 
     // Horizontal rules
     html = html.replace(/^-{3,}$/gm, '<hr/>');

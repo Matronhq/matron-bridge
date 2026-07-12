@@ -96,6 +96,17 @@ describe('formatLimits', () => {
     const { html } = formatLimits(parseUsageLimits(raw), raw);
     expect(html).toContain('&lt;bad&gt;');
     expect(html).toContain('&amp;');
+    expect(html).toContain('&quot;stuff&quot;');
     expect(html).not.toContain('<bad>');
+    expect(html).not.toContain('"stuff"');
+  });
+
+  it('escapes double quotes in parsed labels and reset times', () => {
+    const { html } = formatLimits(
+      { ok: true, lines: [{ label: 'week ("all" models)', percent: 10, resets: 'Jul 9, "noon"' }] },
+      '',
+    );
+    expect(html).toContain('week (&quot;all&quot; models)');
+    expect(html).toContain('Jul 9, &quot;noon&quot;');
   });
 });

@@ -141,7 +141,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `DEBUG` | Set to `1` to log raw JSON events from Claude Code | `0` |
 | `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work over Matrix | `0` |
-| `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to `/tmp/iv-pty-<roomId>.log` for debugging stuck-prompt issues | `0` |
+| `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
