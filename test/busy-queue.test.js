@@ -1,14 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'fs';
 import { dispatchBusyQueueMagicWord, handleBusyQueueMagicWord } from '../lib/busy-queue.js';
 
 // Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
 // send/interrupt/!interrupt (flush now) and cancel (pop last) handling is
 // extracted into lib/busy-queue.js so the journal session-text route can
 // reuse the SAME implementation. Matrix behavior is pinned byte-for-byte via
-// the full seam set (sendHtml + stripQueueNotificationLinks + editMessage);
-// the journal caller passes only sendReply/formatQueueSummary/flushQueue —
-// no message editing exists in the journal protocol, so its feedback is a
-// fresh text and the Matrix-only notification edits are simply skipped.
+// the full seam set. Per the PR #104 review findings, the journal caller
+// passes BOTH Matrix notification seams too (editMessage AND
+// stripQueueNotificationLinks — session.roomId is a real Matrix room, and
+// queuedMessages/queueNotifications must move in lockstep on every path or
+// later indexed cancels edit the WRONG tile); only sendHtml is omitted,
+// because journal feedback stays plain text.
 
 // The real formatQueueSummary lives in index.js (it leans on escapeHtml);
 // tests inject a recognizable stand-in so assertions can prove it was fed
@@ -45,20 +48,36 @@ function matrixDeps(overrides = {}) {
   };
 }
 
+// Faithful stand-in for index.js's stripQueueNotificationLinks (index.js
+// ~3150): clears session.queueNotifications AND edits every tile back to its
+// plain text (removing the action links). Bound to a deps object so the
+// per-tile edits are observable on the same editMessage mock.
+function realisticStrip(deps) {
+  return vi.fn(async (session) => {
+    const notifs = session.queueNotifications || [];
+    if (notifs.length === 0) return;
+    session.queueNotifications = [];
+    for (const { eventId, plain } of notifs) {
+      await deps.editMessage(session.roomId, eventId, plain);
+    }
+  });
+}
+
 function journalDeps(overrides = {}) {
   // What journalRouteTextToSession passes: a plain reply sink, the shared
-  // queue primitives, and the real editMessage — session.roomId is a real
-  // Matrix room, so a Matron cancel edits the cancelled message's "📨
-  // Queued" tile exactly like a Matrix cancel would (cross-transport
-  // display parity; PR #104 review finding). Still no sendHtml (journal
-  // feedback stays plain text) and no stripQueueNotificationLinks.
-  return {
+  // queue primitives, and BOTH Matrix notification seams (PR #104 review
+  // findings) — session.roomId is a real Matrix room, so a Matron cancel
+  // pops-and-edits the cancelled tile and a Matron send clears + strips the
+  // queued tiles, exactly like their Matrix counterparts. Only sendHtml is
+  // omitted (journal feedback stays plain text).
+  const deps = {
     sendReply: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
     flushQueue: vi.fn(),
     editMessage: vi.fn(async () => {}),
-    ...overrides,
   };
+  deps.stripQueueNotificationLinks = realisticStrip(deps);
+  return { ...deps, ...overrides };
 }
 
 describe('dispatchBusyQueueMagicWord — gating', () => {
@@ -155,15 +174,68 @@ describe('handleBusyQueueMagicWord — send/interrupt (journal seams)', () => {
     expect(session.queuedMessages).toBeNull();
   });
 
-  it('does not strip notification links when that seam is absent (guard, do not crash)', async () => {
+  it('a caller that omits the strip seam is guarded (no crash), tiles left as-is', async () => {
     const session = makeSession();
-    const deps = journalDeps();
+    const deps = journalDeps({ stripQueueNotificationLinks: undefined });
     await expect(handleBusyQueueMagicWord(session, 'send', deps)).resolves.toBeUndefined();
-    // No stripQueueNotificationLinks seam passed — the "📨 Queued" tiles
-    // stay as-is (their actions no-op against the now-empty queue), and
-    // editMessage is a cancel-path seam only, never invoked on a flush.
     expect(session.queueNotifications).toHaveLength(2);
     expect(deps.editMessage).not.toHaveBeenCalled();
+  });
+
+  it('journal send-flush clears queueNotifications and strips each tile to its plain text (PR #104 Bugbot finding)', async () => {
+    const session = makeSession();
+    const deps = journalDeps();
+
+    await handleBusyQueueMagicWord(session, 'send', deps);
+    // strip is fire-and-forget (un-awaited, like the Matrix original) — let
+    // its per-tile edits drain before asserting them.
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
+    expect(session.queueNotifications).toEqual([]);
+    expect(deps.editMessage).toHaveBeenCalledWith('!room:server', '$ev1', '📨 Queued (1): first');
+    expect(deps.editMessage).toHaveBeenCalledWith('!room:server', '$ev2', '📨 Queued (2): second');
+    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('Bugbot scenario invariant: after a Matron send-flush, a re-queued message is index-aligned with its tile', async () => {
+    // The indexed cancel:<idx> button handler lives in index.js's Matrix
+    // button_response path and is not importable in this harness (top-level
+    // Matrix/express side effects — see showbashoutput.test.js). What
+    // protects it is the invariant asserted here: a Matron send-flush leaves
+    // BOTH arrays empty, so post-flush queueing rebuilds them in lockstep
+    // from index 0 — cancel:0 then splices queue[0] and notifs[0] for the
+    // SAME message. Pre-fix, notifs kept the two stale entries, so
+    // notifs[0] was tileA while queue[0] was the new message C.
+    const session = makeSession();
+    const deps = journalDeps();
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(session.queuedMessages).toBeNull();
+    expect(session.queueNotifications).toEqual([]);
+
+    // Re-queue exactly like index.js's busy paths do (push to both arrays).
+    session.queuedMessages = [[{ type: 'text', text: 'C' }]];
+    session.queueNotifications.push({ eventId: '$evC', plain: '📨 Queued (1): C' });
+    expect(session.queueNotifications[0].eventId).toBe('$evC');
+    expect(session.queuedMessages).toHaveLength(session.queueNotifications.length);
+  });
+});
+
+// The wiring half of the PR #104 Bugbot findings: index.js can't be imported
+// in-process, so pin by source inspection that the journal busy caller hands
+// the shared dispatcher BOTH Matrix notification seams (the lib guards make
+// omitting them silently "work" — this is what keeps the wiring honest).
+describe('index.js journal busy caller — notification seams wiring (source inspection)', () => {
+  it('passes editMessage AND stripQueueNotificationLinks to dispatchBusyQueueMagicWord', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('dispatchBusyQueueMagicWord(trimmed, session, {');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('});', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/\beditMessage\b/);
+    expect(args).toMatch(/\bstripQueueNotificationLinks\b/);
   });
 });
 
