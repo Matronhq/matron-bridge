@@ -14,8 +14,9 @@ vi.mock('child_process', () => {
 // Mock fs
 vi.mock('fs', () => ({
   default: {
+    mkdtempSync: vi.fn((prefix) => `${prefix}XXXXXX`),
     writeFileSync: vi.fn(),
-    unlinkSync: vi.fn(),
+    rmSync: vi.fn(),
   },
 }));
 
@@ -180,7 +181,7 @@ describe('transcribeAudio', () => {
     expect(fs.writeFileSync.mock.calls[0][1]).toBe(fakeBuffer);
   });
 
-  it('cleans up temp files on success', async () => {
+  it('cleans up the temp dir on success', async () => {
     mockExecFile(
       { stdout: '' },
       { stdout: 'text' },
@@ -188,7 +189,9 @@ describe('transcribeAudio', () => {
 
     await transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG);
 
-    expect(fs.unlinkSync).toHaveBeenCalledTimes(2);
+    expect(fs.rmSync).toHaveBeenCalledTimes(1);
+    expect(fs.rmSync.mock.calls[0][0]).toBe(fs.mkdtempSync.mock.results[0].value);
+    expect(fs.rmSync.mock.calls[0][1]).toEqual({ recursive: true, force: true });
   });
 
   it('cleans up temp files on ffmpeg error', async () => {
@@ -200,7 +203,7 @@ describe('transcribeAudio', () => {
     await expect(transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG))
       .rejects.toThrow('ffmpeg failed');
 
-    expect(fs.unlinkSync).toHaveBeenCalledTimes(2);
+    expect(fs.rmSync).toHaveBeenCalledTimes(1);
   });
 
   it('cleans up temp files on whisper error', async () => {
@@ -212,7 +215,7 @@ describe('transcribeAudio', () => {
     await expect(transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG))
       .rejects.toThrow('whisper crashed');
 
-    expect(fs.unlinkSync).toHaveBeenCalledTimes(2);
+    expect(fs.rmSync).toHaveBeenCalledTimes(1);
   });
 
   it('respects custom language config', async () => {
