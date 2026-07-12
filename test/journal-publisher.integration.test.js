@@ -10,7 +10,10 @@ function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function waitFor(predicate, timeoutMs = 5000, intervalMs = 20) {
+// 10s default: these tests spawn a real matron-journal server, and under full
+// parallel suite load its WS round-trips can exceed 5s (a long-standing flake
+// on the cursor-redelivery test). Still bounded by each it()'s 15-20s timeout.
+async function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
   const start = Date.now();
   while (!predicate()) {
     if (Date.now() - start > timeoutMs) throw new Error('waitFor: timed out waiting for condition');
