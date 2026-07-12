@@ -1024,6 +1024,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       session.subagentWatcher = null;
     }
     flushResponse(session);
+    // Same exit-seam overlay clear as print-mode's proc.on('close'). iv-mode
+    // reads complete messages from the transcript, so no overlay should ever
+    // be open here today — this is symmetry/defense (and it deletes the
+    // publisher's throttle entry) in case the transcript path ever grows
+    // partials.
+    journalStreamClear(session);
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
