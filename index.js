@@ -4465,9 +4465,10 @@ async function journalRouteTextToSession(session, body) {
     // journal, like every other command reply. editMessage IS passed (PR
     // #104 review finding): session.roomId is a real Matrix room, so a
     // Matron cancel pops-and-edits the cancelled message's "📨 Queued" tile
-    // exactly like a Matrix cancel — leaving it dangling misaligned
-    // queueNotifications against queuedMessages and made a LATER Matrix
-    // cancel edit the wrong tile. (No sendHtml — journal feedback stays
+    // exactly like a Matrix cancel. (Omitting it left a dangling
+    // queueNotifications entry misaligned against queuedMessages and made a
+    // LATER Matrix cancel edit the wrong tile.) (No sendHtml — journal
+    // feedback stays
     // plain — and no stripQueueNotificationLinks: flush leaves tiles as-is;
     // their actions no-op against the emptied queue.) A flush still goes
     // through the one true flushQueue (single merged send + origin-aware
