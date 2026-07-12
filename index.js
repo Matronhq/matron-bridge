@@ -494,10 +494,15 @@ function journalStream(session, messageId, replaceText) {
   if (!session.claudeSessionId) return;
   const nextRef = streamRefFor(session._journalStreamRef, session._journalStreamMsgId, messageId);
   if (session._journalStreamRef && session._journalStreamRef !== nextRef) {
-    // A new assistant message superseded the previous overlay before it
-    // finalized: drop the old overlay's pending frames so nothing stale lands
-    // under the retired ref (its own durable message retires it separately).
-    journalPublisher.endStream(session.claudeSessionId, session._journalStreamRef);
+    // A new assistant message superseded the previous overlay WITHOUT its
+    // durable publish having retired it. That durable is provably never
+    // coming: on the normal path flushResponse -> sendCallback -> sendToRoom
+    // consumes the armed ref (and nulls _journalStreamRef) synchronously
+    // before control returns here, so reaching this branch means the old
+    // buffer was discarded unflushed (waitingForAnswer) or there was no
+    // sendCallback to publish it. Clear, don't just drop: collapse the
+    // orphaned overlay with a final empty replace_text.
+    journalPublisher.endStream(session.claudeSessionId, session._journalStreamRef, { clear: true });
   }
   session._journalStreamRef = nextRef;
   session._journalStreamMsgId = messageId;
