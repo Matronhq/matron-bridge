@@ -49,6 +49,7 @@ import { dispatchBusyQueueMagicWord } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
+import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 
@@ -432,6 +433,19 @@ function journalUpsertConvo(session, opts) {
   journalPublish(session, 'upsertConvo', opts);
 }
 
+// Fire-and-forget at session creation: read the room's existing m.room.name
+// back into the journal so resumed sessions don't sit titleless (UUID in the
+// journal UI) until the next 5-message Gemini rename. Guards and rationale
+// live in lib/journal-title-seed.js.
+function journalSeedTitle(session) {
+  if (!JOURNAL_ENABLED || !session) return;
+  seedJournalTitleFromRoom(session, {
+    getRoomName: async () => (await client.getRoomStateEvent(session.roomId, 'm.room.name', ''))?.name,
+    upsertConvo: journalUpsertConvo,
+    warn: (msg) => console.warn(msg),
+  });
+}
+
 // Single choke point for mirroring anything USER-authored into the journal:
 // publishes the item, then advances the user's read marker so mirrored user
 // messages don't inflate unread badges on the user's other devices. Every
@@ -599,7 +613,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     fallback: INTERACTIVE_MODE,
   });
   if (interactive) {
-    return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
+    const ivSession = createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
+    journalSeedTitle(ivSession);
+    return ivSession;
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
@@ -844,6 +860,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
 
   sessions.set(roomId, session);
+  journalSeedTitle(session);
   return session;
 }
 
