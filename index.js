@@ -5170,7 +5170,9 @@ client.on('room.message', async (roomId, event) => {
     // (classifyBusyMagicWord in lib/command-dispatch.js +
     // lib/busy-queue.js) so the two transports can't fork — the Matrix-only
     // notification edits ride in as the stripQueueNotificationLinks /
-    // editMessage seams, which the journal caller simply doesn't pass.
+    // editMessage seams, which the journal caller now also passes (its
+    // session.roomId is a real Matrix room) so send/cancel keep the queue
+    // and its notification tiles aligned identically on both transports.
     const handledMagicWord = await dispatchBusyQueueMagicWord(text, session, {
       sendReply,
       sendHtml: sendHtmlFn,
