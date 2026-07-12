@@ -3,10 +3,13 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import {
   extractSummaryFromContent,
   readSessionSummary,
   listSessionSummaries,
+  listSessionIdsByMtime,
+  pathExists,
 } from '../lib/session-summary.js';
 
 // Bounded, async session-summary reads (review fast-follow on the /sessions
@@ -166,5 +169,162 @@ describe('listSessionSummaries (stat-sort first, read only the top limit)', () =
   it('returns [] for an empty or missing directory', async () => {
     expect(await listSessionSummaries(dir)).toEqual([]);
     expect(await listSessionSummaries(path.join(dir, 'missing'))).toEqual([]);
+  });
+});
+
+// Issue #102 (short-read nit): FileHandle.read() may return fewer bytes than
+// asked for; the old single-read code never checked bytesRead, so a short
+// read left the tail of the buffer NUL-filled and the NUL-padded line
+// aborted the whole scan to ''.
+describe('readSessionSummary — short reads', () => {
+  let dir;
+  beforeEach(async () => { dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'shortread-test-')); });
+  afterEach(async () => { await fsp.rm(dir, { recursive: true, force: true }); });
+
+  it('assembles the full head chunk even when read() returns a few bytes per call', async () => {
+    const p = path.join(dir, 'short.jsonl');
+    await fsp.writeFile(p, userLine('short-read survivor') + '\n');
+    const realOpen = fsp.open.bind(fsp);
+    const spy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fh = await realOpen(...args);
+      const realRead = fh.read.bind(fh);
+      // Clamp every read to at most 7 bytes, whatever was requested —
+      // a worst-case short-reading file handle.
+      fh.read = (buffer, offset, length, position) =>
+        realRead(buffer, offset, Math.min(length, 7), position);
+      return fh;
+    });
+    try {
+      expect(await readSessionSummary(p)).toBe('short-read survivor');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a read that comes up short of the stat size drops the trailing partial line instead of mis-parsing it', async () => {
+    const p = path.join(dir, 'eof.jsonl');
+    const line1 = userLine('complete line');
+    const line2 = userLine('cut off mid-record');
+    await fsp.writeFile(p, line1 + '\n' + line2 + '\n');
+    const realOpen = fsp.open.bind(fsp);
+    const cutAt = line1.length + 1 + Math.floor(line2.length / 2);
+    const spy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fh = await realOpen(...args);
+      const realRead = fh.read.bind(fh);
+      let served = 0;
+      // Serve bytes only up to `cutAt`, then report EOF (bytesRead 0) — as if
+      // the file shrank between stat and read.
+      fh.read = async (buffer, offset, length, position) => {
+        const allowed = Math.max(0, Math.min(length, cutAt - served));
+        if (allowed === 0) return { bytesRead: 0, buffer };
+        const res = await realRead(buffer, offset, allowed, position);
+        served += res.bytesRead;
+        return res;
+      };
+      return fh;
+    });
+    try {
+      // line2's half-record must be dropped, not JSON.parse-aborted (which
+      // would return '' and lose line1's summary too).
+      expect(await readSessionSummary(p)).toBe('complete line');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+// Issue #102: !resume's id resolution ran readdirSync + statSync INSIDE a
+// sort comparator (O(n log n) stats, all on the event loop) plus existsSync
+// checks. These pin the async replacement's semantics to the old chain:
+// readdir -> filter .jsonl -> strip the extension -> sort newest-first by
+// mtime (stat once per file, stable on ties).
+describe('listSessionIdsByMtime (async !resume id resolution)', () => {
+  let dir;
+  beforeEach(async () => { dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'resume-ids-test-')); });
+  afterEach(async () => { await fsp.rm(dir, { recursive: true, force: true }); });
+
+  async function writeSession(name, mtimeSec) {
+    const p = path.join(dir, name);
+    await fsp.writeFile(p, userLine('m') + '\n');
+    fs.utimesSync(p, mtimeSec, mtimeSec);
+  }
+
+  it('returns ids newest-first by mtime — the exact order the old statSync comparator produced', async () => {
+    const base = Math.floor(Date.now() / 1000) - 3600;
+    await writeSession('old-session.jsonl', base);
+    await writeSession('newest-session.jsonl', base + 120);
+    await writeSession('middle-session.jsonl', base + 60);
+    expect(await listSessionIdsByMtime(dir)).toEqual([
+      'newest-session', 'middle-session', 'old-session',
+    ]);
+  });
+
+  it('ignores non-.jsonl entries, exactly like the old endsWith filter', async () => {
+    const base = Math.floor(Date.now() / 1000) - 3600;
+    await writeSession('real.jsonl', base);
+    await fsp.writeFile(path.join(dir, 'notes.txt'), 'nope');
+    await fsp.mkdir(path.join(dir, 'subdir.d'));
+    expect(await listSessionIdsByMtime(dir)).toEqual(['real']);
+  });
+
+  it('numbered selection semantics are preserved: files[n-1] picks the n-th newest', async () => {
+    // /resume <n> indexes into this list 1-based; pin that the 2nd entry is
+    // the 2nd-newest, matching what /sessions displays.
+    const base = Math.floor(Date.now() / 1000) - 3600;
+    await writeSession('aaa.jsonl', base + 30);
+    await writeSession('bbb.jsonl', base + 90);
+    await writeSession('ccc.jsonl', base + 60);
+    const files = await listSessionIdsByMtime(dir);
+    expect(files[2 - 1]).toBe('ccc');
+  });
+
+  it('propagates a missing-directory error (callers gate on pathExists first, like the old existsSync)', async () => {
+    await expect(listSessionIdsByMtime(path.join(dir, 'missing'))).rejects.toThrow();
+  });
+
+  it('returns [] for a directory with no transcripts', async () => {
+    expect(await listSessionIdsByMtime(dir)).toEqual([]);
+  });
+});
+
+describe('pathExists (async replacement for the resume/sessions existsSync checks)', () => {
+  let dir;
+  beforeEach(async () => { dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'pathexists-test-')); });
+  afterEach(async () => { await fsp.rm(dir, { recursive: true, force: true }); });
+
+  it('is true for an existing directory and file, false for a missing path', async () => {
+    expect(await pathExists(dir)).toBe(true);
+    const f = path.join(dir, 'f.jsonl');
+    await fsp.writeFile(f, 'x');
+    expect(await pathExists(f)).toBe(true);
+    expect(await pathExists(path.join(dir, 'missing'))).toBe(false);
+  });
+});
+
+// The other half of issue #102 lives in index.js's !resume / !sessions
+// cases, which can't be imported in-process (top-level Matrix/express side
+// effects — see showbashoutput.test.js for the precedent). Pin the fix by
+// source inspection instead: the command blocks must contain no synchronous
+// fs metadata calls.
+describe('index.js resume/sessions paths — no sync fs calls (source inspection)', () => {
+  const indexSource = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'index.js'), 'utf-8');
+
+  function commandBlock(startMarker, endMarker) {
+    const start = indexSource.indexOf(startMarker);
+    const end = indexSource.indexOf(endMarker, start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return indexSource.slice(start, end);
+  }
+
+  it("the !resume case runs no readdirSync/statSync/existsSync", () => {
+    const block = commandBlock("case '!resume':", "case '!workdir':");
+    expect(block).not.toMatch(/\b(?:readdirSync|statSync|existsSync)\b/);
+  });
+
+  it("the !sessions case runs no readdirSync/statSync/existsSync", () => {
+    const block = commandBlock("case '!sessions':", "case '!help':");
+    expect(block).not.toMatch(/\b(?:readdirSync|statSync|existsSync)\b/);
   });
 });

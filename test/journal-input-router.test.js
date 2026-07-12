@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createJournalInputConsumer, resolvePromptChoice } from '../lib/journal-input-router.js';
+import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -307,5 +307,219 @@ describe('createJournalInputConsumer — prompt_reply staleness (target_seq)', (
     expect(() => consumer(replyFrame(5))).not.toThrow();
     expect(deps.routePromptReply).not.toHaveBeenCalled();
     expect(warnings.some(w => /stale/i.test(w))).toBe(true);
+  });
+});
+
+// Issue #98: the staleness guard used to record EVERY published prompt event
+// — including the /model, /effort and /mode pickers and the queued-while-busy
+// "📨 Queued" notification, none of which create pending-answer state the
+// reply guard could meaningfully compare against. A picker mirrored between
+// a real prompt and the user's reply made the guard falsely refuse the reply
+// as "superseded". Only answerable prompts may advance the guard; a reply to
+// a genuinely replaced answerable prompt must still be refused.
+describe('createJournalInputConsumer — non-answerable prompts must not supersede replies (issue #98)', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  // AskUserQuestion set, exactly as sendAllQuestions journals it (option ids
+  // opt_a, opt_b, …) — creates waitingForAnswer state: answerable.
+  const questionFrame = (seq, convoId = 'convo-1') => baseFrame({
+    seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'Which approach?', mode: 'pick_one',
+      options: [{ id: 'opt_a', label: 'Approach A', value: 'Approach A' }, { id: 'opt_b', label: 'Approach B', value: 'Approach B' }],
+    },
+  });
+
+  // iv-mode TUI prompt, exactly as promptButtons() journals it — creates
+  // pendingInteractivePrompt state: answerable.
+  const ivPromptFrame = (seq, convoId = 'convo-1') => baseFrame({
+    seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'Proceed?', mode: 'pick_one',
+      options: [{ id: 'prompt-opt-0', label: 'Yes', value: 'prompt-opt:0' }, { id: 'prompt-opt-1', label: 'No', value: 'prompt-opt:1' }],
+    },
+  });
+
+  // No-arg /model picker (modelButtons() shape) — answered via Matrix button
+  // values (model:<alias>), never via prompt_reply: NOT answerable.
+  const modelPickerFrame = (seq, convoId = 'convo-1') => baseFrame({
+    seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'Current model: sonnet', mode: 'pick_one',
+      options: [{ id: 'model-sonnet', label: 'Sonnet', value: 'model:sonnet' }, { id: 'model-opus', label: 'Opus', value: 'model:opus' }],
+    },
+  });
+
+  const effortPickerFrame = (seq, convoId = 'convo-1') => baseFrame({
+    seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'Effort level', mode: 'pick_one',
+      options: [{ id: 'effort-low', label: 'Low', value: 'effort:low' }, { id: 'effort-high', label: 'High', value: 'effort:high' }],
+    },
+  });
+
+  const modeToggleFrame = (seq, convoId = 'convo-1') => baseFrame({
+    seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'Mode: interactive', mode: 'pick_one',
+      options: [{ id: 'mode-print', label: 'Switch to non-interactive', value: 'mode:print' }],
+    },
+  });
+
+  // Queued-while-busy notification (index.js's queue-action buttons) — NOT
+  // answerable.
+  const queueNotifFrame = (seq, convoId = 'convo-1') => baseFrame({
+    seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: '📨 Queued (1): hello', mode: 'pick_one',
+      options: [{ id: 'cancel', label: '✕ Cancel', value: 'cancel:0' }, { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' }],
+    },
+  });
+
+  const replyFrame = (targetSeq, convoId = 'convo-1') => baseFrame({
+    seq: 100, convo_id: convoId, type: 'prompt_reply',
+    payload: { target_seq: targetSeq, choice: 'opt_a', text: null },
+  });
+
+  it('a model picker mirrored between a question and its reply does not supersede the question', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(questionFrame(10));
+    consumer(modelPickerFrame(12)); // interleaved picker — unrelated to the pending question
+    consumer(replyFrame(10));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('effort and mode pickers do not supersede a pending iv TUI prompt', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(ivPromptFrame(20));
+    consumer(effortPickerFrame(21));
+    consumer(modeToggleFrame(22));
+    consumer(replyFrame(20));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('a queued-message notification does not supersede a pending question', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(questionFrame(10));
+    consumer(queueNotifFrame(11)); // user queued a message while busy — still answering seq 10
+    consumer(replyFrame(10));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('a genuinely superseded answerable prompt is still refused (question replaced by a newer question)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(questionFrame(10));
+    consumer(questionFrame(15)); // a NEW question set replaced the one at 10
+    consumer(replyFrame(10));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
+      username: 'dan', targetSeq: 10, latestSeq: 15,
+    });
+  });
+
+  it('an answerable prompt of a different shape still supersedes (iv prompt after a question)', () => {
+    // Both shapes create pending-answer state, and journalRoutePromptReply
+    // resolves iv prompts FIRST — accepting the old reply here would
+    // mis-answer the newer TUI prompt, so refusal is the fail-safe outcome.
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(questionFrame(10));
+    consumer(ivPromptFrame(15));
+    consumer(replyFrame(10));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalled();
+  });
+
+  it('pickers alone never record a guard seq — a reply then fails open exactly like an unrecorded convo', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(modelPickerFrame(12));
+    consumer(queueNotifFrame(13));
+    consumer(replyFrame(5)); // nothing answerable was ever recorded
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('exposes evictConvo(convoId): teardown clears the guard for that convo only', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    expect(typeof consumer.evictConvo).toBe('function');
+    consumer(questionFrame(10, 'convo-a'));
+    consumer(questionFrame(20, 'convo-b'));
+    consumer.evictConvo('convo-a');
+    // convo-a: record evicted — a late reply fails open (accepted), the same
+    // contract as a bridge restart.
+    consumer(replyFrame(3, 'convo-a'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    // convo-b: untouched — its guard still refuses a stale reply.
+    consumer(replyFrame(3, 'convo-b'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-b', {
+      username: 'dan', targetSeq: 3, latestSeq: 20,
+    });
+  });
+
+  it('evictConvo tolerates unknown convo ids and non-string input', () => {
+    const consumer = createJournalInputConsumer(makeDeps());
+    expect(() => consumer.evictConvo('never-seen')).not.toThrow();
+    expect(() => consumer.evictConvo(null)).not.toThrow();
+    expect(() => consumer.evictConvo(undefined)).not.toThrow();
+  });
+});
+
+// The payload classifier behind the issue #98 fix. Option IDs are
+// bridge-controlled constants (never user/model text), which is what makes
+// shape-matching on them safe.
+describe('promptExpectsReply', () => {
+  it('is true for AskUserQuestion option sets (opt_a, opt_b, …)', () => {
+    expect(promptExpectsReply({ options: [{ id: 'opt_a', label: 'A' }, { id: 'opt_b', label: 'B' }] })).toBe(true);
+  });
+
+  it('is true for iv TUI prompt option sets (prompt-opt-<n>)', () => {
+    expect(promptExpectsReply({ options: [{ id: 'prompt-opt-0', label: 'Yes' }, { id: 'prompt-opt-1', label: 'No' }] })).toBe(true);
+  });
+
+  it('is false for model/effort/mode pickers', () => {
+    expect(promptExpectsReply({ options: [{ id: 'model-sonnet', label: 'Sonnet' }] })).toBe(false);
+    expect(promptExpectsReply({ options: [{ id: 'effort-high', label: 'High' }] })).toBe(false);
+    expect(promptExpectsReply({ options: [{ id: 'mode-print', label: 'Print' }] })).toBe(false);
+  });
+
+  it('is false for queue-notification action buttons (cancel/interrupt)', () => {
+    expect(promptExpectsReply({ options: [{ id: 'cancel', label: '✕ Cancel' }, { id: 'interrupt', label: '⚡ Send now' }] })).toBe(false);
+  });
+
+  it('defaults to true (guard stays active) for unrecognized or missing option shapes', () => {
+    // Fails safe: an unknown future prompt kind is guarded (worst case a
+    // refusal notice), never silently unguarded.
+    expect(promptExpectsReply({ options: [{ id: 'something-new', label: 'X' }] })).toBe(true);
+    expect(promptExpectsReply({ options: [] })).toBe(true);
+    expect(promptExpectsReply({})).toBe(true);
+    expect(promptExpectsReply(null)).toBe(true);
+    expect(promptExpectsReply({ options: 'not-an-array' })).toBe(true);
+  });
+
+  it('a mixed set with any answerable-looking option stays guarded', () => {
+    expect(promptExpectsReply({ options: [{ id: 'model-sonnet' }, { id: 'opt_a' }] })).toBe(true);
   });
 });

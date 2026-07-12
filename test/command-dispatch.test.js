@@ -3,6 +3,9 @@ import {
   BRIDGE_COMMAND_NAMES,
   classifyBridgeCommand,
   classifyRescueKeystroke,
+  classifyBusyMagicWord,
+  isPlanBuildText,
+  dispatchPlanBuild,
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
   dispatchJournalRescueKeystroke,
@@ -122,6 +125,43 @@ describe('classifyRescueKeystroke (Matrix regression pin: !esc)', () => {
   });
 });
 
+// Busy-queue magic words (PR #101 follow-up). While a session is busy, bare
+// send/interrupt/!interrupt flush the queue and bare cancel pops the last
+// queued message — Matrix behavior pinned here, now shared with the journal
+// session-text route (lib/busy-queue.js). Classification only: the busy
+// gating lives at the call sites (and in dispatchBusyQueueMagicWord).
+describe('classifyBusyMagicWord (Matrix regression pins)', () => {
+  it("classifies the flush words exactly as the Matrix busy branch compared them", () => {
+    expect(classifyBusyMagicWord('send')).toBe('send');
+    expect(classifyBusyMagicWord('interrupt')).toBe('send');
+    expect(classifyBusyMagicWord('!interrupt')).toBe('send');
+  });
+
+  it('classifies cancel', () => {
+    expect(classifyBusyMagicWord('cancel')).toBe('cancel');
+  });
+
+  it('is case-insensitive and trims whitespace, like the Matrix lowerText comparison', () => {
+    expect(classifyBusyMagicWord('  SEND ')).toBe('send');
+    expect(classifyBusyMagicWord('Cancel')).toBe('cancel');
+    expect(classifyBusyMagicWord(' !Interrupt ')).toBe('send');
+  });
+
+  it('returns null for anything else — including near-misses that must queue as ordinary text', () => {
+    expect(classifyBusyMagicWord('send it')).toBeNull();
+    expect(classifyBusyMagicWord('/interrupt')).toBeNull();
+    expect(classifyBusyMagicWord('!send')).toBeNull();
+    expect(classifyBusyMagicWord('cancel:0')).toBeNull();
+    expect(classifyBusyMagicWord('')).toBeNull();
+  });
+
+  it('returns null for non-string input rather than throwing', () => {
+    expect(classifyBusyMagicWord(null)).toBeNull();
+    expect(classifyBusyMagicWord(undefined)).toBeNull();
+    expect(classifyBusyMagicWord(7)).toBeNull();
+  });
+});
+
 describe('isIvSlashPassthrough (Matrix regression pin: unknown-slash passthrough + // escape)', () => {
   it('is true for an unknown slash command', () => {
     expect(isIvSlashPassthrough('/compact')).toBe(true);
@@ -145,6 +185,58 @@ describe('isIvSlashPassthrough (Matrix regression pin: unknown-slash passthrough
   it('returns false for non-string input rather than throwing', () => {
     expect(isIvSlashPassthrough(null)).toBe(false);
     expect(isIvSlashPassthrough(undefined)).toBe(false);
+  });
+});
+
+// Plan-mode `build` keyword (PR #101 follow-up). Matrix approves a pending
+// plan when the text is exactly "build" (case-insensitive, trimmed) and the
+// session has plan state (pendingPlan || pendingPlanDenialId ||
+// ivPendingPlanToolUseId). Decision shared here; the approval implementation
+// (approvePlanBuild, index.js) is reused AS-IS by both transports.
+describe('isPlanBuildText (Matrix regression pins)', () => {
+  it("matches exactly the Matrix comparison: text.toLowerCase().trim() === 'build'", () => {
+    expect(isPlanBuildText('build')).toBe(true);
+    expect(isPlanBuildText('Build')).toBe(true);
+    expect(isPlanBuildText('  BUILD  ')).toBe(true);
+  });
+
+  it('does not match longer phrases or prefixed spellings — those are plan feedback, not approval', () => {
+    expect(isPlanBuildText('build it')).toBe(false);
+    expect(isPlanBuildText('please build')).toBe(false);
+    expect(isPlanBuildText('!build')).toBe(false);
+    expect(isPlanBuildText('/build')).toBe(false);
+    expect(isPlanBuildText('')).toBe(false);
+  });
+
+  it('returns false for non-string input rather than throwing', () => {
+    expect(isPlanBuildText(null)).toBe(false);
+    expect(isPlanBuildText(undefined)).toBe(false);
+    expect(isPlanBuildText(9)).toBe(false);
+  });
+});
+
+describe('dispatchPlanBuild', () => {
+  it('approves via the injected approvePlan when the text is build and a plan is pending', async () => {
+    const approvePlan = vi.fn(async () => {});
+    expect(await dispatchPlanBuild('build', true, { approvePlan })).toBe(true);
+    expect(approvePlan).toHaveBeenCalledTimes(1);
+  });
+
+  it('with no pending plan, build is NOT intercepted — it routes as ordinary text', async () => {
+    const approvePlan = vi.fn();
+    expect(await dispatchPlanBuild('build', false, { approvePlan })).toBe(false);
+    expect(approvePlan).not.toHaveBeenCalled();
+  });
+
+  it('with a pending plan, non-build text is NOT intercepted (plan feedback flows through)', async () => {
+    const approvePlan = vi.fn();
+    expect(await dispatchPlanBuild('actually, use vitest instead', true, { approvePlan })).toBe(false);
+    expect(approvePlan).not.toHaveBeenCalled();
+  });
+
+  it('propagates a thrown error from approvePlan (caller catches — see journalOnText)', async () => {
+    const approvePlan = vi.fn(async () => { throw new Error('kaboom'); });
+    await expect(dispatchPlanBuild('build', true, { approvePlan })).rejects.toThrow('kaboom');
   });
 });
 

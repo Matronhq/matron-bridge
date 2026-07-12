@@ -32,18 +32,20 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
-import { readSessionSummary, listSessionSummaries } from './lib/session-summary.js';
+import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   classifyBridgeCommand,
   classifyRescueKeystroke,
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
   dispatchJournalRescueKeystroke,
+  dispatchPlanBuild,
   classifyJournalControlCommand,
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
+import { dispatchBusyQueueMagicWord } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
@@ -703,6 +705,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Auto-restart is about to replace `session` outright (no
         // journalSessionState('done') — the convo isn't over, it's
@@ -752,6 +755,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -960,6 +964,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // See the matching print-mode branch's comment: the terminal exit
         // paths already emit idle on restart, this auto-restart branch
@@ -999,6 +1004,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         sessions.delete(roomId);
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
@@ -3554,6 +3560,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       killSession(session);
       sessions.delete(roomId);
+      journalEvictConvoInput(session);
       // Append [done] to the session room name
       try {
         const nameEvent = await client.getRoomStateEvent(session.roomId, 'm.room.name', '');
@@ -3616,19 +3623,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const encodedPath = resumeWorkdir.replace(/\//g, '-');
       const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
-      if (!fs.existsSync(projectDir)) {
+      if (!(await pathExists(projectDir))) {
         await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
         return;
       }
 
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => f.replace('.jsonl', ''))
-        .sort((a, b) => {
-          const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
-          const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
-          return sb.mtimeMs - sa.mtimeMs;
-        });
+      // Async id resolution (issue #102): the old inline version ran a
+      // synchronous readdir and then a synchronous stat INSIDE the sort
+      // comparator — O(n log n) blocking metadata calls on the event loop.
+      // Same ordering and fallbacks, one stat per file, via fs.promises
+      // (lib/session-summary.js; the no-sync-fs pin lives in
+      // test/session-summary.test.js's source-inspection block).
+      const files = await listSessionIdsByMtime(projectDir);
 
       let resumeSessionId;
       let actualWorkdir = resumeWorkdir;
@@ -3653,7 +3659,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             const altEncoded = foundEntry.workdir.replace(/\//g, '-');
             const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
-            if (fs.existsSync(altFile)) {
+            if (await pathExists(altFile)) {
               resumeSessionId = foundEntry.sessionId;
               actualWorkdir = foundEntry.workdir;
             }
@@ -3863,7 +3869,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const encodedPath = workdir.replace(/\//g, '-');
       const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
-      if (!fs.existsSync(projectDir)) {
+      if (!(await pathExists(projectDir))) {
         await sendReply('No sessions found for this workdir.');
         break;
       }
@@ -4313,8 +4319,9 @@ function journalSessionCommandCtx(session) {
 // pending-TUI-prompt resolution (maybeResolveInteractivePrompt, same
 // parseOptionReply-driven logic a typed Matrix reply uses), the
 // detector-missed "unclassified prompt" menu guard, print-mode
-// AskUserQuestion resolution, iv-mode PTY rescue keystrokes
-// (classifyRescueKeystroke), THEN busy-queueing (with the same
+// AskUserQuestion resolution, the plan-mode `build` keyword
+// (dispatchPlanBuild + the shared approvePlanBuild), iv-mode PTY rescue
+// keystrokes (classifyRescueKeystroke), THEN busy-queueing (with the same
 // TUI-slash-passthrough bypass Matrix uses), THEN a normal turn — using the
 // exact same session state (queuedMessages, pendingInteractivePrompt,
 // pendingUnclassifiedPrompt) a Matrix message would, rather than a second
@@ -4322,12 +4329,13 @@ function journalSessionCommandCtx(session) {
 // journal already has this text as the client's own `send` row, so nothing
 // here may publish a duplicate agent-sourced echo of it.
 //
-// Scope note (v1): the Matrix handler's plan-mode "build" keyword and the
-// busy-queue magic words (bare "send"/"interrupt"/"cancel", which edit a
-// Matrix notification message by event ID) are NOT reproduced here — both
-// remain reachable from the session's still-fully-synced Matrix room.
-// Everything else a plain typed reply — or a bridge command — can do, a
-// Matron text message can do too.
+// Scope note: the busy-queue magic words (bare "send"/"interrupt"/"cancel")
+// are reproduced below via the shared lib/busy-queue.js implementation the
+// Matrix busy branch also uses — feedback is a fresh text, and the Matrix
+// "📨 Queued" tiles are maintained exactly like their Matrix counterparts
+// (cancel pops-and-edits the cancelled tile; send clears + strips the rest
+// — cross-transport display parity). Everything a plain typed reply — or a
+// bridge command — can do, a Matron text message can do too.
 async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
@@ -4393,6 +4401,26 @@ async function journalRouteTextToSession(session, body) {
     return;
   }
 
+  // Plan-mode `build` keyword — the SAME decision gate and approval
+  // implementation as the Matrix handler (dispatchPlanBuild +
+  // approvePlanBuild), checked at the same position in the ordering: after
+  // prompt/menu/question resolution, before rescue keystrokes and
+  // busy-queueing. With no pending plan, `build` falls through and routes to
+  // Claude as ordinary text, exactly like Matrix. The "▶️ Building..."
+  // notice goes through the session ctx's sendHtml (sendToRoom), which
+  // mirrors into the journal like every other bridge reply.
+  const dispatchedBuild = await dispatchPlanBuild(
+    trimmed,
+    !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId),
+    {
+      approvePlan: () => {
+        const ctx = journalSessionCommandCtx(session);
+        return approvePlanBuild(session, { sendHtml: ctx.sendHtml });
+      },
+    },
+  );
+  if (dispatchedBuild) return;
+
   // iv-mode PTY rescue keystrokes (!enter/!esc/!escape/!stop) — same
   // classifier and same session.iv.sendKeystroke calls the Matrix handler
   // uses, checked at the same point in the order (after prompt/menu/question
@@ -4443,6 +4471,31 @@ async function journalRouteTextToSession(session, body) {
       sendTextToSession(session, trimmed, { skipJournalMirror: true });
       return;
     }
+    // Busy-queue magic words — the SAME classifier and implementation the
+    // Matrix busy branch uses (lib/busy-queue.js), checked at the same point
+    // (busy, not a TUI slash passthrough). Feedback goes through
+    // ctx.sendReply — a fresh sendToRoom text that also mirrors into the
+    // journal, like every other command reply. BOTH Matrix notification
+    // seams ARE passed (PR #104 review findings): session.roomId is a real
+    // Matrix room, and queuedMessages/queueNotifications must move in
+    // lockstep on EVERY path — a Matron cancel pops-and-edits the cancelled
+    // tile, and a Matron send clears + strips the queued tiles, exactly
+    // like their Matrix counterparts. Skipping either seam left dangling
+    // notif entries, so a later Matrix cancel's "(cancelled)" edit — and
+    // the indexed cancel:<n> buttons on stale, still-linked tiles — landed
+    // on the WRONG message. Only sendHtml is omitted: journal feedback
+    // stays plain. A flush still goes through the one true flushQueue
+    // (single merged send + origin-aware mirroring, PR #100) — never a
+    // second flush path.
+    const ctx = journalSessionCommandCtx(session);
+    const handledMagicWord = await dispatchBusyQueueMagicWord(trimmed, session, {
+      sendReply: ctx.sendReply,
+      formatQueueSummary,
+      flushQueue,
+      stripQueueNotificationLinks,
+      editMessage,
+    });
+    if (handledMagicWord) return;
     // Queue like a Matrix message would, but marked journal-origin so the
     // eventual flushQueue send skips the journal mirror — the journal
     // already has this text as the client's own send row, and re-mirroring
@@ -4661,6 +4714,105 @@ const journalInputConsumer = createJournalInputConsumer({
 // been assigned).
 function journalHandleInboundEvent(frame) {
   journalInputConsumer(frame);
+}
+
+// Evict the reply-staleness guard record for a torn-down session's convo
+// (issue #98 nit — the consumer's per-convo map is otherwise never pruned).
+// Called from every TERMINAL session teardown (the exit handlers' non-restart
+// branches and !stop), alongside the other journal state those sites already
+// settle (journalSessionState 'done' / journalActivity 'idle'). Deliberately
+// NOT called on auto-restart or recreateSession: the same convo (same
+// claudeSessionId) lives on there and its guard record is still meaningful.
+// Hoisted function declaration — the exit handlers are defined earlier in
+// this file but only ever fire long after journalInputConsumer is assigned.
+function journalEvictConvoInput(session) {
+  if (session && session.claudeSessionId) journalInputConsumer.evictConvo(session.claudeSessionId);
+}
+
+// Plan approval for the `build` keyword — the Matrix handler's original
+// build block, extracted verbatim so the journal session-text route runs
+// the SAME code path (PR #101 follow-up; decision gate: dispatchPlanBuild,
+// lib/command-dispatch.js). iv-mode resolves the pending /plan-decision
+// hook with allow; print-mode does the tool_result/denial dance (or falls
+// back to a plain approval message when the denial was already answered).
+// `sendHtml` is the transport's reply sink for the final "▶️ Building..."
+// notice — Matrix passes its room sink, the journal passes the session
+// ctx's sendToRoom sink, which also mirrors into the journal.
+async function approvePlanBuild(session, { sendHtml }) {
+  const toolUseId = session.pendingPlanDenialId;
+  console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
+
+  // Check if a tool_result already exists in the session history for this tool_use_id.
+  // Claude CLI auto-generates a tool_result for permission denials, so sending another
+  // one causes a duplicate tool_result API 400 error.
+  const alreadyAnswered = toolUseId && session.claudeSessionId
+    ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
+    : false;
+  console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
+
+  if (session.iv) {
+    // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
+    // it with allow so the hook returns and claude proceeds naturally.
+    // No stdin.write or follow-up text needed — the hook's allow decision
+    // unblocks the original tool call and claude continues its turn.
+    const pending = session.ivPendingPlanToolUseId
+      ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
+      : null;
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    session.ivPendingPlanToolUseId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
+    if (pending) {
+      console.log(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
+      pending.resolve({ decision: 'allow', reason: 'approved by user' });
+    } else {
+      console.log(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
+      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+    }
+  } else if (!toolUseId || alreadyAnswered) {
+    // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
+    console.log(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
+    sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+  } else {
+    // No existing tool_result — send tool_result to properly exit plan mode
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
+    session.busy = true;
+    const jsonMsg = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            tool_use_id: toolUseId,
+            type: 'tool_result',
+            content: 'Plan approved by user.',
+          },
+          {
+            type: 'text',
+            text: 'Go ahead and execute the plan now.',
+          }
+        ]
+      }
+    }) + '\n';
+    console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
+    session.proc.stdin.write(jsonMsg);
+    if (session.resetTimeout) session.resetTimeout();
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
+  }
+  const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
+  await sendHtml(buildNotice.plain, buildNotice.html);
 }
 
 // --- Matrix Message Handler ---
@@ -4941,85 +5093,18 @@ client.on('room.message', async (roomId, event) => {
     return;
   }
 
-  // Handle text "build" for plan approval
+  // Handle text "build" for plan approval. Decision (exact keyword + the
+  // pending-plan gate) is shared with the journal session-text route via
+  // dispatchPlanBuild (lib/command-dispatch.js); the implementation is the
+  // shared approvePlanBuild below — extracted verbatim from the block that
+  // used to live here, so both transports run the SAME code path.
   console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
-  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId)) {
-    const toolUseId = session.pendingPlanDenialId;
-    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
-
-    // Check if a tool_result already exists in the session history for this tool_use_id.
-    // Claude CLI auto-generates a tool_result for permission denials, so sending another
-    // one causes a duplicate tool_result API 400 error.
-    const alreadyAnswered = toolUseId && session.claudeSessionId
-      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
-      : false;
-    console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
-
-    if (session.iv) {
-      // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
-      // it with allow so the hook returns and claude proceeds naturally.
-      // No stdin.write or follow-up text needed — the hook's allow decision
-      // unblocks the original tool call and claude continues its turn.
-      const pending = session.ivPendingPlanToolUseId
-        ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
-        : null;
-      session.pendingPlan = null;
-      session.pendingPlanDenialId = null;
-      session.ivPendingPlanToolUseId = null;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
-      }
-      if (pending) {
-        console.log(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
-        pending.resolve({ decision: 'allow', reason: 'approved by user' });
-      } else {
-        console.log(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
-        sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
-      }
-    } else if (!toolUseId || alreadyAnswered) {
-      // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
-      session.pendingPlan = null;
-      session.pendingPlanDenialId = null;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
-      }
-      console.log(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
-      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
-    } else {
-      // No existing tool_result — send tool_result to properly exit plan mode
-      session.pendingPlan = null;
-      session.pendingPlanDenialId = null;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
-      }
-      session.busy = true;
-      const jsonMsg = JSON.stringify({
-        type: 'user',
-        message: {
-          role: 'user',
-          content: [
-            {
-              tool_use_id: toolUseId,
-              type: 'tool_result',
-              content: 'Plan approved by user.',
-            },
-            {
-              type: 'text',
-              text: 'Go ahead and execute the plan now.',
-            }
-          ]
-        }
-      }) + '\n';
-      console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
-      session.proc.stdin.write(jsonMsg);
-      if (session.resetTimeout) session.resetTimeout();
-      if (session.typingInterval) clearInterval(session.typingInterval);
-      session.typingInterval = startTyping(session.roomId);
-    }
-    const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
-    await sendHtmlFn(buildNotice.plain, buildNotice.html);
-    return;
-  }
+  const handledBuild = await dispatchPlanBuild(
+    text,
+    !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId),
+    { approvePlan: () => approvePlanBuild(session, { sendHtml: sendHtmlFn }) },
+  );
+  if (handledBuild) return;
 
   // User sent feedback on the plan (not "build") — clear plan state and forward as message.
   // Only do this when Claude is idle; if busy, leave pendingPlan so "build" still works later.
@@ -5091,49 +5176,24 @@ client.on('room.message', async (roomId, event) => {
     }
   }
   if (session.busy && !isClaudeSlashCommand) {
-    const lowerText = text.toLowerCase().trim();
-    if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
-      const queued = session.queuedMessages || [];
-      session.queuedMessages = null;
-      stripQueueNotificationLinks(session);
-      if (queued.length > 0) {
-        const summary = formatQueueSummary(queued);
-        if (sendHtmlFn) {
-          const plainMsg = `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
-          const htmlMsg = `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
-          await sendHtmlFn(plainMsg, htmlMsg);
-        } else {
-          await sendReply(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
-        }
-        flushQueue(session, queued);
-      } else {
-        await sendReply('⚡ No queued messages to send.');
-      }
-      return;
-    }
-    if (lowerText === 'cancel') {
-      const queue = session.queuedMessages || [];
-      const notifs = session.queueNotifications || [];
-      if (queue.length === 0) {
-        await sendReply('No queued messages to cancel.');
-        return;
-      }
-      queue.pop();
-      if (notifs.length > 0) {
-        const { eventId, plain } = notifs.pop();
-        if (eventId) {
-          await editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
-        }
-      }
-      const remaining = queue.length;
-      if (remaining === 0) {
-        session.queuedMessages = null;
-      }
-      await sendReply(remaining === 0
-        ? 'Cancelled queued message (queue empty).'
-        : `Cancelled queued message (${remaining} remaining).`);
-      return;
-    }
+    // Busy-queue magic words: bare send/interrupt/!interrupt flush the queue
+    // now; bare cancel pops the last queued message. Classification and
+    // implementation are shared with the journal session-text route
+    // (classifyBusyMagicWord in lib/command-dispatch.js +
+    // lib/busy-queue.js) so the two transports can't fork — the Matrix-only
+    // notification edits ride in as the stripQueueNotificationLinks /
+    // editMessage seams, which the journal caller now also passes (its
+    // session.roomId is a real Matrix room) so send/cancel keep the queue
+    // and its notification tiles aligned identically on both transports.
+    const handledMagicWord = await dispatchBusyQueueMagicWord(text, session, {
+      sendReply,
+      sendHtml: sendHtmlFn,
+      formatQueueSummary,
+      flushQueue,
+      stripQueueNotificationLinks,
+      editMessage,
+    });
+    if (handledMagicWord) return;
     // Queue the message
     if (!session.queuedMessages) session.queuedMessages = [];
     if (!session.queueNotifications) session.queueNotifications = [];
