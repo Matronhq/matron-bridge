@@ -3360,7 +3360,12 @@ async function buildMediaContentBlocks(event, session) {
   if (!mxcUrl) return blocks;
 
   const buffer = await downloadMatrixFile(mxcUrl, content.file);
-  const fileName = content.body || 'file';
+  // fileName is used as a path segment for workdir saves below — basename()
+  // strips directory components a malicious/odd Matrix body might carry
+  // (mirrors resolveUploadMeta in lib/iv-uploads.js; '.'/'..' survive
+  // basename, so fold them into the fallback).
+  const rawFileName = path.basename(content.body || 'file');
+  const fileName = rawFileName === '' || rawFileName === '.' || rawFileName === '..' ? 'file' : rawFileName;
   const mime = content.info?.mimetype || 'application/octet-stream';
   // Matrix image events commonly carry width/height in `info` — cheap to
   // reuse for the journal's optional image dims, no image lib needed.
