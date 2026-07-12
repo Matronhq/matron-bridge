@@ -46,12 +46,17 @@ function matrixDeps(overrides = {}) {
 }
 
 function journalDeps(overrides = {}) {
-  // What journalRouteTextToSession passes: a plain reply sink and the shared
-  // queue primitives — no Matrix editing seams at all.
+  // What journalRouteTextToSession passes: a plain reply sink, the shared
+  // queue primitives, and the real editMessage — session.roomId is a real
+  // Matrix room, so a Matron cancel edits the cancelled message's "📨
+  // Queued" tile exactly like a Matrix cancel would (cross-transport
+  // display parity; PR #104 review finding). Still no sendHtml (journal
+  // feedback stays plain text) and no stripQueueNotificationLinks.
   return {
     sendReply: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
     flushQueue: vi.fn(),
+    editMessage: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -150,12 +155,15 @@ describe('handleBusyQueueMagicWord — send/interrupt (journal seams)', () => {
     expect(session.queuedMessages).toBeNull();
   });
 
-  it('never touches Matrix notification seams it was not given (guard, do not crash)', async () => {
+  it('does not strip notification links when that seam is absent (guard, do not crash)', async () => {
     const session = makeSession();
     const deps = journalDeps();
     await expect(handleBusyQueueMagicWord(session, 'send', deps)).resolves.toBeUndefined();
-    // queueNotifications survive untouched — nothing to edit from the journal.
+    // No stripQueueNotificationLinks seam passed — the "📨 Queued" tiles
+    // stay as-is (their actions no-op against the now-empty queue), and
+    // editMessage is a cancel-path seam only, never invoked on a flush.
     expect(session.queueNotifications).toHaveLength(2);
+    expect(deps.editMessage).not.toHaveBeenCalled();
   });
 });
 
@@ -203,12 +211,27 @@ describe('handleBusyQueueMagicWord — cancel (Matrix pin, full seams)', () => {
     const deps = matrixDeps();
     await expect(handleBusyQueueMagicWord(session, 'cancel', deps)).resolves.toBeUndefined();
     expect(deps.editMessage).not.toHaveBeenCalled();
+    // The notif is still popped in lockstep with the queue entry.
+    expect(session.queueNotifications).toHaveLength(0);
     expect(deps.sendReply).toHaveBeenCalledWith('Cancelled queued message (queue empty).');
+  });
+
+  it('pops the notification in lockstep even when NO editMessage seam is passed (arrays never drift)', async () => {
+    // PR #104 review finding: skipping the pop when the edit seam was absent
+    // left queueNotifications longer than queuedMessages, so a LATER Matrix
+    // cancel edited the wrong tile. The pop must be unconditional; only the
+    // edit itself is seam-gated.
+    const session = makeSession();
+    const deps = journalDeps({ editMessage: undefined });
+    await expect(handleBusyQueueMagicWord(session, 'cancel', deps)).resolves.toBeUndefined();
+    expect(session.queuedMessages).toHaveLength(1);
+    expect(session.queueNotifications).toHaveLength(1);
+    expect(session.queueNotifications[0].eventId).toBe('$ev1');
   });
 });
 
 describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
-  it('pops the last queued message and publishes a fresh remaining-count text — no notification edits', async () => {
+  it('pops BOTH arrays in lockstep, edits the popped tile "(cancelled)", and publishes the remaining count', async () => {
     const session = makeSession();
     const deps = journalDeps();
 
@@ -216,11 +239,38 @@ describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
 
     expect(session.queuedMessages).toHaveLength(1);
     expect(session.queuedMessages[0]).toEqual([{ type: 'text', text: 'first' }]);
+    // Cross-transport display parity (PR #104 review finding): the
+    // cancelled message's own notification is popped AND edited, exactly
+    // like a Matrix-typed cancel — never left dangling to misalign a later
+    // Matrix cancel.
+    expect(session.queueNotifications).toHaveLength(1);
+    expect(session.queueNotifications[0].eventId).toBe('$ev1');
+    expect(deps.editMessage).toHaveBeenCalledWith(
+      '!room:server', '$ev2', '✕ 📨 Queued (2): second (cancelled)',
+    );
     expect(deps.sendReply).toHaveBeenCalledWith('Cancelled queued message (1 remaining).');
-    // Matrix notifications are untouched from the journal (no editMessage
-    // seam): a stale "📨 Queued" tile in the room beats crashing or editing
-    // the wrong event.
-    expect(session.queueNotifications).toHaveLength(2);
+  });
+
+  it('mixed sequence: a Matron cancel then a Matrix cancel each edit the CORRECT tile', async () => {
+    const session = makeSession();
+    const journal = journalDeps();
+    const matrix = matrixDeps();
+
+    // Matron cancels the last queued message -> $ev2's tile is edited.
+    await handleBusyQueueMagicWord(session, 'cancel', journal);
+    expect(journal.editMessage).toHaveBeenCalledWith(
+      '!room:server', '$ev2', '✕ 📨 Queued (2): second (cancelled)',
+    );
+
+    // A subsequent Matrix-typed cancel pops the remaining pair and edits
+    // $ev1 — NOT a dangling $ev2 (the pre-fix misalignment).
+    await handleBusyQueueMagicWord(session, 'cancel', matrix);
+    expect(matrix.editMessage).toHaveBeenCalledWith(
+      '!room:server', '$ev1', '✕ 📨 Queued (1): first (cancelled)',
+    );
+    expect(session.queuedMessages).toBeNull();
+    expect(session.queueNotifications).toHaveLength(0);
+    expect(matrix.sendReply).toHaveBeenCalledWith('Cancelled queued message (queue empty).');
   });
 
   it('empty queue: fresh "No queued messages to cancel." text, nothing mutated', async () => {
@@ -228,5 +278,7 @@ describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
     const deps = journalDeps();
     await handleBusyQueueMagicWord(session, 'cancel', deps);
     expect(deps.sendReply).toHaveBeenCalledWith('No queued messages to cancel.');
+    expect(deps.editMessage).not.toHaveBeenCalled();
+    expect(session.queueNotifications).toHaveLength(2);
   });
 });

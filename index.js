@@ -4319,9 +4319,10 @@ function journalSessionCommandCtx(session) {
 //
 // Scope note: the busy-queue magic words (bare "send"/"interrupt"/"cancel")
 // are reproduced below via the shared lib/busy-queue.js implementation the
-// Matrix busy branch also uses — with journal-appropriate feedback (fresh
-// texts; no Matrix notification edits). Everything a plain typed reply — or
-// a bridge command — can do, a Matron text message can do too.
+// Matrix busy branch also uses — feedback is a fresh text, and a cancel
+// pops-and-edits the cancelled message's Matrix queue tile exactly like a
+// Matrix cancel (cross-transport display parity). Everything a plain typed
+// reply — or a bridge command — can do, a Matron text message can do too.
 async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
@@ -4459,19 +4460,24 @@ async function journalRouteTextToSession(session, body) {
     }
     // Busy-queue magic words — the SAME classifier and implementation the
     // Matrix busy branch uses (lib/busy-queue.js), checked at the same point
-    // (busy, not a TUI slash passthrough). Journal-appropriate seams only:
-    // feedback goes through ctx.sendReply — a fresh sendToRoom text that
-    // also mirrors into the journal, like every other command reply — and no
-    // editMessage/stripQueueNotificationLinks are passed, because the
-    // journal protocol has no message editing (the Matrix "📨 Queued" tiles
-    // are left as-is). A flush still goes through the one true flushQueue
-    // (single merged send + origin-aware mirroring, PR #100) — never a
-    // second flush path.
+    // (busy, not a TUI slash passthrough). Feedback goes through
+    // ctx.sendReply — a fresh sendToRoom text that also mirrors into the
+    // journal, like every other command reply. editMessage IS passed (PR
+    // #104 review finding): session.roomId is a real Matrix room, so a
+    // Matron cancel pops-and-edits the cancelled message's "📨 Queued" tile
+    // exactly like a Matrix cancel — leaving it dangling misaligned
+    // queueNotifications against queuedMessages and made a LATER Matrix
+    // cancel edit the wrong tile. (No sendHtml — journal feedback stays
+    // plain — and no stripQueueNotificationLinks: flush leaves tiles as-is;
+    // their actions no-op against the emptied queue.) A flush still goes
+    // through the one true flushQueue (single merged send + origin-aware
+    // mirroring, PR #100) — never a second flush path.
     const ctx = journalSessionCommandCtx(session);
     const handledMagicWord = await dispatchBusyQueueMagicWord(trimmed, session, {
       sendReply: ctx.sendReply,
       formatQueueSummary,
       flushQueue,
+      editMessage,
     });
     if (handledMagicWord) return;
     // Queue like a Matrix message would, but marked journal-origin so the
