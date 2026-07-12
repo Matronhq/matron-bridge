@@ -13,22 +13,32 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// Syntax highlighting via highlight.js CDN
-function renderHtml(filename, content) {
-  const escaped = content
+// Escape a value for interpolation into HTML text or attribute context.
+function escapeHtml(value) {
+  return String(value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
-  const ext = path.extname(filename).slice(1);
+// Syntax highlighting via highlight.js CDN
+function renderHtml(filename, content) {
+  const escaped = escapeHtml(content);
+
+  // Only [A-Za-z0-9_-] extensions make sense as a highlight.js language
+  // class; anything else is dropped rather than interpolated into HTML.
+  const ext = path.extname(filename).slice(1).replace(/[^A-Za-z0-9_-]/g, '');
   const langClass = ext ? `language-${ext}` : '';
+  const safeFilename = escapeHtml(filename);
 
   return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${filename}</title>
+  <title>${safeFilename}</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
   <style>
     body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
@@ -39,7 +49,7 @@ function renderHtml(filename, content) {
   </style>
 </head>
 <body>
-  <div class="header"><span class="filename">${filename}</span></div>
+  <div class="header"><span class="filename">${safeFilename}</span></div>
   <pre><code class="${langClass}">${escaped}</code></pre>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script>hljs.highlightAll();</script>
@@ -69,9 +79,9 @@ function renderSecretForm(label, token) {
 <body>
   <div class="card">
     <h2>🔐 Enter Secret</h2>
-    <div class="label">${label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+    <div class="label">${escapeHtml(label)}</div>
     <form method="POST" action="/secret">
-      <input type="hidden" name="token" value="${token}">
+      <input type="hidden" name="token" value="${escapeHtml(token)}">
       <input type="password" name="value" placeholder="Paste secret here..." autofocus required>
       <button type="submit">Submit</button>
     </form>
@@ -104,8 +114,8 @@ function renderSecretSuccess() {
 }
 
 function renderSensitiveData(label, content) {
-  const escaped = content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  const labelEscaped = label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const escaped = escapeHtml(content);
+  const labelEscaped = escapeHtml(label);
 
   return `<!DOCTYPE html>
 <html>
