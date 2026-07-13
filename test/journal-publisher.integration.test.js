@@ -532,37 +532,60 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
       });
       const client = await connectClient();
       const toolFrames = [];
+      const journalFrames = [];
       client.ws.on('message', (data) => {
         let msg;
         try { msg = JSON.parse(data.toString()); } catch { return; }
         if (msg.kind === 'ephemeral' && msg.tool_stream) toolFrames.push(msg);
+        if (msg.kind === 'journal') journalFrames.push(msg);
       });
       try {
-        pub.upsertConvo('e2e-stream-convo', { title: 'stream e2e' });
         client.send({ op: 'viewing', convo_id: 'e2e-stream-convo' });
-        await delay(300); // hello_ok + viewing settle
+
+        // The convo must exist before stream_append is accepted (server-side
+        // ownership check); wait for the viewer's durable journal copy of the
+        // upsert to confirm the server actually processed it — same idiom as
+        // the activity/stream ephemeral tests above — instead of a bare sleep.
+        pub.upsertConvo('e2e-stream-convo', { title: 'stream e2e' });
+        await waitFor(() => journalFrames.some((f) => f.convo_id === 'e2e-stream-convo'));
 
         // Drop exactly one frame (the 'bbbb' append) to force the self-heal.
+        // Record what the wrapper actually swallows so the 'cccc' write can be
+        // held off until the drop has genuinely happened — otherwise, under
+        // load, the fs.watch pass can coalesce the 'bbbb' and 'cccc' writes
+        // into one frame, the drop would swallow both, and the resync wait
+        // below would hang.
         let dropNext = false;
+        const dropped = [];
         pump = createToolStreamPump({
           logPath,
           convoId: 'e2e-stream-convo',
           messageRef: 'tu-e2e-1',
           meta: { tool: 'Bash', command: 'make e2e' },
           streamAppend: (c, r, off, chunk, meta) => {
-            if (dropNext) { dropNext = false; return; }
+            if (dropNext) { dropNext = false; dropped.push({ offset: off, chunk }); return; }
             pub.streamAppend(c, r, off, chunk, meta);
           },
           throttleMs: 0,
         });
         pump.start();
+        // (a) the pump's initial read reaches the viewer: proves its offset is
+        // now 4 and the server-side buffer exists.
         await waitFor(() => toolFrames.some((f) =>
-          f.message_ref === 'tu-e2e-1' && f.tool_stream.event === 'append' && f.tool_stream.offset === 0));
+          f.message_ref === 'tu-e2e-1' && f.tool_stream.event === 'append' &&
+          f.tool_stream.offset === 0 && f.tool_stream.chunk === 'aaaa'));
 
+        // (b) arm the drop, write 'bbbb', then wait for the wrapper to have
+        // actually recorded swallowing it before writing anything else — this
+        // is what rules out the coalescing race described above ('cccc'
+        // cannot be coalesced in because it hasn't been written yet).
         dropNext = true;
         appendFileSync(logPath, 'bbbb'); // this frame is swallowed bridge-side
-        await delay(300); // give the (dropped) pump pass time to run
-        appendFileSync(logPath, 'cccc'); // offset 8 > server end 4 -> stream_resync have:4
+        await waitFor(() => dropped.length >= 1);
+        expect(dropped[0]).toEqual({ offset: 4, chunk: 'bbbb' });
+
+        // (c) only now write 'cccc' — offset 8 > server end 4 -> stream_resync have:4
+        appendFileSync(logPath, 'cccc');
 
         await waitFor(() => resyncs.length >= 1, 10000);
         expect(resyncs[0]).toBe(4);
@@ -594,42 +617,88 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
         log: silentLogLike,
       });
       const client = await connectClient();
-      const journalFrames = [];
+      let late;
+      const clientFrames = [];
       client.ws.on('message', (data) => {
         let msg;
         try { msg = JSON.parse(data.toString()); } catch { return; }
-        if (msg.kind === 'journal' && msg.type === 'tool_output') journalFrames.push(msg);
+        clientFrames.push(msg);
       });
+      const toolOutputFrames = () => clientFrames.filter((f) => f.kind === 'journal' && f.type === 'tool_output');
       try {
+        client.send({ op: 'viewing', convo_id: 'e2e-fin-convo' });
+
+        // The convo must exist before stream_append/finalize (server-side
+        // ownership check); wait for the durable journal echo of the upsert,
+        // same idiom as the sibling tests above, instead of a bare sleep.
         pub.upsertConvo('e2e-fin-convo', { title: 'finalize e2e' });
-        await delay(300);
+        await waitFor(() => clientFrames.some((f) => f.kind === 'journal' && f.convo_id === 'e2e-fin-convo'));
+
         pub.streamAppend('e2e-fin-convo', 'tu-e2e-2', 0, '$ ls\n', { tool: 'Bash', command: 'ls' });
+
+        // Confirm the buffer actually landed server-side (the live ephemeral
+        // append reaching our already-viewing client) before relying on it
+        // below — both for the sync-on-viewing positive control and so
+        // finalize has something real to retire.
+        await waitFor(() => clientFrames.some((f) =>
+          f.kind === 'ephemeral' && f.tool_stream?.event === 'append' &&
+          f.message_ref === 'tu-e2e-2' && f.tool_stream.offset === 0));
+
+        // Positive control for the "late viewer gets no sync frame" check
+        // below: prove the sync-on-viewing mechanism actually fires when a
+        // buffer DOES exist, by connecting a fresh viewer now (buffer
+        // confirmed present above) and observing its catch-up sync frame
+        // (src/ws.js `case 'viewing'` -> toolStreams.buffersFor).
+        const syncViewer = await connectClient();
+        const syncFrames = [];
+        syncViewer.ws.on('message', (data) => {
+          let msg;
+          try { msg = JSON.parse(data.toString()); } catch { return; }
+          syncFrames.push(msg);
+        });
+        syncViewer.send({ op: 'viewing', convo_id: 'e2e-fin-convo' });
+        await waitFor(() => syncFrames.some((f) =>
+          f.kind === 'ephemeral' && f.tool_stream?.event === 'sync' &&
+          f.message_ref === 'tu-e2e-2' && f.tool_stream.content === '$ ls\n'));
+        syncViewer.close();
+
         const payload = {
           message_ref: 'tu-e2e-2', command: 'ls', exit_code: 0, denied: false,
           truncated: false, snippet: '$ ls\n', blob_ref: null, live_log: true,
         };
         pub.finalizeToolOutput('e2e-fin-convo', 'tu-e2e-2', payload, null);
         pub.finalizeToolOutput('e2e-fin-convo', 'tu-e2e-2', payload, null); // idem retry — must dedupe
-        await waitFor(() => journalFrames.length >= 1, 10000);
+        await waitFor(() => toolOutputFrames().length >= 1, 10000);
         await delay(500);
-        expect(journalFrames).toHaveLength(1); // server idem key fin:<ref> absorbed the retry
-        expect(journalFrames[0].payload).toMatchObject({
+        expect(toolOutputFrames()).toHaveLength(1); // server idem key fin:<ref> absorbed the retry
+        expect(toolOutputFrames()[0].payload).toMatchObject({
           message_ref: 'tu-e2e-2', command: 'ls', exit_code: 0, live_log: true,
         });
 
         // Buffer is freed: a fresh viewing of the convo gets no sync frame.
-        const late = await connectClient();
-        const lateTool = [];
+        // Bound that absence assertion by forcing a same-connection round
+        // trip strictly AFTER the viewing handshake: a client `send` op
+        // echoes back to its own sender via the same durable-journal
+        // broadcast every client receives (see the return-path test above),
+        // and WS preserves per-connection send order, so by the time this
+        // echo arrives, whatever `viewing` would have sent (a tool_stream
+        // sync frame, had a buffer still existed) has already been sent or
+        // not sent.
+        late = await connectClient();
+        const lateFrames = [];
         late.ws.on('message', (data) => {
           let msg;
           try { msg = JSON.parse(data.toString()); } catch { return; }
-          if (msg.kind === 'ephemeral' && msg.tool_stream) lateTool.push(msg);
+          lateFrames.push(msg);
         });
         late.send({ op: 'viewing', convo_id: 'e2e-fin-convo' });
-        await delay(500);
+        late.send({ op: 'send', convo_id: 'e2e-fin-convo', type: 'text', payload: { body: 'late-marker' } });
+        await waitFor(() => lateFrames.some((f) =>
+          f.kind === 'journal' && f.type === 'text' && f.convo_id === 'e2e-fin-convo' && f.payload?.body === 'late-marker'));
+        const lateTool = lateFrames.filter((f) => f.kind === 'ephemeral' && f.tool_stream && f.message_ref === 'tu-e2e-2');
         expect(lateTool).toHaveLength(0);
-        late.close();
       } finally {
+        late?.close();
         client.close();
         pub.close();
       }
