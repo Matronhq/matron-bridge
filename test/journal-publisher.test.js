@@ -1056,3 +1056,149 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
     await fake.close();
   });
 });
+
+describe('tool-output streaming (streamAppend / stream_resync / finalizeToolOutput)', () => {
+  it('streamAppend sends the exact frame, meta only when provided', async () => {
+    const server = await startFakeServer();
+    const pub = createJournalPublisher({ url: server.url, token: 't', log: silentLog });
+    try {
+      await waitFor(() => server.connections.length === 1);
+      await delay(20); // let hello_ok land
+      pub.streamAppend('c1', 'tu1', 0, '$ make\n', { tool: 'Bash', command: 'make' });
+      pub.streamAppend('c1', 'tu1', 7, 'ok\n');
+      await waitFor(() => server.received.length === 2);
+      expect(server.received[0]).toEqual({
+        op: 'stream_append', convo_id: 'c1', message_ref: 'tu1',
+        offset: 0, chunk: '$ make\n', meta: { tool: 'Bash', command: 'make' },
+      });
+      expect(server.received[1]).toEqual({
+        op: 'stream_append', convo_id: 'c1', message_ref: 'tu1', offset: 7, chunk: 'ok\n',
+      });
+    } finally {
+      pub.close();
+      await server.close();
+    }
+  });
+
+  it('streamAppend before hello_ok drops silently — never queued, never replayed', async () => {
+    // Point the publisher at a free port with no server yet: the ephemeral
+    // must drop, while a queued publish sent in the same window survives to
+    // the eventual connection.
+    const port = await getFreePort();
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 't', log: silentLog, backoffBaseMs: 30,
+    });
+    try {
+      pub.streamAppend('c1', 'tu1', 0, 'dropped', { tool: 'Bash', command: 'x' });
+      pub.publishText('c1', { body: 'after' }); // queued frame DOES arrive
+      const server = await startFakeServer({}, port);
+      await waitFor(() => server.received.some((f) => f.op === 'publish'));
+      expect(server.received.some((f) => f.op === 'stream_append')).toBe(false);
+      await server.close();
+    } finally {
+      pub.close();
+    }
+  });
+
+  it('dispatches inbound stream_resync control frames to onStreamResync', async () => {
+    const resyncs = [];
+    const server = await startFakeServer({
+      onFrame: (msg) => {
+        if (msg.op === 'stream_append') {
+          return { kind: 'control', op: 'stream_resync', convo_id: msg.convo_id, message_ref: msg.message_ref, have: 4 };
+        }
+        return null;
+      },
+    });
+    const pub = createJournalPublisher({
+      url: server.url, token: 't', log: silentLog,
+      onStreamResync: (convoId, messageRef, have) => resyncs.push({ convoId, messageRef, have }),
+    });
+    try {
+      await waitFor(() => server.connections.length === 1);
+      await delay(20);
+      pub.streamAppend('c1', 'tu1', 999, 'gap');
+      await waitFor(() => resyncs.length === 1);
+      expect(resyncs[0]).toEqual({ convoId: 'c1', messageRef: 'tu1', have: 4 });
+    } finally {
+      pub.close();
+      await server.close();
+    }
+  });
+
+  it('a throwing onStreamResync handler is contained — later frames still processed', async () => {
+    const seen = [];
+    const server = await startFakeServer({
+      onFrame: (msg) => {
+        if (msg.op === 'stream_append' && msg.offset === 999) {
+          return { kind: 'control', op: 'stream_resync', convo_id: msg.convo_id, message_ref: msg.message_ref, have: 0 };
+        }
+        return null;
+      },
+    });
+    const pub = createJournalPublisher({
+      url: server.url, token: 't', log: silentLog,
+      onStreamResync: () => { throw new Error('boom'); },
+      onEvent: (msg) => seen.push(msg),
+    });
+    try {
+      await waitFor(() => server.connections.length === 1);
+      await delay(20);
+      pub.streamAppend('c1', 'tu1', 999, 'gap');
+      await delay(50); // resync arrives, handler throws, must be swallowed
+      server.connections[0].ws.send(JSON.stringify({ kind: 'journal', seq: 1, type: 'text', payload: {} }));
+      await waitFor(() => seen.length === 1);
+    } finally {
+      pub.close();
+      await server.close();
+    }
+  });
+
+  it('finalizeToolOutput is durable: exact frame, queued until a server appears', async () => {
+    const port = await getFreePort();
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 't', log: silentLog, backoffBaseMs: 30,
+    });
+    try {
+      pub.finalizeToolOutput('c1', 'tu1', {
+        message_ref: 'tu1', command: 'make', exit_code: 0, denied: false,
+        truncated: false, snippet: 'ok', blob_ref: 'blob9', live_log: true,
+      }, 'blob9');
+      const revived = await startFakeServer({}, port);
+      await waitFor(() => revived.received.some((f) => f.op === 'finalize'));
+      const frame = revived.received.find((f) => f.op === 'finalize');
+      expect(frame).toEqual({
+        op: 'finalize', convo_id: 'c1', type: 'tool_output', message_ref: 'tu1',
+        payload: {
+          message_ref: 'tu1', command: 'make', exit_code: 0, denied: false,
+          truncated: false, snippet: 'ok', blob_ref: 'blob9', live_log: true,
+        },
+        blob_ref: 'blob9',
+      });
+      await revived.close();
+    } finally {
+      pub.close();
+    }
+  });
+
+  it('finalizeToolOutput defaults top-level blob_ref to null', async () => {
+    const server = await startFakeServer();
+    const pub = createJournalPublisher({ url: server.url, token: 't', log: silentLog });
+    try {
+      pub.finalizeToolOutput('c1', 'tu2', { message_ref: 'tu2', live_log: true });
+      await waitFor(() => server.received.some((f) => f.op === 'finalize'));
+      expect(server.received.find((f) => f.op === 'finalize').blob_ref).toBeNull();
+    } finally {
+      pub.close();
+      await server.close();
+    }
+  });
+
+  it('disabled (no url/token) publisher exposes the new methods as no-ops', () => {
+    const pub = createJournalPublisher({ log: silentLog });
+    expect(() => {
+      pub.streamAppend('c1', 'tu1', 0, 'x', { tool: 'Bash', command: 'x' });
+      pub.finalizeToolOutput('c1', 'tu1', {}, null);
+    }).not.toThrow();
+  });
+});
