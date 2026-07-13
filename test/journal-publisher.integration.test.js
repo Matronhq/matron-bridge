@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, readFileSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync, appendFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { spawn, execFileSync } from 'child_process';
 import WebSocket from 'ws';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
+import { createToolStreamPump } from '../lib/tool-stream-pump.js';
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -29,6 +30,12 @@ const MATRON_DIR = '/home/danbarker/matron-journal';
 const HAS_MATRON = existsSync(MATRON_DIR);
 
 const describeIfMatron = HAS_MATRON ? describe : describe.skip;
+
+// Tool-output streaming end-to-end tests need the sibling checkout to also
+// include tool-stream support (matron-journal PR #11) — guarded the same way
+// as HAS_MATRON, one level more specific.
+const HAS_TOOL_STREAM = HAS_MATRON && existsSync(path.join(MATRON_DIR, 'src/tool-stream.js'));
+const describeIfToolStream = HAS_TOOL_STREAM ? describe : describe.skip;
 
 describeIfMatron('journal-publisher against the real matron-journal server', () => {
   let dbPath;
@@ -500,4 +507,132 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
     pub.close();
     viewer.close();
   }, 20000);
+
+  // Nested (rather than a top-level sibling) because it reuses this describe
+  // block's beforeAll-populated closure state (serverPort, agentToken,
+  // connectClient) — those are block-scoped `let`s, not module-level.
+  describeIfToolStream('tool-output streaming end-to-end', () => {
+    const silentLogLike = { warn: () => {}, error: () => {} };
+
+    it('pump -> stream_append -> viewing client sees live scrollback; dropped frame self-heals via resync', async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'tool-stream-e2e-'));
+      const logPath = path.join(dir, 'matron-cmd-e2e1.log');
+      writeFileSync(logPath, 'aaaa');
+
+      const resyncs = [];
+      let pump; // assigned below; the resync dispatcher closes over it
+      const pub = createJournalPublisher({
+        url: `ws://127.0.0.1:${serverPort}/ws`,
+        token: agentToken,
+        log: silentLogLike,
+        onStreamResync: (convoId, messageRef, have) => {
+          resyncs.push(have);
+          pump.resync(have);
+        },
+      });
+      const client = await connectClient();
+      const toolFrames = [];
+      client.ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (msg.kind === 'ephemeral' && msg.tool_stream) toolFrames.push(msg);
+      });
+      try {
+        pub.upsertConvo('e2e-stream-convo', { title: 'stream e2e' });
+        client.send({ op: 'viewing', convo_id: 'e2e-stream-convo' });
+        await delay(300); // hello_ok + viewing settle
+
+        // Drop exactly one frame (the 'bbbb' append) to force the self-heal.
+        let dropNext = false;
+        pump = createToolStreamPump({
+          logPath,
+          convoId: 'e2e-stream-convo',
+          messageRef: 'tu-e2e-1',
+          meta: { tool: 'Bash', command: 'make e2e' },
+          streamAppend: (c, r, off, chunk, meta) => {
+            if (dropNext) { dropNext = false; return; }
+            pub.streamAppend(c, r, off, chunk, meta);
+          },
+          throttleMs: 0,
+        });
+        pump.start();
+        await waitFor(() => toolFrames.some((f) =>
+          f.message_ref === 'tu-e2e-1' && f.tool_stream.event === 'append' && f.tool_stream.offset === 0));
+
+        dropNext = true;
+        appendFileSync(logPath, 'bbbb'); // this frame is swallowed bridge-side
+        await delay(300); // give the (dropped) pump pass time to run
+        appendFileSync(logPath, 'cccc'); // offset 8 > server end 4 -> stream_resync have:4
+
+        await waitFor(() => resyncs.length >= 1, 10000);
+        expect(resyncs[0]).toBe(4);
+
+        // After resync the pump re-sends from byte 4; the client's reassembled
+        // stream converges on the full content.
+        await waitFor(() => {
+          let content = Buffer.alloc(0);
+          for (const f of toolFrames.filter((x) => x.message_ref === 'tu-e2e-1' && x.tool_stream.event === 'append')) {
+            const chunk = Buffer.from(f.tool_stream.chunk);
+            if (f.tool_stream.offset <= content.length) {
+              content = Buffer.concat([content.subarray(0, f.tool_stream.offset), chunk]);
+            }
+          }
+          return content.toString('utf-8') === 'aaaabbbbcccc';
+        }, 10000);
+      } finally {
+        pump?.stop();
+        client.close();
+        pub.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 20000);
+
+    it('finalizeToolOutput lands the durable event, retires the stream, and dedupes retries', async () => {
+      const pub = createJournalPublisher({
+        url: `ws://127.0.0.1:${serverPort}/ws`,
+        token: agentToken,
+        log: silentLogLike,
+      });
+      const client = await connectClient();
+      const journalFrames = [];
+      client.ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (msg.kind === 'journal' && msg.type === 'tool_output') journalFrames.push(msg);
+      });
+      try {
+        pub.upsertConvo('e2e-fin-convo', { title: 'finalize e2e' });
+        await delay(300);
+        pub.streamAppend('e2e-fin-convo', 'tu-e2e-2', 0, '$ ls\n', { tool: 'Bash', command: 'ls' });
+        const payload = {
+          message_ref: 'tu-e2e-2', command: 'ls', exit_code: 0, denied: false,
+          truncated: false, snippet: '$ ls\n', blob_ref: null, live_log: true,
+        };
+        pub.finalizeToolOutput('e2e-fin-convo', 'tu-e2e-2', payload, null);
+        pub.finalizeToolOutput('e2e-fin-convo', 'tu-e2e-2', payload, null); // idem retry — must dedupe
+        await waitFor(() => journalFrames.length >= 1, 10000);
+        await delay(500);
+        expect(journalFrames).toHaveLength(1); // server idem key fin:<ref> absorbed the retry
+        expect(journalFrames[0].payload).toMatchObject({
+          message_ref: 'tu-e2e-2', command: 'ls', exit_code: 0, live_log: true,
+        });
+
+        // Buffer is freed: a fresh viewing of the convo gets no sync frame.
+        const late = await connectClient();
+        const lateTool = [];
+        late.ws.on('message', (data) => {
+          let msg;
+          try { msg = JSON.parse(data.toString()); } catch { return; }
+          if (msg.kind === 'ephemeral' && msg.tool_stream) lateTool.push(msg);
+        });
+        late.send({ op: 'viewing', convo_id: 'e2e-fin-convo' });
+        await delay(500);
+        expect(lateTool).toHaveLength(0);
+        late.close();
+      } finally {
+        client.close();
+        pub.close();
+      }
+    }, 20000);
+  });
 });
