@@ -79,6 +79,79 @@ describe('extractMcpExtraFlags', () => {
   });
 });
 
+// The browser extra's real on-disk shape since the xvfb-run leak fix: the MCP
+// is wrapped in repo-relative ./hooks/xvfb-wrap.sh, which must be resolved to
+// an absolute path in the generated config — claude runs with the SESSION
+// workdir as cwd, not the bridge install dir, so a relative command would
+// ENOENT for every session outside the repo.
+const BASE_WRAP = Object.freeze({
+  mcpServers: {
+    'ask-user': {
+      command: 'node',
+      args: ['./ask-user.js'],
+    },
+  },
+  mcpExtras: {
+    browser: {
+      'chrome-devtools': {
+        command: './hooks/xvfb-wrap.sh',
+        args: [
+          'npx', '-y', 'chrome-devtools-mcp',
+          '--no-usage-statistics',
+          '--chromeArg=--no-sandbox',
+          '--chromeArg=--disable-setuid-sandbox',
+        ],
+      },
+    },
+  },
+});
+
+describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', () => {
+  it('resolves a ./-relative server command against the bridge install dir on Linux', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'linux',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('/opt/bridge/hooks/xvfb-wrap.sh');
+    // args are the real command line, untouched by resolution
+    expect(config.mcpServers['chrome-devtools'].args[0]).toBe('npx');
+  });
+
+  it('leaves the relative command as-is when no base dir is supplied', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'linux',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('./hooks/xvfb-wrap.sh');
+  });
+
+  it('does not touch non-relative commands', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE,
+      extras: ['browser'],
+      platform: 'linux',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('xvfb-run');
+  });
+
+  it('on macOS the resolved wrapper is unwrapped to the real command', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'darwin',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(config.mcpServers['chrome-devtools'].args).toEqual([
+      '-y', 'chrome-devtools-mcp', '--no-usage-statistics',
+    ]);
+  });
+});
+
 describe('buildMcpServers', () => {
   it('returns only the always-on servers when no extras are requested', () => {
     const { config, extras } = buildMcpServers({

@@ -11,8 +11,8 @@
   "mcpExtras": {
     "browser": {
       "chrome-devtools": {
-        "command": "xvfb-run",
-        "args": ["--auto-servernum", "--server-args=-screen 0 1920x1080x24", "npx", "-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
+        "command": "./hooks/xvfb-wrap.sh",
+        "args": ["npx", "-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
       }
     }
   }
