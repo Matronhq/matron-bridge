@@ -12,7 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
-import { createToolStreamPump } from './lib/tool-stream-pump.js';
+import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
@@ -2512,6 +2512,7 @@ function handleClaudeEvent(session, event) {
               const ecMatch = blockText.match(/exit code[: ]+(\d+)/i);
               const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : (block.is_error ? 1 : 0);
               liveOutputStore.markComplete(block.tool_use_id, { exitCode, denied, truncated });
+              stopAndFinalizeToolStream(session, block.tool_use_id, { exitCode, denied, truncated });
               // The tracked tool that put us in 'tool' just completed and
               // Claude continues — back to 'thinking'. Gated on activity
               // state, NOT session.busy (Bugbot finding #2): iv-mode
@@ -3228,6 +3229,69 @@ async function sendLiveOutputEvent(session, { tool_use_id, command }) {
     console.error('Failed to send live_output event:', e.message);
     return false;
   }
+}
+
+// Completion seam for a journal-streamed Bash command: stop the pump, read
+// the full tee log, upload it as a media blob (tail-capped), and publish the
+// durable tool_output completion (spec §5.3) whose payload.message_ref
+// retires the live overlay on viewing clients and frees the server-side
+// buffer. Called from the tool_result handler (normal end, denied included)
+// and killSession (exit_code: null) — every stream ends in exactly one
+// finalize; a second call for the same ref is a no-op (the registry entry is
+// gone). Fire-and-forget async: the upload is HTTP, and journal problems
+// must never touch the Matrix hot path (uploadMedia and finalizeToolOutput
+// both already fail open).
+const TOOL_LOG_UPLOAD_MAX_BYTES = 10 * 1024 * 1024; // well under the server's 50 MB media cap
+const TOOL_SNIPPET_READ_BYTES = 64 * 1024; // decode only the tail we snippet from
+
+function stopAndFinalizeToolStream(session, toolUseId, { exitCode = null, denied = false, truncated = false } = {}) {
+  if (!JOURNAL_ENABLED || !session.claudeSessionId) return;
+  const key = toolStreamKey(session.claudeSessionId, toolUseId);
+  const entry = toolStreamPumps.get(key);
+  if (!entry) return; // not a streamed command, or already finalized
+  toolStreamPumps.delete(key);
+  entry.pump.stop();
+  (async () => {
+    try {
+      let logBuf = null;
+      try {
+        logBuf = await fs.promises.readFile(entry.logPath);
+      } catch { /* denied / tee disabled at spawn: no log file — finalize anyway */ }
+      let blobRef = null;
+      if (logBuf && logBuf.length > 0) {
+        // Tail-cap the upload: the end of a long log (the failure, the
+        // summary) is worth more than its head.
+        const capped = logBuf.length > TOOL_LOG_UPLOAD_MAX_BYTES
+          ? logBuf.subarray(logBuf.length - TOOL_LOG_UPLOAD_MAX_BYTES)
+          : logBuf;
+        const media = await journalPublisher.uploadMedia({
+          bytes: capped,
+          contentType: 'text/plain; charset=utf-8',
+          name: `tool-output-${toolUseId}.log`,
+        });
+        if (media) blobRef = media.media_id;
+      }
+      // Snippet from the decoded tail only. An arbitrary tail cut can start
+      // mid-character; decodeByteExact turns those leading continuation
+      // bytes into '?', which a snippet tolerates.
+      const tail = logBuf && logBuf.length > 0
+        ? logBuf.subarray(Math.max(0, logBuf.length - TOOL_SNIPPET_READ_BYTES))
+        : null;
+      const text = tail ? decodeByteExact(tail).text : '';
+      journalPublisher.finalizeToolOutput(session.claudeSessionId, toolUseId, {
+        message_ref: toolUseId,
+        command: entry.command,
+        exit_code: exitCode,
+        denied,
+        truncated,
+        snippet: toolOutputSnippet(text),
+        blob_ref: blobRef,
+        live_log: true,
+      }, blobRef);
+    } catch (e) {
+      try { console.warn(`[journal] tool-output finalize failed: ${e.message}`); } catch { /* logging must never throw */ }
+    }
+  })();
 }
 
 async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
