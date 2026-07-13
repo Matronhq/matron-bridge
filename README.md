@@ -1,6 +1,11 @@
 # claude-matrix-bridge
 
-Bridge Matrix messages directly to Claude Code CLI sessions. Uses Claude Code's `--print` mode with structured JSON streaming — no TUI scraping, no ANSI stripping. Per-session rooms can use Matrix E2EE when `ENCRYPT_SESSION_ROOMS=1`.
+Chat with Claude Code CLI sessions from anywhere. The bridge spawns and manages Claude Code sessions on your dev box and connects them to two transports:
+
+- **Matrix** — messages arrive in per-session Matrix rooms (E2EE-capable when `ENCRYPT_SESSION_ROOMS=1`), so any Matrix client works.
+- **Matron journal** (optional) — the same traffic is mirrored to a [matron-journal](https://github.com/Matronhq/matron-journal) server for the native Matron apps ([iOS](https://github.com/Matronhq/matron-iOS-app), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)), including live typing/streaming indicators and a return path for user input.
+
+Uses Claude Code's `--print` mode with structured JSON streaming — no TUI scraping, no ANSI stripping.
 
 ## License
 
@@ -171,6 +176,28 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 
 Any other message is forwarded directly to Claude Code. Claude Code slash commands (e.g. `/commit`, `/review-pr`) are passed through directly.
 
+## Matron journal transport
+
+Optionally, the bridge connects to a [matron-journal](https://github.com/Matronhq/matron-journal) server as an **agent** device and dual-posts everything alongside Matrix. Leave `JOURNAL_WS_URL` or the token unset to disable; a journal outage never affects Matrix behavior.
+
+What rides the journal connection:
+
+- **Outbound mirror** — session output, uploaded files/images (media mirroring), and read-marker advances are published as journal events. The media HTTP endpoint is derived from `JOURNAL_WS_URL`; no extra config.
+- **Ephemeral live UX** — activity indicators (typing / "running `<command>`…") and in-progress assistant-text streaming for Matron clients viewing the conversation. Best-effort: never queued or replayed, so an outage means a missed indicator, not a stale one.
+- **Return path** — user messages and prompt-button replies sent from Matron clients are routed into the owning Claude session. The inbound cursor persists to `JOURNAL_CURSOR_FILE` so a restart resumes where it left off.
+- **Control convo** — one stable conversation (`JOURNAL_CONTROL_CONVO_ID`, default `bridge-<hostname>`) accepts session-management commands from Matron clients: `/start [dir]` (alias `new`), `/sessions` (alias `list`), `/resume`, `/workdir`, `/help`. Session-scoped commands (`/status`, `/stop`, …) don't apply there — they belong to each session's own conversation. `/` and `!` prefixes are interchangeable.
+
+| Variable | Description | Default |
+|---|---|---|
+| `JOURNAL_WS_URL` | Journal server WebSocket URL; unset disables the journal transport | — |
+| `JOURNAL_TOKEN_FILE` | Path to a file containing the agent token (takes precedence over `JOURNAL_TOKEN`) | — |
+| `JOURNAL_TOKEN` | Raw agent token | — |
+| `JOURNAL_CURSOR_FILE` | Where the inbound cursor is persisted | `journal-cursor.json` in the repo root |
+| `JOURNAL_CONTROL_CONVO_ID` | Stable convo id for session-management commands | `bridge-<hostname>` |
+| `JOURNAL_STREAM_INTERVAL_MS` | Streaming-overlay coalescing floor (at most one in-progress frame per conversation+message per window) | `200` |
+
+Provision the agent token on the journal server with `matron-admin agent add <user> <device-name>`.
+
 ## How it works
 
 1. Matrix messages arrive via `matrix-bot-sdk`
@@ -187,18 +214,19 @@ Any other message is forwarded directly to Claude Code. Claude Code slash comman
 
 ```
 claude-matrix-bridge/
-├── index.js              # Main bridge
-├── ask-user.js           # MCP server for user questions
+├── index.js              # Main bridge (Matrix + journal wiring, session lifecycle)
+├── lib/                  # Bridge modules: journal-* (Matron transport), command
+│                         # dispatch, prompt detection/buttons, PTY interactive mode,
+│                         # media mirroring, transcription, session summaries, …
+├── ask-user.js           # MCP server for user questions / secure secret flows
 ├── BRIDGE_CLAUDE.md      # Extra instructions for bridge-spawned Claude sessions
 ├── mcp-config.json       # MCP server config for Claude Code
-├── viewer/
-│   └── server.js         # HMAC-signed file viewer
-├── setup/
-│   ├── install.sh        # OS-dispatching installer
-│   ├── service.sh        # OS-dispatching service installer
-│   ├── import-bot-blob.mjs
-│   └── cloudflare.sh     # macOS Cloudflare viewer helper
+├── viewer/               # HMAC-signed file viewer
+├── setup/                # OS-dispatching installer, service, whisper, Cloudflare
+├── hooks/                # Claude Code hooks used by bridge sessions
+├── test/                 # node --test suite
+├── docs/
+├── SECURITY.md
 ├── package.json
-├── .env.example
-└── README.md
+└── .env.example
 ```
