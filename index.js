@@ -792,6 +792,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // the same convo id may be re-used by an auto-restart, so a stale overlay
     // must not carry across).
     journalStreamClear(session);
+    // The process exited on its own (crash mid-Bash, or any other reason)
+    // without the tool_result seam ever running, so sweep any still-open
+    // tool-output streams too — otherwise their pumps (and fs.watch handles)
+    // leak forever and a viewing client's live overlay dangles until the
+    // server's 30-min idle sweep. Runs on every path below, including
+    // auto-restart.
+    sweepToolStreams(session);
 
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
@@ -1059,6 +1066,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // publisher's throttle entry) in case the transcript path ever grows
     // partials.
     journalStreamClear(session);
+    // Same orphan-pump sweep as the print-mode close handler above: the
+    // process exited on its own without the tool_result seam running.
+    sweepToolStreams(session);
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
@@ -2162,18 +2172,25 @@ function handleClaudeEvent(session, event) {
               // ephemerals replayed late would be stale, so a session whose
               // claudeSessionId isn't known yet just doesn't stream.
               if (JOURNAL_ENABLED && session.claudeSessionId) {
+                // Cap once here so a pathological (~1 MiB) command can't blow
+                // past the server's 1 MiB WS payload cap in the offset-0
+                // frame's meta; the server truncates meta at 2000 chars
+                // itself, so this changes nothing semantically. Matrix-event
+                // and display uses keep the untruncated displayCommand.
+                const streamCommand = String(displayCommand).slice(0, 2000);
                 const pump = createToolStreamPump({
                   logPath: liveLogPath,
                   convoId: session.claudeSessionId,
                   messageRef: liveToolUseId,
-                  meta: { tool: 'Bash', command: displayCommand },
+                  meta: { tool: 'Bash', command: streamCommand },
                   streamAppend: (c, r, off, chunk, meta) =>
                     journalPublisher.streamAppend(c, r, off, chunk, meta),
                 });
                 toolStreamPumps.set(toolStreamKey(session.claudeSessionId, liveToolUseId), {
                   pump,
                   session,
-                  command: displayCommand,
+                  convoId: session.claudeSessionId,
+                  command: streamCommand,
                   logPath: liveLogPath,
                   messageRef: liveToolUseId,
                 });
@@ -3244,15 +3261,16 @@ async function sendLiveOutputEvent(session, { tool_use_id, command }) {
 const TOOL_LOG_UPLOAD_MAX_BYTES = 10 * 1024 * 1024; // well under the server's 50 MB media cap
 const TOOL_SNIPPET_READ_BYTES = 64 * 1024; // decode only the tail we snippet from
 
-function stopAndFinalizeToolStream(session, toolUseId, { exitCode = null, denied = false, truncated = false } = {}) {
-  if (!JOURNAL_ENABLED || !session.claudeSessionId) return;
-  // Capture convoId immediately; session.claudeSessionId is mutable and can be nulled/reassigned across the await gap below.
-  const convoId = session.claudeSessionId;
-  const key = toolStreamKey(convoId, toolUseId);
-  const entry = toolStreamPumps.get(key);
-  if (!entry) return; // not a streamed command, or already finalized
+// Guts of the completion seam, keyed off an already-looked-up registry entry
+// rather than re-deriving anything from the (mutable) session. Synchronously
+// retires the entry (delete + pump.stop()) so a concurrent caller sees it
+// gone immediately, then fires the upload/finalize off async — every stream
+// ends in exactly one finalize; the sync retirement is what makes a second
+// call for the same key a no-op.
+function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, truncated = false } = {}) {
   toolStreamPumps.delete(key);
   entry.pump.stop();
+  const toolUseId = entry.messageRef;
   (async () => {
     try {
       let logBuf = null;
@@ -3280,7 +3298,7 @@ function stopAndFinalizeToolStream(session, toolUseId, { exitCode = null, denied
         ? logBuf.subarray(Math.max(0, logBuf.length - TOOL_SNIPPET_READ_BYTES))
         : null;
       const text = tail ? decodeByteExact(tail).text : '';
-      journalPublisher.finalizeToolOutput(convoId, toolUseId, {
+      journalPublisher.finalizeToolOutput(entry.convoId, toolUseId, {
         message_ref: toolUseId,
         command: entry.command,
         exit_code: exitCode,
@@ -3294,6 +3312,34 @@ function stopAndFinalizeToolStream(session, toolUseId, { exitCode = null, denied
       try { console.warn(`[journal] tool-output finalize failed: ${e.message}`); } catch { /* logging must never throw */ }
     }
   })();
+}
+
+function stopAndFinalizeToolStream(session, toolUseId, opts = {}) {
+  if (!JOURNAL_ENABLED || !session.claudeSessionId) return;
+  const key = toolStreamKey(session.claudeSessionId, toolUseId);
+  const entry = toolStreamPumps.get(key);
+  if (!entry) return; // not a streamed command, or already finalized
+  finalizeToolStreamEntry(key, entry, opts);
+}
+
+// Sweep every still-open tool-output stream belonging to `session` and
+// finalize each with exit_code: null (the command's real exit will never be
+// observed). Called from killSession and from both claude-process close
+// handlers (proc.on('close') and the interactive-view 'exit' seam) so a
+// process that exits on its own — crash mid-Bash — doesn't orphan a pump: no
+// finalize would otherwise be sent (a viewing client's live overlay dangles
+// until the server's 30-min idle sweep) and the Map entry + its fs.watch
+// handle would leak forever, pinning the dead session object. Keyed off
+// `entry.session === session` rather than session.claudeSessionId so it
+// works even if the id was nulled by a failed resume. Deleting the current
+// key during Map iteration is safe (Map iterators tolerate deletes).
+function sweepToolStreams(session) {
+  if (!JOURNAL_ENABLED) return;
+  for (const [key, entry] of toolStreamPumps.entries()) {
+    if (entry.session === session) {
+      finalizeToolStreamEntry(key, entry, { exitCode: null });
+    }
+  }
 }
 
 async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
@@ -6255,18 +6301,12 @@ function killSession(session, signal = 'SIGTERM') {
     session.subagentWatcher = null;
   }
 
-  // Stop and finalize any still-open tool-output streams for this session
-  // (exit_code: null — the command's real exit will never be observed) so the
-  // server frees their buffers now; the idle sweep is the backstop, not the
-  // mechanism (spec §9). Before the alive check, like the watcher above: a
-  // process that died without delivering tool_result leaves pumps dangling.
-  // Deleting entries mid-iteration is safe (Map iterators tolerate deletes),
-  // and stopAndFinalizeToolStream no-ops when JOURNAL_ENABLED is off.
-  for (const entry of toolStreamPumps.values()) {
-    if (entry.session === session) {
-      stopAndFinalizeToolStream(session, entry.messageRef, { exitCode: null });
-    }
-  }
+  // Stop and finalize any still-open tool-output streams for this session so
+  // the server frees their buffers now; the idle sweep is the backstop, not
+  // the mechanism (spec §9). Before the alive check, like the watcher above:
+  // a process that died without delivering tool_result leaves pumps
+  // dangling.
+  sweepToolStreams(session);
 
   if (!session.alive) return;
   try {
