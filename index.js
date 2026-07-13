@@ -6254,6 +6254,20 @@ function killSession(session, signal = 'SIGTERM') {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
   }
+
+  // Stop and finalize any still-open tool-output streams for this session
+  // (exit_code: null — the command's real exit will never be observed) so the
+  // server frees their buffers now; the idle sweep is the backstop, not the
+  // mechanism (spec §9). Before the alive check, like the watcher above: a
+  // process that died without delivering tool_result leaves pumps dangling.
+  // Deleting entries mid-iteration is safe (Map iterators tolerate deletes),
+  // and stopAndFinalizeToolStream no-ops when JOURNAL_ENABLED is off.
+  for (const entry of toolStreamPumps.values()) {
+    if (entry.session === session) {
+      stopAndFinalizeToolStream(session, entry.messageRef, { exitCode: null });
+    }
+  }
+
   if (!session.alive) return;
   try {
     if (session.iv) session.iv.kill(signal);
