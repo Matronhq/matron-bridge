@@ -2449,6 +2449,14 @@ function handleClaudeEvent(session, event) {
           if (session.iv && typeof session.onTurnEnd === 'function') {
             session.onTurnEnd();
           } else {
+            // Retire any still-open streaming overlay before clearing busy —
+            // the same "no dangling overlay past turn-end" cleanup the normal
+            // `result` turn-end (journalStreamClear above) and iv-mode's
+            // onTurnEnd already do. A print-mode turn whose assistant text was
+            // still streaming when a manual /compact landed would otherwise
+            // leave the overlay open on viewing Matron clients until some later
+            // unrelated event cleared it. No-op when nothing was streaming.
+            journalStreamClear(session);
             session.busy = false;
           }
         }
@@ -6071,6 +6079,15 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const workdir = existing.workdir;
   const originRoomId = existing.originRoomId;
   sessions.delete(roomId);
+  // Retire any open streaming overlay on the outgoing session now — by its own
+  // ref and claudeSessionId — before the swap. Otherwise a final buffered
+  // `result` from the dying process arms the durable ref on THIS (old) session
+  // while sendToRoom reads it back from sessions.get(roomId), which is already
+  // the new session, so the durable publish drops message_ref and the overlay
+  // retires only via the fallback path. journalStreamClear also nulls
+  // _journalDurableRef, so a late flush on the old session can't carry a stale
+  // ref onto the new session's journal. No-op when nothing was streaming.
+  journalStreamClear(existing);
   killSession(existing);
   const next = createSession(roomId, workdir, sessionId, {
     mcpExtras: existing.mcpExtras,
