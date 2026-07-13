@@ -4826,6 +4826,32 @@ async function journalHandleControlCommand(body) {
     (plainText) => reply(plainText), sender);
 }
 
+// Journal-side auto-resume (the router's resumeSessionForConvo seam): the
+// idle reaper kills sessions on the assumption that "the next user message
+// auto-resumes" them — which the Matrix room path does, but the journal path
+// used to dead-end with "no longer active". A convo id IS the persisted
+// claude session id, so scan persisted sessions for it and respawn through
+// the SAME helper the Matrix path uses (resumePersistedSession — hoisted,
+// defined next to the Matrix handler below). Returns the new session for the
+// router to route the triggering text into (delivery is safe: sendToSession
+// holds input in _resumeOutbox until the resumed TUI is ready), or null to
+// fall back to the unknown-convo notice.
+function journalResumeConvo(convoId) {
+  const data = loadPersistedSessions();
+  for (const [roomId, prev] of Object.entries(data)) {
+    if (!prev || prev.sessionId !== convoId) continue;
+    const existing = sessions.get(roomId);
+    // A live session in this room under a DIFFERENT claude session id means
+    // this convo is stale history (the room has moved on) — don't hijack it.
+    if (existing && existing.alive) return null;
+    if (existing) sessions.delete(roomId);
+    console.log(`[journal-input] auto-resuming reaped session ${convoId} in ${roomId}`);
+    journalPublishNotice(convoId, '⏳ Session was idle — auto-resuming it now. Your message will be delivered as soon as it\'s ready.');
+    return resumePersistedSession(roomId, prev);
+  }
+  return null;
+}
+
 // Assembled once, after every dependency above is defined, and invoked from
 // journalHandleInboundEvent (the `function` declaration wired into
 // createJournalPublisher near the top of this file — hoisted, so that
@@ -4846,6 +4872,7 @@ const journalInputConsumer = createJournalInputConsumer({
   findSessionByConvoId: findSessionByClaudeSessionId,
   routeTextToSession: journalOnText,
   routePromptReply: journalOnPromptReply,
+  resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
     journalPublishNotice(convoId, type === 'prompt_reply'
       ? "This session is no longer active on this bridge — your answer wasn't delivered."
@@ -4966,6 +4993,38 @@ async function approvePlanBuild(session, { sendHtml }) {
   await sendHtml(buildNotice.plain, buildNotice.html);
 }
 
+// Respawn a persisted session into its room: recreate the process with
+// --resume, restore room-scoped state, announce to the room, and hold input
+// until the resumed TUI is ready. Shared by the Matrix room.message
+// auto-resume branch below and the journal input path's
+// resumeSessionForConvo (journalResumeConvo), so the two transports can't
+// drift apart on what a resume restores. Synchronous — the "Auto-resuming…"
+// room notice is fire-and-forget, which is what lets the journal router's
+// sync consumer call this directly.
+function resumePersistedSession(roomId, prev) {
+  const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
+  const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
+  newSession.originRoomId = prev.originRoomId || null;
+  newSession.firstMessageCaptured = true;
+  newSession.chatHistory = prev.chatHistory || [];
+  newSession.pinnedSummaryText = prev.pinnedSummaryText || '';
+  newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
+  newSession.sendCallback = sendReply;
+  newSession.sendHtml = sendHtmlFn;
+  newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+
+  const shortId = prev.sessionId.slice(0, 8);
+  const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
+  Promise.resolve(sendHtmlFn(arNotice.plain, arNotice.html)).catch(() => {});
+  // Hold the triggering (and any further) message until the resumed TUI is
+  // ready — claude --resume + auto-compaction can take seconds, far longer
+  // than the paste→Enter window, so an immediate type-in is silently dropped.
+  enterResumeHold(newSession);
+  return newSession;
+}
+
 // --- Matrix Message Handler ---
 
 client.on('room.message', async (roomId, event) => {
@@ -5035,26 +5094,7 @@ client.on('room.message', async (roomId, event) => {
     if (prev && prev.sessionId) {
       // Clean up dead session if present
       if (session) sessions.delete(roomId);
-
-      const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
-      newSession.originRoomId = prev.originRoomId || null;
-      newSession.firstMessageCaptured = true;
-      newSession.chatHistory = prev.chatHistory || [];
-      newSession.pinnedSummaryText = prev.pinnedSummaryText || '';
-      newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
-      newSession.sendCallback = sendReply;
-      newSession.sendHtml = sendHtmlFn;
-      newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
-      session = newSession;
-
-      const shortId = prev.sessionId.slice(0, 8);
-      const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
-      await sendHtmlFn(arNotice.plain, arNotice.html);
-      // Hold this (and any further) message until the resumed TUI is ready —
-      // claude --resume + auto-compaction can take seconds, far longer than
-      // the paste→Enter window, so an immediate type-in is silently dropped.
-      enterResumeHold(session);
+      session = resumePersistedSession(roomId, prev);
     } else {
       // Auto-start a session in this room
       const workdir = DEFAULT_WORKDIR;

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'fs';
 import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
@@ -484,6 +485,122 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
     expect(() => consumer.evictConvo('never-seen')).not.toThrow();
     expect(() => consumer.evictConvo(null)).not.toThrow();
     expect(() => consumer.evictConvo(undefined)).not.toThrow();
+  });
+});
+
+// Auto-resume seam: the idle reaper silently kills sessions assuming "the
+// next user message auto-resumes" — true for Matrix room messages, but the
+// journal path used to dead-end with "no longer active". A text event for an
+// unknown convo now gives the caller a chance to respawn the session (from
+// persisted state) before declaring it dead. prompt_reply is NOT resumed:
+// the pending prompt died with the process, so an answer has nothing valid
+// to land on.
+describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeSessionForConvo)', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      resumeSessionForConvo: vi.fn(() => ({ claudeSessionId: 'convo-1', resumed: true })),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  it('a text event for an unknown convo resumes the session and routes the text to it, with no unknown-convo notice', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ payload: { body: '  hello again  ' } }));
+    expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'dan' });
+    expect(deps.routeTextToSession).toHaveBeenCalledWith(
+      { claudeSessionId: 'convo-1', resumed: true }, 'hello again', { username: 'dan' },
+    );
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('resume returning null falls back to the unknown-convo notice, never routes', () => {
+    const deps = makeDeps({ resumeSessionForConvo: vi.fn(() => null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame());
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'text', username: 'dan' });
+  });
+
+  it('resume throwing is tolerated: logs, falls back to the unknown-convo notice, never crashes', () => {
+    const deps = makeDeps({ resumeSessionForConvo: vi.fn(() => { throw new Error('boom-resume'); }) });
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(baseFrame())).not.toThrow();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'text', username: 'dan' });
+    expect(warnings.some(w => /boom-resume/.test(w))).toBe(true);
+  });
+
+  it('a prompt_reply for an unknown convo is never resumed — notice as before', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'prompt_reply', payload: { target_seq: 5, choice: 'opt_a', text: null } }));
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+  });
+
+  it('a text event with no usable body never triggers a resume (no session spawned for a blank message)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ payload: { body: '   ' } }));
+    consumer(baseFrame({ payload: {} }));
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('a known live session never triggers a resume', () => {
+    const deps = makeDeps({ findSessionByConvoId: vi.fn(() => ({ claudeSessionId: 'convo-1' })) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame());
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('without a resumeSessionForConvo dep, unknown-convo behavior is unchanged (notice, no route)', () => {
+    const deps = makeDeps({ resumeSessionForConvo: undefined });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame());
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'text', username: 'dan' });
+  });
+});
+
+// The wiring half of the auto-resume seam: index.js can't be imported
+// in-process, so pin by source inspection that (a) the journal input
+// consumer is actually handed a resumeSessionForConvo (the lib treats it as
+// optional, so omitting it silently reverts to the "no longer active" dead
+// end), and (b) the journal path and the Matrix room.message path respawn
+// persisted sessions through the SAME helper, so the two transports can't
+// drift apart on what a resume restores.
+describe('index.js journal input consumer — auto-resume wiring (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+
+  it('passes resumeSessionForConvo to createJournalInputConsumer', () => {
+    const start = src.indexOf('createJournalInputConsumer({');
+    expect(start).toBeGreaterThan(-1);
+    // The deps object's last property is `log:` — a plain `});` search would
+    // stop inside the handleControlCommand callback body.
+    const end = src.indexOf('log: console,', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/\bresumeSessionForConvo\b/);
+  });
+
+  it('the Matrix auto-resume branch and the journal resume share one respawn helper', () => {
+    // 1 function declaration + at least 2 call sites (Matrix handler,
+    // journal resume).
+    const uses = src.match(/\bresumePersistedSession\(/g) || [];
+    expect(uses.length).toBeGreaterThanOrEqual(3);
   });
 });
 
