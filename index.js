@@ -56,7 +56,7 @@ import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, emailFromClaudeConfig } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig } from './lib/session-status.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -2600,6 +2600,14 @@ function handleClaudeEvent(session, event) {
           journalStatus(session);
         }
 
+        // Confirmation carries the fresh gauge when the boundary told us the
+        // post-compact size — "compacted to what?" is the question the user
+        // actually has (Dan, 2026-07-14).
+        const gauge = contextGaugeText(postTokens, session.currentModel || session.initData?.model);
+        const doneText = gauge
+          ? `✅ Compacted — context now ${gauge}`
+          : '✅ Done compacting — context summarized, ready for your next message.';
+
         // A manual `/compact` finishes here: the transcript writes a
         // compact_boundary marker but — unlike a normal turn — no Stop hook
         // fires, so onTurnEnd (the authoritative iv turn-end signal) never
@@ -2610,7 +2618,12 @@ function handleClaudeEvent(session, event) {
         // via onTurnEnd. Auto-compactions (trigger='auto') happen mid-turn
         // and MUST NOT clear busy here — their real Stop hook fires when the
         // interrupted turn completes.
-        const trigger = event.compactMetadata?.trigger;
+        //
+        // compactTriggerFrom reads both metadata spellings: print-mode
+        // boundaries carry snake_case compact_metadata, and the previous
+        // camelCase-only read left trigger undefined there (see
+        // postCompactContextTokens).
+        const trigger = compactTriggerFrom(event);
         if (session._operatorCompactPending && trigger === 'manual'
             && session.turnCount === session._operatorCompactPendingTurn) {
           session._operatorCompactPending = false;
@@ -2618,11 +2631,14 @@ function handleClaudeEvent(session, event) {
             clearTimeout(session._operatorCompactTimer);
             session._operatorCompactTimer = null;
           }
+          const pendingNow = Date.now();
+          session._lastManualCompactConfirm = pendingNow;
+          session.lastCompactCompleteNotify = pendingNow;
           if (session.sendHtml) {
-            const n = notice('success', '✅ Done compacting — context summarized, ready for your next message.');
+            const n = notice('success', doneText);
             session.sendHtml(n.plain, n.html);
           } else if (session.sendCallback) {
-            session.sendCallback('✅ Done compacting — context summarized, ready for your next message.');
+            session.sendCallback(doneText);
           }
           // onTurnEnd clears busy + typing and flushes any queued messages.
           // Print-mode sessions have no onTurnEnd (no PTY); clear busy directly.
@@ -2639,6 +2655,35 @@ function handleClaudeEvent(session, event) {
             journalStreamClear(session);
             session.busy = false;
             clearPendingInterrupt(session);
+          }
+        } else if (trigger === 'manual') {
+          // Manual compact with no pending flag armed — the print-mode path
+          // (the flag only arms behind isClaudeSlashCommand, which is
+          // iv-only), or an iv /compact typed while busy, or a model-invoked
+          // /compact mid-turn. No turn-end work needed: print mode's compact
+          // run emits its own (all-zero) result event and busy clears there.
+          // The only missing piece is the user-facing confirmation — before
+          // this branch, a print-mode /compact finished in total chat
+          // silence (Dan, 2026-07-14).
+          //
+          // Deliberately NOT gated on lastCompactCompleteNotify: that field
+          // is stamped by the legacy 🗜️ notice and by earlier compactions,
+          // and an explicit manual /compact must always confirm (bugbot,
+          // PR #125). A short dedicated window absorbs duplicate/replayed
+          // boundary events — distinct manual compacts are minutes apart —
+          // and stamping the shared field afterwards keeps the generic
+          // legacy notice from double-posting the same compaction.
+          const now = Date.now();
+          const DUP_BOUNDARY_MS = 5_000;
+          if (!session._lastManualCompactConfirm || (now - session._lastManualCompactConfirm) > DUP_BOUNDARY_MS) {
+            session._lastManualCompactConfirm = now;
+            session.lastCompactCompleteNotify = now;
+            if (session.sendHtml) {
+              const n = notice('success', doneText);
+              session.sendHtml(n.plain, n.html);
+            } else if (session.sendCallback) {
+              session.sendCallback(doneText);
+            }
           }
         }
       }

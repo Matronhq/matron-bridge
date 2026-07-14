@@ -6,6 +6,8 @@ import {
   contextTokensFromUsage,
   contextTokensFromAssistantEvent,
   postCompactContextTokens,
+  compactTriggerFrom,
+  contextGaugeText,
   buildSessionStatus,
   emailFromClaudeConfig,
 } from '../lib/session-status.js';
@@ -93,6 +95,43 @@ describe('postCompactContextTokens', () => {
     expect(postCompactContextTokens({ type: 'system', subtype: 'compact_boundary' })).toBeNull();
     expect(postCompactContextTokens({ compactMetadata: { postTokens: 0 } })).toBeNull();
     expect(postCompactContextTokens(null)).toBeNull();
+  });
+});
+
+describe('compactTriggerFrom', () => {
+  it('reads camelCase compactMetadata (transcript files, iv-mode)', () => {
+    expect(compactTriggerFrom({ compactMetadata: { trigger: 'manual', postTokens: 2_399 } })).toBe('manual');
+  });
+
+  it('reads snake_case compact_metadata (stream-json stdout, print mode)', () => {
+    expect(compactTriggerFrom({ compact_metadata: { trigger: 'auto', post_tokens: 2_399 } })).toBe('auto');
+  });
+
+  it('returns null when the trigger is absent or malformed', () => {
+    expect(compactTriggerFrom({ compactMetadata: {} })).toBeNull();
+    expect(compactTriggerFrom({ compact_metadata: { trigger: '' } })).toBeNull();
+    expect(compactTriggerFrom({})).toBeNull();
+    expect(compactTriggerFrom(null)).toBeNull();
+  });
+});
+
+describe('contextGaugeText', () => {
+  it('formats tokens over the model window ("24k/200k")', () => {
+    expect(contextGaugeText(24_313, 'claude-opus-4-8')).toBe('24k/200k');
+  });
+
+  it('keeps one decimal under 10k and formats 1m-class windows', () => {
+    expect(contextGaugeText(2_399, 'claude-fable-5')).toBe('2.4k/1m');
+  });
+
+  it('passes sub-1k counts through raw', () => {
+    expect(contextGaugeText(950, 'claude-opus-4-8')).toBe('950/200k');
+  });
+
+  it('returns null without a usable token count so callers fall back to non-numeric wording', () => {
+    expect(contextGaugeText(null, 'claude-opus-4-8')).toBeNull();
+    expect(contextGaugeText(0, 'claude-opus-4-8')).toBeNull();
+    expect(contextGaugeText(undefined, 'claude-fable-5')).toBeNull();
   });
 });
 
@@ -198,6 +237,27 @@ describe('index.js wiring', () => {
     expect(body).toContain('postCompactContextTokens(');
     expect(body).toContain('_lastContextTokens');
     expect(body).toContain('journalStatus(session)');
+  });
+
+  it('the compact_boundary handler confirms a manual compact in chat with the fresh gauge, in both modes', () => {
+    const start = src.indexOf("subtype === 'compact_boundary'");
+    const end = src.indexOf("case 'stream_event'", start);
+    const body = src.slice(start, end);
+    // Both metadata spellings: a camelCase-only trigger read goes dark in
+    // print mode (compact_metadata), which is exactly how the confirmation
+    // used to get lost there.
+    expect(body).toContain('compactTriggerFrom(');
+    expect(body).not.toContain('event.compactMetadata?.trigger');
+    expect(body).toContain('contextGaugeText(');
+    expect(body).toContain('✅ Compacted — context now');
+    // The non-pending manual branch (print mode) sends the confirmation too.
+    expect(body).toContain("else if (trigger === 'manual')");
+    // The confirm is deduped on its own dedicated field — gating it on the
+    // legacy notice's shared lastCompactCompleteNotify cooldown silently
+    // swallowed manual confirms that followed any recent compaction notice
+    // (bugbot, PR #125). The shared field is only ever written here.
+    expect(body).toContain('_lastManualCompactConfirm');
+    expect(body).not.toMatch(/if \([^)]*lastCompactCompleteNotify/);
   });
 
   it('limits refresh is throttled through a shared cache with an inflight guard', () => {
