@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 SERVICE_USER="${SERVICE_USER:-$(whoami)}"
 
-echo "=== Claude Matrix Bridge - Install ==="
+echo "=== Matron Bridge - Install ==="
 echo "Repo: $REPO_DIR"
 echo "User: $SERVICE_USER"
 echo

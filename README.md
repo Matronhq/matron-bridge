@@ -1,9 +1,6 @@
-# claude-matrix-bridge
+# matron-bridge
 
-Chat with Claude Code CLI sessions from anywhere. The bridge spawns and manages Claude Code sessions on your dev box and connects them to two transports:
-
-- **Matrix** — messages arrive in per-session Matrix rooms (E2EE-capable when `ENCRYPT_SESSION_ROOMS=1`), so any Matrix client works.
-- **Matron journal** (optional) — the same traffic is mirrored to a [matron-journal](https://github.com/Matronhq/matron-journal) server for the native Matron apps ([iOS](https://github.com/Matronhq/matron-apple), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)), including live typing/streaming indicators and a return path for user input.
+Chat with Claude Code CLI sessions from anywhere. The bridge spawns and manages Claude Code sessions on your dev box and connects them to a [matron-journal](https://github.com/Matronhq/matron-journal) server, so the native Matron apps ([iOS](https://github.com/Matronhq/matron-apple), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)) can chat with them — including live typing/streaming indicators and a return path for user input.
 
 Uses Claude Code's `--print` mode with structured JSON streaming — no TUI scraping, no ANSI stripping.
 
@@ -121,20 +118,20 @@ secret requests, and one-time sensitive-data links.
 
 | Action | Command |
 |---|---|
-| Status | `systemctl status claude-matrix-bridge` |
-| Restart | `sudo systemctl restart claude-matrix-bridge` |
-| Logs | `journalctl -u claude-matrix-bridge -f` |
-| Stop | `sudo systemctl stop claude-matrix-bridge` |
+| Status | `systemctl status matron-bridge` |
+| Restart | `sudo systemctl restart matron-bridge` |
+| Logs | `journalctl -u matron-bridge -f` |
+| Stop | `sudo systemctl stop matron-bridge` |
 
 **macOS (launchd, user scope):**
 
 | Action | Command |
 |---|---|
-| Status | `launchctl print gui/$UID/chat.matron.claude-matrix-bridge \| head -20` |
-| Restart | `launchctl kickstart -k gui/$UID/chat.matron.claude-matrix-bridge` |
-| Logs | `tail -f ~/Library/Logs/claude-matrix-bridge.log` |
-| Stop | `launchctl kill TERM gui/$UID/chat.matron.claude-matrix-bridge` |
-| Uninstall | `launchctl bootout gui/$UID/chat.matron.claude-matrix-bridge && rm ~/Library/LaunchAgents/chat.matron.claude-matrix-bridge.plist` |
+| Status | `launchctl print gui/$UID/chat.matron.matron-bridge \| head -20` |
+| Restart | `launchctl kickstart -k gui/$UID/chat.matron.matron-bridge` |
+| Logs | `tail -f ~/Library/Logs/matron-bridge.log` |
+| Stop | `launchctl kill TERM gui/$UID/chat.matron.matron-bridge` |
+| Uninstall | `launchctl bootout gui/$UID/chat.matron.matron-bridge && rm ~/Library/LaunchAgents/chat.matron.matron-bridge.plist` |
 
 For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/LaunchAgents` with `/Library/LaunchDaemons`.
 
@@ -223,8 +220,8 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 ## File structure
 
 ```
-claude-matrix-bridge/
-├── index.js              # Main bridge (Matrix + journal wiring, session lifecycle)
+matron-bridge/
+├── index.js              # Main bridge (journal wiring, session lifecycle)
 ├── lib/                  # Bridge modules: journal-* (Matron transport), command
 │                         # dispatch, prompt detection/buttons, PTY interactive mode,
 │                         # media mirroring, transcription, session summaries, …
@@ -234,7 +231,7 @@ claude-matrix-bridge/
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, whisper, Cloudflare
 ├── hooks/                # Claude Code hooks used by bridge sessions
-├── test/                 # node --test suite
+├── test/                 # Vitest suite
 ├── docs/
 ├── SECURITY.md
 ├── package.json

@@ -390,8 +390,8 @@ describe('classifyScreen — numbered list inside prose', () => {
     const screen = [
       'Verification',
       '',
-      '1. cd ~/claude-matrix-bridge && git pull',
-      '2. sudo systemctl restart claude-matrix-bridge.service',
+      '1. cd ~/matron-bridge && git pull',
+      '2. sudo systemctl restart matron-bridge.service',
       '3. In Matrix, send !version',
     ].join('\n');
     expect(classifyScreen(screen)).toBeNull();
@@ -663,7 +663,7 @@ describe('classifyScreen — multiple numbered runs', () => {
     // failed its guard, and fell through to a bad arrow-menu match.
     const screen = [
       'Verification',
-      '1. cd ~/claude-matrix-bridge && git pull',
+      '1. cd ~/matron-bridge && git pull',
       '2. sudo systemctl restart',
       '3. send !version',
       '4. try /version',

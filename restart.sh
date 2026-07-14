@@ -1,5 +1,5 @@
 #!/bin/bash
-# Restart the claude-matrix-bridge.
+# Restart the matron-bridge.
 # Kills any process holding the API port and any matching node processes.
 
 cd "$(dirname "$0")"
@@ -9,7 +9,7 @@ PORT=9802
 echo "Stopping existing bridge processes..."
 
 # Kill by process pattern
-pkill -f 'node.*claude-matrix-bridge/index\.js' 2>/dev/null || true
+pkill -f 'node.*matron-bridge/index\.js' 2>/dev/null || true
 
 # Kill anything holding our port
 PORT_PID=$(lsof -ti :$PORT 2>/dev/null)
@@ -38,15 +38,15 @@ if lsof -ti :$PORT >/dev/null 2>&1; then
 fi
 
 echo "Starting bridge..."
-nohup node index.js > /tmp/claude-matrix-bridge.log 2>&1 &
+nohup node index.js > /tmp/matron-bridge.log 2>&1 &
 NEW_PID=$!
 sleep 1
 
 if kill -0 $NEW_PID 2>/dev/null; then
   echo "Bridge started with PID: $NEW_PID"
-  echo "Logs: /tmp/claude-matrix-bridge.log"
+  echo "Logs: /tmp/matron-bridge.log"
 else
   echo "ERROR: Bridge failed to start. Check logs:"
-  tail -20 /tmp/claude-matrix-bridge.log
+  tail -20 /tmp/matron-bridge.log
   exit 1
 fi

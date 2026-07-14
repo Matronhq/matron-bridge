@@ -1,6 +1,6 @@
-# Claude Matrix Bridge Instructions
+# Matron Bridge Instructions
 
-You are running inside a Claude Matrix bridge session. The user is interacting through Matrix, not through an interactive terminal.
+You are running inside a Matron bridge session. The user is interacting through Matron, not through an interactive terminal.
 
 ## User Interaction
 

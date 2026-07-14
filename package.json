@@ -1,7 +1,7 @@
 {
-  "name": "claude-matrix-bridge",
+  "name": "matron-bridge",
   "version": "1.0.0",
-  "description": "Bridge Matrix messages directly to Claude Code CLI sessions",
+  "description": "Bridge Claude Code sessions to a matron-journal server",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"

@@ -40,8 +40,8 @@ esac
 
 mkdir -p "$PLIST_DIR" "$LOG_DIR"
 
-BRIDGE_LABEL="chat.matron.claude-matrix-bridge"
-VIEWER_LABEL="chat.matron.claude-matrix-file-viewer"
+BRIDGE_LABEL="chat.matron.matron-bridge"
+VIEWER_LABEL="chat.matron.matron-bridge-viewer"
 BRIDGE_PLIST="$PLIST_DIR/$BRIDGE_LABEL.plist"
 VIEWER_PLIST="$PLIST_DIR/$VIEWER_LABEL.plist"
 
@@ -145,8 +145,8 @@ reload_service() {
   launchctl kickstart -k "$TARGET/$label"
 }
 
-write_plist "$BRIDGE_PLIST" "$BRIDGE_LABEL" "index.js" "$LOG_DIR/claude-matrix-bridge.log"
-write_plist "$VIEWER_PLIST" "$VIEWER_LABEL" "viewer/start.js" "$LOG_DIR/claude-matrix-file-viewer.log"
+write_plist "$BRIDGE_PLIST" "$BRIDGE_LABEL" "index.js" "$LOG_DIR/matron-bridge.log"
+write_plist "$VIEWER_PLIST" "$VIEWER_LABEL" "viewer/start.js" "$LOG_DIR/matron-bridge-viewer.log"
 
 reload_service "$BRIDGE_LABEL" "$BRIDGE_PLIST"
 reload_service "$VIEWER_LABEL" "$VIEWER_PLIST"
@@ -155,14 +155,14 @@ echo
 echo "✅ Services installed and started ($SCOPE scope):"
 echo "    Bridge plist:  $BRIDGE_PLIST"
 echo "    Viewer plist:  $VIEWER_PLIST"
-echo "    Bridge log:    $LOG_DIR/claude-matrix-bridge.log"
-echo "    Viewer log:    $LOG_DIR/claude-matrix-file-viewer.log"
+echo "    Bridge log:    $LOG_DIR/matron-bridge.log"
+echo "    Viewer log:    $LOG_DIR/matron-bridge-viewer.log"
 echo
 echo "Lifecycle:"
 echo "    Restart:   launchctl kickstart -k $TARGET/$BRIDGE_LABEL"
 echo "    Stop:      launchctl kill TERM $TARGET/$BRIDGE_LABEL"
 echo "    Status:    launchctl print $TARGET/$BRIDGE_LABEL | head -20"
-echo "    Logs:      tail -f $LOG_DIR/claude-matrix-bridge.log"
+echo "    Logs:      tail -f $LOG_DIR/matron-bridge.log"
 echo "    Uninstall: launchctl bootout $TARGET/$BRIDGE_LABEL && rm $BRIDGE_PLIST"
 echo "               launchctl bootout $TARGET/$VIEWER_LABEL && rm $VIEWER_PLIST"
 echo

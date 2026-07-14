@@ -288,7 +288,7 @@ async function main() {
   if (botDeviceId) {
     log('');
     log('Next steps:');
-    log('  1. Restart the bridge: sudo systemctl restart claude-matrix-bridge');
+    log('  1. Restart the bridge: sudo systemctl restart matron-bridge');
     log('  2. In Element, verify the bot user to trust its cross-signing key');
   }
   log('');

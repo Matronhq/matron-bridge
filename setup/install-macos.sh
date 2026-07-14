@@ -24,7 +24,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-echo "=== Claude Matrix Bridge - Install (macOS) ==="
+echo "=== Matron Bridge - Install (macOS) ==="
 echo "Repo: $REPO_DIR"
 echo "User: $SERVICE_USER"
 echo
