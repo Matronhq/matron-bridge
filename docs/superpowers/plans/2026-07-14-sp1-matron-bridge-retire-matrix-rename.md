@@ -51,8 +51,8 @@ Expected: the sites listed under **Files** above. If grep surfaces a file not li
 
 ```bash
 cd ~/claude-matrix-bridge
-git grep -l 'MATRON_BRIDGE_API_PORT' | xargs sed -i 's/MATRON_BRIDGE_API_PORT/MATRON_BRIDGE_API_PORT/g'
-git grep -l 'MATRON_VIEWER_PORT'     | xargs sed -i 's/MATRON_VIEWER_PORT/MATRON_VIEWER_PORT/g'
+git grep -l 'MATRIX_BRIDGE_API_PORT' | xargs sed -i 's/MATRIX_BRIDGE_API_PORT/MATRON_BRIDGE_API_PORT/g'
+git grep -l 'MATRIX_VIEWER_PORT'     | xargs sed -i 's/MATRIX_VIEWER_PORT/MATRON_VIEWER_PORT/g'
 ```
 
 - [ ] **Step 4: Verify no occurrences remain and nothing else broke**
