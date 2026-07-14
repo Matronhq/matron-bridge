@@ -17,6 +17,14 @@ iOS/Mac (Phase 5) and Matron X consume natively:
 | `chat.matron.button_response` | client → bridge | Content key `{ selected_values: [String] }` + `m.relates_to: { rel_type: "chat.matron.button_answer", event_id: <buttons event> }`; `body` carries the values joined with `", "` as fallback |
 | `chat.matron.live_output` | bridge → client | Bash tool-start event `{tool_use_id, command}`; `viewer_url`/`expires_at` removed 2026-07 — live output now streams over the journal protocol |
 
+Note on that journal-protocol successor: the `stream_append` offset-0
+frame's `meta.command` and the durable `finalize` event's
+`payload.command` are both capped at 2000 characters (the bridge truncates
+once; the server truncates again independently to the same limit). This
+`chat.matron.live_output` event and every other Matrix-side display
+(message bodies, tool-call indicators) always carry the untruncated
+command string — only the journal-protocol frames are capped.
+
 Canonical constants: matron-web `src/matron/EventTypes.ts`. Any change
 here must stay byte-compatible with that file.
 
