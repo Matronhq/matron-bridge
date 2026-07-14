@@ -100,6 +100,27 @@ describe('computeEditDiff', () => {
     expect(Buffer.byteLength(r.diff, 'utf8')).toBeLessThanOrEqual(64 * 1024);
   });
 
+  it('returns synchronously — not a Promise — so diff publishes keep stream order', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+    const f = path.join(dir, 'sync.txt');
+    await fs.writeFile(f, 'old\n');
+    // Write is the only path with file I/O; if it ever goes async again,
+    // publishEditDiff would enqueue the journal diff event after later
+    // stream events and reorder cards against their tool_use.
+    const r = computeEditDiff('Write', { file_path: f, content: 'new\n' }, dir);
+    expect(r).not.toBeInstanceOf(Promise);
+    expect(r.diff).toContain('-old');
+    expect(r.diff).toContain('+new');
+  });
+
+  it('Write over a file larger than 1 MB -> null (sync read cap)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+    const f = path.join(dir, 'big.txt');
+    await fs.writeFile(f, 'x'.repeat(1024 * 1024 + 1));
+    const r = computeEditDiff('Write', { file_path: f, content: 'tiny\n' }, dir);
+    expect(r).toBeNull();
+  });
+
   it('unknown tool / missing fields -> null', async () => {
     expect(await computeEditDiff('Bash', { command: 'ls' }, '/tmp')).toBeNull();
     expect(await computeEditDiff('Edit', { file_path: '/tmp/x' }, '/tmp')).toBeNull();

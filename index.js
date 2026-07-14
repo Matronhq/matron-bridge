@@ -529,31 +529,31 @@ function journalActivity(session, state, detail) {
 // matron-apple docs/superpowers/specs/2026-07-14-diff-cards-design.md).
 // `label` is the subagent label, null for the parent agent. Published at
 // tool_use time, same semantics as the old message (a denied edit still
-// shows its card). Fire-and-forget async (Write reads the file); every
-// failure path is swallowed — journal problems never touch the Matrix
-// hot path.
+// shows its card). Deliberately SYNCHRONOUS end to end: journalPublish
+// delivers in call order, so an async diff compute would let later stream
+// events publish first and reorder cards against their tool_use. The only
+// I/O is Write's size-capped readFileSync of the old content inside
+// computeEditDiff, which swallows every failure — journal problems never
+// touch the Matrix hot path.
 function publishEditDiff(session, toolName, input, label) {
   if (!JOURNAL_ENABLED || !input?.file_path) return;
   const absPath = path.isAbsolute(input.file_path)
     ? input.file_path
     : path.join(session.workdir, input.file_path);
-  computeEditDiff(toolName, input, session.workdir).then(result => {
-    if (!result) return;
-    journalPublish(session, 'publishDiff', {
-      file_path: absPath,
-      display_path: input.file_path,
-      viewer_url: generateFileLink(absPath, session.workdir),
-      tool: toolName,
-      label: label || null,
-      diff: result.diff,
-      added: result.added,
-      removed: result.removed,
-      truncated: result.truncated,
-      new_file: result.newFile,
-      from: 'assistant',
-    });
-  }).catch(e => {
-    debug('publishEditDiff failed: %s', e?.message);
+  const result = computeEditDiff(toolName, input, session.workdir);
+  if (!result) return;
+  journalPublish(session, 'publishDiff', {
+    file_path: absPath,
+    display_path: input.file_path,
+    viewer_url: generateFileLink(absPath, session.workdir),
+    tool: toolName,
+    label: label || null,
+    diff: result.diff,
+    added: result.added,
+    removed: result.removed,
+    truncated: result.truncated,
+    new_file: result.newFile,
+    from: 'assistant',
   });
 }
 
