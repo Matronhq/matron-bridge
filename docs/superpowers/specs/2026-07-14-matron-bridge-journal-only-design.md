@@ -180,7 +180,7 @@ logic. Exact heuristic is a plan-time detail.
 | systemd service | `claude-matrix-bridge.service` | `matron-bridge.service` |
 | viewer service | `claude-matrix-file-viewer.service` | `matron-bridge-viewer.service` |
 | launchd labels | `chat.matron.claude-matrix-bridge` / `…file-viewer` | `chat.matron.matron-bridge` / `…viewer` |
-| env prefix | `MATRIX_BRIDGE_API_PORT`, `MATRIX_VIEWER_PORT` | `MATRON_BRIDGE_API_PORT`, `MATRON_VIEWER_PORT` |
+| env prefix | `MATRON_BRIDGE_API_PORT`, `MATRON_VIEWER_PORT` | `MATRON_BRIDGE_API_PORT`, `MATRON_VIEWER_PORT` |
 | package name, README, `BRIDGE_CLAUDE.md`, bridge instructions | "Claude Matrix Bridge" | "Matron Bridge" |
 
 - Service/plist files are **generated at install time** by shell heredocs

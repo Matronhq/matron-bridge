@@ -32,7 +32,7 @@ ingress block without changing cloudflared or bridge config.
 
 Options:
   --hostname HOST          Public viewer hostname, e.g. viewer.example.com
-  --service-url URL        Local viewer service URL (default from MATRIX_VIEWER_PORT)
+  --service-url URL        Local viewer service URL (default from MATRON_VIEWER_PORT)
   --apply-env             Set VIEWER_BASE_URL=https://HOST in .env
   --apply-dns             Upsert HOST as a proxied CNAME to the tunnel
   --create-tunnel         Create a new Cloudflare tunnel through the API
@@ -96,7 +96,7 @@ env_value() {
 }
 
 if [ -z "$SERVICE_URL" ]; then
-  VIEWER_PORT="$(env_value MATRIX_VIEWER_PORT 9803)"
+  VIEWER_PORT="$(env_value MATRON_VIEWER_PORT 9803)"
   SERVICE_URL="http://127.0.0.1:${VIEWER_PORT}"
 fi
 

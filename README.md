@@ -61,7 +61,7 @@ time).
 
 ## Publishing The Viewer On macOS
 
-The macOS service installer starts both the Matrix bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRIX_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
+The macOS service installer starts both the Matrix bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRON_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
 
 To make those links usable from Matrix clients, set `VIEWER_BASE_URL` to a public HTTPS URL that forwards to the local viewer. The Cloudflare helper is dry-run by default and is careful around existing tunnel setups:
 
@@ -160,8 +160,8 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
-| `MATRIX_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
-| `MATRIX_VIEWER_PORT` | Local file viewer port | `9803` |
+| `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
+| `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
 
 ## Commands
 

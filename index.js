@@ -831,7 +831,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       CLAUDECODE: '',
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
-      MATRIX_BRIDGE_API_PORT: String(API_PORT),
+      MATRON_BRIDGE_API_PORT: String(API_PORT),
       // Env is fixed at spawn time; toggling the flag later requires
       // !restart to take effect.
       MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
@@ -1091,7 +1091,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       CLAUDECODE: '',
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
-      MATRIX_BRIDGE_API_PORT: String(API_PORT),
+      MATRON_BRIDGE_API_PORT: String(API_PORT),
       MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     },
   });
@@ -4046,7 +4046,7 @@ function fetchUsageLimitsText(cwd) {
       // nested inside another Claude Code session. This is a global,
       // session-less one-shot (no roomId/workdir session to speak of), so
       // it doesn't replicate the rest of the session spawns' env shape
-      // (BRIDGE_ROOM_ID, MATRIX_BRIDGE_API_PORT, MATRON_BASH_TEE_ENABLED —
+      // (BRIDGE_ROOM_ID, MATRON_BRIDGE_API_PORT, MATRON_BASH_TEE_ENABLED —
       // all meaningless here); it just needs the same CLAUDECODE treatment.
       env: { ...process.env, CLAUDECODE: '' },
     });
@@ -6068,7 +6068,7 @@ const pendingPlanDecisions = new Map();
 
 // --- Local HTTP API ---
 
-const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || '9802', 10);
+const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);

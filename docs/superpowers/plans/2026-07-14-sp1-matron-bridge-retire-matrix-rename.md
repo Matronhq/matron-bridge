@@ -25,12 +25,12 @@
 
 ### Task 1: Branch + baseline + repo-wide env-var rename
 
-Rename the two port env vars everywhere they are produced or consumed. This is mechanical and Matrix-independent, so it is safe to do first. `MATRIX_BRIDGE_API_PORT` is injected into the spawned Claude's environment (`index.js:834`, `1094`) and read by the ask-user MCP flow, so a repo-wide rename is required — missing a consumer silently breaks the secure-data flow.
+Rename the two port env vars everywhere they are produced or consumed. This is mechanical and Matrix-independent, so it is safe to do first. `MATRON_BRIDGE_API_PORT` is injected into the spawned Claude's environment (`index.js:834`, `1094`) and read by the ask-user MCP flow, so a repo-wide rename is required — missing a consumer silently breaks the secure-data flow.
 
 **Files:**
 - Modify: `index.js` (`:834`, `:1094`, `:6071`, comment `:4049`)
-- Modify: every other file that reads `MATRIX_BRIDGE_API_PORT` / `MATRIX_VIEWER_PORT` — enumerate with grep (expected: `ask-user.js`, `viewer/start.js`, `viewer/server.js`, `lib/mcp-config.js`, `lib/mcp-config-mac.js`, and their `test/*.test.js`)
-- Modify: `.env.example` (`:31` `MATRIX_BRIDGE_API_PORT=9802`, `:32` `MATRIX_VIEWER_PORT=9803`)
+- Modify: every other file that reads `MATRON_BRIDGE_API_PORT` / `MATRON_VIEWER_PORT` — enumerate with grep (expected: `ask-user.js`, `viewer/start.js`, `viewer/server.js`, `lib/mcp-config.js`, `lib/mcp-config-mac.js`, and their `test/*.test.js`)
+- Modify: `.env.example` (`:31` `MATRON_BRIDGE_API_PORT=9802`, `:32` `MATRON_VIEWER_PORT=9803`)
 
 - [ ] **Step 1: Create the branch and record the test baseline**
 
@@ -44,20 +44,20 @@ Record the pass/fail counts and the names of any already-failing tests in the ta
 
 - [ ] **Step 2: Enumerate all env-var occurrences**
 
-Run: `git grep -n 'MATRIX_BRIDGE_API_PORT\|MATRIX_VIEWER_PORT'`
+Run: `git grep -n 'MATRON_BRIDGE_API_PORT\|MATRON_VIEWER_PORT'`
 Expected: the sites listed under **Files** above. If grep surfaces a file not listed, include it — the rename must cover every hit.
 
 - [ ] **Step 3: Rename repo-wide**
 
 ```bash
 cd ~/claude-matrix-bridge
-git grep -l 'MATRIX_BRIDGE_API_PORT' | xargs sed -i 's/MATRIX_BRIDGE_API_PORT/MATRON_BRIDGE_API_PORT/g'
-git grep -l 'MATRIX_VIEWER_PORT'     | xargs sed -i 's/MATRIX_VIEWER_PORT/MATRON_VIEWER_PORT/g'
+git grep -l 'MATRON_BRIDGE_API_PORT' | xargs sed -i 's/MATRON_BRIDGE_API_PORT/MATRON_BRIDGE_API_PORT/g'
+git grep -l 'MATRON_VIEWER_PORT'     | xargs sed -i 's/MATRON_VIEWER_PORT/MATRON_VIEWER_PORT/g'
 ```
 
 - [ ] **Step 4: Verify no occurrences remain and nothing else broke**
 
-Run: `git grep -n 'MATRIX_BRIDGE_API_PORT\|MATRIX_VIEWER_PORT'` — Expected: no output.
+Run: `git grep -n 'MATRON_BRIDGE_API_PORT\|MATRON_VIEWER_PORT'` — Expected: no output.
 Run: `node --check index.js && node --check ask-user.js` — Expected: clean exit.
 Run: `npm test 2>&1 | tail -20` — Expected: same result as the Step 1 baseline (no new failures).
 

@@ -6,7 +6,7 @@ import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
 import { validateAndOpen, FileLinkDenied } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
-const PORT = process.env.MATRIX_VIEWER_PORT || 9803;
+const PORT = process.env.MATRON_VIEWER_PORT || 9803;
 const SECRET = process.env.HMAC_SECRET;
 
 const app = express();
@@ -183,7 +183,7 @@ app.get('/view', async (req, res) => {
   }
 });
 
-const BRIDGE_API_PORT = process.env.MATRIX_BRIDGE_API_PORT || 9802;
+const BRIDGE_API_PORT = process.env.MATRON_BRIDGE_API_PORT || 9802;
 
 app.get('/action', async (req, res) => {
   const { token } = req.query;
