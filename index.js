@@ -12,7 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
-import { generateSignedUrl } from './lib/viewer-tokens.js';
+import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
@@ -180,7 +180,7 @@ const liveOutputStore = createLiveOutputStore({ ttlSeconds: LIVE_OUTPUT_TTL });
 sweepOrphanedLogs('/tmp', LIVE_OUTPUT_TTL);
 setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
-  console.warn('[live-output] HMAC_SECRET or VIEWER_BASE_URL unset — live-output tiles disabled');
+  console.warn('[viewer] HMAC_SECRET or VIEWER_BASE_URL unset — file links and secure secret/sensitive-data links disabled');
 }
 
 // Journal dual-post (migration off Matrix — see matron-journal's protocol
@@ -218,6 +218,15 @@ const JOURNAL_STREAM_INTERVAL_MS = (() => {
   const raw = parseInt(process.env.JOURNAL_STREAM_INTERVAL_MS || '', 10);
   return Number.isInteger(raw) && raw > 0 ? raw : undefined;
 })();
+// Active tool-output stream pumps, keyed `${convoId}\0${messageRef}` — the
+// same key the server buffers under. Registered by the Bash tool_use seam,
+// drained by stopAndFinalizeToolStream (tool_result) and killSession.
+// Module-level rather than per-session so the single onStreamResync
+// dispatcher below can route a server resync to its pump directly.
+const toolStreamPumps = new Map();
+function toolStreamKey(convoId, messageRef) {
+  return `${convoId}\0${messageRef}`;
+}
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -227,6 +236,9 @@ const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL, token: _journalToken, log: console,
   cursorFile: JOURNAL_CURSOR_FILE,
   onEvent: journalHandleInboundEvent,
+  onStreamResync: (convoId, messageRef, have) => {
+    toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
+  },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -780,6 +792,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // the same convo id may be re-used by an auto-restart, so a stale overlay
     // must not carry across).
     journalStreamClear(session);
+    // The process exited on its own (crash mid-Bash, or any other reason)
+    // without the tool_result seam ever running, so sweep any still-open
+    // tool-output streams too — otherwise their pumps (and fs.watch handles)
+    // leak forever and a viewing client's live overlay dangles until the
+    // server's 30-min idle sweep. Runs on every path below, including
+    // auto-restart.
+    sweepToolStreams(session);
 
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
@@ -1047,6 +1066,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // publisher's throttle entry) in case the transcript path ever grows
     // partials.
     journalStreamClear(session);
+    // Same orphan-pump sweep as the print-mode close handler above: the
+    // process exited on its own without the tool_result seam running.
+    sweepToolStreams(session);
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
@@ -2144,37 +2166,61 @@ function handleClaudeEvent(session, event) {
                 logPath: liveLogPath,
                 roomId: session.roomId,
               });
-              const expiresAt = Math.floor(Date.now() / 1000) + LIVE_OUTPUT_TTL;
-              if (HMAC_SECRET && VIEWER_BASE_URL) {
-                const viewerUrl = generateSignedUrl(
-                  VIEWER_BASE_URL,
-                  null,
-                  HMAC_SECRET,
-                  LIVE_OUTPUT_TTL,
-                  { liveCmdId: liveToolUseId, logPath: liveLogPath, doneSentinelPath: `${liveLogPath}.done` }
-                );
-                const liveUrl = new URL(viewerUrl);
-                liveUrl.pathname = liveUrl.pathname.replace(/\/view$/, '/live');
-                // Optimistically suppress the synchronous indicator post
-                // below; if the async send fails we re-post the regular
-                // indicator so the user isn't left looking at nothing.
-                const fallbackPlain = indicator;
-                const fallbackHtml = indicatorHtml;
-                sendLiveOutputEvent(session, {
-                  tool_use_id: liveToolUseId,
-                  command: displayCommand,
-                  viewer_url: liveUrl.toString(),
-                  expires_at: expiresAt,
-                }).then(ok => {
-                  if (ok) return;
-                  if (session.sendHtml && fallbackHtml) {
-                    session.sendHtml(fallbackPlain, fallbackHtml);
-                  } else if (session.sendCallback) {
-                    session.sendCallback(fallbackPlain);
-                  }
+              // Live output rides the journal protocol: one pump per running
+              // command tails the tee log and feeds stream_append ephemerals
+              // (spec §9). Same skip-if-no-session-id rule as journalActivity:
+              // ephemerals replayed late would be stale, so a session whose
+              // claudeSessionId isn't known yet just doesn't stream.
+              if (JOURNAL_ENABLED && session.claudeSessionId) {
+                // Cap once here so a pathological (~1 MiB) command can't blow
+                // past the server's 1 MiB WS payload cap in the offset-0
+                // frame's meta; the server truncates meta at 2000 chars
+                // itself, so this changes nothing semantically. Matrix-event
+                // and display uses keep the untruncated displayCommand.
+                const streamCommand = String(displayCommand).slice(0, 2000);
+                const pump = createToolStreamPump({
+                  logPath: liveLogPath,
+                  convoId: session.claudeSessionId,
+                  messageRef: liveToolUseId,
+                  meta: { tool: 'Bash', command: streamCommand },
+                  streamAppend: (c, r, off, chunk, meta) =>
+                    journalPublisher.streamAppend(c, r, off, chunk, meta),
                 });
-                liveOutputSent = true;
+                const streamRegKey = toolStreamKey(session.claudeSessionId, liveToolUseId);
+                // Stop (never finalize — same message_ref, a finalize would
+                // collide) any prior pump still registered under this exact
+                // key before overwriting the Map entry: Map.set silently
+                // replaces without touching what was there before, so an
+                // unstopped prior pump would leak its fs.watch handle
+                // forever (never reachable again to stop() it).
+                toolStreamPumps.get(streamRegKey)?.pump.stop();
+                toolStreamPumps.set(streamRegKey, {
+                  pump,
+                  session,
+                  convoId: session.claudeSessionId,
+                  command: streamCommand,
+                  logPath: liveLogPath,
+                  messageRef: liveToolUseId,
+                });
+                pump.start();
               }
+              // Optimistically suppress the synchronous indicator post below;
+              // if the async send fails we re-post the regular indicator so
+              // the user isn't left looking at nothing.
+              const fallbackPlain = indicator;
+              const fallbackHtml = indicatorHtml;
+              sendLiveOutputEvent(session, {
+                tool_use_id: liveToolUseId,
+                command: displayCommand,
+              }).then(ok => {
+                if (ok) return;
+                if (session.sendHtml && fallbackHtml) {
+                  session.sendHtml(fallbackPlain, fallbackHtml);
+                } else if (session.sendCallback) {
+                  session.sendCallback(fallbackPlain);
+                }
+              });
+              liveOutputSent = true;
             }
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
@@ -2480,7 +2526,17 @@ function handleClaudeEvent(session, event) {
           // Mark live-output complete on tool_result for any tracked Bash command.
           if (block.type === 'tool_result' && block.tool_use_id) {
             const entry = liveOutputStore.get(block.tool_use_id);
-            if (entry) {
+            // Only pay for the blockText join + three regex scans below when
+            // something will actually consume the result: either the
+            // liveOutputStore entry (markComplete below) or a still-registered
+            // tool-stream pump (stopAndFinalizeToolStream, which no-ops when
+            // there's no pump). Otherwise this ran on EVERY tool_result of
+            // every tool — O(content) string work discarded whenever both are
+            // absent, which is the common case.
+            const pumpRegistered = JOURNAL_ENABLED && session.claudeSessionId
+              && toolStreamPumps.has(toolStreamKey(session.claudeSessionId, block.tool_use_id));
+            let opts;
+            if (entry || pumpRegistered) {
               const blockText = typeof block.content === 'string'
                 ? block.content
                 : (Array.isArray(block.content)
@@ -2490,7 +2546,25 @@ function handleClaudeEvent(session, event) {
               const truncated = blockText.includes('[matron-tee: output truncated');
               const ecMatch = blockText.match(/exit code[: ]+(\d+)/i);
               const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : (block.is_error ? 1 : 0);
-              liveOutputStore.markComplete(block.tool_use_id, { exitCode, denied, truncated });
+              opts = { exitCode, denied, truncated };
+            }
+            // Unconditional on every tool_result (fast-follow brief Item 4):
+            // must NOT sit behind the liveOutputStore lookup below.
+            // liveOutputStore entries are TTL-gc'd independently of the
+            // toolStreamPumps registry a still-running pump lives in, so
+            // gating this call behind `if (entry)` could orphan a pump whose
+            // liveOutputStore entry aged out mid-command until the next
+            // sweep runs. stopAndFinalizeToolStream itself already no-ops
+            // when there's no toolStreamPumps entry for this key or the
+            // journal is disabled, so calling it here for every tool_result
+            // (Read/Write/Edit included, not just Bash) is safe and cheap.
+            // When the derivation above was skipped, opts is undefined and
+            // finalizeToolStreamEntry's own defaults (exitCode: null,
+            // denied: false, truncated: false) apply — same as today's
+            // absent-value defaults.
+            stopAndFinalizeToolStream(session, block.tool_use_id, opts);
+            if (entry) {
+              liveOutputStore.markComplete(block.tool_use_id, opts);
               // The tracked tool that put us in 'tool' just completed and
               // Claude continues — back to 'thinking'. Gated on activity
               // state, NOT session.busy (Bugbot finding #2): iv-mode
@@ -3178,32 +3252,27 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
   }
 }
 
-async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, expires_at }) {
-  journalPublish(session, 'publishToolOutput', { tool_use_id, command, viewer_url, expires_at });
-  // 'tool' activity, detail = the command — the seam the brief calls out
-  // (this function is the one place index.js knows the command string at
-  // tool-start time). Trimmed tighter than the server's own 200-char cap.
+async function sendLiveOutputEvent(session, { tool_use_id, command }) {
+  // 'tool' activity, detail = the command — this is the one place index.js
+  // knows the command string at tool-start time. The DURABLE tool_output
+  // journal event is now published at COMPLETION (stopAndFinalizeToolStream),
+  // not here: live viewers get the command from the stream meta frames, and
+  // history gets it from the finalize payload (spec §5.3). No viewer_url /
+  // expires_at anywhere — live output rides the journal protocol.
   journalActivity(session, 'tool', truncateActivityDetail(command));
-  // Sent as a regular m.room.message with a custom content key:
-  // - matron-web-aware clients pick up `chat.matron.live_output` and render
-  //   the live viewer tile.
-  // - Every other Matrix client just shows the body/formatted_body which
-  //   already contains the command and a link to view live output. That
-  //   makes the regular `🔧 <command>` indicator redundant, so the caller
-  //   in the assistant-event handler skips it when this event is sent.
-  // Match the truncation/icon style of the regular `🔧 <cmd>` indicator so
-  // clients that can't render the custom event (most mobile clients) still
-  // get a tight, readable fallback instead of a full untruncated command
-  // and a viewer URL they can't follow.
+  // Matrix room UX: the same custom event as before minus the viewer link.
+  // matron-web's live tile goes dark for new commands until it implements
+  // the journal client contract (accepted, spec §10) — every other Matrix
+  // client keeps rendering the body/formatted_body fallback below.
   const truncated = command.length > 100 ? command.slice(0, 100) + '…' : command;
   const body = `🔧 \`${truncated}\``;
-  const formatted_body = `🔧 <a href="${escapeHtml(viewer_url)}"><code>${escapeHtml(truncated)}</code></a>`;
+  const formatted_body = `🔧 <code>${escapeHtml(truncated)}</code>`;
   const content = {
     msgtype: 'm.text',
     body,
     format: 'org.matrix.custom.html',
     formatted_body,
-    [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command, viewer_url, expires_at },
+    [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command },
   };
   try {
     await client.sendMessage(session.roomId, content);
@@ -3211,6 +3280,143 @@ async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, 
   } catch (e) {
     console.error('Failed to send live_output event:', e.message);
     return false;
+  }
+}
+
+// Completion seam for a journal-streamed Bash command: stop the pump, flush
+// whatever it hasn't caught up to yet, read only the tee log's TAIL via a
+// positioned read (never the whole file — see finalizeToolStreamEntry),
+// upload that tail as a media blob (with a truncation marker line prepended
+// when the read was actually capped), and publish the durable tool_output
+// completion (spec §5.3) whose payload.message_ref retires the live overlay
+// on viewing clients and frees the server-side buffer. Called from the
+// tool_result handler (normal end, denied included) and killSession
+// (exit_code: null) — every stream ends in exactly one finalize; a second
+// call for the same ref is a no-op (the registry entry is gone).
+// Fire-and-forget async: the upload is HTTP, and journal problems must never
+// touch the Matrix hot path (uploadMedia and finalizeToolOutput both already
+// fail open).
+const TOOL_LOG_UPLOAD_MAX_BYTES = 10 * 1024 * 1024; // well under the server's 50 MB media cap
+const TOOL_SNIPPET_READ_BYTES = 64 * 1024; // decode only the tail we snippet from
+
+// Guts of the completion seam, keyed off an already-looked-up registry entry
+// rather than re-deriving anything from the (mutable) session. Synchronously
+// retires the entry (delete + pump.stop()) so a concurrent caller sees it
+// gone immediately, then fires the upload/finalize off async — every stream
+// ends in exactly one finalize; the sync retirement is what makes a second
+// call for the same key a no-op.
+function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, truncated = false } = {}) {
+  toolStreamPumps.delete(key);
+  entry.pump.stop();
+  const toolUseId = entry.messageRef;
+  (async () => {
+    try {
+      // Bounded final flush BEFORE the durable finalize publish below: bytes
+      // written after stop()'s last pass (stop() is synchronous and never
+      // flushes — see lib/tool-stream-pump.js) never streamed as live
+      // appends. Must be awaited HERE, in this order: the server frees the
+      // stream buffer on finalize, so a stream_append arriving after
+      // finalize would recreate a zombie buffer. Code order — not timing —
+      // is what guarantees flush-then-finalize. flushFinal never throws.
+      await entry.pump.flushFinal();
+
+      // Positioned tail read: stat first, then read only the last
+      // min(size, TOOL_LOG_UPLOAD_MAX_BYTES) bytes at that offset, instead
+      // of reading the whole log into heap just to keep the last 10 MiB — a
+      // multi-GB log would otherwise be read fully every time a command
+      // finishes. `logSize` is the true on-disk size (needed below to know
+      // whether this tail read was actually capped).
+      let logBuf = null;
+      let logSize = 0;
+      try {
+        const st = await fs.promises.stat(entry.logPath);
+        logSize = st.size;
+        const readLen = Math.min(st.size, TOOL_LOG_UPLOAD_MAX_BYTES);
+        if (readLen > 0) {
+          const handle = await fs.promises.open(entry.logPath, 'r');
+          try {
+            const buf = Buffer.alloc(readLen);
+            const { bytesRead } = await handle.read(buf, 0, readLen, st.size - readLen);
+            logBuf = bytesRead === buf.length ? buf : buf.subarray(0, bytesRead);
+          } finally {
+            await handle.close();
+          }
+        } else {
+          logBuf = Buffer.alloc(0);
+        }
+      } catch { /* denied / tee disabled at spawn: no log file — finalize anyway */ }
+      let blobRef = null;
+      if (logBuf && logBuf.length > 0) {
+        // logBuf is already the tail-capped read above: the end of a long
+        // log (the failure, the summary) is worth more than its head. When
+        // the true on-disk size exceeded the cap, prepend a marker line to
+        // the UPLOADED bytes only — never the snippet (derived from logBuf
+        // below, untouched by this), and never opts.truncated in the
+        // payload (that field means something else entirely: matron-tee's
+        // own per-command output cap) — so a blob reader knows it's looking
+        // at a silent tail slice, not the whole log.
+        const wasCapped = logSize > TOOL_LOG_UPLOAD_MAX_BYTES;
+        const uploadBytes = wasCapped
+          ? Buffer.concat([
+              Buffer.from(`[log truncated: showing last ${TOOL_LOG_UPLOAD_MAX_BYTES} of ${logSize} bytes]\n`, 'utf-8'),
+              logBuf,
+            ])
+          : logBuf;
+        const media = await journalPublisher.uploadMedia({
+          bytes: uploadBytes,
+          contentType: 'text/plain; charset=utf-8',
+          name: `tool-output-${toolUseId}.log`,
+        });
+        if (media) blobRef = media.media_id;
+      }
+      // Snippet from the decoded tail only. An arbitrary tail cut can start
+      // mid-character; decodeByteExact turns those leading continuation
+      // bytes into '?', which a snippet tolerates.
+      const tail = logBuf && logBuf.length > 0
+        ? logBuf.subarray(Math.max(0, logBuf.length - TOOL_SNIPPET_READ_BYTES))
+        : null;
+      const text = tail ? decodeByteExact(tail).text : '';
+      journalPublisher.finalizeToolOutput(entry.convoId, toolUseId, {
+        message_ref: toolUseId,
+        command: entry.command,
+        exit_code: exitCode,
+        denied,
+        truncated,
+        snippet: toolOutputSnippet(text),
+        blob_ref: blobRef,
+        live_log: true,
+      }, blobRef);
+    } catch (e) {
+      try { console.warn(`[journal] tool-output finalize failed: ${e.message}`); } catch { /* logging must never throw */ }
+    }
+  })();
+}
+
+function stopAndFinalizeToolStream(session, toolUseId, opts = {}) {
+  if (!JOURNAL_ENABLED || !session.claudeSessionId) return;
+  const key = toolStreamKey(session.claudeSessionId, toolUseId);
+  const entry = toolStreamPumps.get(key);
+  if (!entry) return; // not a streamed command, or already finalized
+  finalizeToolStreamEntry(key, entry, opts);
+}
+
+// Sweep every still-open tool-output stream belonging to `session` and
+// finalize each with exit_code: null (the command's real exit will never be
+// observed). Called from killSession and from both claude-process close
+// handlers (proc.on('close') and the interactive-view 'exit' seam) so a
+// process that exits on its own — crash mid-Bash — doesn't orphan a pump: no
+// finalize would otherwise be sent (a viewing client's live overlay dangles
+// until the server's 30-min idle sweep) and the Map entry + its fs.watch
+// handle would leak forever, pinning the dead session object. Keyed off
+// `entry.session === session` rather than session.claudeSessionId so it
+// works even if the id was nulled by a failed resume. Deleting the current
+// key during Map iteration is safe (Map iterators tolerate deletes).
+function sweepToolStreams(session) {
+  if (!JOURNAL_ENABLED) return;
+  for (const [key, entry] of toolStreamPumps.entries()) {
+    if (entry.session === session) {
+      finalizeToolStreamEntry(key, entry, { exitCode: null });
+    }
   }
 }
 
@@ -6172,6 +6378,14 @@ function killSession(session, signal = 'SIGTERM') {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
   }
+
+  // Stop and finalize any still-open tool-output streams for this session so
+  // the server frees their buffers now; the idle sweep is the backstop, not
+  // the mechanism (spec §9). Before the alive check, like the watcher above:
+  // a process that died without delivering tool_result leaves pumps
+  // dangling.
+  sweepToolStreams(session);
+
   if (!session.alive) return;
   try {
     if (session.iv) session.iv.kill(signal);

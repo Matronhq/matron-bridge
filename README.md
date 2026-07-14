@@ -100,37 +100,15 @@ CLOUDFLARE_API_TOKEN=... setup/cloudflare.sh \
 
 That writes only bridge-managed files under `~/.cloudflared` by default. Existing non-bridge cloudflared configs are reported but not overwritten.
 
-### Reverse proxies: the live-output tile needs WebSocket upgrades
+### Live command output rides the journal protocol
 
-`VIEWER_BASE_URL` also backs the live-output tile (`chat.matron.live_output.v1`): the client opens `wss://<VIEWER_BASE_URL host>/live/ws?token=…` and streams command output over that socket. The Cloudflare helper above forwards WebSockets automatically, but if you publish the viewer through your own reverse proxy (nginx, Caddy, Traefik, …) you must forward the WebSocket upgrade to `/live/ws`, or live-output tiles render empty with a `⚠ disconnected` status.
-
-nginx example:
-
-```nginx
-location = /live/ws {
-    proxy_pass http://127.0.0.1:9803;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_read_timeout 86400s;   # long-lived; matches MATRON_LIVE_OUTPUT_TTL (24h default)
-    proxy_send_timeout 86400s;
-}
-
-location / {
-    proxy_pass http://127.0.0.1:9803;
-    # ... your normal proxy headers ...
-}
-```
-
-Symptom → cause: a tile stuck on `⚠ disconnected` with an empty body almost always means the proxy isn't upgrading the socket — a plain `GET /live/ws` reaches the viewer's Express handler and 404s instead of hitting the WebSocket path. Verify the handshake:
-
-```bash
-curl -i -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
-  https://viewer.example.com/live/ws?token=probe
-# expect: HTTP/1.1 101 Switching Protocols
-```
+Live Bash output streams to Matron clients over the authenticated
+matron-journal WebSocket (`stream_append` frames — see the design spec
+`docs/superpowers/specs/2026-07-13-tool-output-streaming-design.md` in the
+matron-journal repo). It no longer uses `VIEWER_BASE_URL` or the viewer's
+`/live/ws` endpoint, and new `chat.matron.live_output` events carry no
+`viewer_url`. The viewer service is still required for file links, secure
+secret requests, and one-time sensitive-data links.
 
 ## Managing The Service
 
