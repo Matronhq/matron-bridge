@@ -602,6 +602,26 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     const uses = src.match(/\bresumePersistedSession\(/g) || [];
     expect(uses.length).toBeGreaterThanOrEqual(3);
   });
+
+  it('a journal-triggered resume produces ONE journal message, not two', () => {
+    // journalResumeConvo posts its own "Session was idle" journal notice, so
+    // it must tell the shared helper NOT to also mirror the room-facing
+    // "Auto-resuming session…" notice into the journal — Matron users were
+    // getting both.
+    const start = src.indexOf('function journalResumeConvo(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toMatch(/resumePersistedSession\(roomId, prev, \{ skipJournalMirror: true \}\)/);
+
+    // …and the helper threads that flag into the sendToRoom carrying the
+    // notice (the session's own sendCallback/sendHtml stay mirrored).
+    const hStart = src.indexOf('function resumePersistedSession(');
+    const hEnd = src.indexOf('\n// --- Matrix Message Handler ---', hStart);
+    const hBody = src.slice(hStart, hEnd);
+    expect(hBody).toMatch(/skipJournalMirror = false/);
+    expect(hBody).toMatch(/sendToRoom\(roomId, arNotice\.plain, arNotice\.html, \{ skipJournalMirror \}\)/);
+  });
 });
 
 // The payload classifier behind the issue #98 fix. Option IDs are

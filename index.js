@@ -5217,7 +5217,10 @@ function journalResumeConvo(convoId) {
     if (existing) sessions.delete(roomId);
     console.log(`[journal-input] auto-resuming reaped session ${convoId} in ${roomId}`);
     journalPublishNotice(convoId, '⏳ Session was idle — auto-resuming it now. Your message will be delivered as soon as it\'s ready.');
-    return resumePersistedSession(roomId, prev);
+    // This notice IS the journal's resume announcement — tell the shared
+    // helper not to also mirror its room-facing "Auto-resuming session…"
+    // notice into the journal, or Matron users see both.
+    return resumePersistedSession(roomId, prev, { skipJournalMirror: true });
   }
   return null;
 }
@@ -5371,7 +5374,12 @@ async function approvePlanBuild(session, { sendHtml }) {
 // drift apart on what a resume restores. Synchronous — the "Auto-resuming…"
 // room notice is fire-and-forget, which is what lets the journal router's
 // sync consumer call this directly.
-function resumePersistedSession(roomId, prev) {
+//
+// skipJournalMirror applies to that notice only (the session's own
+// sendCallback/sendHtml stay mirrored as usual): the journal resume path
+// posts its own richer "Session was idle" notice first, and without the
+// skip Matron users would see both.
+function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
   const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
@@ -5387,7 +5395,7 @@ function resumePersistedSession(roomId, prev) {
 
   const shortId = prev.sessionId.slice(0, 8);
   const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
-  Promise.resolve(sendHtmlFn(arNotice.plain, arNotice.html)).catch(() => {});
+  Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
   // than the paste→Enter window, so an immediate type-in is silently dropped.
