@@ -75,10 +75,12 @@ needs code.
   journal session state `waiting` / activity `idle`, nulls
   `pendingInterrupt`, and notifies ("turn may still be running; !stop kills
   the session"). The timer no-ops if busy was already cleared.
-- `clearPendingInterrupt(session)` cancels the timer; called from the
-  `case 'result':` busy-clear paths (normal and fatal-error) and from
-  `killSession` — a completed or dead session must never fire a stale wedge
-  into a later turn.
+- `clearPendingInterrupt(session)` cancels the timer. The invariant is that
+  EVERY print-mode `session.busy = false` site also cancels — a completed or
+  dead session must never fire a stale wedge into a later turn. Sites:
+  `case 'result':` normal and fatal-error paths, the `compact_boundary`
+  busy-clear, `killSession`, and the print-mode `proc.on('close')` handler
+  (unsolicited exit and auto-restart, which swaps in a new session object).
 - Matrix seam: `else if (classifyPrintRescue(text))` branch directly after
   the existing iv-rescue block → `printModeInterrupt(session, sendReply)`.
 - Journal seam: the existing `dispatchJournalRescueKeystroke` call gains

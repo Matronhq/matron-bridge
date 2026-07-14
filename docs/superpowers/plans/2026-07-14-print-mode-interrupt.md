@@ -16,7 +16,7 @@
 - iv-mode rescue behavior is byte-for-byte untouched; the iv branch takes precedence whenever `session.iv?.alive`.
 - Fail-open: nothing in these paths may throw into a transport handler. A failed stdin write reports via `onError` and arms no timer.
 - The control_request wire shape is exactly `{"type":"control_request","request_id":"<uuid>","request":{"subtype":"interrupt"}}` + `\n` (verified against claude 2.1.207).
-- `INTERRUPT_FALLBACK_MS = 10000`. The wedge timer MUST be cancelled on every busy-clear path (`case 'result':` normal + fatal-error, `killSession`) so a stale timer can never fire into a later turn.
+- `INTERRUPT_FALLBACK_MS = 10000`. The wedge timer MUST be cancelled on EVERY print-mode busy-clear path so a stale timer can never fire into a later turn. (This plan's Task 3 enumerates `case 'result':` normal + fatal-error and `killSession`; review rounds added the print-mode `proc.on('close')` handler — commit 590635d — and the `compact_boundary` busy-clear — commit bc2b2ab. See the spec for the full site list.)
 - Reply copy (exact strings):
   - `⏹ Interrupt sent — waiting for claude to stop this turn.`
   - `Nothing to interrupt — claude is idle.`
