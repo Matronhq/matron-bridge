@@ -56,7 +56,7 @@ import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromUsage } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromUsage, emailFromClaudeConfig } from './lib/session-status.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -558,6 +558,26 @@ function refreshUsageLimits(cwd) {
   return usageLimitsCache.inflight;
 }
 
+// Logged-in account email for the status frame, read from ~/.claude.json's
+// oauthAccount (the same account every session on this bridge runs as). It
+// only changes on re-login, so cache on the same cadence as the limits
+// refresh — a ~45KB read+parse at most once per window. Read failures (file
+// missing mid-login, torn write) just return the previous value; a stale
+// email beats a flickering one.
+const accountEmailCache = { email: null, fetchedAt: 0 };
+
+function getAccountEmail() {
+  if (Date.now() - accountEmailCache.fetchedAt < LIMITS_REFRESH_MS) return accountEmailCache.email;
+  accountEmailCache.fetchedAt = Date.now();
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf-8'));
+    accountEmailCache.email = emailFromClaudeConfig(config);
+  } catch (e) {
+    debug(`Could not read account email from ~/.claude.json: ${e.message}`);
+  }
+  return accountEmailCache.email;
+}
+
 // Publish the session's header data (model, context gauge, rate limits) as
 // an ephemeral status frame for Matron clients. Same skip-if-no-session-id
 // rule as journalActivity — never buffered, a late status would be stale.
@@ -572,6 +592,7 @@ function journalStatus(session) {
     model: session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
     limits: usageLimitsCache.lines,
+    email: getAccountEmail(),
   });
   if (Object.keys(status).length === 0) return;
   journalPublisher.publishStatus(session.claudeSessionId, status);

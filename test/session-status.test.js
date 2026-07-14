@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { contextWindowFor, contextTokensFromUsage, buildSessionStatus } from '../lib/session-status.js';
+import { contextWindowFor, contextTokensFromUsage, buildSessionStatus, emailFromClaudeConfig } from '../lib/session-status.js';
 
 describe('contextWindowFor', () => {
   it('gives 1m-class models their full window', () => {
@@ -71,6 +71,30 @@ describe('buildSessionStatus', () => {
     expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 1_000 }).context.pct).toBe(1);
     expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 300_000 }).context.pct).toBe(100);
   });
+
+  it('includes the logged-in account email when known, omits it otherwise', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', email: 'gene@yearbook.com' })).toEqual({
+      model: 'claude-fable-5',
+      email: 'gene@yearbook.com',
+    });
+    expect(buildSessionStatus({ model: 'claude-fable-5', email: null })).toEqual({ model: 'claude-fable-5' });
+    expect(buildSessionStatus({ model: 'claude-fable-5', email: '' })).toEqual({ model: 'claude-fable-5' });
+  });
+});
+
+describe('emailFromClaudeConfig', () => {
+  it("extracts the logged-in account's email from a parsed ~/.claude.json", () => {
+    expect(emailFromClaudeConfig({ oauthAccount: { emailAddress: 'gene@yearbook.com', displayName: 'Gene' } }))
+      .toBe('gene@yearbook.com');
+  });
+
+  it('returns null when logged out, malformed, or missing', () => {
+    expect(emailFromClaudeConfig({})).toBeNull();
+    expect(emailFromClaudeConfig({ oauthAccount: {} })).toBeNull();
+    expect(emailFromClaudeConfig({ oauthAccount: { emailAddress: 42 } })).toBeNull();
+    expect(emailFromClaudeConfig(null)).toBeNull();
+    expect(emailFromClaudeConfig(undefined)).toBeNull();
+  });
 });
 
 // index.js can't be imported in-process (it starts the bridge), so pin the
@@ -119,5 +143,19 @@ describe('index.js wiring', () => {
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
     expect(body).toContain('if (!JOURNAL_ENABLED) return null;');
+  });
+
+  it('journalStatus threads the TTL-cached account email into the frame', () => {
+    const gStart = src.indexOf('function getAccountEmail(');
+    expect(gStart).toBeGreaterThan(-1);
+    const gEnd = src.indexOf('\nfunction ', gStart + 1);
+    const gBody = src.slice(gStart, gEnd);
+    expect(gBody).toContain('emailFromClaudeConfig(');
+    expect(gBody).toContain('.claude.json');
+
+    const jStart = src.indexOf('function journalStatus(');
+    const jEnd = src.indexOf('\nfunction ', jStart + 1);
+    const jBody = src.slice(jStart, jEnd);
+    expect(jBody).toContain('email: getAccountEmail()');
   });
 });
