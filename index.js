@@ -532,6 +532,7 @@ function publishEditDiff(session, toolName, input, label) {
       removed: result.removed,
       truncated: result.truncated,
       new_file: result.newFile,
+      from: 'assistant',
     });
   }).catch(e => {
     debug('publishEditDiff failed: %s', e?.message);
