@@ -24,17 +24,17 @@ existing plain-text rendering — that IS the off state).
 
 ### `lib/file-link-guard.js` (new)
 
-- `isSensitivePath(filePath)` — pure denylist test. Basename patterns:
-  `.env(.*)`, `secrets.(json|yaml|yml|toml|txt)`, `credentials(.ext)`,
-  `*.pem/key/p12/pfx/jks/keystore`, `id_rsa`/`id_ed25519`/`id_ecdsa`,
-  `.npmrc`, `.netrc`, `token(s).(json|txt)`, `service[-_]account*.json`,
-  `.htpasswd`, `config.json` (this ecosystem's config.json files hold
-  tokens — `~/.claude-matrix-config.json`). Path patterns: basename patterns
-  from PR #54 verbatim; path-segment patterns added in review flag files
-  inside sensitive directories — `/.aws/`, `/.docker/`, `/.kube/`, `/.ssh/`,
-  `/.gnupg/` (dot-dirs from PR #54), plus `/.env*/`, `/secret(s)/`,
-  `/credential(s)/` (files INSIDE such directories are denied regardless of
-  basename). All case-insensitive.
+- `isSensitivePath(filePath)` — pure denylist test. Basename patterns apply to
+  every path segment (directories with sensitive-shaped names deny their
+  contents). Patterns: `.env(.*)`, `secrets.(json|yaml|yml|toml|txt)`, `secret(s)`
+  (bare name, added in review), `credentials(.ext)`, `*.pem/key/p12/pfx/jks/keystore`,
+  `id_rsa`/`id_ed25519`/`id_ecdsa`, `.npmrc`, `.netrc`, `token(s).(json|txt)`,
+  `service[-_]account*.json`, `.htpasswd`, `config.json` (this ecosystem's
+  config.json files hold tokens — `~/.claude-matrix-config.json`). Explicit
+  `SENSITIVE_PATH_PATTERNS` from PR #54 verbatim kept for readability/
+  defense-in-depth: `/.aws/`, `/.docker/`, `/.kube/`, `/.ssh/`, `/.gnupg/`
+  (dot-dirs), plus `/.env*/`, `/secret(s)/`, `/credential(s)/` (files INSIDE
+  such directories are denied regardless of basename). All case-insensitive.
 - `checkFileLink(filePath, workdir)` — sync generation-time gate. Returns
   `{ ok: true }` or `{ ok: false, reason: 'sensitive' | 'outside-workdir' }`.
   Containment is lexical (`path.resolve` prefix with a `/` boundary so

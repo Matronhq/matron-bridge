@@ -16,6 +16,8 @@ describe('isSensitivePath', () => {
     '/home/u/.docker/x', '/home/u/.gnupg/x',
     '/w/.env/apikey.dat', '/w/.env.production/x.dat', '/w/secrets/db.dat',
     '/w/secret/note.txt', '/w/credentials/token.dat',
+    '/w/proj/secrets', '/w/proj/secret', '/w/prod.env/x.dat', '/w/tokens.json/x.dat',
+    '/w/app.key/nested/file.txt',
   ])('flags %s', (p) => {
     expect(isSensitivePath(p)).toBe(true);
   });
