@@ -54,6 +54,17 @@ describe('checkFileLink', () => {
     expect(checkFileLink('/anywhere/a.js', null)).toEqual({ ok: true });
     expect(checkFileLink('/anywhere/.env', null)).toEqual({ ok: false, reason: 'sensitive' });
   });
+
+  it('treats the filesystem root workdir as containing everything', () => {
+    expect(checkFileLink('/home/u/proj/a.js', '/')).toEqual({ ok: true });
+    expect(checkFileLink('/etc/hosts', '/')).toEqual({ ok: true });
+    expect(checkFileLink('/etc/.env', '/')).toEqual({ ok: false, reason: 'sensitive' });
+  });
+
+  it('rejects relative paths outright', () => {
+    expect(checkFileLink('proj/a.js', '/w/proj')).toEqual({ ok: false, reason: 'relative-path' });
+    expect(checkFileLink('./a.js', null)).toEqual({ ok: false, reason: 'relative-path' });
+  });
 });
 
 describe('validateAndOpen', () => {
@@ -119,6 +130,10 @@ describe('validateAndOpen', () => {
   it('skips containment for legacy calls without a workdir', async () => {
     const { content } = await validateAndOpen(path.join(outside, 'target.txt'), {});
     expect(content.toString('utf-8')).toBe('outside content\n');
+  });
+
+  it('rejects relative paths outright', async () => {
+    expect(await denied('some/relative.txt', { workdir: dir })).toBe('relative-path');
   });
 
   it('rejects a file reached through a symlinked ancestor directory', async () => {

@@ -16,7 +16,7 @@ default). The gate is against accidental exposure — a `.env` or key file
 Claude touches becoming a click-to-view URL over the public tunnel — and
 against the file at the linked path changing between link-post and click
 (symlink swap, replacement). Not in scope: authenticating the viewer itself
-(Cloudflare tunnel policy exists), binary rendering, a `/download` route, a
+(Cloudflare tunnel policy exists), binary rendering, a `/download` route, hardlink-based aliasing (a deliberately `ln`-constructed alias inside the workdir defeats containment; constructing it requires arbitrary command execution, which already implies full read access), a
 per-session toggle or env kill-switch (denied links just fall back to the
 existing plain-text rendering — that IS the off state).
 
@@ -36,12 +36,13 @@ existing plain-text rendering — that IS the off state).
   (dot-dirs), plus `/.env*/`, `/secret(s)/`, `/credential(s)/` (files INSIDE
   such directories are denied regardless of basename). All case-insensitive.
 - `checkFileLink(filePath, workdir)` — sync generation-time gate. Returns
-  `{ ok: true }` or `{ ok: false, reason: 'sensitive' | 'outside-workdir' }`.
+  `{ ok: true }` or `{ ok: false, reason: 'relative-path' | 'sensitive' | 'outside-workdir' }`.
   Containment is lexical (`path.resolve` prefix with a `/` boundary so
-  `/home/x/proj-evil` is not inside `/home/x/proj`): at `tool_use` time the
-  Write target may not exist yet, so realpath is impossible — the hard
-  boundary is serve time; this gate is UX (don't post links that will 404).
-  No workdir (falsy) → containment check is skipped, denylist still applies.
+  `/home/x/proj-evil` is not inside `/home/x/proj`; the filesystem root `'/'`
+  contains everything): at `tool_use` time the Write target may not exist yet,
+  so realpath is impossible — the hard boundary is serve time; this gate is UX
+  (don't post links that will 404). No workdir (falsy) → containment check is
+  skipped, denylist still applies.
 - `MAX_VIEW_BYTES = 5 * 1024 * 1024`.
 - `validateAndOpen(filePath, { workdir, maxBytes = MAX_VIEW_BYTES })` —
   async serve-time boundary, used by the viewer:
