@@ -71,6 +71,19 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectText).not.toHaveBeenCalled();
     expect(deps.buildSavedBlocks).not.toHaveBeenCalled();
     expect(warnings.some(w => /dropping/.test(w))).toBe(true);
+    // The user must be told the attachment never reached claude — same as the
+    // transcription-failure path — since the room already showed a success echo.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't fetch that attachment/));
+  });
+
+  it('a failed fetch labels the notice by declared kind (voice note / image)', async () => {
+    const { route, deps } = makeRouter({ fetchMedia: vi.fn(async () => null) });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg', name: 'v.ogg' }, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't fetch that voice note/));
+
+    deps.publishNotice.mockClear();
+    await route(session, { type: 'image', blobRef: 'i', contentType: 'image/png', name: 'i.png' }, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't fetch that image/));
   });
 
   it('an empty block list is dropped (never injects an empty turn)', async () => {
