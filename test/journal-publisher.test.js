@@ -156,13 +156,24 @@ describe('createJournalPublisher', () => {
     pub.upsertConvo('convo-2', {});
     pub.publishPrompt('convo-2', { question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
     pub.publishToolOutput('convo-2', { tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
+    pub.publishDiff('convo-2', {
+      file_path: '/w/a.swift', display_path: 'a.swift', viewer_url: null,
+      tool: 'Edit', label: null, diff: '@@ -1,1 +1,1 @@\n-a\n+b',
+      added: 1, removed: 1, truncated: false, new_file: false,
+    });
 
-    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 2);
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 3);
     const [prompt, toolOutput] = fake.received.filter(f => f.op === 'publish');
     expect(prompt.type).toBe('prompt');
     expect(prompt.payload).toEqual({ question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
     expect(toolOutput.type).toBe('tool_output');
     expect(toolOutput.payload).toEqual({ tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
+    const diffFrame = fake.received.find(f => f.op === 'publish' && f.type === 'diff');
+    expect(diffFrame).toMatchObject({
+      convo_id: 'convo-2', type: 'diff',
+      payload: { tool: 'Edit', added: 1, removed: 1, new_file: false },
+    });
+    expect(typeof diffFrame.idem_key).toBe('string');
 
     pub.close();
     await fake.close();
@@ -291,6 +302,7 @@ describe('createJournalPublisher', () => {
       pub.publishText('c1', { body: 'hi', from: 'user' });
       pub.publishPrompt('c1', { question: 'q?', options: [] });
       pub.publishToolOutput('c1', { command: 'ls' });
+      pub.publishDiff('c1', { diff: 'x' });
       pub.publishFile('c1', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 1, from: 'user' });
       pub.publishImage('c1', { blob_ref: 'm2', content_type: 'image/png', name: 'pic.png', size: 1, from: 'user' });
       pub.publishActivity('c1', 'thinking');
