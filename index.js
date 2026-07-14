@@ -1294,7 +1294,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         session._operatorCompactTimer = null;
       }
     }
-    stripQueueNotificationLinks(session);
     if (session.typingInterval) {
       clearInterval(session.typingInterval);
       session.typingInterval = null;
@@ -1411,9 +1410,11 @@ async function handleInteractivePrompt(session, prompt) {
       // If a newer prompt superseded this one while we were composing, bail —
       // don't post buttons for a stale prompt against the current TUI menu.
       if (session.pendingInteractivePrompt !== prompt) return;
-      // sendButtonMessage returns null if the Matrix send fails. Fall through
-      // to the text rendering below in that case so the prompt is never
-      // silently dropped while the TUI waits for an answer.
+      // sendButtonMessage (index.js) returns true once it's published the
+      // prompt to the journal, or null when there's no journal session for
+      // this room to publish to (outbound Matrix sends are gone — Task 3).
+      // Fall through to the text rendering below in the null case so the
+      // prompt is never silently dropped while the TUI waits for an answer.
       const sent = await session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
       if (sent != null) return;
     }
@@ -2346,8 +2347,10 @@ function handleClaudeEvent(session, event) {
                 pump.start();
               }
               // Optimistically suppress the synchronous indicator post below;
-              // if the async send fails we re-post the regular indicator so
-              // the user isn't left looking at nothing.
+              // sendLiveOutputEvent (journal-only now — Task 3) always
+              // resolves true once it's published the tool activity, so this
+              // fallback is effectively dead unless a future failure path is
+              // added there, kept as the safety net it always was.
               const fallbackPlain = indicator;
               const fallbackHtml = indicatorHtml;
               sendLiveOutputEvent(session, {
@@ -2526,7 +2529,6 @@ function handleClaudeEvent(session, event) {
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
-      stripQueueNotificationLinks(session);
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
         session.typingInterval = null;
@@ -3460,23 +3462,10 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
         journalSession._journalStreamMsgId = null;
       }
       journalPublish(journalSession, 'publishText', payload);
+      return ref || null;
     }
   }
-  const content = {
-    msgtype: 'm.text',
-    body: text,
-  };
-  if (html) {
-    content.format = 'org.matrix.custom.html';
-    content.formatted_body = html;
-  }
-  try {
-    const eventId = await client.sendMessage(roomId, content);
-    return eventId || null;
-  } catch (e) {
-    console.error('Failed to send message:', e.message);
-    return null;
-  }
+  return null;
 }
 
 async function sendLiveOutputEvent(session, { tool_use_id, command }) {
@@ -3487,27 +3476,7 @@ async function sendLiveOutputEvent(session, { tool_use_id, command }) {
   // history gets it from the finalize payload (spec §5.3). No viewer_url /
   // expires_at anywhere — live output rides the journal protocol.
   journalActivity(session, 'tool', truncateActivityDetail(command));
-  // Matrix room UX: the same custom event as before minus the viewer link.
-  // matron-web's live tile goes dark for new commands until it implements
-  // the journal client contract (accepted, spec §10) — every other Matrix
-  // client keeps rendering the body/formatted_body fallback below.
-  const truncated = command.length > 100 ? command.slice(0, 100) + '…' : command;
-  const body = `🔧 \`${truncated}\``;
-  const formatted_body = `🔧 <code>${escapeHtml(truncated)}</code>`;
-  const content = {
-    msgtype: 'm.text',
-    body,
-    format: 'org.matrix.custom.html',
-    formatted_body,
-    [`${MATRIX_EVENT_NAMESPACE}.live_output`]: { tool_use_id, command },
-  };
-  try {
-    await client.sendMessage(session.roomId, content);
-    return true;
-  } catch (e) {
-    console.error('Failed to send live_output event:', e.message);
-    return false;
-  }
+  return true;
 }
 
 // Completion seam for a journal-streamed Bash command: stop the pump, flush
@@ -3650,25 +3619,11 @@ function sweepToolStreams(session) {
 async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const journalSession = sessions.get(roomId);
-  if (journalSession) journalPublish(journalSession, 'publishPrompt', { question: prompt, options: buttons, mode });
-  const content = {
-    msgtype: 'm.text',
-    body: fallbackBody,
-    format: 'org.matrix.custom.html',
-    formatted_body: fallbackHtml,
-    [`${MATRIX_EVENT_NAMESPACE}.buttons`]: {
-      mode,       // 'pick_one' or 'pick_many'
-      prompt,
-      buttons,    // [{ id, label, value }]
-    },
-  };
-  try {
-    const eventId = await client.sendMessage(roomId, content);
-    return eventId || null;
-  } catch (e) {
-    console.error('Failed to send button message:', e.message);
-    return null;
+  if (journalSession) {
+    journalPublish(journalSession, 'publishPrompt', { question: prompt, options: buttons, mode });
+    return true;
   }
+  return null;
 }
 
 // --- Room Management ---
@@ -3716,49 +3671,12 @@ async function createSessionRoom(inviteUserId) {
   return roomId;
 }
 
-async function editMessage(roomId, eventId, plain, html) {
-  // Not mirrored to the journal in v1: the protocol has an `edit` event type
-  // (spec §7) but this module doesn't use it yet — deferred, see PR description.
-  const content = {
-    msgtype: 'm.text',
-    body: `* ${plain}`,
-    'm.new_content': {
-      msgtype: 'm.text',
-      body: plain,
-      ...(html ? { format: 'org.matrix.custom.html', formatted_body: html } : {}),
-    },
-    'm.relates_to': {
-      rel_type: 'm.replace',
-      event_id: eventId,
-    },
-  };
-  try {
-    await client.sendEvent(roomId, 'm.room.message', content);
-  } catch (e) {
-    debug('Failed to edit message:', e.message);
-  }
-}
-
-async function stripQueueNotificationLinks(session) {
-  const notifs = session.queueNotifications || [];
-  if (notifs.length === 0) return;
-  session.queueNotifications = [];
-  for (const { eventId, plain } of notifs) {
-    await editMessage(session.roomId, eventId, plain);
-  }
-}
-
 async function updateRoomName(roomId, name) {
   // Single choke point for every title change (initial naming, media-file
   // naming, and the LLM-driven rename in maybeUpdatePinnedSummary all call
   // through here) — mirror it once, here, rather than at each call site.
   const journalSession = sessions.get(roomId);
   if (journalSession) journalUpsertConvo(journalSession, { title: name });
-  try {
-    await client.sendStateEvent(roomId, 'm.room.name', '', { name });
-  } catch (e) {
-    debug(`Failed to update room name: ${e.message}`);
-  }
 }
 
 async function maybeUpdatePinnedSummary(session) {
@@ -3825,48 +3743,14 @@ async function maybeUpdatePinnedSummary(session) {
     }
 
     if (updatedSummary) {
-      // Store accumulated summary in session (source of truth)
+      // Store accumulated summary in session (source of truth). The Matrix
+      // pinned-message mechanics (create/verify/edit the pinned event,
+      // m.room.pinned_events bookkeeping) are gone along with outbound
+      // Matrix sends — only the summary text itself has ongoing meaning, so
+      // that's all that gets persisted now.
       session.pinnedSummaryText = updatedSummary;
       if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory, pinnedSummaryText: updatedSummary, pinnedSummaryEventId: session.pinnedSummaryEventId || null });
-      }
-
-      const plainText = `📌 Session Summary\n\n${updatedSummary}`;
-      const htmlText = `<b>📌 Session Summary</b><br/><br/>${escapeHtml(updatedSummary).replace(/\n/g, '<br/>')}`;
-
-      if (session.pinnedSummaryEventId) {
-        // Verify pinned message still exists; reset if deleted so next block creates a new one
-        try {
-          await client.getEvent(session.roomId, session.pinnedSummaryEventId);
-          await editMessage(session.roomId, session.pinnedSummaryEventId, plainText, htmlText);
-        } catch {
-          session.pinnedSummaryEventId = null;
-        }
-      }
-      if (!session.pinnedSummaryEventId) {
-        // Create new pinned message
-        const eventId = await client.sendMessage(session.roomId, {
-          msgtype: 'm.text',
-          body: plainText,
-          format: 'org.matrix.custom.html',
-          formatted_body: htmlText,
-        });
-        session.pinnedSummaryEventId = eventId;
-        if (session.claudeSessionId) {
-          persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pinnedSummaryEventId: eventId });
-        }
-
-        // Pin the message
-        try {
-          const pinnedEvents = await client.getRoomStateEvent(session.roomId, 'm.room.pinned_events', '').catch(() => ({ pinned: [] }));
-          const pinned = Array.isArray(pinnedEvents?.pinned) ? pinnedEvents.pinned : [];
-          if (!pinned.includes(eventId)) {
-            pinned.push(eventId);
-            await client.sendStateEvent(session.roomId, 'm.room.pinned_events', '', { pinned });
-          }
-        } catch (e) {
-          debug(`Failed to pin message: ${e.message}`);
-        }
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory, pinnedSummaryText: updatedSummary });
       }
     }
   } catch (e) {
@@ -3923,39 +3807,22 @@ function hasToolResultInHistory(sessionId, workdir, toolUseId) {
 
 // --- Media Handling ---
 
-async function downloadMatrixFile(mxcUrl, fileInfo) {
-  // Use authenticated media endpoint (unauthenticated downloads are disabled on this homeserver)
-  const urlParts = mxcUrl.replace('mxc://', '').split('/');
-  const domain = encodeURIComponent(urlParts[0]);
-  const mediaId = encodeURIComponent(urlParts[1]);
-  const downloadUrl = `${MATRIX_HOMESERVER_URL}/_matrix/client/v1/media/download/${domain}/${mediaId}`;
-  const res = await fetch(downloadUrl, {
-    headers: { 'Authorization': `Bearer ${resolvedAccessToken}` }
-  });
-  if (!res.ok) throw new Error(`Media download failed: ${res.status} ${res.statusText}`);
-  let buffer = Buffer.from(await res.arrayBuffer());
-
-  // Decrypt if encrypted (E2E attachment)
-  if (fileInfo?.key && fileInfo?.iv) {
-    const { createDecipheriv } = await import('crypto');
-    // Matrix uses AES-256-CTR with a JWK key
-    const keyData = Buffer.from(fileInfo.key.k.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
-    const iv = Buffer.from(fileInfo.iv, 'base64');
-    const decipher = createDecipheriv('aes-256-ctr', keyData, iv);
-    buffer = Buffer.concat([decipher.update(buffer), decipher.final()]);
-  }
-
-  return buffer;
-}
-
+// TODO(Task4): buildMediaContentBlocks has no non-Matrix caller left after
+// this task's edits — both call sites (in the client.on('room.message')
+// handler) live inside the doomed Matrix inbound handler that Task 4
+// deletes. The Matrix-shaped byte source (downloadMatrixFile, mxcUrl,
+// content.url/content.file, E2E-decrypt) was removed here in Task 3 along
+// with outbound Matrix sends; nothing yet supplies `buffer` for a
+// journal-only inbound-media path. Left as a guarded no-op (returns no
+// blocks) rather than guessing the replacement byte source — Task 4 must
+// either wire a journal-sourced buffer here or remove this function
+// outright.
 async function buildMediaContentBlocks(event, session) {
   const blocks = [];
   const content = event.content;
-  const mxcUrl = content.url || content.file?.url;
 
-  if (!mxcUrl) return blocks;
-
-  const buffer = await downloadMatrixFile(mxcUrl, content.file);
+  const buffer = null;
+  if (!buffer) return blocks;
   // fileName is used as a path segment for workdir saves below — basename()
   // strips directory components a malicious/odd Matrix body might carry
   // (mirrors resolveUploadMeta in lib/iv-uploads.js; '.'/'..' survive
@@ -4920,6 +4787,20 @@ function journalSessionCommandCtx(session) {
 // (cancel pops-and-edits the cancelled tile; send clears + strips the rest
 // — cross-transport display parity). Everything a plain typed reply — or a
 // bridge command — can do, a Matron text message can do too.
+
+// Non-Matrix replacement for the deleted stripQueueNotificationLinks: its
+// Matrix tile-edit loop is gone along with outbound Matrix sends (Task 3),
+// but lib/busy-queue.js's 'send'/'interrupt' flush paths still rely on this
+// seam to clear session.queueNotifications when the queue empties — skip it
+// and a later re-queued message misaligns against stale notif entries (the
+// PR #104 Bugbot finding this array exists to prevent). The 'cancel'/
+// 'cancel:<n>' paths don't need this: their notif pop/splice already runs
+// unconditionally, independent of the (now Matrix-only, now null) editMessage
+// seam.
+function clearQueueNotifications(session) {
+  session.queueNotifications = [];
+}
+
 async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
@@ -5063,28 +4944,28 @@ async function journalRouteTextToSession(session, body) {
       return;
     }
     // Busy-queue magic words — the SAME classifier and implementation the
-    // Matrix busy branch uses (lib/busy-queue.js), checked at the same point
-    // (busy, not a TUI slash passthrough). Feedback goes through
+    // old Matrix busy branch used (lib/busy-queue.js), checked at the same
+    // point (busy, not a TUI slash passthrough). Feedback goes through
     // ctx.sendReply — a fresh sendToRoom text that also mirrors into the
-    // journal, like every other command reply. BOTH Matrix notification
-    // seams ARE passed (PR #104 review findings): session.roomId is a real
-    // Matrix room, and queuedMessages/queueNotifications must move in
-    // lockstep on EVERY path — a Matron cancel pops-and-edits the cancelled
-    // tile, and a Matron send clears + strips the queued tiles, exactly
-    // like their Matrix counterparts. Skipping either seam left dangling
-    // notif entries, so a later Matrix cancel's "(cancelled)" edit — and
-    // the indexed cancel:<n> buttons on stale, still-linked tiles — landed
-    // on the WRONG message. Only sendHtml is omitted: journal feedback
-    // stays plain. A flush still goes through the one true flushQueue
-    // (single merged send + origin-aware mirroring, PR #100) — never a
-    // second flush path.
+    // journal, like every other command reply. The Matrix tile-edit half of
+    // the PR #104 seams is gone (outbound Matrix sends retired, Task 3):
+    // editMessage is null (lib/busy-queue.js no-ops it), and
+    // stripQueueNotificationLinks is now clearQueueNotifications — same
+    // array-clearing effect minus the Matrix edit loop, still needed so a
+    // 'send'/'interrupt' flush doesn't leave stale notif entries to misalign
+    // a later re-queue (see clearQueueNotifications above). Kept as named
+    // keys (rather than omitted) so the wiring stays self-documenting and
+    // the source-inspection pin in test/busy-queue.test.js still finds both
+    // identifiers. Only sendHtml is omitted: journal feedback stays plain. A
+    // flush still goes through the one true flushQueue (single merged send +
+    // origin-aware mirroring, PR #100) — never a second flush path.
     const ctx = journalSessionCommandCtx(session);
     const handledMagicWord = await dispatchBusyQueueMagicWord(trimmed, session, {
       sendReply: ctx.sendReply,
       formatQueueSummary,
       flushQueue,
-      stripQueueNotificationLinks,
-      editMessage,
+      stripQueueNotificationLinks: clearQueueNotifications,
+      editMessage: null,
     });
     if (handledMagicWord) return;
     // Queue like a Matrix message would, but marked journal-origin so the
@@ -5223,8 +5104,11 @@ function journalOnPromptReply(session, answer, { username }) {
       sendReply: ctx.sendReply,
       formatQueueSummary,
       flushQueue,
-      stripQueueNotificationLinks,
-      editMessage,
+      // 'interrupt' needs this to clear session.queueNotifications on a full
+      // flush (see clearQueueNotifications above); 'cancel:<n>' doesn't use
+      // it — its notif splice is unconditional. No editMessage: Matrix tile
+      // edits are gone with outbound Matrix sends (Task 3).
+      stripQueueNotificationLinks: clearQueueNotifications,
     });
     return;
   }
@@ -6311,7 +6195,7 @@ const apiServer = createServer(async (req, res) => {
         }
         const queued = session.queuedMessages || [];
         session.queuedMessages = null;
-        stripQueueNotificationLinks(session);
+        clearQueueNotifications(session);
         if (queued.length > 0) {
           const summary = formatQueueSummary(queued);
           if (session.sendHtml) {
@@ -6347,14 +6231,11 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
         queue.splice(index, 1);
-        // Edit the notification for this index to remove links
+        // Keep queueNotifications in lockstep with queuedMessages at this
+        // index — no Matrix tile to edit anymore (Task 3), but the arrays
+        // must still shrink together or a later cancel misaligns.
         const notifs = session.queueNotifications || [];
-        if (index < notifs.length) {
-          const { eventId, plain } = notifs.splice(index, 1)[0];
-          if (eventId) {
-            editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
-          }
-        }
+        if (index < notifs.length) notifs.splice(index, 1);
         const remaining = queue.length;
         if (remaining === 0) session.queuedMessages = null;
         if (session.sendCallback) {
