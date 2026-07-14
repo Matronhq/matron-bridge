@@ -52,7 +52,7 @@ import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, ha
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
+import { seedJournalTitle } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -430,19 +430,11 @@ function journalUpsertConvo(session, opts) {
   journalPublish(session, 'upsertConvo', opts);
 }
 
-// Fire-and-forget at session creation: seed the journal convo title from a
-// pre-existing name so resumed sessions don't sit titleless (UUID in the
-// journal UI) until the next 5-message Gemini rename. The former source was
-// the Matrix room's m.room.name; with Matrix removed there is no such source,
-// so getRoomName always resolves null and this is a guaranteed no-op today.
-// Kept (rather than deleted) so a future journal-native title source can drop
-// straight in. Guards and rationale live in lib/journal-title-seed.js.
 function journalSeedTitle(session) {
-  if (!JOURNAL_ENABLED || !session) return;
-  seedJournalTitleFromRoom(session, {
-    getRoomName: async () => null,
+  return seedJournalTitle(session, {
+    workdir: session.workdir,
     upsertConvo: journalUpsertConvo,
-    warn: (msg) => console.warn(msg),
+    warn: (m) => DEBUG && console.warn(m),
   });
 }
 
