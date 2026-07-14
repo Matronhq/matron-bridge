@@ -1,7 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { contextWindowFor, contextTokensFromUsage, buildSessionStatus, emailFromClaudeConfig } from '../lib/session-status.js';
+import {
+  contextWindowFor,
+  contextTokensFromUsage,
+  contextTokensFromAssistantEvent,
+  postCompactContextTokens,
+  buildSessionStatus,
+  emailFromClaudeConfig,
+} from '../lib/session-status.js';
 
 describe('contextWindowFor', () => {
   it('gives 1m-class models their full window', () => {
@@ -40,6 +47,52 @@ describe('contextTokensFromUsage', () => {
     expect(contextTokensFromUsage(null)).toBeNull();
     expect(contextTokensFromUsage(undefined)).toBeNull();
     expect(contextTokensFromUsage({})).toBeNull();
+  });
+});
+
+describe('contextTokensFromAssistantEvent', () => {
+  const usage = { input_tokens: 2, cache_read_input_tokens: 28_793, cache_creation_input_tokens: 1_315 };
+
+  it("returns the last request's context footprint from a parent-stream assistant event", () => {
+    expect(contextTokensFromAssistantEvent({ type: 'assistant', parent_tool_use_id: null, message: { usage } }))
+      .toBe(30_110);
+  });
+
+  it('ignores subagent events — their usage is the subagent\'s own context, not the parent\'s', () => {
+    expect(contextTokensFromAssistantEvent({ type: 'assistant', parent_tool_use_id: 'toolu_01x', message: { usage } }))
+      .toBeNull();
+    expect(contextTokensFromAssistantEvent({ type: 'assistant', isSidechain: true, message: { usage } }))
+      .toBeNull();
+  });
+
+  it('ignores non-assistant events and events without usage', () => {
+    expect(contextTokensFromAssistantEvent({ type: 'result', usage })).toBeNull();
+    expect(contextTokensFromAssistantEvent({ type: 'assistant', message: {} })).toBeNull();
+    expect(contextTokensFromAssistantEvent(null)).toBeNull();
+  });
+});
+
+describe('postCompactContextTokens', () => {
+  it('reads camelCase compactMetadata (transcript files, iv-mode)', () => {
+    expect(postCompactContextTokens({
+      type: 'system',
+      subtype: 'compact_boundary',
+      compactMetadata: { trigger: 'manual', preTokens: 30_115, postTokens: 2_399 },
+    })).toBe(2_399);
+  });
+
+  it('reads snake_case compact_metadata (stream-json stdout, print mode)', () => {
+    expect(postCompactContextTokens({
+      type: 'system',
+      subtype: 'compact_boundary',
+      compact_metadata: { trigger: 'manual', pre_tokens: 30_115, post_tokens: 2_399 },
+    })).toBe(2_399);
+  });
+
+  it('returns null when metadata or post tokens are absent or zero', () => {
+    expect(postCompactContextTokens({ type: 'system', subtype: 'compact_boundary' })).toBeNull();
+    expect(postCompactContextTokens({ compactMetadata: { postTokens: 0 } })).toBeNull();
+    expect(postCompactContextTokens(null)).toBeNull();
   });
 });
 
@@ -105,7 +158,8 @@ describe('index.js wiring', () => {
 
   it('imports the status helpers from lib/session-status.js', () => {
     expect(src).toMatch(/import \{[^}]*buildSessionStatus[^}]*\} from '\.\/lib\/session-status\.js'/);
-    expect(src).toMatch(/import \{[^}]*contextTokensFromUsage[^}]*\} from '\.\/lib\/session-status\.js'/);
+    expect(src).toMatch(/import \{[^}]*contextTokensFromAssistantEvent[^}]*\} from '\.\/lib\/session-status\.js'/);
+    expect(src).toMatch(/import \{[^}]*postCompactContextTokens[^}]*\} from '\.\/lib\/session-status\.js'/);
   });
 
   it('defines a journalStatus helper that publishes via publishStatus', () => {
@@ -117,14 +171,33 @@ describe('index.js wiring', () => {
     expect(body).toContain('publishStatus(');
   });
 
-  it("the print-mode result handler captures context tokens and publishes status", () => {
+  it("the print-mode result handler publishes status WITHOUT deriving context from result usage (it's cumulative across the turn's API calls, not a context footprint)", () => {
     const start = src.indexOf("case 'result': {");
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf("case 'system': {", start);
     const body = src.slice(start, end);
-    expect(body).toContain('contextTokensFromUsage(');
+    expect(body).not.toContain('contextTokensFromUsage(');
     expect(body).toContain('journalStatus(session)');
     expect(body).toContain('refreshUsageLimits(');
+  });
+
+  it("the assistant handler tracks the last request's context footprint for the gauge", () => {
+    const start = src.indexOf("case 'assistant': {");
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf("case 'result': {", start);
+    const body = src.slice(start, end);
+    expect(body).toContain('contextTokensFromAssistantEvent(');
+    expect(body).toContain('_lastContextTokens');
+  });
+
+  it('the compact_boundary handler repaints the gauge from post-compact tokens', () => {
+    const start = src.indexOf("subtype === 'compact_boundary'");
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf("case 'stream_event'", start);
+    const body = src.slice(start, end);
+    expect(body).toContain('postCompactContextTokens(');
+    expect(body).toContain('_lastContextTokens');
+    expect(body).toContain('journalStatus(session)');
   });
 
   it('limits refresh is throttled through a shared cache with an inflight guard', () => {

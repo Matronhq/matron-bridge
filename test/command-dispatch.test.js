@@ -547,3 +547,16 @@ describe('dispatchJournalRescueKeystroke print path', () => {
     expect(cb.flushCursor).not.toHaveBeenCalled();
   });
 });
+
+// Matron is the only client now — nobody can follow a matrix.to room link, so
+// command replies (/start, /resume, /workdir confirmations) must not contain
+// one. Source inspection because index.js can't be imported in-process (it
+// starts the bridge) — same pattern as session-status's wiring tests.
+describe('command replies carry no matrix.to links', () => {
+  it('index.js builds no matrix.to URLs', async () => {
+    const { readFileSync } = await import('fs');
+    const { fileURLToPath } = await import('url');
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    expect(src).not.toContain('matrix.to/#/');
+  });
+});
