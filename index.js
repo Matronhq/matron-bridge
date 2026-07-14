@@ -52,6 +52,7 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
+import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -2622,10 +2623,22 @@ function extractTextContent(event) {
 }
 
 function flushResponse(session) {
-  const text = session.responseBuffer.trim();
+  let text = session.responseBuffer.trim();
   session.responseBuffer = '';
 
   if (!text) return;
+
+  // /context reports get trimmed to their Model/Tokens headline — the full
+  // table dump is noise on a phone-sized client. /context-full (rewritten to
+  // /context in sendToSession) arms a one-shot escape hatch; the flag is
+  // consumed by the next report either way, so it can't leak onto a later,
+  // unrelated /context. Chat history and the journal mirror get the same
+  // trimmed text the user sees.
+  const briefReport = briefContextReport(text);
+  if (briefReport) {
+    if (session._contextFullOnce) session._contextFullOnce = false;
+    else text = briefReport;
+  }
 
   // Track assistant response for topic summarization (strip code blocks)
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
@@ -2703,6 +2716,21 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
+
+  // /context-full is a bridge-only command — claude itself knows only
+  // /context. Rewrite it here, the single choke point every transport
+  // funnels through (Matrix messages, journal-routed text, queue flushes),
+  // and arm the one-shot flag flushResponse consumes to let the resulting
+  // report through untrimmed. Placed after the journal mirror above so the
+  // journal records what the user actually typed. Plain /context needs no
+  // marking: flushResponse trims any context report by default.
+  if (contentBlocks.length === 1 && contentBlocks[0].type === 'text') {
+    const nativeContext = contextFullToNative(contentBlocks[0].text);
+    if (nativeContext) {
+      session._contextFullOnce = true;
+      contentBlocks = [{ type: 'text', text: nativeContext }];
+    }
+  }
 
   if (session.iv) {
     // Interactive mode: type text blocks into the PTY. Non-text content
