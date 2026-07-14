@@ -109,6 +109,22 @@ describe('toolOutputSnippet', () => {
     expect(toolOutputSnippet('')).toBe('');
     expect(toolOutputSnippet(null)).toBe('');
   });
+
+  it('walks the cut forward past continuation bytes when the naive cut lands mid-character', () => {
+    // 'a' (1 byte) + 😀 (4 bytes: F0 9F 98 80) + 'bb' (2 bytes) = 7 bytes.
+    // maxBytes=4 makes the naive cut (7-4=3) land on the emoji's THIRD byte
+    // (a continuation byte) — unlike the existing 4096-byte-default test,
+    // where the cut happens to land exactly on a character boundary. The
+    // walk-forward `while` loop must advance past the two remaining
+    // continuation bytes (indices 3 and 4) to land cleanly on 'b' at index
+    // 5, dropping the whole torn character rather than emitting a
+    // replacement char or a corrupted partial sequence.
+    const text = 'a😀bb';
+    const snip = toolOutputSnippet(text, { maxBytes: 4 });
+    expect(snip).toBe('bb');
+    expect(Buffer.byteLength(snip)).toBeLessThanOrEqual(4);
+    expect(snip.includes('�')).toBe(false);
+  });
 });
 
 describe('createToolStreamPump', () => {

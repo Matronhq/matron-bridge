@@ -618,6 +618,7 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
       });
       const client = await connectClient();
       let late;
+      let syncViewer;
       const clientFrames = [];
       client.ws.on('message', (data) => {
         let msg;
@@ -649,7 +650,7 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
         // buffer DOES exist, by connecting a fresh viewer now (buffer
         // confirmed present above) and observing its catch-up sync frame
         // (src/ws.js `case 'viewing'` -> toolStreams.buffersFor).
-        const syncViewer = await connectClient();
+        syncViewer = await connectClient();
         const syncFrames = [];
         syncViewer.ws.on('message', (data) => {
           let msg;
@@ -660,7 +661,6 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
         await waitFor(() => syncFrames.some((f) =>
           f.kind === 'ephemeral' && f.tool_stream?.event === 'sync' &&
           f.message_ref === 'tu-e2e-2' && f.tool_stream.content === '$ ls\n'));
-        syncViewer.close();
 
         const payload = {
           message_ref: 'tu-e2e-2', command: 'ls', exit_code: 0, denied: false,
@@ -699,6 +699,7 @@ describeIfMatron('journal-publisher against the real matron-journal server', () 
         expect(lateTool).toHaveLength(0);
       } finally {
         late?.close();
+        syncViewer?.close();
         client.close();
         pub.close();
       }

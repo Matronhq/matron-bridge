@@ -1088,14 +1088,15 @@ describe('tool-output streaming (streamAppend / stream_resync / finalizeToolOutp
     const pub = createJournalPublisher({
       url: `ws://127.0.0.1:${port}/ws`, token: 't', log: silentLog, backoffBaseMs: 30,
     });
+    let server;
     try {
       pub.streamAppend('c1', 'tu1', 0, 'dropped', { tool: 'Bash', command: 'x' });
       pub.publishText('c1', { body: 'after' }); // queued frame DOES arrive
-      const server = await startFakeServer({}, port);
+      server = await startFakeServer({}, port);
       await waitFor(() => server.received.some((f) => f.op === 'publish'));
       expect(server.received.some((f) => f.op === 'stream_append')).toBe(false);
-      await server.close();
     } finally {
+      if (server) await server.close();
       pub.close();
     }
   });
@@ -1159,12 +1160,13 @@ describe('tool-output streaming (streamAppend / stream_resync / finalizeToolOutp
     const pub = createJournalPublisher({
       url: `ws://127.0.0.1:${port}/ws`, token: 't', log: silentLog, backoffBaseMs: 30,
     });
+    let revived;
     try {
       pub.finalizeToolOutput('c1', 'tu1', {
         message_ref: 'tu1', command: 'make', exit_code: 0, denied: false,
         truncated: false, snippet: 'ok', blob_ref: 'blob9', live_log: true,
       }, 'blob9');
-      const revived = await startFakeServer({}, port);
+      revived = await startFakeServer({}, port);
       await waitFor(() => revived.received.some((f) => f.op === 'finalize'));
       const frame = revived.received.find((f) => f.op === 'finalize');
       expect(frame).toEqual({
@@ -1175,8 +1177,8 @@ describe('tool-output streaming (streamAppend / stream_resync / finalizeToolOutp
         },
         blob_ref: 'blob9',
       });
-      await revived.close();
     } finally {
+      if (revived) await revived.close();
       pub.close();
     }
   });
