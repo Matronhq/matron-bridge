@@ -801,6 +801,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // server's 30-min idle sweep. Runs on every path below, including
     // auto-restart.
     sweepToolStreams(session);
+    clearPendingInterrupt(session);
 
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
