@@ -2457,14 +2457,15 @@ function handleClaudeEvent(session, event) {
           debug('Suppressed compaction completion notice (cooldown, last=%dms ago)', now - session.lastCompactCompleteNotify);
         }
       } else if (event.subtype === 'task_notification') {
-        const isComplete = event.status === 'completed';
-        const taskPlain = `${isComplete ? '✅' : '❌'} Task: ${event.summary || 'unknown'}`;
-        if (session.sendHtml) {
-          const n = notice(isComplete ? 'success' : 'error', taskPlain);
-          session.sendHtml(n.plain, n.html);
-        } else if (session.sendCallback) {
-          session.sendCallback(taskPlain);
-        }
+        // Deliberately NOT surfaced in chat: the background task's tool_use
+        // (Bash / Agent / Workflow) already renders as a tool-call panel in
+        // every client, so a "✅ Task: <summary>" message is pure
+        // duplication — and for background Bash the summary is the raw
+        // matron-tee wrapper command, an enormous unreadable blob
+        // (Dan, 2026-07-14). Claude narrates the outcome in its reply;
+        // the transcript keeps the event for debugging.
+        debug('task_notification suppressed (status=%s): %s',
+          event.status, (event.summary || 'unknown').slice(0, 120));
       } else if (event.subtype === 'compact_boundary') {
         // A manual `/compact` finishes here: the transcript writes a
         // compact_boundary marker but — unlike a normal turn — no Stop hook
