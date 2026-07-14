@@ -121,6 +121,35 @@ describe('createJournalMediaRouter — file/image', () => {
   });
 });
 
+describe('createJournalMediaRouter — ordering', () => {
+  it('serializes concurrent frames per conversation in arrival order', async () => {
+    // First frame's fetch is slow, second's is instant — without per-convo
+    // chaining the second would inject first and claude would see the
+    // attachments out of journal order.
+    let resolveFirst;
+    const firstFetch = new Promise((r) => { resolveFirst = r; });
+    const fetchMedia = vi.fn()
+      .mockImplementationOnce(() => firstFetch)
+      .mockImplementationOnce(async () => ({ buffer: Buffer.from('two'), contentType: 'application/pdf' }));
+    const injected = [];
+    const { route } = makeRouter({
+      fetchMedia,
+      buildSavedBlocks: vi.fn((sess, { name }) => [{ type: 'text', text: `saved:${name}` }]),
+      injectBlocks: vi.fn((sess, blocks) => { injected.push(blocks[0].text); return true; }),
+    });
+
+    const p1 = route(session, { type: 'file', blobRef: 'b1', contentType: 'application/pdf', name: 'one.pdf' }, ctx);
+    const p2 = route(session, { type: 'file', blobRef: 'b2', contentType: 'application/pdf', name: 'two.pdf' }, ctx);
+    // Second frame must not even fetch until the first settles.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(fetchMedia).toHaveBeenCalledTimes(1);
+
+    resolveFirst({ buffer: Buffer.from('one'), contentType: 'application/pdf' });
+    await Promise.all([p1, p2]);
+    expect(injected).toEqual(['saved:one.pdf', 'saved:two.pdf']);
+  });
+});
+
 describe('createJournalMediaRouter — audio (voice note)', () => {
   it('an audio content-type is transcribed and injected as user text (mirrors the Matrix m.audio wording)', async () => {
     const { route, deps } = makeRouter({

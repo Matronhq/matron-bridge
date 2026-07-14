@@ -5291,10 +5291,18 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) 
   if (!mirrorToJournal) markJournalOrigin(entry);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
-  await notifyQueuedMessage(session, preview, {
-    sendReply: ctx.sendReply,
-    htmlEscape: escapeHtml,
-  });
+  // The queued tile is cosmetic: the entry above IS queued and will flush at
+  // turn end regardless, so a notify failure must not propagate — the
+  // router's catch would otherwise publish a false "wasn't delivered" notice
+  // for media that will in fact be delivered.
+  try {
+    await notifyQueuedMessage(session, preview, {
+      sendReply: ctx.sendReply,
+      htmlEscape: escapeHtml,
+    });
+  } catch (e) {
+    warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
+  }
 }
 
 function journalOnMedia(session, media, ctx) {
