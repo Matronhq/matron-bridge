@@ -7,6 +7,7 @@ import {
   mergeAgentStates,
   normalizeHistoryCursor,
   prependHandoffPrompt,
+  resolveNativeSessionIdForPersistence,
   snapshotAgentState,
 } from '../lib/agent-handoff.js';
 
@@ -135,6 +136,34 @@ describe('matchSessionIdPrefix', () => {
     expect(result.match).toBeNull();
     expect(result.matches).toEqual(['shared-1', 'shared-2']);
     expect(result.ambiguous).toBe(true);
+  });
+});
+
+describe('resolveNativeSessionIdForPersistence', () => {
+  it('preserves an established same-provider ID while a fresh process has not announced one', () => {
+    expect(resolveNativeSessionIdForPersistence({
+      sessionId: null,
+      currentStateId: 'codex-existing',
+      existingSessionId: 'legacy-existing',
+      sameAgent: true,
+    })).toBe('codex-existing');
+  });
+
+  it('keeps null when switching to a genuinely fresh provider', () => {
+    expect(resolveNativeSessionIdForPersistence({
+      sessionId: null,
+      currentStateId: 'claude-outgoing',
+      existingSessionId: 'claude-outgoing',
+      sameAgent: false,
+    })).toBeNull();
+  });
+
+  it('always accepts a newly announced native ID', () => {
+    expect(resolveNativeSessionIdForPersistence({
+      sessionId: 'codex-new',
+      currentStateId: 'codex-old',
+      sameAgent: true,
+    })).toBe('codex-new');
   });
 });
 

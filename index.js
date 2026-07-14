@@ -75,6 +75,7 @@ import {
   normalizeHistoryCursor,
   otherAgent,
   prependHandoffPrompt,
+  resolveNativeSessionIdForPersistence,
   snapshotAgentState,
 } from './lib/agent-handoff.js';
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
@@ -421,6 +422,21 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
+  const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
+  const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
+  const currentState = activeAgent
+    ? getPersistedAgentState(existing, activeAgent, historyLength)
+    : null;
+  const sameAgent = !!activeAgent && activeAgent === existingAgent;
+  // A null live ID normally means the CLI has not announced it yet, not that
+  // an established same-provider ID should be erased. Agent switches are the
+  // intentional reset case: activeAgent differs, so null remains null.
+  const effectiveSessionId = resolveNativeSessionIdForPersistence({
+    sessionId,
+    currentStateId: currentState?.sessionId,
+    existingSessionId: existing.sessionId,
+    sameAgent,
+  });
   // A newly created room (notably !resume) may inherit both providers from a
   // different persisted room. Carry that live inherited map automatically so
   // later narrow persistence calls cannot silently discard the inactive
@@ -428,8 +444,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   let agentSessions = mergeAgentStates(existing.agentSessions, live?._agentSessions);
   agentSessions = mergeAgentStates(agentSessions, extra?.agentSessions);
   if (activeAgent) {
-    const currentState = getPersistedAgentState(existing, activeAgent, live?.chatHistory?.length || existing.chatHistory?.length || 0);
-    const state = live?.agent === activeAgent
+    let state = live?.agent === activeAgent
       ? snapshotAgentState(
         live,
         Number.isFinite(live._agentHistoryCursor)
@@ -446,12 +461,15 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
         mcpExtras: Array.isArray(extra?.mcpExtras) ? extra.mcpExtras : currentState.mcpExtras,
         lastUsed: Date.now(),
       };
+    if (sameAgent && !state.sessionId && effectiveSessionId) {
+      state = { ...state, sessionId: effectiveSessionId };
+    }
     agentSessions = mergeAgentStates(agentSessions, { [activeAgent]: state });
   }
   data[String(roomId)] = {
     ...existing,
     ...derived,
-    sessionId,
+    sessionId: effectiveSessionId,
     workdir,
     lastUsed: Date.now(),
     originRoomId: originRoomId || null,

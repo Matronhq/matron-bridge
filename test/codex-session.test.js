@@ -159,4 +159,14 @@ describe('Codex bridge wiring', () => {
     expect(recreateBody).toContain("killSession(existing, 'SIGTERM', { preserveQueue: true })");
     expect(recreateBody).toContain('flushPendingSessionQueue(next)');
   });
+
+  it('does not overwrite an established same-provider ID with a pre-init null', () => {
+    const start = src.indexOf('function persistSession(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+
+    expect(body).toContain('resolveNativeSessionIdForPersistence');
+    expect(body).toContain('state = { ...state, sessionId: effectiveSessionId }');
+    expect(body).toContain('sessionId: effectiveSessionId');
+  });
 });
