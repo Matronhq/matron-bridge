@@ -640,3 +640,72 @@ describe('promptExpectsReply', () => {
     expect(promptExpectsReply({ options: [{ id: 'model-sonnet' }, { id: 'opt_a' }] })).toBe(true);
   });
 });
+
+// Queue-tile taps from Matron arrive as prompt_reply frames whose `choice`
+// carries the tile's option VALUE (`interrupt` / `cancel:<n>`). Their tile
+// never advances the staleness guard (non-answerable, issue #98), so the
+// guard's target_seq comparison would wrongly refuse them whenever ANY
+// answerable prompt has been recorded — the consumer must classify them by
+// value shape and route them around the guard.
+describe('createJournalInputConsumer — queue-action replies bypass the staleness guard', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const answerableFrame = (seq) => baseFrame({
+    seq, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'Which approach?', mode: 'pick_one',
+      options: [{ id: 'opt_a', label: 'A' }, { id: 'opt_b', label: 'B' }],
+    },
+  });
+
+  const queueReply = (targetSeq, choice) => baseFrame({
+    seq: 100, type: 'prompt_reply',
+    payload: { target_seq: targetSeq, choice, text: null },
+  });
+
+  it('an interrupt tap routes even when its target_seq mismatches the latest answerable prompt', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerableFrame(10));           // guard now expects target_seq 10
+    consumer(queueReply(12, 'interrupt'));   // tile at seq 12 — mismatch, but a queue action
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
+      target_seq: 12, choice: 'interrupt', text: null,
+    });
+  });
+
+  it('an indexed cancel tap routes the same way', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerableFrame(10));
+    consumer(queueReply(12, 'cancel:0'));
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledWith(
+      expect.anything(),
+      { target_seq: 12, choice: 'cancel:0', text: null },
+      { username: 'dan' },
+    );
+  });
+
+  it('a NON-queue choice with a mismatched target_seq is still refused as stale', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerableFrame(10));
+    consumer(queueReply(12, 'opt_a'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+});

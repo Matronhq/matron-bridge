@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { dispatchBusyQueueMagicWord, handleBusyQueueMagicWord } from '../lib/busy-queue.js';
+import { dispatchBusyQueueMagicWord, handleBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from '../lib/busy-queue.js';
 
 // Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
 // send/interrupt/!interrupt (flush now) and cancel (pop last) handling is
@@ -352,5 +352,178 @@ describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
     expect(deps.sendReply).toHaveBeenCalledWith('No queued messages to cancel.');
     expect(deps.editMessage).not.toHaveBeenCalled();
     expect(session.queueNotifications).toHaveLength(2);
+  });
+});
+
+// --- Queued-tile notification + button actions (journal parity) -----------
+// A Matron-origin message used to queue SILENTLY (the journal busy branch
+// only pushed the blocks), and a Matron tap on the tile's buttons was
+// dropped (journalRoutePromptReply only resolves real pending prompts).
+// Both halves are extracted here so the transports share one implementation:
+// notifyQueuedMessage posts the tile, handleQueueActionValue runs the taps.
+
+describe('notifyQueuedMessage', () => {
+  it('button channel: posts the tile with indexed cancel + interrupt values and records the notif', async () => {
+    const sendButtonMessage = vi.fn(async () => '$tile2');
+    const session = makeSession({
+      sendButtonMessage,
+      queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): first' }],
+    });
+    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(), htmlEscape: (s) => s });
+    expect(sendButtonMessage).toHaveBeenCalledWith(
+      '📨 Queued (2): second',
+      [
+        { id: 'cancel', label: '✕ Cancel', value: 'cancel:1' },
+        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
+      ],
+      'pick_one', '📨 Queued (2): second', '📨 Queued (2): second',
+    );
+    expect(session.queueNotifications).toEqual([
+      { eventId: '$ev1', plain: '📨 Queued (1): first' },
+      { eventId: '$tile2', plain: '📨 Queued (2): second' },
+    ]);
+  });
+
+  it('button send that returns no event id records nothing (no dangling notif entry)', async () => {
+    const session = makeSession({
+      sendButtonMessage: vi.fn(async () => null),
+      queueNotifications: [],
+    });
+    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn() });
+    expect(session.queueNotifications).toEqual([]);
+  });
+
+  it('no button channel, no link builder: plain sendReply fallback (journal caller shape)', async () => {
+    const sendReply = vi.fn(async () => {});
+    const session = makeSession({ queueNotifications: [] });
+    await notifyQueuedMessage(session, 'second', { sendReply });
+    expect(sendReply).toHaveBeenCalledWith('📨 Queued (2): second');
+    expect(session.queueNotifications).toEqual([]);
+  });
+
+  it('Matrix signed-link fallback: html tile via sendHtml, notif recorded on event id', async () => {
+    const sendHtml = vi.fn(async () => '$linktile');
+    const session = makeSession({ queueNotifications: [] });
+    await notifyQueuedMessage(session, 'second', {
+      sendReply: vi.fn(),
+      sendHtml,
+      htmlEscape: (s) => s,
+      buildActionLinks: (queueIndex) => `<a href="x?i=${queueIndex}">✕ Cancel</a>`,
+    });
+    expect(sendHtml).toHaveBeenCalledWith(
+      '📨 Queued (2): second',
+      '📨 Queued (2): second<br/><a href="x?i=1">✕ Cancel</a>',
+    );
+    expect(session.queueNotifications).toEqual([
+      { eventId: '$linktile', plain: '📨 Queued (2): second' },
+    ]);
+  });
+
+  it('initializes queueNotifications when the session has none yet', async () => {
+    const session = makeSession({ queueNotifications: undefined });
+    delete session.queueNotifications;
+    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(async () => {}) });
+    expect(session.queueNotifications).toEqual([]);
+  });
+});
+
+describe('isQueueActionValue', () => {
+  it('matches exactly the bridge-controlled wire values', () => {
+    expect(isQueueActionValue('interrupt')).toBe(true);
+    expect(isQueueActionValue('cancel:0')).toBe(true);
+    expect(isQueueActionValue('cancel:12')).toBe(true);
+    expect(isQueueActionValue('cancel')).toBe(false);
+    expect(isQueueActionValue('cancel:x')).toBe(false);
+    expect(isQueueActionValue('send')).toBe(false);
+    expect(isQueueActionValue('opt_a')).toBe(false);
+    expect(isQueueActionValue(null)).toBe(false);
+    expect(isQueueActionValue(undefined)).toBe(false);
+  });
+});
+
+describe('handleQueueActionValue', () => {
+  it('interrupt: detaches + strips + announces (html preferred) + flushes, returns true', () => {
+    const session = makeSession();
+    const deps = matrixDeps();
+    const handled = handleQueueActionValue('interrupt', session, deps);
+    expect(handled).toBe(true);
+    expect(session.queuedMessages).toBeNull();
+    expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
+    expect(deps.sendHtml).toHaveBeenCalledWith(
+      '⚡ Sending 2 queued messages now:\n  1. [2 entries]',
+      '<b>⚡ Sending 2 queued messages now:</b><ol><li>[2 entries]</li></ol>',
+    );
+    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
+    expect(deps.flushQueue.mock.calls[0][1]).toHaveLength(2);
+  });
+
+  it('interrupt via journal seams: plain sendReply announcement, same flush', () => {
+    const session = makeSession();
+    const deps = matrixDeps({ sendHtml: null });
+    const handled = handleQueueActionValue('interrupt', session, deps);
+    expect(handled).toBe(true);
+    expect(deps.sendReply).toHaveBeenCalledWith('⚡ Sending 2 queued messages now:\n  1. [2 entries]');
+    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('interrupt on an empty queue is a SILENT no-op (stale-tile tap), still handled', () => {
+    const session = makeSession({ queuedMessages: null });
+    const deps = matrixDeps();
+    expect(handleQueueActionValue('interrupt', session, deps)).toBe(true);
+    expect(deps.sendHtml).not.toHaveBeenCalled();
+    expect(deps.sendReply).not.toHaveBeenCalled();
+    expect(deps.flushQueue).not.toHaveBeenCalled();
+  });
+
+  it('cancel:<n> splices exactly the indexed message AND its tile, edits it, reports remaining', () => {
+    const session = makeSession();
+    const deps = matrixDeps();
+    expect(handleQueueActionValue('cancel:0', session, deps)).toBe(true);
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
+    expect(session.queueNotifications).toEqual([{ eventId: '$ev2', plain: '📨 Queued (2): second' }]);
+    expect(deps.editMessage).toHaveBeenCalledWith(
+      '!room:server', '$ev1', '✕ 📨 Queued (1): first (cancelled)',
+    );
+    expect(deps.sendReply).toHaveBeenCalledWith('✕ Cancelled queued message (1 remaining)');
+  });
+
+  it('cancel of the last remaining message nulls the queue and says so', () => {
+    const session = makeSession({
+      queuedMessages: [[{ type: 'text', text: 'solo' }]],
+      queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
+    });
+    const deps = matrixDeps();
+    handleQueueActionValue('cancel:0', session, deps);
+    expect(session.queuedMessages).toBeNull();
+    expect(deps.sendReply).toHaveBeenCalledWith('✕ Cancelled queued message (queue empty)');
+  });
+
+  it('cancel with an out-of-range index is a SILENT no-op (stale tile), still handled', () => {
+    const session = makeSession();
+    const deps = matrixDeps();
+    expect(handleQueueActionValue('cancel:9', session, deps)).toBe(true);
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(deps.editMessage).not.toHaveBeenCalled();
+    expect(deps.sendReply).not.toHaveBeenCalled();
+  });
+
+  it('non-queue values touch nothing and return false', () => {
+    const session = makeSession();
+    const deps = matrixDeps();
+    expect(handleQueueActionValue('model:opus', session, deps)).toBe(false);
+    expect(handleQueueActionValue('opt_a', session, deps)).toBe(false);
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(deps.flushQueue).not.toHaveBeenCalled();
+  });
+});
+
+describe('index.js journal busy caller — queued-tile notification wiring (source inspection)', () => {
+  it('the journal busy branch posts the tile via notifyQueuedMessage with the journal ctx sink', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('session.queuedMessages.push(markJournalOrigin(');
+    expect(start).toBeGreaterThan(-1);
+    const window = src.slice(start, start + 800);
+    expect(window).toMatch(/notifyQueuedMessage\(session, preview, \{/);
+    expect(window).toMatch(/sendReply: ctx\.sendReply/);
   });
 });

@@ -45,7 +45,7 @@ import {
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
-import { dispatchBusyQueueMagicWord } from './lib/busy-queue.js';
+import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
@@ -4859,6 +4859,18 @@ async function journalRouteTextToSession(session, body) {
     // on flush would show a duplicate in Matron (see lib/queue-flush.js).
     if (!session.queuedMessages) session.queuedMessages = [];
     session.queuedMessages.push(markJournalOrigin([{ type: 'text', text: trimmed }]));
+    // Post the SAME "📨 Queued" tile a Matrix-origin queue gets (shared
+    // notifyQueuedMessage, lib/busy-queue.js). Until this call existed a
+    // Matron send queued silently — session.sendButtonMessage both posts
+    // the Matrix tile and journal-publishes the prompt, so the app renders
+    // the notification card too. No signed-link fallback here: journal
+    // feedback degrades to the plain ctx.sendReply text, which also
+    // mirrors into the journal.
+    const preview = trimmed.length > 40 ? trimmed.slice(0, 37) + '…' : trimmed;
+    await notifyQueuedMessage(session, preview, {
+      sendReply: ctx.sendReply,
+      htmlEscape: escapeHtml,
+    });
     return;
   }
 
@@ -4961,6 +4973,27 @@ function journalOnPromptReply(session, answer, { username }) {
   // cursor's ~1s debounce window must not replay it on restart. The frame's
   // seq was recorded before onEvent fired; force it to disk now.
   journalPublisher.flushCursor();
+  // Queue-tile buttons (✕ Cancel / ⚡ Send now): a Matron card tap arrives
+  // here as a prompt_reply whose `choice` carries the option VALUE
+  // (`interrupt` / `cancel:<n>` — the app's .buttonResponse channel sends
+  // values), the same wire constants a Matrix button tap posts. Run the
+  // SAME extracted implementation the Matrix button_response handler uses.
+  // Feedback ("⚡ Sending …" / "✕ Cancelled …") comes from the handler via
+  // the journal-mirroring ctx.sendReply, so the "answered:" echo below must
+  // not also fire — and a queue action is never a pending-prompt answer, so
+  // journalRoutePromptReply must not see it (its unmatched path could
+  // otherwise disturb real pending-prompt state).
+  if (isQueueActionValue(answer?.choice)) {
+    const ctx = journalSessionCommandCtx(session);
+    handleQueueActionValue(answer.choice, session, {
+      sendReply: ctx.sendReply,
+      formatQueueSummary,
+      flushQueue,
+      stripQueueNotificationLinks,
+      editMessage,
+    });
+    return;
+  }
   let label;
   try {
     label = journalRoutePromptReply(session, answer);
@@ -5384,44 +5417,18 @@ client.on('room.message', async (roomId, event) => {
     // Override body-based text so the answer handler also uses structured values
     if (selectedValues) text = value;
 
-    // Check if this is a queue action response
-    if (value === 'interrupt') {
-      const queued = session.queuedMessages || [];
-      session.queuedMessages = null;
-      stripQueueNotificationLinks(session);
-      if (queued.length > 0) {
-        const summary = formatQueueSummary(queued);
-        if (session.sendHtml) {
-          const plainMsg = `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
-          const htmlMsg = `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
-          session.sendHtml(plainMsg, htmlMsg);
-        } else if (session.sendCallback) {
-          session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
-        }
-        flushQueue(session, queued);
-      }
-      return;
-    }
-
-    const cancelMatch = value.match(/^cancel:(\d+)$/);
-    if (cancelMatch) {
-      const index = parseInt(cancelMatch[1], 10);
-      const queue = session.queuedMessages;
-      if (queue && index >= 0 && index < queue.length) {
-        queue.splice(index, 1);
-        const notifs = session.queueNotifications || [];
-        if (index < notifs.length) {
-          const { eventId, plain } = notifs.splice(index, 1)[0];
-          if (eventId) editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
-        }
-        if (queue.length === 0) session.queuedMessages = null;
-        if (session.sendCallback) {
-          const remaining = queue.length;
-          session.sendCallback(remaining === 0
-            ? '✕ Cancelled queued message (queue empty)'
-            : `✕ Cancelled queued message (${remaining} remaining)`);
-        }
-      }
+    // Queue-tile actions (⚡ Send now / ✕ Cancel) — extracted to
+    // lib/busy-queue.js (handleQueueActionValue) so the journal prompt_reply
+    // route runs the SAME implementation: a Matron card tap sends the exact
+    // wire values this branch matches on.
+    if (handleQueueActionValue(value, session, {
+      sendReply: session.sendCallback ? (m) => session.sendCallback(m) : null,
+      sendHtml: session.sendHtml ? (p, h) => session.sendHtml(p, h) : null,
+      formatQueueSummary,
+      flushQueue,
+      stripQueueNotificationLinks,
+      editMessage,
+    })) {
       return;
     }
 
@@ -5607,37 +5614,25 @@ client.on('room.message', async (roomId, event) => {
     } else {
       session.queuedMessages.push([{ type: 'text', text }]);
     }
-    const count = session.queuedMessages.length;
     const preview = hasMedia
       ? (event.content.body || '[media]')
       : (text.length > 40 ? text.slice(0, 37) + '…' : text);
-    const queueIndex = count - 1;
-    const plainNotif = `📨 Queued (${count}): ${preview}`;
-    if (session.sendButtonMessage) {
-      const buttons = [
-        { id: 'cancel', label: '✕ Cancel', value: `cancel:${queueIndex}` },
-        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
-      ];
-      const htmlQueue = escapeHtml(plainNotif);
-      const notifEventId = await session.sendButtonMessage(
-        plainNotif, buttons, 'pick_one', plainNotif, htmlQueue
-      );
-      if (notifEventId) session.queueNotifications.push({ eventId: notifEventId, plain: plainNotif });
-    } else {
-      // Fallback to signed links (existing behavior)
-      const interruptLink = generateActionLink('interrupt', roomId);
-      const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
-      if (interruptLink || cancelLink) {
+    // Shared with the journal session-text route (lib/busy-queue.js) so both
+    // transports post the same tile. buildActionLinks is the Matrix-only
+    // signed-link fallback for button-less sessions (existing behavior).
+    await notifyQueuedMessage(session, preview, {
+      sendReply,
+      sendHtml: sendHtmlFn,
+      htmlEscape: escapeHtml,
+      buildActionLinks: (queueIndex) => {
+        const interruptLink = generateActionLink('interrupt', roomId);
+        const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
         const links = [];
         if (cancelLink) links.push(`<a href="${cancelLink}">✕ Cancel</a>`);
         if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Send now</a>`);
-        const htmlQueue = `${escapeHtml(plainNotif)}<br/>${links.join(' · ')}`;
-        const notifEventId = await sendHtmlFn(plainNotif, htmlQueue);
-        if (notifEventId) session.queueNotifications.push({ eventId: notifEventId, plain: plainNotif });
-      } else {
-        await sendReply(plainNotif);
-      }
-    }
+        return links.length ? links.join(' · ') : null;
+      },
+    });
     return;
   }
 
