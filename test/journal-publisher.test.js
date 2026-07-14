@@ -1056,7 +1056,12 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
 
     // Force a reconnect.
     fake.connections[0].ws.terminate();
-    await waitFor(() => fake.connections.length >= 2, 4000);
+    // Wait for the reconnect's hello to be RECEIVED, not just the socket
+    // accepted: helloCursor stays `undefined` until the fake server parses the
+    // hello frame, so a bare connections.length>=2 wait races the hello and
+    // reads the initial undefined.
+    await waitFor(() => fake.connections.length >= 2
+      && fake.connections[1].helloCursor !== undefined, 4000);
 
     expect(fake.connections[1].helloCursor).toBe(7);
 
@@ -1080,7 +1085,8 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
       url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
       cursorFile, onEvent: () => {},
     });
-    await waitFor(() => fake.connections.length >= 2);
+    await waitFor(() => fake.connections.length >= 2
+      && fake.connections[1].helloCursor !== undefined);
     expect(fake.connections[1].helloCursor).toBe(42);
 
     pub2.close();
@@ -1142,7 +1148,11 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
       cursorFile, onEvent: () => {},
     });
 
-    await waitFor(() => fake.connections.length >= 2, 4000);
+    // Wait for the reconnect's hello to be RECEIVED (helloCursor set), not just
+    // the socket accepted — otherwise this races the hello and reads the
+    // initial `undefined`. See the reconnect-cursor test for the same guard.
+    await waitFor(() => fake.connections.length >= 2
+      && fake.connections[1].helloCursor !== undefined, 4000);
     expect(fake.connections[1].helloCursor).toBeNull();
     expect(warnings.some(w => /snapshot_required/i.test(w))).toBe(true);
 
