@@ -112,7 +112,7 @@ describe('toolOutputSnippet', () => {
 });
 
 describe('createToolStreamPump', () => {
-  function setup({ preContent = null, throttleMs = 0, chunkBytes = 65536 } = {}) {
+  function setup({ preContent = null, throttleMs = 0, chunkBytes = 65536, maxBytesPerPass } = {}) {
     const dir = mkdtempSync(path.join(tmpdir(), 'tool-stream-pump-'));
     const logPath = path.join(dir, 'matron-cmd-tu1.log');
     if (preContent !== null) writeFileSync(logPath, preContent);
@@ -125,6 +125,7 @@ describe('createToolStreamPump', () => {
       streamAppend: sink,
       throttleMs,
       chunkBytes,
+      ...(maxBytesPerPass !== undefined ? { maxBytesPerPass } : {}),
     });
     const cleanup = () => {
       pump.stop();
@@ -261,6 +262,34 @@ describe('createToolStreamPump', () => {
       pump.resync(0);
       await delay(80);
       expect(sink.content()).toBe('a');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('drains a backlog over the per-pass byte budget across multiple passes, self-scheduled without further writes', async () => {
+    // 500 bytes of preContent, all written before start() — no appendFileSync
+    // ever happens in this test. With a 50-byte budget the pump can only
+    // publish 50 bytes per pass, so full drain REQUIRES self-scheduling
+    // follow-up passes; fs.watch will never fire again since nothing more is
+    // written. throttleMs is small but nonzero so passes are genuinely
+    // spaced out (not one synchronous unwind), exercising the real
+    // self-schedule path.
+    const content = 'x'.repeat(500);
+    const { sink, pump, cleanup } = setup({ preContent: content, throttleMs: 5, maxBytesPerPass: 50 });
+    try {
+      pump.start();
+      await waitFor(() => sink.content() === content, 5000);
+      // Budget engaged: more than one pass was needed (500 / 50 == 10 passes).
+      expect(sink.frames.length).toBeGreaterThan(1);
+      // Byte-exact, contiguous offsets across every published frame — no
+      // drops, no coalescing, no overlap — and the total matches exactly.
+      let expected = 0;
+      for (const f of [...sink.frames].sort((a, b) => a.offset - b.offset)) {
+        expect(f.offset).toBe(expected);
+        expected += Buffer.byteLength(f.chunk);
+      }
+      expect(expected).toBe(500);
     } finally {
       cleanup();
     }
