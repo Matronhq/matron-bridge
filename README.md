@@ -7,6 +7,8 @@ Chat with Claude Code or Codex CLI sessions from anywhere. The bridge spawns and
 
 Claude uses `--print` structured JSON streaming. Codex uses the stable programmatic `codex exec --json` interface, starting one process per turn and resuming the same Codex thread automatically.
 
+Use `/switch codex` or `/switch claude` inside an idle session to hand the same bridge conversation to the other agent. The bridge keeps separate native session IDs for Claude and Codex, resumes each one when you switch back, and prepends only the transcript messages that agent has not seen to your next real prompt. The room and Matron conversation ID stay stable, as do the shared working directory, files, and Git state. Provider-private reasoning and tool state are not transferable.
+
 Codex turns run with `approval_policy="never"` because there is no interactive terminal to approve escalations. The sandbox defaults to `workspace-write`; blocked operations fail closed and the bridge surfaces the error. Only use `CODEX_SANDBOX_MODE=danger-full-access` on a host you intentionally trust for unattended agent execution.
 
 ## License
@@ -182,6 +184,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!workdir [--claude\|--codex] <path> [--browser]` | Start an agent session in another working directory (`--browser` is Claude-only) |
 | `!status` | Show session info (uptime, workdir, restarts) |
 | `!agent` | Show the current/default coding agent |
+| `!switch <claude\|codex>` | Hand the current conversation to the other agent (idle sessions only) |
 | `!working` | Toggle tool call visibility |
 | `!mcp` | Show MCP server status |
 | `!model` | Show current model info |
@@ -190,7 +193,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!tools` | List available tools |
 | `!help` | Show available commands |
 
-Any other message is forwarded directly to the selected agent. Claude Code slash commands (e.g. `/commit`, `/review-pr`) are passed through in Claude interactive mode; Codex programmatic sessions treat messages as normal task prompts.
+Any other message is forwarded directly to the selected agent. Claude Code slash commands (e.g. `/commit`, `/review-pr`) are passed through in Claude interactive mode; Codex programmatic sessions treat messages as normal task prompts. `/model` changes a model within the active provider; `/switch` hands the bridge conversation between Claude and Codex.
 
 ## Matron journal transport
 
@@ -223,8 +226,9 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 5. The complete response is sent to the Matrix room when a `result` event arrives (turn complete)
 6. Long responses are split at 32K-char boundaries
 7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `exec resume <thread-id>`
-8. Crashed sessions auto-restart up to 3 times
-9. Messages sent while Claude is busy are queued and sent when the turn completes
+8. Agent handoffs persist one native session ID per provider plus a shared transcript cursor; the next prompt carries a bounded unseen transcript delta
+9. Crashed sessions auto-restart up to 3 times
+10. Messages sent while an agent is busy are queued and sent when the turn completes
 
 ## File structure
 

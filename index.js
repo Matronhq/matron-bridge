@@ -66,6 +66,16 @@ import {
   normalizeAgent,
   resolveAgent,
 } from './lib/agent-backend.js';
+import {
+  buildAgentHandoffPrompt,
+  canSwitchAgent,
+  getPersistedAgentState,
+  mergeAgentStates,
+  normalizeHistoryCursor,
+  otherAgent,
+  prependHandoffPrompt,
+  snapshotAgentState,
+} from './lib/agent-handoff.js';
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -408,6 +418,30 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
   if (live?.agent) derived.agent = live.agent;
+  if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
+  const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
+  let agentSessions = mergeAgentStates(existing.agentSessions, extra?.agentSessions);
+  if (activeAgent) {
+    const currentState = getPersistedAgentState(existing, activeAgent, live?.chatHistory?.length || existing.chatHistory?.length || 0);
+    const state = live?.agent === activeAgent
+      ? snapshotAgentState(
+        live,
+        Number.isFinite(live._agentHistoryCursor)
+          ? live._agentHistoryCursor
+          : (live.chatHistory?.length || 0),
+      )
+      : {
+        ...currentState,
+        sessionId: sessionId || currentState.sessionId,
+        model: extra?.model !== undefined ? extra.model : currentState.model,
+        interactiveMode: extra?.interactiveMode !== undefined
+          ? extra.interactiveMode
+          : currentState.interactiveMode,
+        mcpExtras: Array.isArray(extra?.mcpExtras) ? extra.mcpExtras : currentState.mcpExtras,
+        lastUsed: Date.now(),
+      };
+    agentSessions = mergeAgentStates(agentSessions, { [activeAgent]: state });
+  }
   data[String(roomId)] = {
     ...existing,
     ...derived,
@@ -416,6 +450,8 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
     lastUsed: Date.now(),
     originRoomId: originRoomId || null,
     ...(extra || {}),
+    ...(activeAgent ? { agent: activeAgent } : {}),
+    agentSessions,
   };
   savePersistedSessions(data);
 }
@@ -432,17 +468,24 @@ function getPersistedSession(roomId) {
 function listPersistedAgentSessions(agent, workdir = null) {
   const byId = new Map();
   for (const entry of Object.values(loadPersistedSessions())) {
-    if (!entry?.sessionId) continue;
-    if (resolveAgent({ persisted: entry.agent, fallback: AGENT_CLAUDE }) !== agent) continue;
+    if (!entry) continue;
     if (workdir && entry.workdir !== workdir) continue;
-    const current = byId.get(entry.sessionId);
-    if (current && (current.lastUsed || 0) >= (entry.lastUsed || 0)) continue;
+    const historyLength = Array.isArray(entry.chatHistory) ? entry.chatHistory.length : 0;
+    const state = getPersistedAgentState(entry, agent, historyLength);
+    if (!state.sessionId) continue;
+    const current = byId.get(state.sessionId);
+    const modified = state.lastUsed || entry.lastUsed || 0;
+    if (current && (current.lastUsed || 0) >= modified) continue;
     const firstUser = Array.isArray(entry.chatHistory)
       ? entry.chatHistory.find(item => item?.role === 'user' && item.text)?.text || ''
       : '';
-    byId.set(entry.sessionId, {
+    byId.set(state.sessionId, {
       ...entry,
-      modified: entry.lastUsed || 0,
+      ...state,
+      agent,
+      sessionId: state.sessionId,
+      modified,
+      lastUsed: modified,
       summary: firstUser.slice(0, 80) + (firstUser.length > 80 ? '…' : ''),
     });
   }
@@ -453,24 +496,31 @@ function listPersistedAgentSessions(agent, workdir = null) {
 
 const sessions = new Map(); // roomId -> session
 
+function journalConvoIdFor(session) {
+  return session?.journalConvoId || session?.claudeSessionId || null;
+}
+
 // Reverse lookup for the journal return path: a journal frame's convo_id is
-// session.claudeSessionId, but `sessions` is keyed by roomId. The session
+// the stable bridge conversation ID (historically the first native Claude
+// session ID), but `sessions` is keyed by roomId. The session
 // count is small (a handful of concurrent rooms per box), so a linear scan
 // on each inbound event is simpler than maintaining a second map in sync
 // with every place a session is created/restarted/deleted.
 function findSessionByClaudeSessionId(claudeSessionId) {
   if (!claudeSessionId) return null;
   for (const session of sessions.values()) {
-    if (session.claudeSessionId === claudeSessionId) return session;
+    if (journalConvoIdFor(session) === claudeSessionId || session.claudeSessionId === claudeSessionId) return session;
   }
   return null;
 }
 
 // --- Journal dual-post mirroring ---
 //
-// The journal's convo_id is the Claude session UUID (session.claudeSessionId).
-// It's known immediately in interactive mode (assigned at spawn) but only
-// after the first transcript event lands in print mode. Until it's known,
+// A legacy conversation uses the first native session UUID as its journal
+// convo_id. Agent-switching keeps that ID stable in session.journalConvoId
+// while session.claudeSessionId changes between provider-native sessions.
+// The ID is known immediately in interactive mode (assigned at spawn) but only
+// after the first transcript event lands in fresh print mode. Until it's known,
 // journal traffic for that session is buffered (bounded) and flushed —
 // convo_upsert first, then the buffered frames in order — the moment the id
 // shows up (see the session_id capture in handleClaudeEvent). Rooms that
@@ -493,7 +543,8 @@ function journalBufferPush(session, method, payload) {
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
 function journalPublish(session, method, payload) {
   if (!JOURNAL_ENABLED) return;
-  if (session.claudeSessionId) {
+  const convoId = journalConvoIdFor(session);
+  if (convoId) {
     // Protocol requirement: a convo_upsert must reach the server before (or
     // with) the first publish to a convo — the server hard-rejects publishes
     // to conversations that don't exist yet. Print-mode sessions get this via
@@ -503,10 +554,10 @@ function journalPublish(session, method, payload) {
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
-        journalPublisher.upsertConvo(session.claudeSessionId, { title: session._journalTitleHint });
+        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
       }
     }
-    journalPublisher[method](session.claudeSessionId, payload);
+    journalPublisher[method](convoId, payload);
   } else {
     journalBufferPush(session, method, payload);
   }
@@ -537,7 +588,7 @@ function journalSeedTitle(session) {
 // answers, media uploads) MUST route through this rather than calling
 // journalPublish directly, so the markRead pairing can't be forgotten by a
 // future seam. journalPublish already handles the pre-session-id buffering
-// case (session.claudeSessionId not yet known) for both calls, so a buffered
+// case (neither journalConvoId nor claudeSessionId known yet) for both calls, so a buffered
 // markRead replays right after its paired publish, in order, once the
 // session id shows up (see journalFlushForSession).
 function journalPublishUserItem(session, method, payload) {
@@ -570,10 +621,11 @@ function journalSessionState(session, state) {
 // session_status vs. ephemeral activity) that don't always change together.
 function journalActivity(session, state, detail) {
   if (!JOURNAL_ENABLED) return;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   if (!activityStateChanged(session._journalActivityState, state)) return;
   session._journalActivityState = state;
-  journalPublisher.publishActivity(session.claudeSessionId, state, detail);
+  journalPublisher.publishActivity(convoId, state, detail);
 }
 
 // Compute and publish a structured `diff` journal event for an
@@ -676,7 +728,8 @@ function getAccountEmail() {
 // end, and the journal server's per-convo cache makes redelivery idempotent.
 function journalStatus(session) {
   if (!JOURNAL_ENABLED) return;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   const status = buildSessionStatus({
     model: session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
@@ -690,7 +743,7 @@ function journalStatus(session) {
     delete status.email;
   }
   if (Object.keys(status).length === 0) return;
-  journalPublisher.publishStatus(session.claudeSessionId, status);
+  journalPublisher.publishStatus(convoId, status);
 }
 
 // Stream in-progress assistant text to viewing Matron clients as an ephemeral
@@ -706,7 +759,8 @@ function journalStatus(session) {
 // (latest-wins), never a delta — see the publisher's wire-contract comment.
 function journalStream(session, messageId, replaceText) {
   if (!JOURNAL_ENABLED) return;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   const nextRef = streamRefFor(session._journalStreamRef, session._journalStreamMsgId, messageId);
   if (session._journalStreamRef && session._journalStreamRef !== nextRef) {
     // A new assistant message superseded the previous overlay WITHOUT its
@@ -717,11 +771,11 @@ function journalStream(session, messageId, replaceText) {
     // buffer was discarded unflushed (waitingForAnswer) or there was no
     // sendCallback to publish it. Clear, don't just drop: collapse the
     // orphaned overlay with a final empty replace_text.
-    journalPublisher.endStream(session.claudeSessionId, session._journalStreamRef, { clear: true });
+    journalPublisher.endStream(convoId, session._journalStreamRef, { clear: true });
   }
   session._journalStreamRef = nextRef;
   session._journalStreamMsgId = messageId;
-  journalPublisher.stream(session.claudeSessionId, nextRef, replaceText);
+  journalPublisher.stream(convoId, nextRef, replaceText);
 }
 
 // Retire a still-open streaming overlay that was NOT already retired by a
@@ -736,12 +790,13 @@ function journalStream(session, messageId, replaceText) {
 function journalStreamClear(session) {
   if (!JOURNAL_ENABLED) return;
   session._journalDurableRef = null;
-  if (!session.claudeSessionId) return;
+  const convoId = journalConvoIdFor(session);
+  if (!convoId) return;
   const ref = session._journalStreamRef;
   if (!ref) return;
   session._journalStreamRef = null;
   session._journalStreamMsgId = null;
-  journalPublisher.endStream(session.claudeSessionId, ref, { clear: true });
+  journalPublisher.endStream(convoId, ref, { clear: true });
 }
 
 // Mirror a user's accepted prompt answer (button tap, numbered/lettered
@@ -756,6 +811,13 @@ function journalMirrorUserAnswer(session, text) {
   const body = typeof text === 'string' ? text.trim() : '';
   if (!body) return;
   journalPublishUserItem(session, 'publishText', { body, from: 'user' });
+}
+
+function recordUserAnswer(session, text, { mirrorToJournal = true } = {}) {
+  const body = typeof text === 'string' ? text.trim() : '';
+  if (!body) return;
+  recordConversationMessage(session, 'user', body);
+  if (mirrorToJournal) journalMirrorUserAnswer(session, body);
 }
 
 // Mirror a Matrix media upload the user just sent into the journal, once it
@@ -794,7 +856,7 @@ function journalMirrorUserMedia(session, { buffer, mime, name, dims }) {
 // (with whatever title we've learned so far, if any) and replays anything
 // buffered while we didn't yet know the convo_id, in order.
 function journalFlushForSession(session) {
-  const convoId = session.claudeSessionId;
+  const convoId = journalConvoIdFor(session);
   if (!convoId) return;
   session._journalConvoEstablished = true;
   journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
@@ -867,7 +929,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       },
     }),
   ];
-  const printModel = resolveModel({ option: options.model, persisted: persistedMode?.model });
+  const printModel = options.model === null
+    ? undefined
+    : resolveModel({ option: options.model, persisted: persistedMode?.model });
   if (printModel) {
     args.push('--model', printModel);
   }
@@ -922,6 +986,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: resumeSessionId || null,
+    journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || resumeSessionId || null,
+    _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
     toolCalls: [], // collected tool indicators for this turn
@@ -931,7 +997,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     firstMessageCaptured: false,
     // Captured from system init event
     initData: null,
-    currentModel: null,
+    currentModel: printModel || null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -1016,7 +1082,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // state, but a print-mode session that crashes before its session_id
         // is delivered hasn't been persisted yet, and would silently respawn
         // without the user's --browser opt-in.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { agent: session.agent, mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, {
+          agent: session.agent,
+          model: session.currentModel || undefined,
+          mcpExtras: session.mcpExtras,
+          journalConvoId: session.journalConvoId,
+        });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -1029,6 +1100,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        restarted.chatHistory = session.chatHistory;
+        restarted.pinnedSummaryText = session.pinnedSummaryText;
+        restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
+        restarted._agentHistoryCursor = session._agentHistoryCursor;
+        restarted._pendingAgentHandoff = session._pendingAgentHandoff;
+        restarted._agentSessions = session._agentSessions;
+        restarted.totalUsage = session.totalUsage;
+        restarted.turnCount = session.turnCount;
         // Carry journal-mirror state too: traffic buffered before the first
         // session_id arrived would otherwise be silently dropped, keeping
         // _journalState preserves the change-dedup across the restart, and
@@ -1089,7 +1168,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
 function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persisted = getPersistedSession(roomId);
-  const model = options.model ?? persisted?.model ?? undefined;
+  const model = options.model === null ? undefined : (options.model ?? persisted?.model ?? undefined);
   const codex = new CodexExecSession({
     cwd,
     threadId: resumeSessionId || null,
@@ -1121,6 +1200,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // Kept under the historical property name for compatibility with the
     // journal protocol and existing persistence/routing code.
     claudeSessionId: resumeSessionId || null,
+    journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || null,
+    _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
     toolCalls: [],
@@ -1204,6 +1285,7 @@ function handleCodexEvent(session, event) {
       if (!event.thread_id) break;
       if (!session.claudeSessionId) {
         session.claudeSessionId = event.thread_id;
+        if (!session.journalConvoId) session.journalConvoId = event.thread_id;
         persistSession(session.roomId, event.thread_id, session.workdir, session.originRoomId, {
           chatHistory: session.chatHistory,
           model: session.currentModel || null,
@@ -1327,7 +1409,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const sessionId = resumeSessionId || randomUUID();
-  const model = resolveModel({ option: options.model, persisted: persistedForRoom?.model });
+  const model = options.model === null
+    ? undefined
+    : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
 
   const settings = {
     hooks: {
@@ -1417,6 +1501,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: sessionId,
+    journalConvoId: options.journalConvoId || persistedForRoom?.journalConvoId || sessionId,
+    _agentHistoryCursor: 0,
     busy: false,
     lineBuf: '',
     toolCalls: [],
@@ -1424,7 +1510,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     originRoomId: null,
     firstMessageCaptured: false,
     initData: null,
-    currentModel: null,
+    currentModel: model || null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -1514,7 +1600,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { agent: session.agent, mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, {
+          agent: session.agent,
+          model: session.currentModel || undefined,
+          mcpExtras: session.mcpExtras,
+          journalConvoId: session.journalConvoId,
+        });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -1527,6 +1618,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.queueNotifications = session.queueNotifications;
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
+        restarted.chatHistory = session.chatHistory;
+        restarted.pinnedSummaryText = session.pinnedSummaryText;
+        restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
+        restarted._agentHistoryCursor = session._agentHistoryCursor;
+        restarted._pendingAgentHandoff = session._pendingAgentHandoff;
+        restarted._agentSessions = session._agentSessions;
+        restarted.totalUsage = session.totalUsage;
+        restarted.turnCount = session.turnCount;
         // Carry journal-mirror state (see the matching print-mode block).
         restarted._journalBuffer = session._journalBuffer;
         restarted._journalTitleHint = session._journalTitleHint;
@@ -1776,7 +1875,7 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
   const p = session.pendingInteractivePrompt;
   if (!p) return false;
   const trimmed = (userText || '').trim().toLowerCase();
-  const mirrorAnswer = (text) => { if (mirrorToJournal) journalMirrorUserAnswer(session, text); };
+  const mirrorAnswer = (text) => recordUserAnswer(session, text, { mirrorToJournal });
 
   // Confirm to the Matrix user what we sent on their behalf (without this the
   // consumption is invisible) and start a typing indicator for the next render.
@@ -2233,7 +2332,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
     journalActivity(session, 'thinking');
     // This answer goes in via a raw tool_result stdin write (not
     // sendToSession), so mirror the user's side of it here.
-    if (mirrorToJournal) journalMirrorUserAnswer(session, answerText);
+    recordUserAnswer(session, answerText, { mirrorToJournal });
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -2401,6 +2500,7 @@ function handleClaudeEvent(session, event) {
   // Capture session ID from any event that carries it.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
+    if (!session.journalConvoId) session.journalConvoId = event.session_id;
     persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
     journalFlushForSession(session);
@@ -2611,7 +2711,8 @@ function handleClaudeEvent(session, event) {
               // (spec §9). Same skip-if-no-session-id rule as journalActivity:
               // ephemerals replayed late would be stale, so a session whose
               // claudeSessionId isn't known yet just doesn't stream.
-              if (JOURNAL_ENABLED && session.claudeSessionId) {
+              const journalConvoId = journalConvoIdFor(session);
+              if (JOURNAL_ENABLED && journalConvoId) {
                 // Cap once here so a pathological (~1 MiB) command can't blow
                 // past the server's 1 MiB WS payload cap in the offset-0
                 // frame's meta; the server truncates meta at 2000 chars
@@ -2620,13 +2721,13 @@ function handleClaudeEvent(session, event) {
                 const streamCommand = String(displayCommand).slice(0, 2000);
                 const pump = createToolStreamPump({
                   logPath: liveLogPath,
-                  convoId: session.claudeSessionId,
+                  convoId: journalConvoId,
                   messageRef: liveToolUseId,
                   meta: { tool: 'Bash', command: streamCommand },
                   streamAppend: (c, r, off, chunk, meta) =>
                     journalPublisher.streamAppend(c, r, off, chunk, meta),
                 });
-                const streamRegKey = toolStreamKey(session.claudeSessionId, liveToolUseId);
+                const streamRegKey = toolStreamKey(journalConvoId, liveToolUseId);
                 // Stop (never finalize — same message_ref, a finalize would
                 // collide) any prior pump still registered under this exact
                 // key before overwriting the Map entry: Map.set silently
@@ -2637,7 +2738,7 @@ function handleClaudeEvent(session, event) {
                 toolStreamPumps.set(streamRegKey, {
                   pump,
                   session,
-                  convoId: session.claudeSessionId,
+                  convoId: journalConvoId,
                   command: streamCommand,
                   logPath: liveLogPath,
                   messageRef: liveToolUseId,
@@ -2738,12 +2839,23 @@ function handleClaudeEvent(session, event) {
           console.log(`Resume failed for room ${session.roomId}: session not found, clearing stale ID`);
           session.claudeSessionId = null;
           session._resumeFailed = true;
-          // Remove stale persisted session so future !resume won't retry it
+          // Clear only this provider's stale native ID. A switched
+          // conversation may still have a valid session for the other
+          // provider plus the shared transcript and stable journal ID.
           const data = loadPersistedSessions();
-          delete data[String(session.roomId)];
+          const persisted = data[String(session.roomId)];
+          if (persisted?.agentSessions) {
+            persisted.sessionId = null;
+            persisted.agentSessions = mergeAgentStates(persisted.agentSessions, {
+              [session.agent]: { sessionId: null, historyCursor: 0, lastUsed: Date.now() },
+            });
+            data[String(session.roomId)] = persisted;
+          } else {
+            delete data[String(session.roomId)];
+          }
           savePersistedSessions(data);
           if (session.sendCallback) {
-            session.sendCallback('Previous session not found (expired or deleted). Send !start to begin a new session.');
+            session.sendCallback('Previous native session not found (expired or deleted). The next message will start this agent fresh; /switch can still return to the other agent.');
           }
           // Reset busy/typing so the session isn't stuck if claude exits 0
           // without our normal result-handling path running.
@@ -3032,8 +3144,9 @@ function handleClaudeEvent(session, event) {
             // there's no pump). Otherwise this ran on EVERY tool_result of
             // every tool — O(content) string work discarded whenever both are
             // absent, which is the common case.
-            const pumpRegistered = JOURNAL_ENABLED && session.claudeSessionId
-              && toolStreamPumps.has(toolStreamKey(session.claudeSessionId, block.tool_use_id));
+            const journalConvoId = journalConvoIdFor(session);
+            const pumpRegistered = JOURNAL_ENABLED && journalConvoId
+              && toolStreamPumps.has(toolStreamKey(journalConvoId, block.tool_use_id));
             let opts;
             if (entry || pumpRegistered) {
               const blockText = typeof block.content === 'string'
@@ -3119,6 +3232,44 @@ function extractTextContent(event) {
   return '';
 }
 
+function recordConversationMessage(session, role, text) {
+  const normalized = typeof text === 'string' ? text.trim() : '';
+  if (!normalized || (role !== 'user' && role !== 'assistant')) return;
+  if (!session.chatHistory) session.chatHistory = [];
+  session.chatHistory.push({
+    role,
+    text: normalized,
+    ...(role === 'assistant' && session.agent ? { agent: session.agent } : {}),
+  });
+  // Once a message is dispatched to, or emitted by, the active native
+  // session, that provider has seen the shared transcript through this item.
+  session._agentHistoryCursor = session.chatHistory.length;
+  debug(`Added ${role} message to chatHistory, length now: ${session.chatHistory.length}`);
+  persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+    chatHistory: session.chatHistory,
+  });
+}
+
+function applyPendingAgentHandoff(session, contentBlocks) {
+  const pending = session._pendingAgentHandoff;
+  if (!pending?.prompt) return { blocks: contentBlocks, pending: null };
+  return {
+    blocks: prependHandoffPrompt(contentBlocks, pending),
+    pending,
+  };
+}
+
+function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
+  if (historyText) recordConversationMessage(session, 'user', historyText);
+  if (pendingHandoff && session._pendingAgentHandoff === pendingHandoff) {
+    session._pendingAgentHandoff = null;
+    session._agentHistoryCursor = session.chatHistory?.length || pendingHandoff.toIndex || 0;
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+      chatHistory: session.chatHistory || [],
+    });
+  }
+}
+
 function flushResponse(session) {
   let text = session.responseBuffer.trim();
   session.responseBuffer = '';
@@ -3140,13 +3291,7 @@ function flushResponse(session) {
   // Track assistant response for topic summarization (strip code blocks)
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
   if (cleanText) {
-    if (!session.chatHistory) session.chatHistory = [];
-    session.chatHistory.push({ role: 'assistant', text: cleanText });
-    debug(`Added assistant message to chatHistory, length now: ${session.chatHistory.length}`);
-    // Persist chatHistory for resume across restarts
-    if (session.claudeSessionId) {
-      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
-    }
+    recordConversationMessage(session, 'assistant', cleanText);
     // Update room name and pinned summary after adding message
     maybeUpdatePinnedSummary(session);
   }
@@ -3210,6 +3355,12 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     const journalText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
     if (journalText) journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
   }
+  const historyText = contentBlocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
 
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
@@ -3229,11 +3380,14 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     }
   }
 
+  const preparedHandoff = applyPendingAgentHandoff(session, contentBlocks);
+  contentBlocks = preparedHandoff.blocks;
+
   if (session.agent === AGENT_CODEX) {
     // codex exec accepts one text prompt per process. Media builders always
     // include an absolute-path text annotation; binary/base64 blocks are
     // intentionally omitted here because Codex can inspect the saved file.
-    if (!contentBlocksToCodexPrompt(contentBlocks)) {
+    if (!historyText || !contentBlocksToCodexPrompt(contentBlocks)) {
       session.busy = false;
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
@@ -3246,6 +3400,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
       return true;
     }
     const sent = session.codex?.send(contentBlocks) === true;
+    if (sent) commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
     if (!sent) {
       session.busy = false;
       journalSessionState(session, 'waiting');
@@ -3272,6 +3427,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
       session.iv.sendText(text);
+      commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (session.resetTimeout) session.resetTimeout();
       return true;
     }
@@ -3304,7 +3460,21 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   debug('Sending to stdin:', jsonMsg.length > 1000
     ? jsonMsg.slice(0, 500) + `... [${jsonMsg.length} chars total]`
     : jsonMsg.trim());
-  session.proc.stdin.write(jsonMsg);
+  try {
+    session.proc.stdin.write(jsonMsg);
+  } catch (error) {
+    session.busy = false;
+    journalSessionState(session, 'waiting');
+    journalActivity(session, 'idle');
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+    debug(`Failed to write Claude turn: ${error.message}`);
+    return false;
+  }
+  commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
   if (session.resetTimeout) session.resetTimeout();
   return true;
 }
@@ -3794,8 +3964,9 @@ async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}
       if (ref) {
         payload.message_ref = ref;
         journalSession._journalDurableRef = null;
-        if (journalSession.claudeSessionId) {
-          journalPublisher.endStream(journalSession.claudeSessionId, ref);
+        const convoId = journalConvoIdFor(journalSession);
+        if (convoId) {
+          journalPublisher.endStream(convoId, ref);
         }
         journalSession._journalStreamRef = null;
         journalSession._journalStreamMsgId = null;
@@ -3961,8 +4132,9 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
 }
 
 function stopAndFinalizeToolStream(session, toolUseId, opts = {}) {
-  if (!JOURNAL_ENABLED || !session.claudeSessionId) return;
-  const key = toolStreamKey(session.claudeSessionId, toolUseId);
+  const convoId = journalConvoIdFor(session);
+  if (!JOURNAL_ENABLED || !convoId) return;
+  const key = toolStreamKey(convoId, toolUseId);
   const entry = toolStreamPumps.get(key);
   if (!entry) return; // not a streamed command, or already finalized
   finalizeToolStreamEntry(key, entry, opts);
@@ -4022,6 +4194,8 @@ const MATRON_COMMANDS = [
   { command: 'sessions', description: 'List past sessions' },
   { command: 'workdir', args: '<path>', description: 'Start in a specific directory' },
   { command: 'status', description: 'Show session info' },
+  { command: 'agent', description: 'Show the active coding agent' },
+  { command: 'switch', args: '<claude|codex>', description: 'Hand off to the other agent' },
   { command: 'working', description: 'Toggle tool call visibility' },
   { command: 'mcp', description: 'Show MCP server status' },
   { command: 'model', description: 'Show current model' },
@@ -4589,9 +4763,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // when the caller omitted --codex. Numeric selection remains scoped to
       // the selected/default agent because numbers are list-relative.
       if (!resumeAgentFlags.agent && isNaN(num)) {
-        const persistedMatch = Object.values(loadPersistedSessions())
-          .find(entry => entry?.sessionId?.startsWith(resumeArg));
-        if (persistedMatch?.agent) selectedAgent = resolveAgent({ persisted: persistedMatch.agent });
+        const codexMatch = listPersistedAgentSessions(AGENT_CODEX)
+          .find(entry => entry.sessionId.startsWith(resumeArg));
+        const claudeMatch = listPersistedAgentSessions(AGENT_CLAUDE)
+          .find(entry => entry.sessionId.startsWith(resumeArg));
+        if (codexMatch && !claudeMatch) selectedAgent = AGENT_CODEX;
+        else if (claudeMatch && !codexMatch) selectedAgent = AGENT_CLAUDE;
       }
 
       if (selectedAgent === AGENT_CODEX) {
@@ -4633,16 +4810,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           } else {
             // Session not found in current workdir — check persisted Claude
             // sessions for a different workdir.
-            const allPersisted = loadPersistedSessions();
-            let foundEntry = null;
-            for (const entry of Object.values(allPersisted)) {
-              const entryAgent = resolveAgent({ persisted: entry?.agent, fallback: AGENT_CLAUDE });
-              if (entryAgent === AGENT_CLAUDE && entry.sessionId?.startsWith(resumeArg)
-                  && entry.workdir && entry.workdir !== resumeWorkdir) {
-                foundEntry = entry;
-                break;
-              }
-            }
+            const foundEntry = listPersistedAgentSessions(AGENT_CLAUDE)
+              .find(entry => entry.sessionId.startsWith(resumeArg)
+                && entry.workdir && entry.workdir !== resumeWorkdir) || null;
             if (foundEntry) {
               const altEncoded = foundEntry.workdir.replace(/\//g, '-');
               const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
@@ -4708,15 +4878,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
+      session.chatHistory = Array.isArray(resumePersisted?.chatHistory) ? resumePersisted.chatHistory : [];
+      session.pinnedSummaryText = resumePersisted?.pinnedSummaryText || '';
+      session.pinnedSummaryEventId = resumePersisted?.pinnedSummaryEventId || null;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      if (resumePersisted) hydrateAgentState(session, resumePersisted);
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
 
       // Persist immediately — we already know the agent session ID.
-      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
+      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId, {
+        chatHistory: session.chatHistory,
+        pinnedSummaryText: session.pinnedSummaryText,
+        pinnedSummaryEventId: session.pinnedSummaryEventId,
+      });
 
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
       const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
@@ -4951,6 +5129,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/workdir [--claude|--codex] <path> — Start a session in a different directory\n` +
         `/status — Show current session info\n` +
         `/agent — Show the current agent\n` +
+        `/switch <claude|codex> — Hand this conversation to the other agent\n` +
         `/working — Toggle tool call visibility\n` +
         `/mcp — Show MCP server status\n` +
         `/model — Show current model\n` +
@@ -4989,6 +5168,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         cmdGroup('Info', [
           ['/status', 'Show current session info'],
           ['/agent', 'Show the current coding agent'],
+          ['/switch &lt;claude|codex&gt;', 'Hand this conversation to the other coding agent'],
           ['/working', 'Toggle tool call visibility'],
           ['/mcp', 'Show MCP server status'],
           ['/model', 'Show current model'],
@@ -5021,7 +5201,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       if (!parts[1]) {
-        await sendReply(`Agent: ${agentLabel(session.agent)}\n\nAgent conversations aren't interchangeable. Use /start --codex or /start --claude to begin with the other agent.`);
+        await sendReply(`Agent: ${agentLabel(session.agent)}\n\nUse /switch ${otherAgent(session.agent)} to hand this conversation to ${agentLabel(otherAgent(session.agent))}.`);
         break;
       }
       if (!arg) {
@@ -5032,7 +5212,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`Already using ${agentLabel(session.agent)}.`);
         break;
       }
-      await sendReply(`A ${agentLabel(session.agent)} conversation can't be converted to ${agentLabel(arg)}. Use /start --${arg} to begin a new conversation.`);
+      await sendReply(`Use /switch ${arg} to hand this conversation from ${agentLabel(session.agent)} to ${agentLabel(arg)}.`);
+      break;
+    }
+
+    case '!switch': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      if (!parts[1]) {
+        await sendReply(
+          `Currently using ${agentLabel(session.agent)}.\n\nUsage: /switch ${otherAgent(session.agent)}`,
+        );
+        break;
+      }
+      if (parts.length > 2) {
+        await sendReply('Usage: /switch <claude|codex>');
+        break;
+      }
+      const target = normalizeAgent(parts[1].replace(/^--/, ''));
+      await switchAgentSession(roomId, target, { sendReply });
       break;
     }
 
@@ -5462,7 +5663,7 @@ async function journalRouteTextToSession(session, body) {
     // Not a valid selector — do NOT type it into the still-open menu (same
     // PTY-desync risk the Matrix path guards against). Notice instead of
     // silently dropping it.
-    journalPublishNotice(session.claudeSessionId,
+    journalPublishNotice(journalConvoIdFor(session),
       "That doesn't look like one of the options. Reply with the option number shown, or use the session's Matrix room to send !esc and cancel the menu.");
     return;
   }
@@ -5630,6 +5831,7 @@ function journalRoutePromptReply(session, { choice, text }) {
           session.pendingInteractivePrompt = null;
           session.pendingUnclassifiedPrompt = false;
           session.iv.respondToPrompt(resp);
+          recordUserAnswer(session, resolved.option.label, { mirrorToJournal: false });
           return resolved.option.label;
         }
       }
@@ -5647,6 +5849,7 @@ function journalRoutePromptReply(session, { choice, text }) {
       session.pendingInteractivePrompt = null;
       session.iv.respondToPrompt(ftResponse);
       setTimeout(() => { if (session.iv && session.iv.alive) session.iv.sendText(freeText); }, 250);
+      recordUserAnswer(session, freeText, { mirrorToJournal: false });
       return freeText;
     }
     return null;
@@ -5689,7 +5892,7 @@ function journalOnText(session, body, { username }) {
   // thrown/rejected dispatch can never crash the consumer.
   journalRouteTextToSession(session, body).catch((e) => {
     console.warn(`[journal-input] routing text to session failed: ${e.message}`);
-    journalPublishNotice(session.claudeSessionId, `⚠️ Could not deliver your message: ${e.message}`);
+    journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your message: ${e.message}`);
   });
 }
 
@@ -5727,12 +5930,12 @@ function journalOnPromptReply(session, answer, { username }) {
     label = journalRoutePromptReply(session, answer);
   } catch (e) {
     console.warn(`[journal-input] routing prompt_reply failed: ${e.message}`);
-    journalPublishNotice(session.claudeSessionId, `⚠️ Could not deliver your answer: ${e.message}`);
+    journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your answer: ${e.message}`);
     return;
   }
   if (label == null) {
-    console.warn(`[journal-input] prompt_reply with no resolvable pending prompt for convo=${session.claudeSessionId}`);
-    journalPublishNotice(session.claudeSessionId, "Nothing to answer right now — there's no open prompt in this session.");
+    console.warn(`[journal-input] prompt_reply with no resolvable pending prompt for convo=${journalConvoIdFor(session)}`);
+    journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
     return;
   }
   journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
@@ -5806,7 +6009,7 @@ async function journalHandleControlCommand(body) {
 function journalResumeConvo(convoId) {
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
-    if (!prev || prev.sessionId !== convoId) continue;
+    if (!prev || (prev.journalConvoId !== convoId && prev.sessionId !== convoId)) continue;
     const existing = sessions.get(roomId);
     // A live session in this room under a DIFFERENT claude session id means
     // this convo is stale history (the room has moved on) — don't hijack it.
@@ -5874,7 +6077,8 @@ function journalHandleInboundEvent(frame) {
 // Hoisted function declaration — the exit handlers are defined earlier in
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
-  if (session && session.claudeSessionId) journalInputConsumer.evictConvo(session.claudeSessionId);
+  const convoId = journalConvoIdFor(session);
+  if (convoId) journalInputConsumer.evictConvo(convoId);
 }
 
 // Plan approval for the `build` keyword — the Matrix handler's original
@@ -5979,28 +6183,37 @@ async function approvePlanBuild(session, { sendHtml }) {
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
+  const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
+  const activeAgent = resolveAgent({ persisted: prev.agent, fallback: DEFAULT_AGENT });
+  const activeState = getPersistedAgentState(prev, activeAgent, history.length);
   const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId, {
-    agent: prev.agent,
-    model: prev.model,
-    mcpExtras: prev.mcpExtras,
+    agent: activeAgent,
+    model: activeState.model || prev.model,
+    interactive: activeAgent === AGENT_CLAUDE
+      ? (activeState.interactiveMode ?? prev.interactiveMode)
+      : undefined,
+    mcpExtras: activeState.mcpExtras.length ? activeState.mcpExtras : prev.mcpExtras,
+    journalConvoId: prev.journalConvoId,
   });
   newSession.originRoomId = prev.originRoomId || null;
   newSession.firstMessageCaptured = true;
-  newSession.chatHistory = prev.chatHistory || [];
+  newSession.chatHistory = history;
   newSession.pinnedSummaryText = prev.pinnedSummaryText || '';
   newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
   newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
     sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  hydrateAgentState(newSession, prev);
 
-  const shortId = prev.sessionId.slice(0, 8);
-  const arNotice = notice('info', `Auto-resuming ${agentLabel(newSession.agent)} session ${shortId}…`, `Auto-resuming ${escapeHtml(agentLabel(newSession.agent))} session <code>${shortId}</code>…`);
+  const shortId = prev.sessionId ? prev.sessionId.slice(0, 8) : 'new';
+  const verb = prev.sessionId ? 'Auto-resuming' : 'Restoring';
+  const arNotice = notice('info', `${verb} ${agentLabel(newSession.agent)} session ${shortId}…`, `${verb} ${escapeHtml(agentLabel(newSession.agent))} session <code>${shortId}</code>…`);
   Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
   // than the paste→Enter window, so an immediate type-in is silently dropped.
-  enterResumeHold(newSession);
+  if (prev.sessionId) enterResumeHold(newSession);
   return newSession;
 }
 
@@ -6070,7 +6283,7 @@ client.on('room.message', async (roomId, event) => {
   if (!session || !session.alive) {
     // Auto-resume if this room has a persisted session (session-specific room)
     const prev = getPersistedSession(roomId);
-    if (prev && prev.sessionId) {
+    if (prev && (prev.sessionId || prev.agent)) {
       // Clean up dead session if present
       if (session) sessions.delete(roomId);
       session = resumePersistedSession(roomId, prev);
@@ -6131,13 +6344,13 @@ client.on('room.message', async (roomId, event) => {
       // Don't reset the detector dedup — the just-answered screen may linger a
       // moment, and resetting would let it re-emit unclassified-prompt.
       session.iv.respondToPrompt({ kind: 'numbered', key: sel }, { resetDetector: false });
-      journalMirrorUserAnswer(session, sel);
+      recordUserAnswer(session, sel);
       return;
     }
     if (/^[a-zA-Z]$/.test(sel)) {
       session.pendingUnclassifiedPrompt = false;
       session.iv.respondToPrompt({ kind: 'lettered', key: sel }, { resetDetector: false });
-      journalMirrorUserAnswer(session, sel);
+      recordUserAnswer(session, sel);
       return;
     }
     const guide = "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.";
@@ -6215,7 +6428,7 @@ client.on('room.message', async (roomId, event) => {
         // Mirror the human-readable choice (the tapped option's label; the
         // raw prompt-opt:<n> value is a fallback that shouldn't happen —
         // promptButtons refuses to build buttons for unlabeled options).
-        journalMirrorUserAnswer(session, (p.options?.[optIdx]?.label || '').trim() || value);
+        recordUserAnswer(session, (p.options?.[optIdx]?.label || '').trim() || value);
       }
       return;
     }
@@ -6468,15 +6681,6 @@ client.on('room.message', async (roomId, event) => {
     if (!sendTextToSession(session, text)) {
       await sendReply('Session is not available. Send !start to begin a new one.');
     } else {
-      // Track user message for topic summarization (full text)
-      if (!session.chatHistory) session.chatHistory = [];
-      session.chatHistory.push({ role: 'user', text: text });
-      debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
-      // Persist chatHistory for resume across restarts
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
-      }
-
       if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
         const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
@@ -7018,6 +7222,131 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
 });
 
+function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.agent)) {
+  const history = Array.isArray(session.chatHistory) ? session.chatHistory : [];
+  const state = getPersistedAgentState(persisted, session.agent, history.length);
+  const cursor = normalizeHistoryCursor(state.historyCursor, history.length);
+  session._agentHistoryCursor = cursor;
+  session.totalUsage = { ...session.totalUsage, ...state.totalUsage };
+  session.turnCount = state.turnCount;
+  session._pendingAgentHandoff = null;
+  if (cursor < history.length) {
+    session._pendingAgentHandoff = buildAgentHandoffPrompt({
+      fromAgent,
+      toAgent: session.agent,
+      history,
+      startIndex: cursor,
+      summary: session.pinnedSummaryText,
+      workdir: session.workdir,
+    });
+  }
+  return state;
+}
+
+async function switchAgentSession(roomId, targetAgent, { sendReply }) {
+  const existing = sessions.get(roomId);
+  const decision = canSwitchAgent(existing, targetAgent);
+  if (!decision.ok) {
+    await sendReply(decision.message);
+    return null;
+  }
+
+  const target = decision.target;
+  const persisted = getPersistedSession(roomId) || {};
+  const history = Array.isArray(existing.chatHistory) ? existing.chatHistory : [];
+  const sourceCursor = Number.isFinite(existing._agentHistoryCursor)
+    ? existing._agentHistoryCursor
+    : history.length;
+  const sourceState = snapshotAgentState(existing, sourceCursor);
+  const targetState = getPersistedAgentState(persisted, target, history.length);
+  const agentSessions = mergeAgentStates(persisted.agentSessions, {
+    [existing.agent]: sourceState,
+    [target]: targetState,
+  });
+
+  if (targetState.sessionId) {
+    const conflict = [...sessions.entries()].find(([otherRoomId, session]) =>
+      otherRoomId !== roomId && session.alive && session.claudeSessionId === targetState.sessionId);
+    if (conflict) {
+      await sendReply(
+        `${agentLabel(target)} session ${targetState.sessionId.slice(0, 8)}… is active in another conversation. Stop it there before switching.`,
+      );
+      return null;
+    }
+  }
+
+  const stableConvoId = journalConvoIdFor(existing) || persisted.journalConvoId || randomUUID();
+  const targetOptions = {
+    agent: target,
+    // null is an explicit provider-local default and prevents createSession
+    // from falling back to the outgoing provider's legacy top-level model.
+    model: targetState.model,
+    mcpExtras: target === AGENT_CLAUDE ? targetState.mcpExtras : [],
+    journalConvoId: stableConvoId,
+    ...(target === AGENT_CLAUDE
+      ? { interactive: targetState.interactiveMode ?? INTERACTIVE_MODE }
+      : {}),
+  };
+
+  // Construct the incoming provider before tearing down the outgoing one so
+  // a synchronous spawn/configuration failure leaves the current session
+  // usable. The new process receives no prompt until the user sends again.
+  let next;
+  try {
+    next = createSession(roomId, existing.workdir, targetState.sessionId, targetOptions);
+  } catch (error) {
+    sessions.set(roomId, existing);
+    await sendReply(`Could not switch to ${agentLabel(target)}: ${error.message}`);
+    return null;
+  }
+
+  journalStreamClear(existing);
+  killSession(existing);
+
+  next.originRoomId = existing.originRoomId;
+  next.firstMessageCaptured = true;
+  next.sendCallback = existing.sendCallback;
+  next.sendHtml = existing.sendHtml;
+  next.sendButtonMessage = existing.sendButtonMessage;
+  next.showWorking = existing.showWorking;
+  next.showBashOutput = existing.showBashOutput;
+  next.chatHistory = history;
+  next.pinnedSummaryText = existing.pinnedSummaryText;
+  next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  next.journalConvoId = stableConvoId;
+  next._journalBuffer = existing._journalBuffer;
+  next._journalTitleHint = existing._journalTitleHint;
+  next._journalState = existing._journalState;
+  next._journalActivityState = existing._journalActivityState;
+  next._journalConvoEstablished = existing._journalConvoEstablished;
+  next._agentSessions = agentSessions;
+  hydrateAgentState(next, { ...persisted, agentSessions }, existing.agent);
+  if (targetState.sessionId) enterResumeHold(next);
+
+  persistSession(roomId, next.claudeSessionId, next.workdir, next.originRoomId, {
+    agent: target,
+    agentSessions,
+    journalConvoId: stableConvoId,
+    chatHistory: history,
+    pinnedSummaryText: next.pinnedSummaryText || '',
+    pinnedSummaryEventId: next.pinnedSummaryEventId || null,
+    model: next.currentModel || null,
+    interactiveMode: target === AGENT_CLAUDE ? !!next.iv : undefined,
+    mcpExtras: next.mcpExtras,
+    totalUsage: next.totalUsage,
+    turnCount: next.turnCount,
+  });
+
+  const nativeState = targetState.sessionId
+    ? `Resumed its previous native session ${targetState.sessionId.slice(0, 8)}….`
+    : 'A native session will be created with your next message.';
+  const handoffState = next._pendingAgentHandoff
+    ? ` ${next._pendingAgentHandoff.toIndex - next._pendingAgentHandoff.fromIndex} unseen transcript message${next._pendingAgentHandoff.toIndex - next._pendingAgentHandoff.fromIndex === 1 ? '' : 's'} will be handed over with that message.`
+    : '';
+  await sendReply(`Switched from ${agentLabel(existing.agent)} to ${agentLabel(target)}. ${nativeState}${handoffState}`);
+  return next;
+}
+
 // Apply a /model switch for either mode. Interactive sessions type /model into
 // the live TUI (immediate); print sessions restart the claude -p process with
 // --model <alias> --resume (history preserved). Used by the !model command and
@@ -7104,6 +7433,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const next = createSession(roomId, workdir, sessionId, {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
+    journalConvoId: existing.journalConvoId,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
     // this a /mode toggle or /restart would resume on the stale persisted/
@@ -7125,8 +7455,21 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.chatHistory = existing.chatHistory;
   next.pinnedSummaryText = existing.pinnedSummaryText;
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  next._agentHistoryCursor = existing._agentHistoryCursor;
+  next._pendingAgentHandoff = existing._pendingAgentHandoff;
+  next._agentSessions = existing._agentSessions;
+  next.totalUsage = existing.totalUsage;
+  next.turnCount = existing.turnCount;
+  next._journalBuffer = existing._journalBuffer;
+  next._journalTitleHint = existing._journalTitleHint;
+  next._journalState = existing._journalState;
+  next._journalActivityState = existing._journalActivityState;
+  next._journalConvoEstablished = existing._journalConvoEstablished;
   if (sessionId) {
-    persistSession(roomId, sessionId, workdir, originRoomId);
+    persistSession(roomId, sessionId, workdir, originRoomId, {
+      agentSessions: existing._agentSessions,
+      journalConvoId: existing.journalConvoId,
+    });
   }
   // A resumed interactive TUI isn't ready for input for a few seconds; hold
   // the first post-switch message until it is, so it isn't typed into a

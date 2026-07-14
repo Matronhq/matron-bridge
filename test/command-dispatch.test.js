@@ -46,6 +46,7 @@ describe('classifyBridgeCommand (Matrix regression pins)', () => {
   it('preserves arguments verbatim after the bang-normalized command', () => {
     expect(classifyBridgeCommand('/start /tmp/some dir --browser')).toBe('!start /tmp/some dir --browser');
     expect(classifyBridgeCommand('/model sonnet')).toBe('!model sonnet');
+    expect(classifyBridgeCommand('/switch codex')).toBe('!switch codex');
   });
 
   it('classifies every bridge command name', () => {
