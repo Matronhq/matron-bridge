@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -61,6 +61,82 @@ describe('GET /view', () => {
     // Server must still be alive and serving.
     const ok = await fetch(url);
     expect(ok.status).toBe(200);
+  });
+});
+
+describe('GET /view (hardened)', () => {
+  it('serves a normal file inside the token workdir', async () => {
+    const { generateSignedUrl } = await import('../viewer/server.js');
+    const filePath = path.join(tmpDir, 'guarded-ok.js');
+    writeFileSync(filePath, 'const ok = true;\n');
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60, { path: filePath, workdir: tmpDir });
+    const res = await fetch(url);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('const ok = true;');
+  });
+
+  it('404s a sensitive file even inside the workdir', async () => {
+    const { generateSignedUrl } = await import('../viewer/server.js');
+    const filePath = path.join(tmpDir, '.env');
+    writeFileSync(filePath, 'SECRET=1\n');
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60, { path: filePath, workdir: tmpDir });
+    const res = await fetch(url);
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain('SECRET');
+  });
+
+  it('404s a file outside the token workdir', async () => {
+    const { generateSignedUrl } = await import('../viewer/server.js');
+    const inner = path.join(tmpDir, 'inner-workdir');
+    mkdirSync(inner, { recursive: true });
+    const filePath = path.join(tmpDir, 'outside-inner.txt');
+    writeFileSync(filePath, 'outside inner\n');
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60, { path: filePath, workdir: inner });
+    const res = await fetch(url);
+    expect(res.status).toBe(404);
+  });
+
+  it('404s a symlink pointing outside the workdir', async () => {
+    const { generateSignedUrl } = await import('../viewer/server.js');
+    const inner = path.join(tmpDir, 'sym-workdir');
+    mkdirSync(inner, { recursive: true });
+    const target = path.join(tmpDir, 'sym-target.txt');
+    writeFileSync(target, 'reached through symlink\n');
+    const linkPath = path.join(inner, 'link.txt');
+    symlinkSync(target, linkPath);
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, linkPath, undefined, 60, { path: linkPath, workdir: inner });
+    const res = await fetch(url);
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain('reached through symlink');
+  });
+
+  it('404s an oversized file', async () => {
+    const { generateSignedUrl } = await import('../viewer/server.js');
+    const filePath = path.join(tmpDir, 'huge.txt');
+    writeFileSync(filePath, Buffer.alloc(5 * 1024 * 1024 + 1, 0x61));
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60, { path: filePath, workdir: tmpDir });
+    const res = await fetch(url);
+    expect(res.status).toBe(404);
+  });
+
+  it('legacy token without workdir: still serves a normal file', async () => {
+    const { generateSignedUrl } = await import('../viewer/server.js');
+    const filePath = path.join(tmpDir, 'legacy-ok.txt');
+    writeFileSync(filePath, 'legacy fine\n');
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60);
+    const res = await fetch(url);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('legacy fine');
+  });
+
+  it('legacy token without workdir: still 404s a sensitive file', async () => {
+    const { generateSignedUrl } = await import('../viewer/server.js');
+    const filePath = path.join(tmpDir, 'service-account-prod.json');
+    writeFileSync(filePath, '{"private_key":"x"}\n');
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60);
+    const res = await fetch(url);
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain('private_key');
   });
 });
 

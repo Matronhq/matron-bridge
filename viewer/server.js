@@ -4,6 +4,7 @@ import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSyn
 import path from 'path';
 import { WebSocketServer } from 'ws';
 import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
+import { validateAndOpen, FileLinkDenied } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
 const PORT = process.env.MATRIX_VIEWER_PORT || 9803;
@@ -170,16 +171,16 @@ app.get('/view', async (req, res) => {
   if (!data) return res.status(403).send('Invalid or expired token');
 
   try {
-    // Resolve and prevent path traversal
-    const filePath = path.resolve(data.path);
-    const content = await fs.readFile(filePath, 'utf-8');
-    const filename = path.basename(filePath);
-
-    res.type('html').send(renderHtml(filename, content));
+    // Serve-time boundary (lib/file-link-guard.js): fd-pinned symlink,
+    // sensitivity, workdir-containment, and size checks. Legacy tokens
+    // without a workdir still get everything but containment. Every
+    // rejection — denied, missing, oversize — is a uniform 404 so the
+    // response leaks nothing about why.
+    const { content, realPath } = await validateAndOpen(data.path, { workdir: data.workdir });
+    res.type('html').send(renderHtml(path.basename(realPath), content.toString('utf-8')));
   } catch (err) {
-    if (err.code === 'ENOENT') return res.status(404).send('File not found');
-    console.error('Error reading file:', err);
-    res.status(500).send('Internal error');
+    if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
+    res.status(404).send('File not found');
   }
 });
 
