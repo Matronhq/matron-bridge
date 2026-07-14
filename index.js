@@ -5301,7 +5301,7 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) 
       htmlEscape: escapeHtml,
     });
   } catch (e) {
-    warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
+    console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
   }
 }
 
