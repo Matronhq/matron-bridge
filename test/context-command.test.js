@@ -113,4 +113,15 @@ describe('index.js wiring', () => {
     expect(body).toContain('briefContextReport(');
     expect(body).toContain('_contextFullOnce');
   });
+
+  it('flushResponse consumes the one-shot full flag on ANY flush, not only on a report', () => {
+    // A /context-full whose report never arrives (error, interrupt) must not
+    // leave the flag armed for a later, unrelated /context — so the flag is
+    // read and cleared unconditionally, before the report gate.
+    const start = src.indexOf('function flushResponse(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toContain('const wantFull = session._contextFullOnce;');
+    expect(body).toContain('if (wantFull) session._contextFullOnce = false;');
+  });
 });

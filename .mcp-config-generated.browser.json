@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "ask-user": {
+      "command": "node",
+      "args": [
+        "/home/danbarker/claude-matrix-bridge/ask-user.js"
+      ],
+      "env": {
+        "BRIDGE_API_URL": "http://127.0.0.1:9802"
+      }
+    },
+    "chrome-devtools": {
+      "command": "/home/danbarker/claude-matrix-bridge/hooks/xvfb-wrap.sh",
+      "args": [
+        "npx",
+        "-y",
+        "chrome-devtools-mcp",
+        "--no-usage-statistics",
+        "--acceptInsecureCerts",
+        "--chromeArg=--no-sandbox",
+        "--chromeArg=--disable-setuid-sandbox",
+        "--viewport=1920x1080"
+      ]
+    }
+  }
+}

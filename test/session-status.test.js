@@ -113,4 +113,11 @@ describe('index.js wiring', () => {
     expect(body).toContain('parseUsageLimits(');
     expect(src).toContain('LIMITS_REFRESH_MS');
   });
+
+  it('limits refresh is a no-op when the journal is disabled (nothing consumes the cache)', () => {
+    const start = src.indexOf('function refreshUsageLimits(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toContain('if (!JOURNAL_ENABLED) return null;');
+  });
 });

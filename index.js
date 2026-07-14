@@ -523,6 +523,9 @@ const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
 // a fetch is running, or null when the cache is still fresh — callers use
 // the promise to repaint the status frame once new numbers land.
 function refreshUsageLimits(cwd) {
+  // The cache exists solely to feed status frames — with the journal
+  // disabled nothing consumes it, and each refresh boots a claude process.
+  if (!JOURNAL_ENABLED) return null;
   if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
   if (Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
   usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
@@ -2706,15 +2709,15 @@ function flushResponse(session) {
 
   // /context reports get trimmed to their Model/Tokens headline — the full
   // table dump is noise on a phone-sized client. /context-full (rewritten to
-  // /context in sendToSession) arms a one-shot escape hatch; the flag is
-  // consumed by the next report either way, so it can't leak onto a later,
-  // unrelated /context. Chat history and the journal mirror get the same
-  // trimmed text the user sees.
+  // /context in sendToSession) arms a one-shot escape hatch, consumed by the
+  // NEXT flush whether or not it turned out to be a report: a /context-full
+  // whose report never arrived (error, interrupt) must not leave the flag
+  // armed for a later, unrelated /context. Chat history and the journal
+  // mirror get the same trimmed text the user sees.
+  const wantFull = session._contextFullOnce;
+  if (wantFull) session._contextFullOnce = false;
   const briefReport = briefContextReport(text);
-  if (briefReport) {
-    if (session._contextFullOnce) session._contextFullOnce = false;
-    else text = briefReport;
-  }
+  if (briefReport && !wantFull) text = briefReport;
 
   // Track assistant response for topic summarization (strip code blocks)
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
