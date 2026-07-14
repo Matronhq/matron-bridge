@@ -2186,7 +2186,15 @@ function handleClaudeEvent(session, event) {
                   streamAppend: (c, r, off, chunk, meta) =>
                     journalPublisher.streamAppend(c, r, off, chunk, meta),
                 });
-                toolStreamPumps.set(toolStreamKey(session.claudeSessionId, liveToolUseId), {
+                const streamRegKey = toolStreamKey(session.claudeSessionId, liveToolUseId);
+                // Stop (never finalize — same message_ref, a finalize would
+                // collide) any prior pump still registered under this exact
+                // key before overwriting the Map entry: Map.set silently
+                // replaces without touching what was there before, so an
+                // unstopped prior pump would leak its fs.watch handle
+                // forever (never reachable again to stop() it).
+                toolStreamPumps.get(streamRegKey)?.pump.stop();
+                toolStreamPumps.set(streamRegKey, {
                   pump,
                   session,
                   convoId: session.claudeSessionId,

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { decodeByteExact, toolOutputSnippet, createToolStreamPump } from '../lib/tool-stream-pump.js';
@@ -374,5 +374,32 @@ describe('createToolStreamPump', () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+// index.js can't be imported in-process (top-level side effects — starts
+// express, connects to Matrix, etc; see test/showbashoutput.test.js's own
+// note on this), so killSession's "finalize every open tool-stream pump
+// belonging to a killed session" behavior (killSession calling
+// sweepToolStreams, index.js ~6355) is pinned by source inspection instead —
+// the same idiom test/busy-queue.test.js and test/journal-input-router.test.js
+// already use for other index.js-only wiring this suite can't exercise
+// directly.
+describe('index.js killSession — tool-stream sweep wiring (source inspection)', () => {
+  it('killSession calls sweepToolStreams(session) unconditionally, before the alive/kill-signal gate', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('function killSession(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    expect(end).toBeGreaterThan(start);
+    const body = src.slice(start, end);
+    expect(body).toMatch(/\bsweepToolStreams\(session\)/);
+    // Unconditional: the sweep must run BEFORE the `!session.alive` early
+    // return, so a process that already died (or never went alive) still
+    // gets its open tool-stream pumps finalized rather than orphaned.
+    const sweepIdx = body.indexOf('sweepToolStreams(session)');
+    const aliveGateIdx = body.indexOf('if (!session.alive)');
+    expect(aliveGateIdx).toBeGreaterThan(-1);
+    expect(sweepIdx).toBeLessThan(aliveGateIdx);
   });
 });
