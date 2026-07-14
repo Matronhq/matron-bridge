@@ -35,6 +35,7 @@ import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   classifyBridgeCommand,
+  classifyPrintRescue,
   classifyRescueKeystroke,
   isIvSlashPassthrough,
   dispatchJournalBridgeCommand,
@@ -44,6 +45,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
+import { sendPrintInterrupt } from './lib/print-interrupt.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
@@ -2324,6 +2326,7 @@ function handleClaudeEvent(session, event) {
           // Reset busy/typing so the session isn't stuck if claude exits 0
           // without our normal result-handling path running.
           session.busy = false;
+          clearPendingInterrupt(session);
           if (session.typingInterval) {
             clearInterval(session.typingInterval);
             session.typingInterval = null;
@@ -2381,6 +2384,7 @@ function handleClaudeEvent(session, event) {
       // (the durable publish already cleared the ref).
       journalStreamClear(session);
       session.busy = false;
+      clearPendingInterrupt(session);
       // Print-mode's turn-end (this `case 'result':` block is its equivalent
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
       journalSessionState(session, 'waiting');
@@ -4299,7 +4303,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
-        `  Send "interrupt" to force interrupt\n\n` +
+        `  Send "interrupt" to force interrupt\n` +
+        `  !esc — cancel claude's current turn without killing the session\n\n` +
         `Send any other text to chat with Claude Code.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
@@ -4338,6 +4343,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
+        `<li><code>!esc</code> — cancel claude's current turn without killing the session</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
@@ -4786,7 +4792,9 @@ async function journalRouteTextToSession(session, body) {
   // guidance to "send !esc to cancel" works identically from Matron. Same
   // replay guard as the bridge-command dispatch above (inside
   // dispatchJournalRescueKeystroke): !esc/!enter have real side effects
-  // (keystrokes into the TUI, clearing busy state).
+  // (keystrokes into the TUI, clearing busy state). Print-mode sessions
+  // route !esc/!escape to printModeInterrupt via the printActive branch
+  // instead.
   const dispatchedRescue = await dispatchJournalRescueKeystroke(trimmed, !!(session.iv && session.iv.alive), {
     flushCursor: () => journalPublisher.flushCursor(),
     sendRescueKeystroke: async (rescue) => {
@@ -4815,6 +4823,11 @@ async function journalRouteTextToSession(session, body) {
       } catch (err) {
         ctx.sendReply(`Could not send Esc: ${err.message}`);
       }
+    },
+    printActive: !!(session.proc && session.alive && !(session.iv && session.iv.alive)),
+    sendPrintInterrupt: async () => {
+      const ctx = journalSessionCommandCtx(session);
+      await printModeInterrupt(session, (m) => ctx.sendReply(m));
     },
   });
   if (dispatchedRescue) return;
@@ -5579,6 +5592,14 @@ client.on('room.message', async (roomId, event) => {
       }
       return;
     }
+  } else if (classifyPrintRescue(text)) {
+    // Print-mode counterpart: cancel the current turn via a control_request
+    // on the CLI's stdin. Runs before busy-queueing for the same reason the
+    // iv branch does — interrupting is exactly what you need while busy.
+    // !stop deliberately keeps its stop-session meaning here (handled by the
+    // command dispatch above); !enter stays iv-only.
+    await printModeInterrupt(session, sendReply);
+    return;
   }
   if (session.busy && !isClaudeSlashCommand) {
     // Busy-queue magic words: bare send/interrupt/!interrupt flush the queue
@@ -6365,6 +6386,60 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   return next;
 }
 
+// Print-mode turn interrupt — the print-mode counterpart of iv-mode's Esc
+// keystroke rescue, shared verbatim by the Matrix handler and the journal
+// session-text route (same convention as approvePlanBuild). The turn's
+// `result` event is the success signal: it clears busy and cancels the
+// fallback timer via clearPendingInterrupt. The timer only fires if the CLI
+// never delivers one (wedged process), so the bridge stops queueing
+// messages behind a busy flag nothing will ever clear.
+async function printModeInterrupt(session, sendReply) {
+  if (!session.proc || !session.alive) {
+    await sendReply('No claude process to interrupt.');
+    return;
+  }
+  if (!session.busy) {
+    await sendReply('Nothing to interrupt — claude is idle.');
+    return;
+  }
+  if (session.pendingInterrupt) {
+    await sendReply('Interrupt already sent — still waiting for claude to stop this turn.');
+    return;
+  }
+  session.pendingInterrupt = sendPrintInterrupt({
+    stdin: session.proc.stdin,
+    onWedge: () => {
+      session.pendingInterrupt = null;
+      if (!session.busy) return;
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+      journalSessionState(session, 'waiting');
+      journalActivity(session, 'idle');
+      Promise.resolve(sendReply('⚠️ No response to the interrupt after 10s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.')).catch(() => {});
+    },
+    onError: (err) => {
+      Promise.resolve(sendReply(`Could not send interrupt: ${err.message}`)).catch(() => {});
+    },
+  });
+  if (session.pendingInterrupt) {
+    await sendReply('⏹ Interrupt sent — waiting for claude to stop this turn.');
+  }
+}
+
+// Cancels a pending interrupt's wedge timer. Called wherever busy state
+// resolves for real (result event, fatal-error result path, killSession) —
+// a stale timer firing into a later turn would falsely clear its busy flag.
+function clearPendingInterrupt(session) {
+  if (session.pendingInterrupt) {
+    session.pendingInterrupt.cancel();
+    session.pendingInterrupt = null;
+  }
+}
+
 function killSession(session, signal = 'SIGTERM') {
   if (!session) return;
   // Stop the subagent watcher up-front so its tails and burst timer don't
@@ -6381,6 +6456,7 @@ function killSession(session, signal = 'SIGTERM') {
   // a process that died without delivering tool_result leaves pumps
   // dangling.
   sweepToolStreams(session);
+  clearPendingInterrupt(session);
 
   if (!session.alive) return;
   try {
