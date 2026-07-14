@@ -1,5 +1,5 @@
 node_modules/
 .env
 *.log
-.mcp-config-generated.json
+.mcp-config-generated*.json
 journal-cursor.json

@@ -270,16 +270,21 @@ function expandHome(p) {
 
 function generateFileLink(filePath, workdir) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  // Normalize BEFORE gating and signing: a relative session.workdir (or
+  // target) would otherwise resolve against the wrong process cwd in the
+  // viewer, or trip the guard's relative-path check and kill the link.
+  const absTarget = path.resolve(filePath);
+  const absWorkdir = workdir ? path.resolve(workdir) : null;
   // Generation-time gate (UX — the viewer re-validates at serve time with
   // the fd-pinned checks): sensitive names and out-of-workdir targets never
   // get a link; callers render plain text on null.
-  const gate = checkFileLink(filePath, workdir);
+  const gate = checkFileLink(absTarget, absWorkdir);
   if (!gate.ok) {
-    console.log(`file-link denied (${gate.reason}): ${filePath}`);
+    console.log(`file-link denied (${gate.reason}): ${absTarget}`);
     return null;
   }
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: filePath, exp, workdir: workdir || null })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }

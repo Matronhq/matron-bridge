@@ -55,8 +55,10 @@ existing plain-text rendering — that IS the off state).
      workdir and require containment of `realPath` (covers symlinked parent
      dirs, which O_NOFOLLOW does not).
   4. `fd.stat()` — regular file, `size <= maxBytes`.
-  5. Read content from the fd. Return `{ content, realPath }`. Close the fd
-     in a `finally`.
+  5. Bounded read: allocate exactly the stat-time size and read at most that
+     many bytes from offset 0 — a file that grows between stat and read
+     cannot inflate the response past the size we approved. Return `{ content, realPath }`.
+     Close the fd in a `finally`.
   - Every rejection throws `FileLinkDenied` (carries `reason`); callers map
     ANY failure — denied, missing, oversize — to a uniform 404 (no
     information leak about why; matches matron-journal's 404-not-403
@@ -64,9 +66,11 @@ existing plain-text rendering — that IS the off state).
 
 ### `index.js`
 
-- `generateFileLink(filePath, workdir)` gains the workdir param and the
-  generation gate: `checkFileLink` first — denied returns `null` (both call
-  sites already render a plain non-link line on null, which becomes the
+- `generateFileLink(filePath, workdir)` normalizes target and workdir to
+  absolute paths before gating and signing, preventing relative-path
+  traversal across the bridge/viewer process boundary. Gains the workdir param
+  and the generation gate: `checkFileLink` first — denied returns `null` (both
+  call sites already render a plain non-link line on null, which becomes the
   denied UX) and logs one greppable line
   `file-link denied (<reason>): <path>`. The signed payload gains `workdir`
   (`{path, exp, workdir}`) so the viewer can enforce containment at serve
