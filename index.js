@@ -56,7 +56,7 @@ import { seedJournalTitleFromRoom } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromUsage, emailFromClaudeConfig } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, emailFromClaudeConfig } from './lib/session-status.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -581,10 +581,11 @@ function getAccountEmail() {
 // Publish the session's header data (model, context gauge, rate limits) as
 // an ephemeral status frame for Matron clients. Same skip-if-no-session-id
 // rule as journalActivity — never buffered, a late status would be stale.
-// The context tokens come from the last result event's usage
-// (session._lastContextTokens, set in the result handler); limits come from
-// the shared cache above. No dedup needed: this fires once per turn end,
-// and the journal server's per-convo cache makes redelivery idempotent.
+// The context tokens (session._lastContextTokens) come from the turn's last
+// parent assistant event's usage (set in case 'assistant'), or from the
+// compact_boundary's post-compact size right after a compaction; limits come
+// from the shared cache above. No dedup needed: this fires once per turn
+// end, and the journal server's per-convo cache makes redelivery idempotent.
 function journalStatus(session) {
   if (!JOURNAL_ENABLED) return;
   if (!session.claudeSessionId) return;
@@ -2093,6 +2094,15 @@ function handleClaudeEvent(session, event) {
 
   switch (event.type) {
     case 'assistant': {
+      // Track the context gauge from each parent assistant event's usage —
+      // the last one standing when the turn ends is the final request's
+      // footprint, which is what the header should show. The result event's
+      // own usage is deliberately NOT used: it's cumulative across all the
+      // turn's API calls (see lib/session-status.js), which is how the gauge
+      // once read 2m/1m.
+      const assistantCtxTokens = contextTokensFromAssistantEvent(event);
+      if (assistantCtxTokens) session._lastContextTokens = assistantCtxTokens;
+
       const content = event.message?.content;
       if (!Array.isArray(content)) break;
 
@@ -2452,15 +2462,12 @@ function handleClaudeEvent(session, event) {
         session.totalUsage.cost_usd = event.total_cost_usd;
       }
 
-      // Header status for Matron clients: the context gauge comes passively
-      // from this turn's usage (never by sending /context into the session —
-      // that would append its own report to the transcript, bump
-      // lastActivityAt, and race real turns), limits from the shared cache.
-      // A stale cache also kicks off a throttled background refresh; when it
-      // lands, repaint so the header doesn't wait a whole turn for fresh
-      // numbers.
-      const ctxTokens = contextTokensFromUsage(u);
-      if (ctxTokens) session._lastContextTokens = ctxTokens;
+      // Header status for Matron clients: the context gauge was tracked from
+      // this turn's assistant events (see case 'assistant' — result usage is
+      // cumulative across the turn's API calls, so it must not feed the
+      // gauge), limits from the shared cache. A stale cache also kicks off a
+      // throttled background refresh; when it lands, repaint so the header
+      // doesn't wait a whole turn for fresh numbers.
       journalStatus(session);
       const limitsRefresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
       if (limitsRefresh) {
@@ -2581,6 +2588,18 @@ function handleClaudeEvent(session, event) {
         debug('task_notification suppressed (status=%s): %s',
           event.status, (event.summary || 'unknown').slice(0, 120));
       } else if (event.subtype === 'compact_boundary') {
+        // Repaint the header gauge with the post-compact context size the
+        // boundary carries — for both manual and auto triggers. Without
+        // this, the status frame published at the compact turn's end reuses
+        // _lastContextTokens from BEFORE the compaction (the compact run's
+        // own result usage is all zeros), so the user compacts and still
+        // sees the old near-full gauge.
+        const postTokens = postCompactContextTokens(event);
+        if (postTokens) {
+          session._lastContextTokens = postTokens;
+          journalStatus(session);
+        }
+
         // A manual `/compact` finishes here: the transcript writes a
         // compact_boundary marker but — unlike a normal turn — no Stop hook
         // fires, so onTurnEnd (the authoritative iv turn-end signal) never
@@ -4043,10 +4062,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      // Confirm in origin room with a link to the new room
-      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      // Confirm in the origin room/convo. No matrix.to room link: Matron is
+      // the only client now, and its new conversation appears on its own —
+      // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`Session started in new room: ${roomLink}${extrasNote}`);
+      await sendReply(`Session started in a new conversation${extrasNote}.`);
 
       // Welcome message will be sent when user joins (see room.join handler)
       break;
@@ -4172,10 +4192,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       // Check if there's already an active room for this Claude session
-      for (const [activeRoomId, activeSession] of sessions) {
+      for (const activeSession of sessions.values()) {
         if (activeSession.claudeSessionId === resumeSessionId && activeSession.alive) {
-          const roomLink = `https://matrix.to/#/${activeRoomId}`;
-          await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active: ${roomLink}`);
+          await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active in another conversation.`);
           return;
         }
       }
@@ -4223,8 +4242,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Persist immediately — we already know the session ID, don't wait for Claude's event
       persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
 
-      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
-      await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
+      await sendReply(`Resuming session ${shortId}… in a new conversation.`);
       const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
@@ -4286,8 +4304,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
-      await sendReply(`Session started in new room: ${roomLink}\nWorkdir: ${resolved}`);
+      await sendReply(`Session started in a new conversation.\nWorkdir: ${resolved}`);
       const wdPlain = `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`;
       const wdHtml =
         `<b>Session started</b><br/>` +
