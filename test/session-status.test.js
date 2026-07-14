@@ -252,6 +252,12 @@ describe('index.js wiring', () => {
     expect(body).toContain('✅ Compacted — context now');
     // The non-pending manual branch (print mode) sends the confirmation too.
     expect(body).toContain("else if (trigger === 'manual')");
+    // The confirm is deduped on its own dedicated field — gating it on the
+    // legacy notice's shared lastCompactCompleteNotify cooldown silently
+    // swallowed manual confirms that followed any recent compaction notice
+    // (bugbot, PR #125). The shared field is only ever written here.
+    expect(body).toContain('_lastManualCompactConfirm');
+    expect(body).not.toMatch(/if \([^)]*lastCompactCompleteNotify/);
   });
 
   it('limits refresh is throttled through a shared cache with an inflight guard', () => {

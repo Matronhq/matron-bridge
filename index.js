@@ -2631,7 +2631,9 @@ function handleClaudeEvent(session, event) {
             clearTimeout(session._operatorCompactTimer);
             session._operatorCompactTimer = null;
           }
-          session.lastCompactCompleteNotify = Date.now();
+          const pendingNow = Date.now();
+          session._lastManualCompactConfirm = pendingNow;
+          session.lastCompactCompleteNotify = pendingNow;
           if (session.sendHtml) {
             const n = notice('success', doneText);
             session.sendHtml(n.plain, n.html);
@@ -2662,11 +2664,19 @@ function handleClaudeEvent(session, event) {
           // run emits its own (all-zero) result event and busy clears there.
           // The only missing piece is the user-facing confirmation — before
           // this branch, a print-mode /compact finished in total chat
-          // silence (Dan, 2026-07-14). Reuses the completion-notice cooldown
-          // so a transcript replay or a duplicate boundary can't double-post.
+          // silence (Dan, 2026-07-14).
+          //
+          // Deliberately NOT gated on lastCompactCompleteNotify: that field
+          // is stamped by the legacy 🗜️ notice and by earlier compactions,
+          // and an explicit manual /compact must always confirm (bugbot,
+          // PR #125). A short dedicated window absorbs duplicate/replayed
+          // boundary events — distinct manual compacts are minutes apart —
+          // and stamping the shared field afterwards keeps the generic
+          // legacy notice from double-posting the same compaction.
           const now = Date.now();
-          const COMPACT_COOLDOWN_MS = 60_000;
-          if (!session.lastCompactCompleteNotify || (now - session.lastCompactCompleteNotify) > COMPACT_COOLDOWN_MS) {
+          const DUP_BOUNDARY_MS = 5_000;
+          if (!session._lastManualCompactConfirm || (now - session._lastManualCompactConfirm) > DUP_BOUNDARY_MS) {
+            session._lastManualCompactConfirm = now;
             session.lastCompactCompleteNotify = now;
             if (session.sendHtml) {
               const n = notice('success', doneText);
