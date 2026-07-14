@@ -58,9 +58,20 @@ import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfter
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig } from './lib/session-status.js';
+import {
+  AGENT_CLAUDE,
+  AGENT_CODEX,
+  agentLabel,
+  extractAgentFlag,
+  normalizeAgent,
+  resolveAgent,
+} from './lib/agent-backend.js';
+import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
+const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
+const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat bridge. Work autonomously within the configured sandbox; interactive approvals are unavailable.';
 
 // --- Config ---
 
@@ -73,6 +84,11 @@ const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .filter(Boolean);
 
 const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || process.cwd()));
+const DEFAULT_AGENT = resolveAgent({ fallback: process.env.MATRON_DEFAULT_AGENT || AGENT_CLAUDE });
+if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAULT_AGENT)) {
+  console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
+}
+const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
 // Idle reaping: a session is killed if no activity (incoming user message OR
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
@@ -162,6 +178,7 @@ const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
+const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
 
 // Gemini client for room topic summarization
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -177,6 +194,17 @@ function loadBridgeSystemPrompt() {
 }
 
 const BRIDGE_SYSTEM_PROMPT = loadBridgeSystemPrompt();
+
+function loadCodexBridgePrompt() {
+  try {
+    return fs.readFileSync(BRIDGE_CODEX_MD_PATH, 'utf-8').trim();
+  } catch (e) {
+    console.warn(`Could not read Codex bridge instructions from ${BRIDGE_CODEX_MD_PATH}: ${e.message}`);
+    return FALLBACK_CODEX_BRIDGE_PROMPT;
+  }
+}
+
+const CODEX_BRIDGE_PROMPT = loadCodexBridgePrompt();
 
 // Live-bash-output store (per-process). Tracks active matron-tee'd Bash commands
 // so that tool_result events can write the corresponding .done sentinel.
@@ -379,6 +407,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const live = sessions.get(roomId);
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  if (live?.agent) derived.agent = live.agent;
   data[String(roomId)] = {
     ...existing,
     ...derived,
@@ -394,6 +423,30 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
 function getPersistedSession(roomId) {
   const data = loadPersistedSessions();
   return data[String(roomId)] || null;
+}
+
+// Codex stores rollouts in a date-partitioned tree rather than Claude's
+// per-workdir directory. For bridge-owned Codex conversations, the bridge's
+// persistence file is the authoritative bounded index and also carries the
+// workdir/summary needed by /sessions and /resume.
+function listPersistedAgentSessions(agent, workdir = null) {
+  const byId = new Map();
+  for (const entry of Object.values(loadPersistedSessions())) {
+    if (!entry?.sessionId) continue;
+    if (resolveAgent({ persisted: entry.agent, fallback: AGENT_CLAUDE }) !== agent) continue;
+    if (workdir && entry.workdir !== workdir) continue;
+    const current = byId.get(entry.sessionId);
+    if (current && (current.lastUsed || 0) >= (entry.lastUsed || 0)) continue;
+    const firstUser = Array.isArray(entry.chatHistory)
+      ? entry.chatHistory.find(item => item?.role === 'user' && item.text)?.text || ''
+      : '';
+    byId.set(entry.sessionId, {
+      ...entry,
+      modified: entry.lastUsed || 0,
+      summary: firstUser.slice(0, 80) + (firstUser.length > 80 ? '…' : ''),
+    });
+  }
+  return [...byId.values()].sort((a, b) => b.modified - a.modified);
 }
 
 // --- Session Manager ---
@@ -630,6 +683,12 @@ function journalStatus(session) {
     limits: usageLimitsCache.lines,
     email: getAccountEmail(),
   });
+  // The shared account cache is Claude-specific. Preserve the established
+  // status-builder wiring above, then strip those fields from Codex frames.
+  if (session.agent === AGENT_CODEX) {
+    delete status.limits;
+    delete status.email;
+  }
   if (Object.keys(status).length === 0) return;
   journalPublisher.publishStatus(session.claudeSessionId, status);
 }
@@ -749,6 +808,12 @@ function journalFlushForSession(session) {
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const persistedMode = getPersistedSession(roomId);
+  const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  if (agent === AGENT_CODEX) {
+    const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
+    journalSeedTitle(codexSession);
+    return codexSession;
+  }
   const interactive = resolveInteractive({
     option: options.interactive,
     persisted: persistedMode?.interactiveMode,
@@ -840,6 +905,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   });
 
   const session = {
+    agent: AGENT_CLAUDE,
     proc,
     roomId,
     workdir: cwd,
@@ -950,7 +1016,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // state, but a print-mode session that crashes before its session_id
         // is delivered hasn't been persisted yet, and would silently respawn
         // without the user's --browser opt-in.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { agent: session.agent, mcpExtras: session.mcpExtras });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -1012,6 +1078,238 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   sessions.set(roomId, session);
   journalSeedTitle(session);
   return session;
+}
+
+// --- Codex programmatic sessions ---
+//
+// Codex's stable non-interactive contract is one `codex exec --json` process
+// per turn. The CodexExecSession adapter retains the thread ID and starts a
+// fresh child for each message; this wrapper presents the same logical session
+// shape the rest of the bridge expects from Claude's long-lived process.
+function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
+  const cwd = expandHome(workdir || DEFAULT_WORKDIR);
+  const persisted = getPersistedSession(roomId);
+  const model = options.model ?? persisted?.model ?? undefined;
+  const codex = new CodexExecSession({
+    cwd,
+    threadId: resumeSessionId || null,
+    model,
+    sandbox: CODEX_SANDBOX_MODE,
+    developerInstructions: CODEX_BRIDGE_PROMPT,
+    env: { ...process.env },
+  });
+
+  const session = {
+    agent: AGENT_CODEX,
+    codex,
+    proc: null,
+    roomId,
+    workdir: cwd,
+    mcpExtras: [],
+    responseBuffer: '',
+    sendCallback: null,
+    pendingPlan: null,
+    pendingPlanDenialId: null,
+    sendHtml: null,
+    sendButtonMessage: null,
+    showWorking: false,
+    showBashOutput: false,
+    alive: true,
+    startedAt: Date.now(),
+    lastActivityAt: Date.now(),
+    restartCount: 0,
+    // Kept under the historical property name for compatibility with the
+    // journal protocol and existing persistence/routing code.
+    claudeSessionId: resumeSessionId || null,
+    busy: false,
+    lineBuf: '',
+    toolCalls: [],
+    waitingForAnswer: null,
+    originRoomId: null,
+    firstMessageCaptured: false,
+    initData: null,
+    currentModel: model || null,
+    totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
+    turnCount: 0,
+    chatHistory: [],
+    pinnedSummaryEventId: null,
+    pinnedSummaryText: '',
+    pendingWelcome: true,
+    _codexTurnFinished: true,
+    _codexLastError: null,
+  };
+
+  codex.on('spawn', ({ child, args }) => {
+    session.proc = child;
+    session._codexTurnFinished = false;
+    session._codexLastError = null;
+    session._codexCompletedUsage = null;
+    debug(`Spawning codex with args: ${args.join(' ')}`);
+    debug(`Working directory: ${cwd}`);
+  });
+  codex.on('event', event => {
+    debug('Codex event:', JSON.stringify(event));
+    handleCodexEvent(session, event);
+  });
+  codex.on('parse-error', ({ line }) => debug('Failed to parse Codex JSON line:', line));
+  codex.on('spawn-error', error => {
+    session._codexLastError = error?.message || String(error);
+  });
+  codex.on('turn-exit', ({ code, signal, stderr, sawTurnCompleted }) => {
+    session.proc = null;
+    if (!session.alive || session._codexTurnFinished) return;
+    const interrupted = session._codexInterrupted;
+    session._codexInterrupted = false;
+    if (interrupted) {
+      finishCodexTurn(session, { error: 'Codex turn interrupted.' });
+      return;
+    }
+    if (!sawTurnCompleted || code !== 0) {
+      const detail = session._codexLastError || stderr ||
+        `Codex exited with ${signal ? `signal ${signal}` : `code ${code}`}`;
+      finishCodexTurn(session, { error: detail, usage: session._codexCompletedUsage });
+      return;
+    }
+    finishCodexTurn(session, { usage: session._codexCompletedUsage });
+  });
+
+  session.resetTimeout = () => {};
+  sessions.set(roomId, session);
+  return session;
+}
+
+function codexToolIndicator(item) {
+  if (!item || typeof item !== 'object') return null;
+  if (item.type === 'command_execution') {
+    const command = typeof item.command === 'string' ? item.command : JSON.stringify(item.command || 'command');
+    return `🔧 ${command}`;
+  }
+  if (item.type === 'web_search') return `🌐 ${item.query || 'Web search'}`;
+  if (item.type === 'mcp_tool_call') {
+    const name = [item.server, item.tool].filter(Boolean).join('/') || item.name || 'MCP tool';
+    return `🔌 ${name}`;
+  }
+  if (item.type === 'file_change') {
+    const paths = Array.isArray(item.changes)
+      ? item.changes.map(change => change?.path).filter(Boolean)
+      : [];
+    return `✏️ ${paths.length ? paths.join(', ') : 'Files changed'}`;
+  }
+  return null;
+}
+
+function handleCodexEvent(session, event) {
+  switch (event?.type) {
+    case 'thread.started': {
+      if (!event.thread_id) break;
+      if (!session.claudeSessionId) {
+        session.claudeSessionId = event.thread_id;
+        persistSession(session.roomId, event.thread_id, session.workdir, session.originRoomId, {
+          chatHistory: session.chatHistory,
+          model: session.currentModel || null,
+        });
+        console.log(`Captured Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
+        journalFlushForSession(session);
+      }
+      break;
+    }
+
+    case 'item.started': {
+      const indicator = codexToolIndicator(event.item);
+      if (indicator) {
+        session.toolCalls.push(indicator);
+        journalActivity(session, 'tool', truncateActivityDetail(indicator));
+      }
+      break;
+    }
+
+    case 'item.completed': {
+      const item = event.item || {};
+      if (item.type === 'agent_message' && typeof item.text === 'string' && item.text.trim()) {
+        session.responseBuffer += (session.responseBuffer ? '\n\n' : '') + item.text;
+      }
+      if (codexToolIndicator(item) && session._journalActivityState === 'tool') {
+        journalActivity(session, 'thinking');
+      }
+      break;
+    }
+
+    case 'turn.completed': {
+      // Wait for the child to close before clearing busy/flushing the queue.
+      // codex exec has emitted its result but still owns the adapter's one
+      // process slot until then; starting the next queued turn here races and
+      // gets rejected as "busy".
+      session._codexCompletedUsage = event.usage || null;
+      break;
+    }
+
+    case 'turn.failed': {
+      const detail = event.error?.message || event.error || event.message || 'Codex turn failed.';
+      session._codexLastError = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      session._codexCompletedUsage = event.usage || null;
+      break;
+    }
+
+    case 'error': {
+      const detail = event.message || event.error?.message || event.error;
+      if (detail) session._codexLastError = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+function finishCodexTurn(session, { error = null, usage = null } = {}) {
+  if (session._codexTurnFinished) return;
+  session._codexTurnFinished = true;
+  session.turnCount++;
+
+  if (usage) {
+    session.totalUsage.input_tokens += usage.input_tokens || 0;
+    session.totalUsage.output_tokens += usage.output_tokens || 0;
+    session.totalUsage.cache_read += usage.cached_input_tokens || 0;
+  }
+
+  if (session.toolCalls.length > 0 && session.showWorking && session.sendCallback) {
+    for (const chunk of splitMessage(session.toolCalls.join('\n'))) session.sendCallback(chunk);
+  }
+  session.toolCalls = [];
+  flushResponse(session);
+  journalStreamClear(session);
+  session.busy = false;
+  journalSessionState(session, 'waiting');
+  journalActivity(session, 'idle');
+  journalStatus(session);
+  stripQueueNotificationLinks(session);
+
+  if (session.typingInterval) {
+    clearInterval(session.typingInterval);
+    session.typingInterval = null;
+    client.setTyping(session.roomId, false, 1000).catch(() => {});
+  }
+
+  if (error && session.alive) {
+    const message = `⚠️ ${error}`;
+    if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
+    else if (session.sendCallback) session.sendCallback(message);
+  }
+
+  if (session.alive && session.queuedMessages?.length) {
+    const queued = session.queuedMessages;
+    session.queuedMessages = null;
+    const summary = formatQueueSummary(queued);
+    if (session.sendHtml) {
+      session.sendHtml(
+        `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
+        `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
+      );
+    } else if (session.sendCallback) {
+      session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
+    }
+    flushQueue(session, queued);
+  }
 }
 
 // --- Interactive-mode session (MATRON_INTERACTIVE_MODE=1) ---
@@ -1100,6 +1398,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // call sites that need raw input go via session.iv.sendText / sendKeystroke
   // (wired up in Task 4.2).
   const session = {
+    agent: AGENT_CLAUDE,
     proc: null,
     iv,
     roomId,
@@ -1215,7 +1514,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { agent: session.agent, mcpExtras: session.mcpExtras });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -2930,6 +3229,36 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     }
   }
 
+  if (session.agent === AGENT_CODEX) {
+    // codex exec accepts one text prompt per process. Media builders always
+    // include an absolute-path text annotation; binary/base64 blocks are
+    // intentionally omitted here because Codex can inspect the saved file.
+    if (!contentBlocksToCodexPrompt(contentBlocks)) {
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+      const message = "Codex programmatic mode needs a text prompt or a saved-file path.";
+      if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
+      else if (session.sendCallback) session.sendCallback(message);
+      return true;
+    }
+    const sent = session.codex?.send(contentBlocks) === true;
+    if (!sent) {
+      session.busy = false;
+      journalSessionState(session, 'waiting');
+      journalActivity(session, 'idle');
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+    }
+    return sent;
+  }
+
   if (session.iv) {
     // Interactive mode: type text blocks into the PTY. Non-text content
     // (images, encoded attachments) is not currently supportable via PTY
@@ -3124,6 +3453,18 @@ function dispatchMergedFlush(session, queued) {
 }
 
 function flushQueue(session, queued) {
+  if (session.agent === AGENT_CODEX && session.busy) {
+    // Claude's stream-json stdin can accept a forced follow-up while the
+    // current process is alive; codex exec cannot. Preserve the detached
+    // batch, interrupt the active child, and let finishCodexTurn dispatch it
+    // after that child has exited and released the adapter's process slot.
+    session.queuedMessages = [...(session.queuedMessages || []), ...queued];
+    session._codexInterrupted = true;
+    if (session.codex?.interrupt('SIGINT')) return;
+    session._codexInterrupted = false;
+    console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
+    return;
+  }
   if (!dispatchMergedFlush(session, queued)) {
     console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
   }
@@ -4079,8 +4420,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: positional } = extractMcpExtraFlags(parts.slice(1));
-      const arg = positional[0];
+      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const agentFlags = extractAgentFlag(afterMcp);
+      if (agentFlags.error) {
+        await sendReply(agentFlags.error);
+        return;
+      }
+      const selectedAgent = resolveAgent({ option: agentFlags.agent, fallback: DEFAULT_AGENT });
+      if (selectedAgent === AGENT_CODEX && mcpExtras.length > 0) {
+        await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
+        return;
+      }
+      const arg = agentFlags.rest[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
       let workdir = DEFAULT_WORKDIR;
@@ -4114,7 +4465,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
+      const session = createSession(sessionRoomId, workdir, undefined, { agent: selectedAgent, mcpExtras });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -4131,7 +4482,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // the only client now, and its new conversation appears on its own —
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`Session started in a new conversation${extrasNote}.`);
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}.`);
 
       // Welcome message will be sent when user joins (see room.join handler)
       break;
@@ -4169,20 +4520,33 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // session ID. Passing no flags preserves whatever extras the session
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
-      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const restartAgentFlags = extractAgentFlag(restartAfterMcp);
+      if (restartAgentFlags.error) {
+        await sendReply(restartAgentFlags.error);
+        return;
+      }
+      if (restartAgentFlags.agent && restartAgentFlags.agent !== existing.agent) {
+        await sendReply(`A ${agentLabel(existing.agent)} conversation can't be resumed by ${agentLabel(restartAgentFlags.agent)}. Use /start --${restartAgentFlags.agent} for a new conversation.`);
+        return;
+      }
+      if (existing.agent === AGENT_CODEX && restartFlagExtras.length > 0) {
+        await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
+        return;
+      }
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
         : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
-      await sendReply('🔄 Restarting session...');
+      await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
       recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
       await sendReply(
-        `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
+        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
       );
       break;
     }
@@ -4193,70 +4557,111 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: resumeExtras, rest: resumeTokens } = extractMcpExtraFlags(parts.slice(1));
-      const resumeArg = resumeTokens[0]?.replace(/\.+$/, '') || undefined;
+      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
+      if (resumeAgentFlags.error) {
+        await sendReply(resumeAgentFlags.error);
+        return;
+      }
+      const resumeArg = resumeAgentFlags.rest[0]?.replace(/\.+$/, '') || undefined;
 
       if (!resumeArg) {
         // No arg — show sessions list inline
-        await handleCommand(roomId, '!sessions', sendReply, sendHtml, sender);
+        const flag = resumeAgentFlags.agent ? ` --${resumeAgentFlags.agent}` : '';
+        await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml, sender);
         return;
       }
 
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
       const resumeWorkdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
-      const encodedPath = resumeWorkdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
-
-      if (!(await pathExists(projectDir))) {
-        await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
-        return;
-      }
-
-      // Async id resolution (issue #102): the old inline version ran a
-      // synchronous readdir and then a synchronous stat INSIDE the sort
-      // comparator — O(n log n) blocking metadata calls on the event loop.
-      // Same ordering and fallbacks, one stat per file, via fs.promises
-      // (lib/session-summary.js; the no-sync-fs pin lives in
-      // test/session-summary.test.js's source-inspection block).
-      const files = await listSessionIdsByMtime(projectDir);
-
       let resumeSessionId;
       let actualWorkdir = resumeWorkdir;
+      let resumePersisted = null;
+      let selectedAgent = resolveAgent({
+        option: resumeAgentFlags.agent,
+        persisted: currentSession?.agent || prev?.agent,
+        fallback: DEFAULT_AGENT,
+      });
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
-      if (!isNaN(num) && num >= 1 && num <= files.length) {
-        resumeSessionId = files[num - 1];
-      } else {
-        const match = files.find(f => f.startsWith(resumeArg));
-        if (match) {
-          resumeSessionId = match;
+
+      // An explicit ID prefix can identify a persisted Codex thread even
+      // when the caller omitted --codex. Numeric selection remains scoped to
+      // the selected/default agent because numbers are list-relative.
+      if (!resumeAgentFlags.agent && isNaN(num)) {
+        const persistedMatch = Object.values(loadPersistedSessions())
+          .find(entry => entry?.sessionId?.startsWith(resumeArg));
+        if (persistedMatch?.agent) selectedAgent = resolveAgent({ persisted: persistedMatch.agent });
+      }
+
+      if (selectedAgent === AGENT_CODEX) {
+        if (resumeExtras.length > 0) {
+          await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
+          return;
+        }
+        const localEntries = listPersistedAgentSessions(AGENT_CODEX, resumeWorkdir);
+        if (!isNaN(num) && num >= 1 && num <= localEntries.length) {
+          resumePersisted = localEntries[num - 1];
         } else {
-          // Session not found in current workdir — check persisted sessions for a different workdir
-          const allPersisted = loadPersistedSessions();
-          let foundEntry = null;
-          for (const entry of Object.values(allPersisted)) {
-            if (entry.sessionId && entry.sessionId.startsWith(resumeArg) && entry.workdir && entry.workdir !== resumeWorkdir) {
-              foundEntry = entry;
-              break;
+          resumePersisted = localEntries.find(entry => entry.sessionId.startsWith(resumeArg)) ||
+            listPersistedAgentSessions(AGENT_CODEX).find(entry => entry.sessionId.startsWith(resumeArg));
+        }
+        if (!resumePersisted) {
+          await sendReply(`Codex session not found: ${resumeArg}\nUse /sessions --codex to list bridge-owned Codex sessions.`);
+          return;
+        }
+        resumeSessionId = resumePersisted.sessionId;
+        actualWorkdir = resumePersisted.workdir || resumeWorkdir;
+      } else {
+        const encodedPath = resumeWorkdir.replace(/\//g, '-');
+        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+
+        if (!(await pathExists(projectDir))) {
+          await sendReply(`No Claude sessions directory found for workdir: ${resumeWorkdir}`);
+          return;
+        }
+
+        // Async id resolution (issue #102): metadata is statted once per
+        // transcript and sorted without synchronous work in the comparator.
+        const files = await listSessionIdsByMtime(projectDir);
+        if (!isNaN(num) && num >= 1 && num <= files.length) {
+          resumeSessionId = files[num - 1];
+        } else {
+          const match = files.find(f => f.startsWith(resumeArg));
+          if (match) {
+            resumeSessionId = match;
+          } else {
+            // Session not found in current workdir — check persisted Claude
+            // sessions for a different workdir.
+            const allPersisted = loadPersistedSessions();
+            let foundEntry = null;
+            for (const entry of Object.values(allPersisted)) {
+              const entryAgent = resolveAgent({ persisted: entry?.agent, fallback: AGENT_CLAUDE });
+              if (entryAgent === AGENT_CLAUDE && entry.sessionId?.startsWith(resumeArg)
+                  && entry.workdir && entry.workdir !== resumeWorkdir) {
+                foundEntry = entry;
+                break;
+              }
             }
-          }
-          if (foundEntry) {
-            const altEncoded = foundEntry.workdir.replace(/\//g, '-');
-            const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
-            const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
-            if (await pathExists(altFile)) {
-              resumeSessionId = foundEntry.sessionId;
-              actualWorkdir = foundEntry.workdir;
+            if (foundEntry) {
+              const altEncoded = foundEntry.workdir.replace(/\//g, '-');
+              const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
+              const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
+              if (await pathExists(altFile)) {
+                resumeSessionId = foundEntry.sessionId;
+                actualWorkdir = foundEntry.workdir;
+                resumePersisted = foundEntry;
+              }
             }
-          }
-          if (!resumeSessionId) {
-            await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
-            return;
+            if (!resumeSessionId) {
+              await sendReply(`Claude session not found: ${resumeArg}\nUse /sessions --claude to list available sessions.`);
+              return;
+            }
           }
         }
       }
 
-      // Check if there's already an active room for this Claude session
+      // Check if there's already an active room for this agent session.
       for (const activeSession of sessions.values()) {
         if (activeSession.claudeSessionId === resumeSessionId && activeSession.alive) {
           await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active in another conversation.`);
@@ -4275,7 +4680,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const shortId = resumeSessionId.slice(0, 8);
-      const summary = await getSessionSummary(resumeSessionId, actualWorkdir);
+      const summary = selectedAgent === AGENT_CODEX
+        ? (resumePersisted?.summary || '')
+        : await getSessionSummary(resumeSessionId, actualWorkdir);
       const roomName = summary
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
@@ -4288,13 +4695,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Inherit the resumed session's previously persisted extras unless the
       // user is explicitly overriding via the command line; this lets a
       // resume "just work" if /start --browser was used originally.
-      const resumePersisted = getPersistedSession(sessionRoomId) || (resumeSessionId
+      resumePersisted ||= getPersistedSession(sessionRoomId) || (resumeSessionId
         ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
         : null);
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
         : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
-      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras });
+      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, {
+        agent: selectedAgent,
+        model: resumePersisted?.model,
+        mcpExtras: effectiveResumeExtras,
+      });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
       session.sendCallback = sessionSendReply;
@@ -4304,13 +4715,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
 
-      // Persist immediately — we already know the session ID, don't wait for Claude's event
+      // Persist immediately — we already know the agent session ID.
       persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
 
-      await sendReply(`Resuming session ${shortId}… in a new conversation.`);
-      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
+      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
       const resumeHtml =
-        `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
+        `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
         `Workdir: <code>${escapeHtml(actualWorkdir)}</code><br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
@@ -4323,8 +4734,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: workdirExtras, rest: workdirTokens } = extractMcpExtraFlags(parts.slice(1));
-      const newDir = workdirTokens.join(' ');
+      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
+      if (workdirAgentFlags.error) {
+        await sendReply(workdirAgentFlags.error);
+        return;
+      }
+      const selectedAgent = resolveAgent({ option: workdirAgentFlags.agent, fallback: DEFAULT_AGENT });
+      if (selectedAgent === AGENT_CODEX && workdirExtras.length > 0) {
+        await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
+        return;
+      }
+      const newDir = workdirAgentFlags.rest.join(' ');
       if (!newDir) {
         const session = sessions.get(roomId);
         const current = session?.workdir || DEFAULT_WORKDIR;
@@ -4360,7 +4781,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, resolved, undefined, { mcpExtras: workdirExtras });
+      const session = createSession(sessionRoomId, resolved, undefined, { agent: selectedAgent, mcpExtras: workdirExtras });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -4369,12 +4790,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      await sendReply(`Session started in a new conversation.\nWorkdir: ${resolved}`);
-      const wdPlain = `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`;
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation.\nWorkdir: ${resolved}`);
+      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
-        `<b>Session started</b><br/>` +
+        `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
         `Workdir: <code>${escapeHtml(resolved)}</code><br/><br/>` +
-        `<i>Send any message to interact with Claude Code.</i>`;
+        `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
       await sessionSendHtml(wdPlain, wdHtml);
       break;
     }
@@ -4390,7 +4811,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const busyText = session.busy ? 'yes' : 'no';
 
       const plainStatus =
-        `Session active\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
+        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
 
       const busyHtml = session.busy
@@ -4399,12 +4820,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const htmlStatus =
         `<b>Session Status</b><table>` +
         `<tr><td>State</td><td>${busyHtml}</td></tr>` +
+        `<tr><td>Agent</td><td>${escapeHtml(agentLabel(session.agent))}</td></tr>` +
         `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
         `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
         `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
         `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
         `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>` +
+        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>`) +
         `</table>`;
 
       await sendHtml(plainStatus, htmlStatus);
@@ -4432,6 +4854,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Live Bash tee output is a Claude-hook feature and is not available in Codex programmatic mode.');
+        break;
+      }
       session.showBashOutput = !session.showBashOutput;
       // Persist so !restart re-reads the value at spawn. Gated like the
       // pendingPlanDenialId persist at the ExitPlanMode handler — passing a
@@ -4447,23 +4873,38 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
       const workdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
-
-      const encodedPath = workdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
-
-      if (!(await pathExists(projectDir))) {
-        await sendReply('No sessions found for this workdir.');
+      const sessionAgentFlags = extractAgentFlag(parts.slice(1));
+      if (sessionAgentFlags.error) {
+        await sendReply(sessionAgentFlags.error);
         break;
       }
+      if (sessionAgentFlags.rest.length > 0) {
+        await sendReply('Usage: /sessions [--claude|--codex]');
+        break;
+      }
+      const selectedAgent = resolveAgent({
+        option: sessionAgentFlags.agent,
+        persisted: currentSession?.agent || prev?.agent,
+        fallback: DEFAULT_AGENT,
+      });
 
-      // Bounded listing (lib/session-summary.js): stat + sort by mtime
-      // first, then read summaries — bounded head chunks, via fs.promises —
-      // for ONLY the 15 newest, instead of the old synchronous whole-file
-      // read of every transcript in the dir.
-      const items = await listSessionSummaries(projectDir, { limit: 15 });
+      let items;
+      if (selectedAgent === AGENT_CODEX) {
+        items = listPersistedAgentSessions(AGENT_CODEX, workdir).slice(0, 15);
+      } else {
+        const encodedPath = workdir.replace(/\//g, '-');
+        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+        if (!(await pathExists(projectDir))) {
+          await sendReply('No Claude sessions found for this workdir.');
+          break;
+        }
+        // Bounded listing (lib/session-summary.js): stat + sort by mtime
+        // first, then read summaries for only the 15 newest transcripts.
+        items = await listSessionSummaries(projectDir, { limit: 15 });
+      }
 
       if (items.length === 0) {
-        await sendReply('No sessions found.');
+        await sendReply(`No ${agentLabel(selectedAgent)} sessions found for this workdir.`);
         break;
       }
 
@@ -4489,8 +4930,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
       }).join('\n');
 
-      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse /resume <number> or /resume <id> to resume.`;
-      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume &lt;number&gt;</code> or <code>/resume &lt;id&gt;</code> to resume.</i>`;
+      const agentFlag = `--${selectedAgent}`;
+      const plainText = `${agentLabel(selectedAgent)} sessions for ${workdir}:\n\n${plainList}\n\nUse /resume ${agentFlag} <number> or /resume ${agentFlag} <id> to resume.`;
+      const html = `<b>${escapeHtml(agentLabel(selectedAgent))} sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume ${agentFlag} &lt;number&gt;</code> or <code>/resume ${agentFlag} &lt;id&gt;</code> to resume.</i>`;
 
       await sendHtml(plainText, html);
       break;
@@ -4499,16 +4941,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     case '!help': {
       const plainHelp =
         `Available commands:\n\n` +
-        `/start — Start a new session (creates a new room)\n` +
-        `/start <workdir> — Start in a specific directory\n` +
+        `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
+        `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
         `/stop — Stop the current session\n` +
         `/restart — Stop and immediately resume the session (--browser also accepted)\n` +
-        `/resume <n> — Resume session #n from /sessions list\n` +
-        `/resume <id> — Resume session by ID prefix (--browser also accepted)\n` +
-        `/sessions — List all past sessions\n` +
-        `/workdir <path> — Start session in a different directory (--browser also accepted)\n` +
+        `/resume [--claude|--codex] <n|id> — Resume a session from that agent\n` +
+        `/sessions [--claude|--codex] — List past sessions for an agent\n` +
+        `/workdir [--claude|--codex] <path> — Start a session in a different directory\n` +
         `/status — Show current session info\n` +
+        `/agent — Show the current agent\n` +
         `/working — Toggle tool call visibility\n` +
         `/mcp — Show MCP server status\n` +
         `/model — Show current model\n` +
@@ -4521,11 +4963,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room for the session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
-        `While Claude is working:\n` +
+        `While the agent is working:\n` +
         `  Messages are queued automatically\n` +
         `  Send "interrupt" to force interrupt\n` +
-        `  !esc — cancel claude's current turn without killing the session\n\n` +
-        `Send any other text to chat with Claude Code.\n` +
+        `  !esc — cancel the current turn without killing the session\n\n` +
+        `Send any other text to chat with the selected coding agent.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
       const cmdGroup = (title, cmds) => {
@@ -4535,18 +4977,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const htmlHelp =
         cmdGroup('Sessions', [
-          ['/start', 'Start a new session (creates a new room)'],
-          ['/start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
+          ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
           ['/stop', 'Stop the current session'],
           ['/restart', 'Stop and immediately resume the session (--browser also accepted)'],
-          ['/resume &lt;n&gt;', 'Resume session #n from /sessions list'],
-          ['/resume &lt;id&gt;', 'Resume session by ID prefix (--browser also accepted)'],
-          ['/sessions', 'List all past sessions'],
-          ['/workdir &lt;path&gt;', 'Start session in a different directory (--browser also accepted)'],
+          ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
+          ['/sessions [--claude|--codex]', 'List past sessions for an agent'],
+          ['/workdir [--claude|--codex] &lt;path&gt;', 'Start a session in a different directory'],
         ]) +
         cmdGroup('Info', [
           ['/status', 'Show current session info'],
+          ['/agent', 'Show the current coding agent'],
           ['/working', 'Toggle tool call visibility'],
           ['/mcp', 'Show MCP server status'],
           ['/model', 'Show current model'],
@@ -4561,9 +5003,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<b>Tips</b><ul>` +
         `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
-        `<li>Messages are queued automatically while Claude is working</li>` +
+        `<li>Messages are queued automatically while the agent is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
-        `<li><code>!esc</code> — cancel claude's current turn without killing the session</li>` +
+        `<li><code>!esc</code> — cancel the current turn without killing the session</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
@@ -4571,8 +5013,35 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!agent': {
+      const session = sessions.get(roomId);
+      const arg = normalizeAgent(parts[1]);
+      if (!session || !session.alive) {
+        await sendReply(`Default agent: ${agentLabel(DEFAULT_AGENT)}\n\nStart one with /start --codex or /start --claude.`);
+        break;
+      }
+      if (!parts[1]) {
+        await sendReply(`Agent: ${agentLabel(session.agent)}\n\nAgent conversations aren't interchangeable. Use /start --codex or /start --claude to begin with the other agent.`);
+        break;
+      }
+      if (!arg) {
+        await sendReply('Usage: /agent [claude|codex]');
+        break;
+      }
+      if (arg === session.agent) {
+        await sendReply(`Already using ${agentLabel(session.agent)}.`);
+        break;
+      }
+      await sendReply(`A ${agentLabel(session.agent)} conversation can't be converted to ${agentLabel(arg)}. Use /start --${arg} to begin a new conversation.`);
+      break;
+    }
+
     case '!mcp': {
       const session = sessions.get(roomId);
+      if (session?.agent === AGENT_CODEX) {
+        await sendReply('Codex programmatic sessions use MCP servers from the local Codex config. Live MCP status is not included in codex exec JSON events.');
+        break;
+      }
       if (session?.initData?.mcp_servers) {
         const servers = session.initData.mcp_servers;
         const plainList = servers.map(s => {
@@ -4637,8 +5106,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const extra = session.initData
         ? `\nClaude Code: v${session.initData.claude_code_version || '(unknown)'}\nFast mode: ${session.initData.fast_mode_state || 'off'}`
         : '';
-      const currentLine = current ? `Current model: ${current}` : 'Current model: (appears after the first reply)';
-      if (session.iv) {
+      const currentLine = current
+        ? `Current model: ${current}`
+        : (session.agent === AGENT_CODEX ? 'Current model: Codex config default' : 'Current model: (appears after the first reply)');
+      if (session.agent === AGENT_CODEX) {
+        await sendReply(`${currentLine}\n\nType /model <model-id> to set the model for future Codex turns, or /model default to return to your Codex config default.`);
+      } else if (session.iv) {
         // A live TUI means switching works. Prefer buttons, but fall back to a
         // typed-command hint when no button channel is wired (e.g. some
         // auto-started sessions) — never claim "needs interactive mode" here.
@@ -4671,6 +5144,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session. Start a session first.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Mode: programmatic (codex exec --json). Interactive Codex mode is not part of this first integration.');
+        break;
+      }
       const currentInteractive = !!session.iv;
       const arg = parts[1];
       if (!arg) {
@@ -4700,6 +5177,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
         await sendReply('No active session. Start a session to set the effort level.');
+        break;
+      }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Codex effort switching is not exposed by this first programmatic integration. Set model_reasoning_effort in your Codex config if needed.');
         break;
       }
       const arg = parts[1];
@@ -4734,6 +5215,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply(`Codex exec does not report monetary cost.\nTurns: ${session.turnCount}\nUse /usage for token counts.`);
+        break;
+      }
       const cost = session.totalUsage.cost_usd;
       const costClr = cost < 0.5 ? '#3fb950' : cost < 2 ? '#f0883e' : '#f85149';
       const plainCost = `Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`;
@@ -4759,17 +5244,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Input: ${u.input_tokens.toLocaleString()}\n` +
         `Output: ${u.output_tokens.toLocaleString()}\n` +
         `Cache read: ${u.cache_read.toLocaleString()}\n` +
-        `Cache create: ${u.cache_create.toLocaleString()}\n` +
-        `Turns: ${session.turnCount}\n` +
-        `Cost: $${u.cost_usd.toFixed(4)}`;
+        (session.agent === AGENT_CODEX ? '' : `Cache create: ${u.cache_create.toLocaleString()}\n`) +
+        `Turns: ${session.turnCount}` +
+        (session.agent === AGENT_CODEX ? '' : `\nCost: $${u.cost_usd.toFixed(4)}`);
       const htmlUsage =
         `<b>Token Usage</b><table>` +
         `<tr><td>Input</td><td>${u.input_tokens.toLocaleString()}</td></tr>` +
         `<tr><td>Output</td><td>${u.output_tokens.toLocaleString()}</td></tr>` +
         `<tr><td>Cache read</td><td>${u.cache_read.toLocaleString()}</td></tr>` +
-        `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>` +
+        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>`) +
         `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>` +
+        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>`) +
         `</table>`;
       await sendHtml(plainUsage, htmlUsage);
       break;
@@ -4781,7 +5266,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // so shell out to `claude -p "/usage"` and let Claude Code report them.
       // This is a global query — no active session required.
       try {
-        const cwd = sessions.get(roomId)?.workdir || DEFAULT_WORKDIR;
+        const active = sessions.get(roomId);
+        if (active?.agent === AGENT_CODEX) {
+          await sendReply('Codex subscription limits are not exposed by codex exec JSON output.');
+          break;
+        }
+        const cwd = active?.workdir || DEFAULT_WORKDIR;
         const raw = await fetchUsageLimitsText(cwd);
         const parsed = parseUsageLimits(raw);
         const { plain, html } = formatLimits(parsed, raw);
@@ -4796,6 +5286,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
         await sendReply('No active session. Start a session first.');
+        break;
+      }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('Codex exec does not include an authoritative tool inventory in its JSON event stream. Tools come from the installed Codex CLI, sandbox, skills, and local MCP configuration.');
         break;
       }
       if (!session.initData?.tools) {
@@ -5485,7 +5979,11 @@ async function approvePlanBuild(session, { sendHtml }) {
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
-  const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
+  const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId, {
+    agent: prev.agent,
+    model: prev.model,
+    mcpExtras: prev.mcpExtras,
+  });
   newSession.originRoomId = prev.originRoomId || null;
   newSession.firstMessageCaptured = true;
   newSession.chatHistory = prev.chatHistory || [];
@@ -5497,7 +5995,7 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
     sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
 
   const shortId = prev.sessionId.slice(0, 8);
-  const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
+  const arNotice = notice('info', `Auto-resuming ${agentLabel(newSession.agent)} session ${shortId}…`, `Auto-resuming ${escapeHtml(agentLabel(newSession.agent))} session <code>${shortId}</code>…`);
   Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
@@ -5591,8 +6089,8 @@ client.on('room.message', async (roomId, event) => {
       session = newSession;
 
       const autoNotice = notice('info',
-        `Session started.\nWorkdir: ${workdir}`,
-        `<b>Session started</b><br/>Workdir: <code>${escapeHtml(workdir)}</code>`);
+        `${agentLabel(newSession.agent)} session started.\nWorkdir: ${workdir}`,
+        `<b>${escapeHtml(agentLabel(newSession.agent))} session started</b><br/>Workdir: <code>${escapeHtml(workdir)}</code>`);
       await sendHtmlFn(autoNotice.plain, autoNotice.html);
     }
   }
@@ -6525,6 +7023,25 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
 // --model <alias> --resume (history preserved). Used by the !model command and
 // the model: picker button.
 function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+  if (session.agent === AGENT_CODEX) {
+    if (session.busy) {
+      sendReply('Finish or interrupt the current Codex turn before switching models.');
+      return;
+    }
+    const requested = String(arg || '').trim();
+    if (!requested || /\s/.test(requested)) {
+      sendReply('Usage: /model <model-id> (or /model default)');
+      return;
+    }
+    const model = requested.toLowerCase() === 'default' ? null : requested;
+    session.currentModel = model;
+    session.codex.model = model;
+    persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model });
+    sendReply(model
+      ? `Codex model set to ${model}; it will apply on the next turn.`
+      : 'Codex model reset to the local config default; it will apply on the next turn.');
+    return;
+  }
   if (session.iv) {
     // Interactive: type /model into the live TUI. Not persisted by design —
     // the pick applies to the live session only (spec non-goal); a restart
@@ -6548,6 +7065,10 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
 // mode (same session id, history preserved). Used by the !mode command and the
 // mode: toggle button.
 function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml }) {
+  if (session.agent === AGENT_CODEX) {
+    sendReply('Interactive Codex mode is not part of this first integration.');
+    return;
+  }
   const decision = planModeSwitch(session, wantInteractive);
   if (!decision.ok) {
     sendReply(decision.message);
@@ -6581,6 +7102,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   journalStreamClear(existing);
   killSession(existing);
   const next = createSession(roomId, workdir, sessionId, {
+    agent: existing.agent,
     mcpExtras: existing.mcpExtras,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
@@ -6622,6 +7144,20 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
 // never delivers one (wedged process), so the bridge stops queueing
 // messages behind a busy flag nothing will ever clear.
 async function printModeInterrupt(session, sendReply) {
+  if (session.agent === AGENT_CODEX) {
+    if (!session.alive || !session.busy || !session.codex?.child) {
+      await sendReply('Nothing to interrupt — Codex is idle.');
+      return;
+    }
+    session._codexInterrupted = true;
+    if (session.codex.interrupt('SIGINT')) {
+      await sendReply('⏹ Interrupt sent — waiting for Codex to stop this turn.');
+    } else {
+      session._codexInterrupted = false;
+      await sendReply('Could not interrupt the Codex turn.');
+    }
+    return;
+  }
   if (!session.proc || !session.alive) {
     await sendReply('No claude process to interrupt.');
     return;
@@ -6688,7 +7224,9 @@ function killSession(session, signal = 'SIGTERM') {
 
   if (!session.alive) return;
   try {
-    if (session.iv) session.iv.kill(signal);
+    session.alive = false;
+    if (session.agent === AGENT_CODEX && session.codex) session.codex.kill(signal);
+    else if (session.iv) session.iv.kill(signal);
     else if (session.proc) session.proc.kill(signal);
   } catch (e) {
     debug(`killSession error: ${e.message}`);
@@ -6711,6 +7249,21 @@ function startIdleReaper() {
       debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
       session._autoStopped = true;
       killSession(session, 'SIGTERM');
+      // Claude's persistent child close handler performs this cleanup. An
+      // idle Codex logical session normally has no child between turns, so
+      // there will be no close event to remove it from the live map.
+      if (session.agent === AGENT_CODEX) {
+        sessions.delete(roomId);
+        if (session.typingInterval) {
+          clearInterval(session.typingInterval);
+          session.typingInterval = null;
+          client.setTyping(session.roomId, false, 1000).catch(() => {});
+        }
+        journalStreamClear(session);
+        journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
+      }
     }
   }, SESSION_IDLE_CHECK_MS).unref();
 }

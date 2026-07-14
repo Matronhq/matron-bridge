@@ -1,11 +1,13 @@
 # claude-matrix-bridge
 
-Chat with Claude Code CLI sessions from anywhere. The bridge spawns and manages Claude Code sessions on your dev box and connects them to two transports:
+Chat with Claude Code or Codex CLI sessions from anywhere. The bridge spawns and manages coding-agent sessions on your dev box and connects them to two transports:
 
 - **Matrix** — messages arrive in per-session Matrix rooms (E2EE-capable when `ENCRYPT_SESSION_ROOMS=1`), so any Matrix client works.
 - **Matron journal** (optional) — the same traffic is mirrored to a [matron-journal](https://github.com/Matronhq/matron-journal) server for the native Matron apps ([iOS](https://github.com/Matronhq/matron-apple), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)), including live typing/streaming indicators and a return path for user input.
 
-Uses Claude Code's `--print` mode with structured JSON streaming — no TUI scraping, no ANSI stripping.
+Claude uses `--print` structured JSON streaming. Codex uses the stable programmatic `codex exec --json` interface, starting one process per turn and resuming the same Codex thread automatically.
+
+Codex turns run with `approval_policy="never"` because there is no interactive terminal to approve escalations. The sandbox defaults to `workspace-write`; blocked operations fail closed and the bridge surfaces the error. Only use `CODEX_SANDBOX_MODE=danger-full-access` on a host you intentionally trust for unattended agent execution.
 
 ## License
 
@@ -14,7 +16,7 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 ## Requirements
 
 - Node.js 22+ (matrix-js-sdk 41.x uses `Promise.withResolvers`, which only landed in v22)
-- Claude Code CLI installed and authenticated
+- Claude Code CLI and/or Codex CLI installed and authenticated
 - A Matrix homeserver, such as [matron-server](https://github.com/matronhq/matron-server), Matron's branch of Tuwunel, with a bot account
 
 **Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm). For voice notes: `setup/install-whisper.sh` will install the rest.
@@ -149,11 +151,14 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `MATRIX_BOT_RECOVERY_KEY` | Imported bot recovery key from an add-bot blob | — |
 | `BRIDGE_ROOM_ID` | Imported bridge room ID from an add-bot blob, used by helper tools | — |
 | `ALLOWED_USER_IDS` | Comma-separated Matrix user IDs (e.g. `@alice:matron.chat`) | `""` (any user) |
-| `DEFAULT_WORKDIR` | Default working directory for Claude Code sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
+| `DEFAULT_WORKDIR` | Default working directory for coding-agent sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
+| `MATRON_DEFAULT_AGENT` | Default coding agent (`claude` or `codex`); override per command with `--claude` / `--codex` | `claude` |
 | `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
 | `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
 | `ENCRYPT_SESSION_ROOMS` | Set to `0` to create unencrypted per-session rooms. Unset or `1` creates encrypted per-session rooms. | enabled |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
+| `BRIDGE_CODEX_MD_PATH` | Optional developer-instructions markdown injected into bridge-spawned Codex turns | `BRIDGE_CODEX.md` |
+| `CODEX_SANDBOX_MODE` | Sandbox for Codex programmatic turns: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
 | `DEBUG` | Set to `1` to log raw JSON events from Claude Code | `0` |
 | `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work over Matrix | `0` |
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
@@ -167,15 +172,16 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 
 | Command | Description |
 |---|---|
-| `!start [workdir]` | Start a Claude Code session (optional custom workdir) |
+| `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
 | `!start --browser [workdir]` | Also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
 | `!stop` | Stop the current session |
 | `!restart [--browser]` | Stop and immediately resume the session (toggle browser tools on without losing context) |
-| `!resume [n\|id] [--browser]` | Resume a previous session |
-| `!sessions` | List all past sessions |
-| `!workdir <path> [--browser]` | Change working directory (restarts session) |
+| `!resume [--claude\|--codex] <n\|id> [--browser]` | Resume a previous session (`--browser` is Claude-only) |
+| `!sessions [--claude\|--codex]` | List past sessions for an agent |
+| `!workdir [--claude\|--codex] <path> [--browser]` | Start an agent session in another working directory (`--browser` is Claude-only) |
 | `!status` | Show session info (uptime, workdir, restarts) |
+| `!agent` | Show the current/default coding agent |
 | `!working` | Toggle tool call visibility |
 | `!mcp` | Show MCP server status |
 | `!model` | Show current model info |
@@ -184,7 +190,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!tools` | List available tools |
 | `!help` | Show available commands |
 
-Any other message is forwarded directly to Claude Code. Claude Code slash commands (e.g. `/commit`, `/review-pr`) are passed through directly.
+Any other message is forwarded directly to the selected agent. Claude Code slash commands (e.g. `/commit`, `/review-pr`) are passed through in Claude interactive mode; Codex programmatic sessions treat messages as normal task prompts.
 
 ## Matron journal transport
 
@@ -211,12 +217,12 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 ## How it works
 
 1. Matrix messages arrive via `matrix-bot-sdk`
-2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`
-3. User messages are sent as JSON on stdin
-4. Structured JSON events are parsed from stdout — response text is extracted from `assistant` and `result` events
+2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`, or Codex is run with `codex exec --json`
+3. User messages are sent as Claude stream JSON or as a Codex stdin prompt
+4. Structured JSON events are parsed from stdout and normalized into the shared bridge session lifecycle
 5. The complete response is sent to the Matrix room when a `result` event arrives (turn complete)
 6. Long responses are split at 32K-char boundaries
-7. Sessions persist across restarts via `--resume <session-id>`
+7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `exec resume <thread-id>`
 8. Crashed sessions auto-restart up to 3 times
 9. Messages sent while Claude is busy are queued and sent when the turn completes
 
