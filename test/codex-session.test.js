@@ -166,6 +166,22 @@ describe('Codex bridge wiring', () => {
     expect(recreateBody).toContain('flushPendingSessionQueue(next)');
   });
 
+  it('keeps Codex model defaults provider-local across recreation', () => {
+    const createStart = src.indexOf('function createCodexSessionForRoom(');
+    const createEnd = src.indexOf('\nfunction ', createStart + 1);
+    const createBody = src.slice(createStart, createEnd);
+    expect(createBody).toContain('getPersistedAgentState(persisted, AGENT_CODEX');
+    expect(createBody).toContain('persistedCodexState.model');
+    expect(createBody).not.toContain('persisted?.model');
+
+    const recreateStart = src.indexOf('function recreateSession(');
+    const recreateEnd = src.indexOf('\nfunction ', recreateStart + 1);
+    const recreateBody = src.slice(recreateStart, recreateEnd);
+    expect(recreateBody).toMatch(
+      /model: existing\.agent === AGENT_CODEX[\s\S]*\? existing\.currentModel[\s\S]*: \(existing\.currentModel \|\| undefined\)/,
+    );
+  });
+
   it('does not overwrite an established same-provider ID with a pre-init null', () => {
     const start = src.indexOf('function persistSession(');
     const end = src.indexOf('\nfunction ', start + 1);

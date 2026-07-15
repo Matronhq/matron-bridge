@@ -1158,7 +1158,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
 function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persisted = getPersistedSession(roomId);
-  const model = options.model === null ? undefined : (options.model ?? persisted?.model ?? undefined);
+  const historyLength = Array.isArray(persisted?.chatHistory) ? persisted.chatHistory.length : 0;
+  const persistedCodexState = getPersistedAgentState(persisted, AGENT_CODEX, historyLength);
+  const model = options.model === null
+    ? undefined
+    : (options.model ?? persistedCodexState.model ?? undefined);
   const codex = new CodexExecSession({
     cwd,
     threadId: resumeSessionId || null,
@@ -6843,7 +6847,13 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     // this a /mode toggle or /restart would resume on the stale persisted/
     // default model. An explicit override (e.g. /model in print mode) still
     // wins via the spread below.
-    model: existing.currentModel || undefined,
+    // Codex null means "use its config default" and must remain explicit;
+    // falling back to persisted.model can otherwise pick up Claude's model.
+    // Claude keeps the historical undefined fallback for a not-yet-observed
+    // live model so its persisted selection survives a TUI restart.
+    model: existing.agent === AGENT_CODEX
+      ? existing.currentModel
+      : (existing.currentModel || undefined),
     ...overrides,
   });
   next.sendCallback = sendReply;
