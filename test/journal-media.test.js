@@ -52,6 +52,16 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
   });
 
+  it('awaits an ASYNC buildSavedBlocks (the inline-image downscale path returns a promise)', async () => {
+    const blocks = [{ type: 'text', text: 'Image saved to /w/big.jpg' }, { type: 'image', source: {} }];
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/jpeg' })),
+      buildSavedBlocks: vi.fn(async () => blocks),
+    });
+    await route(session, { type: 'image', blobRef: 'img-2', contentType: 'image/jpeg', name: 'big.jpg' }, ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, blocks);
+  });
+
   it('uses the fetched content-type when the frame declared none', async () => {
     const { route, deps } = makeRouter({
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('x'), contentType: 'text/plain' })),

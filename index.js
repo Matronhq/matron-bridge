@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
+import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -4355,7 +4356,10 @@ function safeMediaFilename(name) {
 // feed the iv upload annotation; `workdirName` names the SDK-mode save.
 // Returns { blocks, ivHandled } — ivHandled true means the iv branch already
 // folded any caption in, so the caller must not append it again.
-function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, ivCaption, workdirName }) {
+// `inline` is an optional prepareInlineImage decision governing the base64
+// image block only (downscaled copy / skip); the buffer written to disk and
+// the pending-media mirror always carry the full-resolution original.
+function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, ivCaption, workdirName, inline }) {
   const blocks = [];
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
@@ -4380,10 +4384,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     const imgPath = deduplicateFilename(session.workdir, workdirName);
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
-    blocks.push({
-      type: 'image',
-      source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
-    });
+    appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
     // Save file to workdir
@@ -4398,10 +4399,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
         source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') }
       });
     } else if (mime.startsWith('image/')) {
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
-      });
+      appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath });
     } else if (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/csv'].includes(mime)) {
       blocks.push({ type: 'text', text: `Contents of ${workdirName}:\n${buffer.toString('utf-8')}` });
     } else {
@@ -5903,11 +5901,22 @@ function journalOnText(session, body, { username }) {
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
-  buildSavedBlocks: (session, { buffer, mime, isImage, name, dims }) => {
+  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims }) => {
     const safeName = safeMediaFilename(name);
+    // Downscale/skip decision for the INLINE copy only (iv mode never inlines,
+    // so don't burn a decode there). The original buffer still goes to disk.
+    let inline = null;
+    if (!session.iv && (isImage || (typeof mime === 'string' && mime.startsWith('image/')))) {
+      inline = await prepareInlineImage(buffer, mime);
+      if (inline.action === 'replace') {
+        console.log(`[journal-media] inline image downscaled: ${buffer.length}B ${mime} -> ${inline.buffer.length}B ${inline.mediaType} ${inline.width}x${inline.height}`);
+      } else if (inline.action === 'skip') {
+        console.warn(`[journal-media] inline image skipped (${inline.reason}); full file still saved for Read`);
+      }
+    }
     return buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
-      ivFilename: safeName, ivCaption: null, workdirName: safeName,
+      ivFilename: safeName, ivCaption: null, workdirName: safeName, inline,
     }).blocks;
   },
   injectText: (session, text) => sendTextToSession(session, text),
