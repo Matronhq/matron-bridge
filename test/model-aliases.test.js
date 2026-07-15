@@ -72,4 +72,12 @@ describe('modelFromEvent', () => {
     expect(modelFromEvent(null)).toBe(null);
     expect(modelFromEvent({ message: {} })).toBe(null);
   });
+  it('skips subagent events — their model must not clobber the parent meter', () => {
+    // Print mode tags subagent events with parent_tool_use_id; older inline
+    // transcripts use isSidechain. contextWindowFor() derives the gauge
+    // window from the model, so one leaked subagent event corrupts both the
+    // header's model label and the context percentage.
+    expect(modelFromEvent({ parent_tool_use_id: 'tu_1', message: { model: 'claude-haiku-4-5' } })).toBe(null);
+    expect(modelFromEvent({ isSidechain: true, message: { model: 'claude-haiku-4-5' } })).toBe(null);
+  });
 });
