@@ -114,6 +114,24 @@ describe('prepareInlineImage — downscale / re-encode', () => {
 });
 
 describe('prepareInlineImage — skip cases', () => {
+  it('skips when encode fails on an image whose known dimensions exceed the API pixel limit', async () => {
+    // A real JPEG whose SOF0 header is patched to declare 30000x30000:
+    // metadata() (header-only parse) reports the huge dimensions, but the full
+    // decode trips sharp's input pixel guard, so encode fails AFTER the
+    // dimensions are known — the fallback must not inline an image the API
+    // would reject on pixels alone.
+    const buf = await flatJpeg(100, 80);
+    const sof = buf.indexOf(Buffer.from([0xff, 0xc0]));
+    expect(sof).toBeGreaterThan(-1);
+    buf.writeUInt16BE(30000, sof + 5); // SOF0 height
+    buf.writeUInt16BE(30000, sof + 7); // SOF0 width
+    const meta = await sharp(buf, { limitInputPixels: false }).metadata();
+    expect(meta.width).toBe(30000); // fixture sanity: header now declares huge dims
+    const res = await prepareInlineImage(buf, 'image/jpeg');
+    expect(res.action).toBe('skip');
+    expect(res.reason).toMatch(/8000/);
+  });
+
   it('skips an undecodable buffer over the API byte cap', async () => {
     const buf = Buffer.alloc(INLINE_IMAGE_DEFAULTS.hardMaxBytes + 1, 7);
     const res = await prepareInlineImage(buf, 'image/png');
