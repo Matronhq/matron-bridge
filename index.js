@@ -31,6 +31,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
+import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -671,14 +672,13 @@ function journalActivity(session, state, detail) {
 // I/O is Write's size-capped readFileSync of the old content inside
 // computeEditDiff, which swallows every failure — journal problems never
 // touch the Matrix hot path.
-function publishEditDiff(session, toolName, input, label) {
-  if (!JOURNAL_ENABLED || !input?.file_path) return;
+function buildEditDiffPayload(session, toolName, input, label) {
   const absPath = path.isAbsolute(input.file_path)
     ? input.file_path
     : path.join(session.workdir, input.file_path);
   const result = computeEditDiff(toolName, input, session.workdir);
-  if (!result) return;
-  journalPublish(session, 'publishDiff', {
+  if (!result) return null;
+  return {
     file_path: absPath,
     display_path: input.file_path,
     viewer_url: generateFileLink(absPath, session.workdir),
@@ -690,7 +690,27 @@ function publishEditDiff(session, toolName, input, label) {
     truncated: result.truncated,
     new_file: result.newFile,
     from: 'assistant',
-  });
+  };
+}
+
+function publishEditDiff(session, toolName, input, label) {
+  if (!JOURNAL_ENABLED || !input?.file_path) return;
+  const payload = buildEditDiffPayload(session, toolName, input, label);
+  if (!payload) return;
+  journalPublish(session, 'publishDiff', payload);
+}
+
+// A subagent's Edit/Write/MultiEdit diff card, routed straight to the child
+// convo (spec PR B) rather than into the parent. Children exist only after the
+// parent session id is known, so this publishes directly (no pre-session-id
+// buffering) — the child's convo_upsert was already enqueued at discovery, so
+// it reaches the server before this diff (FIFO queue). label is null: the card
+// is the child's own edit, and the child convo is already the subagent.
+function publishEditDiffToConvo(session, convoId, toolName, input) {
+  if (!JOURNAL_ENABLED || !convoId || !input?.file_path) return;
+  const payload = buildEditDiffPayload(session, toolName, input, null);
+  if (!payload) return;
+  journalPublisher.publishDiff(convoId, payload);
 }
 
 // Account-wide rate limits for the status frame, shared across all sessions
@@ -1080,10 +1100,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     session.alive = false;
     debug(`Claude process exited with code ${exitCode}`);
 
-    if (session.subagentWatcher) {
-      session.subagentWatcher.stop().catch(() => {});
-      session.subagentWatcher = null;
-    }
+    teardownSubagentTracking(session);
 
     // Flush any remaining response
     flushResponse(session);
@@ -1188,9 +1205,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // the parent's stream emits a Task tool_use. The watcher object is cheap
   // to construct; it doesn't poll until the first Task fires.
   if (session.claudeSessionId) {
-    session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId: session.claudeSessionId });
-    session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
-    session.subagentWatcher.snapshot();
+    setupSubagentWatcher(session, cwd, session.claudeSessionId);
   }
 
   sessions.set(roomId, session);
@@ -1630,10 +1645,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   iv.on('exit', exitCode => {
     session.alive = false;
     debug(`Interactive claude session ${sessionId} exited code=${exitCode}`);
-    if (session.subagentWatcher) {
-      session.subagentWatcher.stop().catch(() => {});
-      session.subagentWatcher = null;
-    }
+    teardownSubagentTracking(session);
     flushResponse(session);
     // Same exit-seam overlay clear as print-mode's proc.on('close'). iv-mode
     // reads complete messages from the transcript, so no overlay should ever
@@ -1794,9 +1806,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   };
 
   // Subagent activity watcher — see createSession() for the rationale.
-  session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId });
-  session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
-  session.subagentWatcher.snapshot();
+  setupSubagentWatcher(session, cwd, sessionId);
 
   sessions.set(roomId, session);
   return session;
@@ -2432,82 +2442,96 @@ function resolveQuestionAnswer(session, text) {
 
 // --- Claude Event Handler ---
 
-// Format a subagent tool_use block as a Matrix indicator. Returns null for
-// tools we don't surface (Read/Glob/Grep/Bash/etc.) to keep the room
-// usable — mirrors the parent's "key event" gating without the
-// liveOutput/showWorking machinery.
-function formatSubagentToolIndicator(label, toolName, input) {
-  const safeLabel = `<i>${escapeHtml(label)}</i>`;
-  if (toolName === 'WebSearch' && input.query) {
-    return {
-      plain: `🔀[${label}] 🌐 ${input.query}`,
-      html: `🔀[${safeLabel}] 🌐 <i>${escapeHtml(input.query)}</i>`,
-    };
-  }
-  if (toolName === 'WebFetch' && input.url) {
-    return {
-      plain: `🔀[${label}] 🌐 ${input.url}`,
-      html: `🔀[${safeLabel}] 🌐 <a href="${escapeHtml(input.url)}">${escapeHtml(input.url)}</a>`,
-    };
-  }
+// Format a subagent tool_use block as a plain journal-text body for the child
+// convo. Returns null for tools we don't surface (Read/Glob/Grep/Bash/etc.) to
+// keep the child convo readable — mirrors the parent's "key event" gating. No
+// 🔀[label] prefix: the child conversation IS the subagent, so its label lives
+// in the convo title, not on every line.
+function formatSubagentToolBody(toolName, input) {
+  if (toolName === 'WebSearch' && input.query) return `🌐 ${input.query}`;
+  if (toolName === 'WebFetch' && input.url) return `🌐 ${input.url}`;
   if (toolName === 'Task' || toolName === 'Agent') {
     const desc = (input.description || input.prompt || '').slice(0, 80);
-    return {
-      plain: `🔀[${label}] 🔀 Nested subtask: ${desc}`,
-      html: `🔀[${safeLabel}] 🔀 Nested subtask: <i>${escapeHtml(desc)}</i>`,
-    };
+    return `🔀 Nested subtask: ${desc}`;
   }
   if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
     const lines = input.todos.map(t => {
       const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
       return `${icon} ${t.content || t.text || ''}`;
     });
-    const htmlItems = input.todos.map(t => {
-      const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
-      return `<li>${icon} ${escapeHtml(t.content || t.text || '')}</li>`;
-    }).join('');
-    return {
-      plain: `🔀[${label}] 📋 Todos:\n${lines.join('\n')}`,
-      html: `🔀[${safeLabel}] 📋 <b>Todos:</b><ul>${htmlItems}</ul>`,
-    };
+    return `📋 Todos:\n${lines.join('\n')}`;
   }
   return null;
 }
 
-function handleSubagentEvent(session, { label, event }) {
+// Construct + wire a session's subagent watcher and its child-convo tracker.
+// The tracker publishes each discovered subagent as its own child conversation
+// (parent_convo_id = this session's convo) and routes the subagent's output
+// there; getParentConvoId resolves lazily so agent-switching (which changes
+// journalConvoId) is followed. Called from every spawn path (print eager,
+// iv-mode, and the lazy print-mode construction in handleClaudeEvent).
+function setupSubagentWatcher(session, workdir, sessionId) {
+  session.subagentConvos = createSubagentConvoTracker({
+    publisher: journalPublisher,
+    getParentConvoId: () => journalConvoIdFor(session),
+    log: console,
+  });
+  session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
+  session.subagentWatcher.on('subagent-start', payload => handleSubagentStart(session, payload));
+  session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
+  session.subagentWatcher.snapshot();
+}
+
+// Stop a session's subagent watcher and settle its children. finishAll marks
+// any still-running child 'done' (the "transcript closes" completion signal and
+// the catch-all for a subagent whose Task tool_result was never paired) before
+// the tracker is dropped.
+function teardownSubagentTracking(session) {
+  if (session.subagentConvos) {
+    session.subagentConvos.finishAll();
+    session.subagentConvos = null;
+  }
+  if (session.subagentWatcher) {
+    session.subagentWatcher.stop().catch(() => {});
+    session.subagentWatcher = null;
+  }
+}
+
+// Watcher discovery: publish the child convo (running, linked to the parent,
+// titled from the sidecar meta) the instant the subagent's transcript appears,
+// even before it emits any event.
+function handleSubagentStart(session, { agentId, label, agentType }) {
+  if (!session || !session.subagentConvos) return;
+  session.subagentConvos.discover(agentId, { label, agentType });
+}
+
+function handleSubagentEvent(session, { agentId, label, agentType, event }) {
   if (!session || !session.alive) return;
   if (!event || !event.message) return;
   const content = event.message.content;
   if (!Array.isArray(content)) return;
+  if (!session.subagentConvos) return;
+
+  // Ensure the child convo exists, refresh its title, and publish the
+  // per-subagent status (model/context from THIS subagent's own event). The
+  // returned child carries the convo id every publish below routes to.
+  const child = session.subagentConvos.onEvent(agentId, { label, agentType, event });
+  if (!child) return;
+  const convoId = child.convoId;
 
   if (event.type === 'assistant') {
-    // Subagent transcripts on disk write each reasoning message as its
-    // own event with its own messageId. Intermediate "let me check X"
-    // narration between tool calls comes with stop_reason=null; only the
-    // final answer gets stop_reason=end_turn. We post all of them —
-    // skipping null would silence most subagent activity, and short
-    // subagents sometimes never emit an end_turn at all.
-
+    // Subagent transcripts write each reasoning message as its own event with
+    // its own messageId; we post all of them (see the on-disk note in
+    // lib/subagent-watcher.js) — short subagents sometimes never emit end_turn.
     const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
     if (textParts.length > 0) {
       const text = textParts.join('').trim();
       const isFiller = textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0]);
       if (text && !isFiller) {
-        const prefix = `🔀[${label}] `;
-        const htmlPrefix = `🔀[<i>${escapeHtml(label)}</i>] `;
-        // Subagents can produce long output (analysis, code dumps). Split
-        // before posting so we don't blow past MAX_MSG_LENGTH.
-        const chunks = splitMessage(prefix + text);
-        for (const chunk of chunks) {
-          if (session.sendHtml) {
-            // Strip the plain prefix off the chunk before re-rendering as
-            // HTML so we don't double-prefix. First chunk always has it;
-            // subsequent chunks start at a wrap point and don't.
-            const chunkBody = chunk.startsWith(prefix) ? chunk.slice(prefix.length) : chunk;
-            session.sendHtml(chunk, htmlPrefix + markdownToHtml(chunkBody));
-          } else if (session.sendCallback) {
-            session.sendCallback(chunk);
-          }
+        // Route to the child convo, no 🔀[label] prefix (spec PR B: drop the
+        // parent-prefixed path). splitMessage keeps a long dump under the cap.
+        for (const chunk of splitMessage(text)) {
+          journalPublisher.publishText(convoId, { body: chunk, from: 'assistant' });
         }
         session.lastActivityAt = Date.now();
       }
@@ -2515,26 +2539,23 @@ function handleSubagentEvent(session, { label, event }) {
 
     for (const block of content) {
       if (block.type !== 'tool_use') continue;
-      // If a subagent itself spawns another subagent, trigger another
-      // discovery burst so the nested agent-<id>.jsonl gets a tail.
+      // A subagent spawning its own subagent: pair the nested Task's id and
+      // trigger another discovery burst so the nested agent-<id>.jsonl gets a
+      // tail. One-level watcher architecture — the nested agent attaches as a
+      // direct child of this parent session (see the PR notes on nesting).
       if ((block.name === 'Task' || block.name === 'Agent') && session.subagentWatcher) {
+        session.subagentConvos.noteTaskStarted(block.id);
         session.subagentWatcher.notifyTaskStarted();
       }
       if ((block.name === 'Edit' || block.name === 'Write' || block.name === 'MultiEdit')
           && block.input?.file_path) {
-        // Rich diff card instead of the "🔀[label] ✏️ Editing …" line —
-        // journal-only, same contract as the parent-agent path.
-        publishEditDiff(session, block.name, block.input, label);
+        publishEditDiffToConvo(session, convoId, block.name, block.input);
         session.lastActivityAt = Date.now();
         continue;
       }
-      const formatted = formatSubagentToolIndicator(label, block.name, block.input || {});
-      if (!formatted) continue;
-      if (session.sendHtml) {
-        session.sendHtml(formatted.plain, formatted.html);
-      } else if (session.sendCallback) {
-        session.sendCallback(formatted.plain);
-      }
+      const body = formatSubagentToolBody(block.name, block.input || {});
+      if (!body) continue;
+      journalPublisher.publishText(convoId, { body, from: 'assistant' });
       session.lastActivityAt = Date.now();
     }
   }
@@ -2564,9 +2585,7 @@ function handleClaudeEvent(session, event) {
   // watcher up front. Decoupled from the id-capture block above so future
   // refactors can't silently lose the watcher on either spawn path.
   if (session.claudeSessionId && !session.subagentWatcher) {
-    session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId });
-    session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
-    session.subagentWatcher.snapshot();
+    setupSubagentWatcher(session, session.workdir, session.claudeSessionId);
   }
 
   // Log all event types for plan mode debugging
@@ -2839,8 +2858,11 @@ function handleClaudeEvent(session, event) {
             indicatorHtml = `🔀 Subtask: <i>${escapeHtml(desc)}</i>`;
             isKeyEvent = true;
             // Trigger the subagent watcher's discovery burst — the new
-            // agent-<id>.jsonl file appears within ~100ms of this event.
+            // agent-<id>.jsonl file appears within ~100ms of this event — and
+            // remember this Task's tool_use_id so the child it spawns can carry
+            // it as task_ref (links the parent's Task card to the child convo).
             if (session.subagentWatcher) {
+              session.subagentConvos?.noteTaskStarted(block.id);
               session.subagentWatcher.notifyTaskStarted();
             }
           } else if (toolName === 'TodoWrite') {
@@ -3172,6 +3194,9 @@ function handleClaudeEvent(session, event) {
         for (const block of userContent) {
           // Mark live-output complete on tool_result for any tracked Bash command.
           if (block.type === 'tool_result' && block.tool_use_id) {
+            // A Task tool_result means the subagent it spawned has completed —
+            // finish that child convo (no-op for every non-Task tool_result).
+            session.subagentConvos?.noteTaskResult(block.tool_use_id);
             const entry = liveOutputStore.get(block.tool_use_id);
             // Only pay for the blockText join + three regex scans below when
             // something will actually consume the result: either the
@@ -7016,11 +7041,8 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   if (!session) return;
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
-  // stops it, but belt-and-braces.
-  if (session.subagentWatcher) {
-    session.subagentWatcher.stop().catch(() => {});
-    session.subagentWatcher = null;
-  }
+  // stops it, but belt-and-braces. Also settles child convos (finishAll).
+  teardownSubagentTracking(session);
 
   // Stop and finalize any still-open tool-output streams for this session so
   // the server frees their buffers now; the idle sweep is the backstop, not
