@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn } from 'child_process';
+import { transcribeAudio } from './lib/transcribe.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -29,6 +30,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
+import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
@@ -45,8 +47,9 @@ import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
-import { pendingMediaMirror } from './lib/media-mirror.js';
+import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
@@ -134,6 +137,9 @@ for (const ex of knownMcpExtras()) {
     console.warn(`[mcp-config] Flag --${ex} is recognised but no matching mcpExtras block exists; sessions opting in will get no extra servers.`);
   }
 }
+const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
+
 // Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
   const hostname = os.hostname();
@@ -3214,6 +3220,22 @@ function plainTextFormat(text) {
   });
 }
 
+// --- File Helpers ---
+
+function deduplicateFilename(dir, filename) {
+  let target = path.join(dir, filename);
+  if (!fs.existsSync(target)) return target;
+
+  const ext = path.extname(filename);
+  const base = path.basename(filename, ext);
+  let i = 1;
+  while (fs.existsSync(target)) {
+    target = path.join(dir, `${base}-${i}${ext}`);
+    i++;
+  }
+  return target;
+}
+
 // --- Send to Session ---
 
 // skipJournalMirror: set by the journal input consumer's Matrix echoes
@@ -3560,6 +3582,86 @@ function hasToolResultInHistory(sessionId, workdir, toolUseId) {
     }
   } catch {}
   return false;
+}
+
+// --- Media Handling ---
+
+// Basename-safe a media filename used as a path segment for workdir/upload
+// saves: strips directory components a malicious/odd name might carry
+// (mirrors resolveUploadMeta in lib/iv-uploads.js; '.'/'..' survive basename,
+// so fold them — and the empty case — into the 'file' fallback).
+function safeMediaFilename(name) {
+  const base = path.basename(typeof name === 'string' && name ? name : 'file');
+  return base === '' || base === '.' || base === '..' ? 'file' : base;
+}
+
+// Build the claude content blocks for an already-materialized (fetched from
+// the journal blob store) NON-audio media buffer: saves the bytes to the right
+// place (iv upload dir vs. session workdir) and produces the same save-path
+// text + inline image/document blocks the media path has always produced.
+// Called by the journal media path (journalOnMedia, whose bytes come from
+// journalPublisher.fetchMedia) so a file sent from Matron feels identical to
+// claude. Audio is NOT handled here — the caller surfaces transcription
+// progress itself, so it runs transcribeAudio directly. `isImage` selects the
+// image branch by msgtype rather than mime — an image-mime file still falls
+// through the file branch's inline-image sub-case. `ivFilename`/`ivCaption`
+// feed the iv upload annotation; `workdirName` names the SDK-mode save.
+// Returns { blocks, ivHandled } — ivHandled true means the iv branch already
+// folded any caption in, so the caller must not append it again.
+function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, ivCaption, workdirName }) {
+  const blocks = [];
+  if (session.iv) {
+    // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
+    // only an absolute-path annotation; Claude reads it with its Read tool.
+    // No base64 blocks and no inline content dump (SDK mode keeps those).
+    const dir = ivUploadDir(session.roomId);
+    const savePath = deduplicateFilename(dir, ivFilename);
+    fs.writeFileSync(savePath, buffer);
+    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption: ivCaption }) });
+    // Journal mirror (upload + publish + markRead) is deferred to actual
+    // dispatch time — see lib/media-mirror.js. Attaching it here (rather
+    // than calling journalMirrorUserMedia now) is what stops a queued
+    // attachment that later gets cancelled from leaving a phantom journal
+    // entry / advanced read marker for something Claude never saw. (The
+    // journal media path never reads these back — its blob is already in the
+    // journal — so the tag is simply inert there.)
+    attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
+    return { blocks, ivHandled: true };
+  }
+  if (isImage) {
+    // Save image to workdir
+    const imgPath = deduplicateFilename(session.workdir, workdirName);
+    fs.writeFileSync(imgPath, buffer);
+    blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
+    blocks.push({
+      type: 'image',
+      source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
+    });
+    attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
+  } else {
+    // Save file to workdir
+    const savePath = deduplicateFilename(session.workdir, workdirName);
+    fs.writeFileSync(savePath, buffer);
+    blocks.push({ type: 'text', text: `File saved to ${savePath}` });
+    attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
+
+    if (mime === 'application/pdf') {
+      blocks.push({
+        type: 'document',
+        source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') }
+      });
+    } else if (mime.startsWith('image/')) {
+      blocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
+      });
+    } else if (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/csv'].includes(mime)) {
+      blocks.push({ type: 'text', text: `Contents of ${workdirName}:\n${buffer.toString('utf-8')}` });
+    } else {
+      blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
+    }
+  }
+  return { blocks, ivHandled: false };
 }
 
 // --- Command Handler ---
@@ -4709,6 +4811,79 @@ function journalOnText(session, body, { username }) {
   });
 }
 
+// media (file/image/voice-note) -> session. Thin wiring around the injectable
+// lib/journal-media.js orchestrator: the router hands us a resolved
+// {type, blobRef, contentType, name, size, dims}; the orchestrator fetches the
+// blob back out of the journal blob store and feeds it to the session exactly
+// the way the Matrix media path does — audio transcribed and injected as if
+// the user typed it, images/files saved to the same per-session location and
+// attached to the next prompt. Fire-and-forget: the orchestrator's returned
+// function never throws/rejects (it swallows internally), matching the
+// router's contract for routeMediaToSession. Nothing here re-mirrors the blob
+// into the journal — the client's own file/image event is already there — so
+// file/image injection passes skipJournalMirror; a voice note's transcript IS
+// published (as the user's message, via sendTextToSession) so it's visible in
+// the journal too, mirroring what the Matrix m.audio path records.
+const journalMediaRouter = createJournalMediaRouter({
+  fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
+  transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  buildSavedBlocks: (session, { buffer, mime, isImage, name, dims }) => {
+    const safeName = safeMediaFilename(name);
+    return buildSavedMediaBlocks(session, {
+      buffer, mime, dims: dims || undefined, isImage,
+      ivFilename: safeName, ivCaption: null, workdirName: safeName,
+    }).blocks;
+  },
+  injectText: (session, text) => sendTextToSession(session, text),
+  injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
+  queueMedia: (session, entry) => journalQueueMedia(session, entry),
+  echoToRoom: journalEchoToRoom,
+  publishNotice: journalPublishNotice,
+  escapeHtml,
+  log: console,
+});
+
+// Queue a prepared media injection while the session is busy — the media
+// counterpart of the journal text busy-queue branch (journalRouteTextToSession)
+// and the Matrix busy media branch (room.message handler). Pushes the
+// already-fetched/built blocks onto the SAME session.queuedMessages a Matrix or
+// journal-text message uses (never a second queue), so the shared flushQueue
+// (one merged sendToSession at turn end) delivers them in arrival order with any
+// interleaved queued text, and posts the SAME "📨 Queued" tile via the shared
+// notifyQueuedMessage.
+//
+// The queued entry is a spread COPY of blocks: buildSavedMediaBlocks attaches a
+// non-enumerable pending-media-mirror tag, and a spread drops it so the flush
+// can't re-mirror a file the journal already recorded as the client's own
+// event. mirrorToJournal picks the origin: a voice-note transcript stays
+// Matrix-origin so flushQueue's mirrorText journal-publishes it (matching the
+// immediate sendTextToSession); a saved file/image is marked journal-origin so
+// it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
+// like the text path.
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) {
+  if (!session.queuedMessages) session.queuedMessages = [];
+  const entry = [...blocks];
+  if (!mirrorToJournal) markJournalOrigin(entry);
+  session.queuedMessages.push(entry);
+  const ctx = journalSessionCommandCtx(session);
+  // The queued tile is cosmetic: the entry above IS queued and will flush at
+  // turn end regardless, so a notify failure must not propagate — the
+  // router's catch would otherwise publish a false "wasn't delivered" notice
+  // for media that will in fact be delivered.
+  try {
+    await notifyQueuedMessage(session, preview, {
+      sendReply: ctx.sendReply,
+      htmlEscape: escapeHtml,
+    });
+  } catch (e) {
+    console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
+  }
+}
+
+function journalOnMedia(session, media, ctx) {
+  journalMediaRouter(session, media, ctx);
+}
+
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
 // {target_seq, choice, text}, {username}) interface.
 function journalOnPromptReply(session, answer, { username }) {
@@ -4860,6 +5035,7 @@ const journalInputConsumer = createJournalInputConsumer({
   },
   findSessionByConvoId: findSessionByClaudeSessionId,
   routeTextToSession: journalOnText,
+  routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
