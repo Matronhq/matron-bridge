@@ -8,6 +8,8 @@ Use `/switch codex` or `/switch claude` inside an idle session to hand the same 
 
 Codex turns run with `approval_policy="never"` because there is no interactive terminal to approve escalations. The sandbox defaults to `workspace-write`; blocked operations fail closed and the bridge surfaces the error. Only use `CODEX_SANDBOX_MODE=danger-full-access` on a host you intentionally trust for unattended agent execution.
 
+For the full operator reference, see [Using the Codex backend](docs/codex.md).
+
 ## License
 
 This project is licensed under AGPLv3. For alternative licensing, contact [licensing@matron.chat](mailto:licensing@matron.chat).
@@ -36,6 +38,38 @@ cp .env.example .env
 # Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN) and ALLOWED_USER_IDS
 npm start
 ```
+
+### Enable Codex
+
+Install and authenticate the Codex CLI as the same OS user that runs the bridge:
+
+```bash
+npm install -g @openai/codex
+codex login
+codex login status
+codex exec --json "Reply with exactly: Codex is ready"
+```
+
+The last command verifies the same non-interactive interface used by the bridge. For a headless machine, use `codex login --device-auth`; API-key login is also supported by the CLI. Do not copy `~/.codex/auth.json` into this repository or put credentials in chat.
+
+To make Codex the default, set these values in `.env`:
+
+```dotenv
+MATRON_DEFAULT_AGENT=codex
+CODEX_SANDBOX_MODE=workspace-write
+# Optional; the repository's BRIDGE_CODEX.md is used when empty
+BRIDGE_CODEX_MD_PATH=
+```
+
+You can keep Claude Code as the default and select Codex per conversation instead:
+
+```text
+/start --codex ~/Dev/my-project
+/agent
+/model default
+```
+
+After changing `.env`, restart the bridge or re-run the service installer as described below. See [Using the Codex backend](docs/codex.md) for sandbox guidance, `/switch` behavior, provider-specific commands, files/media, and troubleshooting.
 
 To run as a managed service, use the OS-detecting installer:
 
@@ -106,7 +140,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `BRIDGE_CODEX_MD_PATH` | Optional developer-instructions markdown injected into bridge-spawned Codex turns | `BRIDGE_CODEX.md` |
 | `CODEX_SANDBOX_MODE` | Sandbox for Codex programmatic turns: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
-| `DEBUG` | Set to `1` to log raw JSON events from Claude Code | `0` |
+| `DEBUG` | Set to `1` to log verbose bridge and coding-agent events | `0` |
 | `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work | `0` |
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
@@ -117,13 +151,15 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 
 ## Commands
 
+`/` and `!` command prefixes are interchangeable; the table uses `!` for brevity.
+
 | Command | Description |
 |---|---|
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
-| `!start --browser [workdir]` | Also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
+| `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
 | `!stop` | Stop the current session |
-| `!restart [--browser]` | Stop and immediately resume the session (toggle browser tools on without losing context) |
+| `!restart [--browser]` | Stop and immediately resume the session (`--browser` is Claude-only) |
 | `!resume [--claude\|--codex] <n\|id> [--browser]` | Resume a previous session (`--browser` is Claude-only) |
 | `!sessions [--claude\|--codex]` | List past sessions for an agent |
 | `!workdir [--claude\|--codex] <path> [--browser]` | Start an agent session in another working directory (`--browser` is Claude-only) |
@@ -132,9 +168,12 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!switch <claude\|codex>` | Hand the current conversation to the other agent (idle sessions only) |
 | `!working` | Toggle tool call visibility |
 | `!mcp` | Show MCP server status |
-| `!model` | Show current model info |
+| `!model [model-id\|default]` | Show or change the active provider's model |
+| `!mode` | Show the active mode (Codex is programmatic-only) |
+| `!effort [level]` | Show or set reasoning effort (Claude only; use Codex config for Codex) |
 | `!cost` | Show session cost |
 | `!usage` | Show token usage stats |
+| `!limits` | Show subscription limits when the active backend exposes them (not available for Codex) |
 | `!tools` | List available tools |
 | `!help` | Show available commands |
 
@@ -149,7 +188,7 @@ What rides the journal connection:
 - **Outbound mirror** — session output, uploaded files/images (media mirroring), and read-marker advances are published as journal events. The media HTTP endpoint is derived from `JOURNAL_WS_URL`; no extra config.
 - **Ephemeral live UX** — activity indicators (typing / "running `<command>`…") and in-progress assistant-text streaming for Matron clients viewing the conversation. Best-effort: never queued or replayed, so an outage means a missed indicator, not a stale one.
 - **Return path** — user messages and prompt-button replies sent from Matron clients are routed into the owning coding-agent session. The inbound cursor persists to `JOURNAL_CURSOR_FILE` so a restart resumes where it left off.
-- **Control convo** — one stable conversation (`JOURNAL_CONTROL_CONVO_ID`, default `bridge-<hostname>`) accepts session-management commands from Matron clients: `/start [dir]` (alias `new`), `/sessions` (alias `list`), `/resume`, `/workdir`, `/help`. Session-scoped commands (`/status`, `/stop`, …) don't apply there — they belong to each session's own conversation. `/` and `!` prefixes are interchangeable.
+- **Control convo** — one stable conversation (`JOURNAL_CONTROL_CONVO_ID`, default `bridge-<hostname>`) accepts session-management commands from Matron clients: `/start [--claude|--codex] [dir]` (alias `new`), `/sessions [--claude|--codex]` (alias `list`), `/resume`, `/workdir`, `/help`. Session-scoped commands (`/status`, `/stop`, …) don't apply there — they belong to each session's own conversation. `/` and `!` prefixes are interchangeable.
 
 | Variable | Description | Default |
 |---|---|---|
@@ -168,7 +207,7 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`, or Codex is run with `codex exec --json`
 3. User messages are sent as Claude stream JSON or as a Codex stdin prompt
 4. Structured JSON events are parsed from stdout and normalized into the shared bridge session lifecycle
-5. The complete response is published to the journal when a `result` event arrives (turn complete)
+5. The complete response is published to the journal when the provider reports that the turn is complete
 6. Long responses are split at 32K-char boundaries
 7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `exec resume <thread-id>`
 8. Agent handoffs persist one native session ID per provider plus a shared transcript cursor; the next prompt carries a bounded unseen transcript delta
@@ -186,6 +225,7 @@ matron-bridge/
 ├── ask-user.js           # MCP server for user questions / secure secret flows
 ├── BRIDGE_CLAUDE.md      # Extra instructions for bridge-spawned Claude sessions
 ├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
+├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, whisper
