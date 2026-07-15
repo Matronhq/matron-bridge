@@ -45,6 +45,7 @@ import {
 import { sendPrintInterrupt } from './lib/print-interrupt.js';
 import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
+import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -236,6 +237,11 @@ const journalPublisher = createJournalPublisher({
   onStreamResync: (convoId, messageRef, have) => {
     toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
   },
+  // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
+  // defined below): safe for the same reason onEvent's forward reference
+  // is — the callback only ever fires once the socket is live, long after
+  // module evaluation.
+  onRpcRequest: (request) => journalRpcHandler(request),
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -355,6 +361,48 @@ function getPersistedSession(roomId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
+
+// RPC-start (lib/journal-rpc.js `start`): the !start command body minus the
+// origin-room replies — an RPC start has no origin chat room. Returns the
+// session; the RPC handler answers with its claudeSessionId (the journal
+// convo id — NOT the room key, which is bridge-internal).
+function journalStartSessionForRpc({ workdir, mcpExtras }) {
+  const sessionRoomId = newSessionConvoId();
+  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+  const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
+    sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+  const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
+  session.originRoomId = null;
+  session.sendCallback = sessionSendReply;
+  session.sendHtml = sessionSendHtml;
+  session.sendButtonMessage = sessionSendButtons;
+  // Same iv-mode persistence rule as !start: claudeSessionId is known
+  // immediately, so persist extras now rather than losing them to a bridge
+  // restart before the first transcript-driven persist.
+  if (mcpExtras.length > 0 && session.claudeSessionId) {
+    persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null);
+  }
+  return session;
+}
+
+const journalRpcHandler = createRpcRequestHandler({
+  respondRpc: (args) => journalPublisher.respondRpc(args),
+  startSession: journalStartSessionForRpc,
+  // The !stop teardown for the unsupported_mode orphan: kill, drop from the
+  // sessions map (keyed by room id — scan, this path is rare), evict input.
+  stopSession: (session) => {
+    killSession(session);
+    for (const [key, value] of sessions) {
+      if (value === session) { sessions.delete(key); break; }
+    }
+    journalEvictConvoInput(session);
+  },
+  listPersistedSessions: () => Object.values(loadPersistedSessions()),
+  defaultWorkdir: DEFAULT_WORKDIR,
+  expandHome,
+  log: console,
+});
 
 // Reverse lookup for the journal return path: a journal frame's convo_id is
 // session.claudeSessionId, but `sessions` is keyed by roomId. The session

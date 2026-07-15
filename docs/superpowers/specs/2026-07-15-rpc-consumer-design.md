@@ -1,7 +1,7 @@
 # Agent RPC consumer: `start` + `recent_folders` — design (SP3, bridge side)
 
 **Date:** 2026-07-15
-**Status:** draft — awaiting review
+**Status:** implemented — pending deploy (bridge restart required)
 **Depends on:** matron-journal's agent RPC relay (merged + deployed;
 `docs/protocol.md` "Agent RPC" section and
 `docs/superpowers/specs/2026-07-15-agent-rpc-design.md` in that repo)
