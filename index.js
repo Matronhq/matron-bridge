@@ -57,7 +57,7 @@ import { seedJournalTitle } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -2565,6 +2565,18 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
 }
 
 function handleClaudeEvent(session, event) {
+  // A subagent's event riding the parent's stdout (parent_tool_use_id /
+  // isSidechain) is NOT the parent's: its text/tool_use/tool_result belong to
+  // the child conversation, and the subagent watcher already routes them
+  // there from the agent transcript (handleSubagentEvent). Letting them
+  // through here published every subagent narration into the parent convo as
+  // regular assistant text (2026-07-15 live dupe), pushed subagent tool
+  // indicators/diffs at the parent, and let a subagent's own Task tool_use
+  // pollute the parent FIFO. Skip them wholesale — the model/context guards
+  // that used to be the only defense (modelFromEvent,
+  // contextTokensFromAssistantEvent) stay as belt-and-braces.
+  if (isSidechainEvent(event)) return;
+
   // Capture the current model from any event that carries message.model.
   // This is the reliable source in iv-mode, where the system/init event (and
   // thus session.initData.model) never arrives.
@@ -3069,7 +3081,27 @@ function handleClaudeEvent(session, event) {
         } else {
           debug('Suppressed compaction completion notice (cooldown, last=%dms ago)', now - session.lastCompactCompleteNotify);
         }
+      } else if (event.subtype === 'task_started') {
+        // Background spawn (Agent tool, run_in_background): the stream hands
+        // us the explicit tool_use_id ↔ task_id pairing here — task_id is the
+        // watcher's agentId (agent-<task_id>.jsonl). Register it so (a) the
+        // FIFO ref can't mis-pair a sibling, (b) the instant launch
+        // tool_result doesn't mark the child done, and (c) the child's
+        // task_ref survives even when this event beats the watcher's
+        // discovery. local_agent only — background Bash task_started events
+        // carry no subagent and must not register phantom refs.
+        if (event.task_type === 'local_agent' && event.tool_use_id && event.task_id) {
+          session.subagentConvos?.noteBackgroundTaskStarted(event.tool_use_id, event.task_id);
+          session.subagentWatcher?.notifyTaskStarted();
+        }
       } else if (event.subtype === 'task_notification') {
+        // A background task actually finished. For a subagent (Agent tool)
+        // this — not the spawning tool_result, which fired at launch — is the
+        // completion signal that flips the child convo to 'done'. finish() is
+        // a no-op for task_ids that never had a child (background Bash).
+        if (event.task_id) {
+          session.subagentConvos?.noteTaskCompleted(event.task_id);
+        }
         // Deliberately NOT surfaced in chat: the background task's tool_use
         // (Bash / Agent / Workflow) already renders as a tool-call panel in
         // every client, so a "✅ Task: <summary>" message is pure

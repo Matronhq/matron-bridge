@@ -252,4 +252,81 @@ describe('createSubagentConvoTracker', () => {
     expect(publisher.calls.upsertConvo).toHaveLength(0);
     expect(t.convoIdFor('agent-1')).toBeNull();
   });
+
+  // Background agents (Agent tool with run_in_background) break both FIFO
+  // assumptions the sync-Task flow rests on: the spawning tool_result
+  // arrives INSTANTLY ("Async agent launched…"), long before the subagent
+  // finishes — and often before the watcher even discovers its transcript.
+  // The stream compensates with system events that carry an explicit
+  // tool_use_id ↔ task_id pairing (task_id IS the watcher's agentId):
+  // task_started at launch and task_notification at real completion.
+  describe('background task lifecycle', () => {
+    it('pairs the ref to its agent directly and removes it from the FIFO', () => {
+      tracker.noteTaskStarted('toolu_bg');            // Agent tool_use in parent stream
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg'); // system task_started
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      expect(child.taskRef).toBe('toolu_bg');
+      // The ref must be OUT of the FIFO — the next sibling may not inherit it.
+      const sibling = tracker.discover('agent-sib', { label: 'Sib', agentType: null });
+      expect(sibling.taskRef).toBeNull();
+    });
+
+    it('ignores the instant launch tool_result — the child stays running', () => {
+      tracker.noteTaskStarted('toolu_bg');
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      publisher.calls.upsertConvo.length = 0;
+      tracker.noteTaskResult('toolu_bg'); // "Async agent launched successfully"
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+    });
+
+    it('finishes the child on noteTaskCompleted(taskId)', () => {
+      tracker.noteTaskStarted('toolu_bg');
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      publisher.calls.upsertConvo.length = 0;
+      tracker.noteTaskCompleted('agent-bg');
+      expect(publisher.calls.upsertConvo).toEqual([
+        { convoId: 'parent-uuid:sub:agent-bg', opts: { sessionState: CHILD_STATE_FINISHED } },
+      ]);
+      // Idempotent — a duplicate notification or late finishAll never re-emits.
+      tracker.noteTaskCompleted('agent-bg');
+      tracker.finishAll();
+      expect(publisher.calls.upsertConvo).toHaveLength(1);
+    });
+
+    it('survives the observed race: launch tool_result BEFORE discovery', () => {
+      // 2026-07-15 live repro: tool_result beat the watcher's discovery, the
+      // FIFO ref was never consumed, and the child sat 'running' forever.
+      tracker.noteTaskStarted('toolu_bg');
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      tracker.noteTaskResult('toolu_bg');   // instant — no child exists yet
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      expect(child.taskRef).toBe('toolu_bg');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      tracker.noteTaskCompleted('agent-bg'); // real completion signal
+      const done = publisher.calls.upsertConvo.filter(
+        u => u.opts.sessionState === CHILD_STATE_FINISHED);
+      expect(done).toHaveLength(1);
+    });
+
+    it('task_started arriving after discovery back-fills the task_ref on the child', () => {
+      // Discovery burst (~100ms) can beat the system event. The child is
+      // created ref-less (or FIFO-paired); the explicit pairing corrects it
+      // and republishes status so the apps' Task-card link still works.
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      expect(child.taskRef).toBeNull();
+      publisher.calls.publishStatus.length = 0;
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      expect(child.taskRef).toBe('toolu_bg');
+      expect(publisher.calls.publishStatus).toEqual([
+        { convoId: 'parent-uuid:sub:agent-bg', status: { task_ref: 'toolu_bg' } },
+      ]);
+    });
+
+    it('noteTaskCompleted for an unknown agent is a safe no-op', () => {
+      expect(() => tracker.noteTaskCompleted('agent-ghost')).not.toThrow();
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+    });
+  });
 });
