@@ -102,6 +102,14 @@ describe('start', () => {
     expect(responses[0].error).toEqual({ code: 'spawn_failed', detail: 'claude not found' });
   });
 
+  it('prefers the stable journalConvoId over claudeSessionId when both are set', () => {
+    const { handler, responses } = harness({
+      startSession: () => ({ journalConvoId: 'stable-convo-id', claudeSessionId: 'native-session-id' }),
+    });
+    handler(REQ('start', {}));
+    expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: true, result: { convo_id: 'stable-convo-id' } });
+  });
+
   it('unsupported_mode tears the session down when claudeSessionId is missing', () => {
     const stopped = [];
     const orphan = { claudeSessionId: null };
