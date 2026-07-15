@@ -122,6 +122,23 @@ describe('dispatch guarantees', () => {
     expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'unknown_method' } });
   });
 
+  it('prototype-inherited method names answer unknown_method, never drop', () => {
+    const { handler, responses } = harness();
+    const methods = ['constructor', 'toString', 'hasOwnProperty', '__proto__', 'valueOf', 'isPrototypeOf'];
+    for (const m of methods) handler(REQ(m, {}, m));
+    expect(responses).toHaveLength(methods.length);
+    for (const r of responses) expect(r.error).toEqual({ code: 'unknown_method' });
+  });
+
+  it('a nullish throw still answers exactly one internal response', () => {
+    const { handler, responses } = harness({
+      listPersistedSessions: () => { throw null; },
+    });
+    handler(REQ('recent_folders', {}));
+    expect(responses).toHaveLength(1);
+    expect(responses[0].error).toEqual({ code: 'internal', detail: 'null' });
+  });
+
   it('a handler-internal throw answers exactly one internal response', () => {
     const { handler, responses } = harness({
       listPersistedSessions: () => { throw new Error('store corrupt'); },
