@@ -1197,7 +1197,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     chatHistory: [],
     pinnedSummaryEventId: null,
     pinnedSummaryText: '',
-    pendingWelcome: true,
     _codexTurnFinished: true,
     _codexLastError: null,
   };
