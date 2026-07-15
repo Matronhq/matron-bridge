@@ -2925,6 +2925,16 @@ function startResumeReadyWatcher(session) {
     const outbox = session._resumeOutbox || [];
     session._resumeOutbox = null;
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
+    // A /login- or /logout-initiated mode switch parked its command here:
+    // type it the moment the TUI is ready, ahead of any held user messages,
+    // via iv.sendText — no busy, because no claude turn runs (see the
+    // '!login' case in handleCommand).
+    const parkedSlash = session._postReadySlashCommand;
+    session._postReadySlashCommand = null;
+    if (parkedSlash && session.alive && session.iv && typeof session.iv.sendText === 'function') {
+      debug(`typing parked ${parkedSlash} into ready TUI`);
+      session.iv.sendText(parkedSlash);
+    }
     // Merge everything the user sent during the hold into ONE send — the
     // gate is now disarmed, so this reaches the real send path via the same
     // merged-send + out-of-band-mirror path flushQueue uses (see
@@ -4117,6 +4127,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/model — Show current model\n` +
         `/effort [level] — Show or set effort level\n` +
         `/mode [interactive|print] — Show or switch interactive vs non-interactive\n` +
+        `/login — Log in to your Anthropic account (auto-switches to interactive mode)\n` +
+        `/logout — Log out of your Anthropic account (auto-switches to interactive mode)\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
@@ -4155,6 +4167,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/model', 'Show current model'],
           ['/effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
           ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
+          ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
+          ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
@@ -4296,6 +4310,36 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const wantInteractive = target === 'interactive';
       applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
+      break;
+    }
+
+    // /login and /logout are claude-native TUI commands — the bridge only
+    // intercepts them because they're unusable from print mode (stream-json
+    // input has no login dialog). An interactive session gets the command
+    // typed straight into its PTY; a print session is switched to
+    // interactive first and the command runs once the resumed TUI is
+    // idle-ready (parked on _postReadySlashCommand, consumed by
+    // startResumeReadyWatcher's finish). Typing uses iv.sendText directly,
+    // NOT sendToSession: account commands run no claude turn, so no Stop
+    // hook would ever clear `busy` — the same failure class /effort works
+    // around (see lib/effort-command.js).
+    case '!login':
+    case '!logout': {
+      const cmdWord = cmd.slice(1);
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply(`No active session. /${cmdWord} runs inside a session — start one first.`);
+        break;
+      }
+      if (session.iv && session.iv.alive) {
+        if (session.iv.sendText(`/${cmdWord}`) === false) {
+          await sendReply(`Could not reach the session TUI — try /restart, then /${cmdWord} again.`);
+        }
+        break;
+      }
+      await sendReply(`/${cmdWord} needs the interactive TUI — switching this session to interactive mode to run it. Type /mode print afterwards to switch back.`);
+      const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml });
+      if (next) next._postReadySlashCommand = `/${cmdWord}`;
       break;
     }
 
@@ -5677,11 +5721,13 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
   const decision = planModeSwitch(session, wantInteractive);
   if (!decision.ok) {
     sendReply(decision.message);
-    return;
+    return null;
   }
   sendReply(decision.message);
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
-  recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
+  // Return the replacement session so callers can park follow-up work on it
+  // (the /login-from-print flow tags _postReadySlashCommand).
+  return recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
 }
 
 // Tear down a room's live session and re-spawn it resuming the SAME claude
