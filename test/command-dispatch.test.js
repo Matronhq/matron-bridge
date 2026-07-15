@@ -60,8 +60,17 @@ describe('classifyBridgeCommand (journal command classification pin)', () => {
   it('returns null for unknown-slash commands (TUI passthrough territory)', () => {
     expect(classifyBridgeCommand('/mcp-login')).toBeNull();
     expect(classifyBridgeCommand('/compact')).toBeNull();
-    expect(classifyBridgeCommand('/login')).toBeNull();
     expect(classifyBridgeCommand('/commit')).toBeNull();
+  });
+
+  it('intercepts /login and /logout (print mode needs the interactive auto-switch)', () => {
+    // Previously TUI-passthrough-only; the bridge now owns them so a print
+    // session can switch itself to interactive and run the account flow
+    // (handleCommand '!login'/'!logout', Dan 2026-07-15).
+    expect(classifyBridgeCommand('/login')).toBe('!login');
+    expect(classifyBridgeCommand('/logout')).toBe('!logout');
+    expect(classifyBridgeCommand('!login')).toBe('!login');
+    expect(classifyBridgeCommand('!logout')).toBe('!logout');
   });
 
   it('returns null for the show_bash family — never wired into the gate, even in Matrix', () => {
