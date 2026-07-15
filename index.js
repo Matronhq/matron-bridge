@@ -2935,13 +2935,19 @@ function startResumeReadyWatcher(session) {
     // asked to re-run the command.
     const parkedSlash = session._postReadySlashCommand;
     session._postReadySlashCommand = null;
-    if (parkedSlash && session.alive && session.iv && typeof session.iv.sendText === 'function') {
-      if (outbox.length === 0) {
-        debug(`typing parked ${parkedSlash} into ready TUI`);
-        session.iv.sendText(parkedSlash);
-      } else {
+    if (parkedSlash) {
+      if (outbox.length > 0) {
         debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
         const note = `Your held message(s) were sent first — type ${parkedSlash} again to continue.`;
+        if (session.sendCallback) session.sendCallback(note);
+      } else if (session.alive && session.iv && typeof session.iv.sendText === 'function'
+                 && session.iv.sendText(parkedSlash) !== false) {
+        debug(`typed parked ${parkedSlash} into ready TUI`);
+      } else {
+        // The user was promised the command would run when the TUI was
+        // ready; if the session died in the gap, say so instead of going
+        // silent.
+        const note = `Couldn't run ${parkedSlash} — the session went away before it was ready. Try ${parkedSlash} again.`;
         if (session.sendCallback) session.sendCallback(note);
       }
     }
@@ -4341,12 +4347,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`No active session. /${cmdWord} runs inside a session — start one first.`);
         break;
       }
-      if (session.iv && session.iv.alive) {
+      // Any session.iv — even a dead one — takes this branch: falling
+      // through to the mode switch would hit planModeSwitch's "already
+      // interactive" no-op (it only checks iv truthiness) and silently do
+      // nothing. A dead PTY makes sendText return false, which produces the
+      // explicit /restart hint instead.
+      if (session.iv) {
         // Mid-resume hold: the TUI is still loading, so typing now would be
         // dropped (the same window planModeSwitch refuses /mode in). Park
         // the command instead — startResumeReadyWatcher types it the moment
         // the TUI is idle-ready.
-        if (session._awaitingInputReady) {
+        if (session.iv.alive && session._awaitingInputReady) {
           session._postReadySlashCommand = `/${cmdWord}`;
           await sendReply(`The session is still resuming — /${cmdWord} will run as soon as it's ready.`);
           break;
