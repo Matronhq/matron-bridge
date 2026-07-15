@@ -318,6 +318,32 @@ describe('createJournalPublisher', () => {
     expect(warnings.length).toBe(1);
   });
 
+  it('upsertConvo forwards parentConvoId as parent_convo_id (child sub-chats), and omits it when absent', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    // Child upsert: parent_convo_id rides alongside title + session_state.
+    pub.upsertConvo('parent:sub:agent-1', {
+      title: 'code-explorer',
+      sessionState: 'running',
+      parentConvoId: 'parent',
+    });
+    // A plain (non-child) upsert must NOT carry a parent_convo_id key at all.
+    pub.upsertConvo('plain', { title: 'Room A' });
+
+    await waitFor(() => fake.received.filter(f => f.op === 'convo_upsert').length >= 2);
+    const [child, plain] = fake.received.filter(f => f.op === 'convo_upsert');
+    expect(child).toMatchObject({
+      op: 'convo_upsert', convo_id: 'parent:sub:agent-1',
+      title: 'code-explorer', session_state: 'running', parent_convo_id: 'parent',
+    });
+    expect(plain).toMatchObject({ op: 'convo_upsert', convo_id: 'plain', title: 'Room A' });
+    expect('parent_convo_id' in plain).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('upsertConvo never throws even for malformed opts (null, missing, non-object)', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
