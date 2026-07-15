@@ -855,6 +855,100 @@ describe('createJournalPublisher', () => {
 
     pub.close();
   });
+
+  it('fetchMedia: happy path GETs the derived HTTP base URL with Bearer auth and returns {buffer, contentType}', async () => {
+    const bytes = Buffer.from('fetched media bytes');
+    const httpServer = await startFakeHttpServer((entry, res) => {
+      if (entry.url === '/media/blob-77') {
+        res.writeHead(200, { 'content-type': 'image/png' });
+        res.end(bytes);
+      } else {
+        res.writeHead(404); res.end();
+      }
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok-xyz', log: silentLog, ...FAST_BACKOFF });
+
+    const result = await pub.fetchMedia('blob-77');
+    expect(result).not.toBeNull();
+    expect(result.contentType).toBe('image/png');
+    expect(result.buffer.equals(bytes)).toBe(true);
+
+    const mediaReqs = httpServer.received.filter(r => r.url === '/media/blob-77');
+    expect(mediaReqs.length).toBe(1);
+    expect(mediaReqs[0].method).toBe('GET');
+    expect(mediaReqs[0].headers['authorization']).toBe('Bearer tok-xyz');
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchMedia: a missing/blank blob_ref resolves null and warns, without any HTTP call', async () => {
+    const httpServer = await startFakeHttpServer();
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log, ...FAST_BACKOFF });
+
+    warnings.length = 0;
+    expect(await pub.fetchMedia('')).toBeNull();
+    expect(await pub.fetchMedia(null)).toBeNull();
+    expect(httpServer.received.filter(r => r.url && r.url.startsWith('/media')).length).toBe(0);
+    expect(warnings.some(w => /fetchMedia/.test(w))).toBe(true);
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchMedia: a non-2xx response resolves null, never throws', async () => {
+    const httpServer = await startFakeHttpServer((_entry, res) => { res.writeHead(404); res.end(); });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    expect(await pub.fetchMedia('nope')).toBeNull();
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchMedia: an over-cap blob (declared content-length beyond fetchMediaMaxBytes) is aborted and dropped, warns', async () => {
+    const big = Buffer.alloc(64, 0x41); // 64 bytes, cap set to 8 below
+    const httpServer = await startFakeHttpServer((_entry, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.end(big);
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log, ...FAST_BACKOFF, fetchMediaMaxBytes: 8 });
+
+    warnings.length = 0;
+    const result = await pub.fetchMedia('big-blob');
+    expect(result).toBeNull();
+    expect(warnings.some(w => /exceeds 8 cap|aborted/.test(w))).toBe(true);
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchMedia: a network failure (nothing listening) resolves null, never throws, warns once', async () => {
+    const port = await getFreePort();
+    const wsUrl = `ws://127.0.0.1:${port}/ws`;
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log, ...FAST_BACKOFF });
+
+    warnings.length = 0;
+    expect(await pub.fetchMedia('blob-1')).toBeNull();
+    expect(warnings.filter(w => /fetchMedia/.test(w)).length).toBe(1);
+
+    pub.close();
+  });
+
+  it('fetchMedia: a disabled (unconfigured) publisher returns null', () => {
+    const pub = createJournalPublisher({ url: null, token: null, log: silentLog });
+    expect(pub.fetchMedia('anything')).toBeNull();
+  });
 });
 
 // Inbound journal-frame consumption (Matron -> bridge input) and cursor
@@ -962,7 +1056,12 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
 
     // Force a reconnect.
     fake.connections[0].ws.terminate();
-    await waitFor(() => fake.connections.length >= 2, 4000);
+    // Wait for the reconnect's hello to be RECEIVED, not just the socket
+    // accepted: helloCursor stays `undefined` until the fake server parses the
+    // hello frame, so a bare connections.length>=2 wait races the hello and
+    // reads the initial undefined.
+    await waitFor(() => fake.connections.length >= 2
+      && fake.connections[1].helloCursor !== undefined, 4000);
 
     expect(fake.connections[1].helloCursor).toBe(7);
 
@@ -986,7 +1085,8 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
       url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
       cursorFile, onEvent: () => {},
     });
-    await waitFor(() => fake.connections.length >= 2);
+    await waitFor(() => fake.connections.length >= 2
+      && fake.connections[1].helloCursor !== undefined);
     expect(fake.connections[1].helloCursor).toBe(42);
 
     pub2.close();
@@ -1048,7 +1148,11 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
       cursorFile, onEvent: () => {},
     });
 
-    await waitFor(() => fake.connections.length >= 2, 4000);
+    // Wait for the reconnect's hello to be RECEIVED (helloCursor set), not just
+    // the socket accepted — otherwise this races the hello and reads the
+    // initial `undefined`. See the reconnect-cursor test for the same guard.
+    await waitFor(() => fake.connections.length >= 2
+      && fake.connections[1].helloCursor !== undefined, 4000);
     expect(fake.connections[1].helloCursor).toBeNull();
     expect(warnings.some(w => /snapshot_required/i.test(w))).toBe(true);
 

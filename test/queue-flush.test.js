@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { markJournalOrigin, isJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
+import { attachPendingMediaMirror, pendingMediaMirror } from '../lib/media-mirror.js';
 
 const text = (t) => [{ type: 'text', text: t }];
 const media = (name) => [{ type: 'image', source: name }];
@@ -104,5 +105,51 @@ describe('planQueueFlush', () => {
     const { blocks, mirrorText } = planQueueFlush([entry]);
     expect(blocks).toEqual([{ type: 'text', text: 'from matron' }, { type: 'image', source: 'x.png' }]);
     expect(mirrorText).toBe('');
+  });
+});
+
+// Reproduces the exact queue-entry shapes index.js's journalQueueMedia builds
+// for busy-time journal media, then flushes them at turn end. Guards the two
+// contracts that keep Matron media consistent with journal text and Matrix
+// media: (1) delivery is one merged send in arrival order, interleaved with any
+// queued text; (2) a saved file/image queued from the journal is journal-origin
+// AND has its pending-media-mirror tag stripped, so the flush never re-mirrors a
+// file the journal already recorded as the client's own event — while a
+// voice-note transcript stays Matrix-origin so it IS mirrored, matching the
+// immediate sendTextToSession.
+describe('journal media busy-queue → turn-end flush', () => {
+  // journalQueueMedia's transform: spread-copy the built blocks (dropping the
+  // non-enumerable pending-media-mirror tag) and mark origin per mirrorToJournal.
+  const queueSavedMedia = (blocks) => markJournalOrigin([...blocks]);      // mirrorToJournal:false
+  const queueVoiceNote = (text) => [...[{ type: 'text', text }]];          // mirrorToJournal:true
+
+  it('flushes queued text and media in arrival order, one merged send', () => {
+    const queued = [
+      markJournalOrigin(text('matron typed while busy')),                  // queued Matron text
+      queueVoiceNote('[Voice note transcription]: buy milk'),             // queued voice note
+      queueSavedMedia([{ type: 'text', text: 'File saved to /w/report.pdf' }, { type: 'document', source: {} }]),
+    ];
+    const { blocks, mirrorText } = planQueueFlush(queued);
+    // The two text-only entries merge; the saved-media entry (text + document)
+    // flushes that accumulator first, then rides in with its own blocks intact.
+    expect(blocks).toEqual([
+      { type: 'text', text: 'matron typed while busy\n\n[Voice note transcription]: buy milk' },
+      { type: 'text', text: 'File saved to /w/report.pdf' },
+      { type: 'document', source: {} },
+    ]);
+    // Only the voice-note transcript mirrors (Matrix-origin); the Matron text
+    // and the saved file are journal-origin and never re-mirror.
+    expect(mirrorText).toBe('[Voice note transcription]: buy milk');
+  });
+
+  it('the spread copy strips the pending-media-mirror tag, so a flushed saved file never double-mirrors', () => {
+    // What buildSavedMediaBlocks returns: blocks carrying a deferred mirror tag.
+    const built = [{ type: 'text', text: 'File saved to /w/a.pdf' }];
+    attachPendingMediaMirror(built, { buffer: Buffer.from('x'), mime: 'application/pdf', name: 'a.pdf' });
+    expect(pendingMediaMirror(built).length).toBe(1); // tag present on the built array
+
+    const queuedEntry = queueSavedMedia(built);        // journalQueueMedia's transform
+    expect(pendingMediaMirror(queuedEntry).length).toBe(0); // tag gone after the spread copy
+    expect(isJournalOrigin(queuedEntry)).toBe(true);
   });
 });

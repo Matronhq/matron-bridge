@@ -661,6 +661,122 @@ describe('promptExpectsReply', () => {
   });
 });
 
+// Client-sent media (file/image/voice-note) events: a `type:'file'|'image'`
+// frame from a user:* sender carries a blob_ref the caller fetches out of the
+// journal blob store. The router only CLASSIFIES and resolves the frame into a
+// {type, blobRef, contentType, name, size, dims} shape and hands it to the
+// injected routeMediaToSession seam (the fetch + transcribe/save + inject
+// lives in index.js/lib/journal-media.js, exercised separately). Media routing
+// is gated on the seam being present, so a bridge without it keeps the old
+// publish-only behavior for file/image frames.
+describe('createJournalInputConsumer — media (file/image) routing', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: (id) => id === 'control-1',
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routeMediaToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const fileFrame = (overrides = {}) => baseFrame({
+    type: 'file',
+    payload: { blob_ref: 'blob-1', content_type: 'application/pdf', name: 'report.pdf', size: 1234 },
+    ...overrides,
+  });
+
+  it('routes a user file event to routeMediaToSession with the resolved media shape', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    const [session, media, ctx] = deps.routeMediaToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(media).toEqual({
+      type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
+      name: 'report.pdf', size: 1234, dims: null,
+    });
+    expect(ctx).toEqual({ username: 'dan' });
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('routes a user image event and passes through image dims', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'image',
+      payload: { blob_ref: 'img-9', content_type: 'image/png', name: 'shot.png', size: 55, dims: { w: 800, h: 600 } },
+    }));
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    const [, media] = deps.routeMediaToSession.mock.calls[0];
+    expect(media).toEqual({
+      type: 'image', blobRef: 'img-9', contentType: 'image/png',
+      name: 'shot.png', size: 55, dims: { w: 800, h: 600 },
+    });
+  });
+
+  it('falls back to a top-level frame.blob_ref when the payload has none', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'file', blob_ref: 'top-level-blob',
+      payload: { content_type: 'audio/ogg', name: 'voice.ogg' },
+    }));
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeMediaToSession.mock.calls[0][1].blobRef).toBe('top-level-blob');
+  });
+
+  it('drops a media event with no blob_ref (nothing to fetch): warns, never routes, never throws', () => {
+    const deps = makeDeps();
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(baseFrame({ type: 'file', payload: { content_type: 'application/pdf', name: 'x.pdf' } }))).not.toThrow();
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(warnings.some(w => /blob_ref/.test(w))).toBe(true);
+  });
+
+  it('ignores agent-sender media events (loop prevention — same as text echoes)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame({ sender: 'agent:dev-2' }));
+    consumer(baseFrame({ type: 'image', sender: 'agent:dev-2', payload: { blob_ref: 'b', content_type: 'image/png' } }));
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+  });
+
+  it('media for an unknown/dead session notices and drops, never routes (media is not auto-resumed)', () => {
+    const deps = makeDeps({ findSessionByConvoId: vi.fn(() => null), resumeSessionForConvo: vi.fn(() => ({ claudeSessionId: 'x' })) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'file', username: 'dan' });
+  });
+
+  it('media in the control convo is ignored (control understands only text commands)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame({ convo_id: 'control-1' }));
+    expect(deps.routeMediaToSession).not.toHaveBeenCalled();
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('without a routeMediaToSession seam, file/image frames stay pass-through (never looked up or routed)', () => {
+    const deps = makeDeps({ routeMediaToSession: undefined });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame());
+    consumer(baseFrame({ type: 'image', payload: { blob_ref: 'b', content_type: 'image/png' } }));
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+});
+
 // Queue-tile taps from Matron arrive as prompt_reply frames whose `choice`
 // carries the tile's option VALUE (`interrupt` / `cancel:<n>`). Their tile
 // never advances the staleness guard (non-answerable, issue #98), so the
