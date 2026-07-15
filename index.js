@@ -2926,14 +2926,24 @@ function startResumeReadyWatcher(session) {
     session._resumeOutbox = null;
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
     // A /login- or /logout-initiated mode switch parked its command here:
-    // type it the moment the TUI is ready, ahead of any held user messages,
-    // via iv.sendText — no busy, because no claude turn runs (see the
-    // '!login' case in handleCommand).
+    // type it the moment the TUI is ready, via iv.sendText — no busy,
+    // because no claude turn runs (see the '!login' case in handleCommand).
+    // Only when nothing else is held: back-to-back sendText calls cancel
+    // each other's pending Enter (see lib/interactive-session.js), and once
+    // the login dialog opens, flushed text would be typed INTO it — there
+    // is no safe interleave, so held user messages win and the user is
+    // asked to re-run the command.
     const parkedSlash = session._postReadySlashCommand;
     session._postReadySlashCommand = null;
     if (parkedSlash && session.alive && session.iv && typeof session.iv.sendText === 'function') {
-      debug(`typing parked ${parkedSlash} into ready TUI`);
-      session.iv.sendText(parkedSlash);
+      if (outbox.length === 0) {
+        debug(`typing parked ${parkedSlash} into ready TUI`);
+        session.iv.sendText(parkedSlash);
+      } else {
+        debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
+        const note = `Your held message(s) were sent first — type ${parkedSlash} again to continue.`;
+        if (session.sendCallback) session.sendCallback(note);
+      }
     }
     // Merge everything the user sent during the hold into ONE send — the
     // gate is now disarmed, so this reaches the real send path via the same
@@ -4332,14 +4342,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       if (session.iv && session.iv.alive) {
+        // Mid-resume hold: the TUI is still loading, so typing now would be
+        // dropped (the same window planModeSwitch refuses /mode in). Park
+        // the command instead — startResumeReadyWatcher types it the moment
+        // the TUI is idle-ready.
+        if (session._awaitingInputReady) {
+          session._postReadySlashCommand = `/${cmdWord}`;
+          await sendReply(`The session is still resuming — /${cmdWord} will run as soon as it's ready.`);
+          break;
+        }
         if (session.iv.sendText(`/${cmdWord}`) === false) {
           await sendReply(`Could not reach the session TUI — try /restart, then /${cmdWord} again.`);
         }
         break;
       }
-      await sendReply(`/${cmdWord} needs the interactive TUI — switching this session to interactive mode to run it. Type /mode print afterwards to switch back.`);
+      // Print mode: applyModeSwitch announces the switch itself (or sends
+      // planModeSwitch's refusal — busy, mid-resume, no session id yet — in
+      // which case nothing was promised and nothing is parked).
       const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml });
-      if (next) next._postReadySlashCommand = `/${cmdWord}`;
+      if (next) {
+        next._postReadySlashCommand = `/${cmdWord}`;
+        await sendReply(`/${cmdWord} needs the interactive TUI — it will run as soon as the switched session is ready. Type /mode print afterwards to switch back.`);
+      }
       break;
     }
 
