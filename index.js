@@ -25,6 +25,7 @@ import {
   modeLabel,
   modeButtons,
   planModeSwitch,
+  planSessionIdentity,
 } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
@@ -505,9 +506,9 @@ function journalStartSessionForRpc({ workdir, mcpExtras }) {
   session.sendCallback = sessionSendReply;
   session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
-  // Same iv-mode persistence rule as !start: claudeSessionId is known
-  // immediately, so persist extras now rather than losing them to a bridge
-  // restart before the first transcript-driven persist.
+  // Same persistence rule as !start: claudeSessionId is known immediately
+  // (pre-assigned at spawn), so persist extras now rather than losing them
+  // to a bridge restart before the first transcript-driven persist.
   if (mcpExtras.length > 0 && session.claudeSessionId) {
     persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null);
   }
@@ -584,10 +585,11 @@ function journalPublish(session, method, payload) {
   if (convoId) {
     // Protocol requirement: a convo_upsert must reach the server before (or
     // with) the first publish to a convo — the server hard-rejects publishes
-    // to conversations that don't exist yet. Print-mode sessions get this via
-    // journalFlushForSession, but iv-mode sessions know their id at spawn and
-    // never buffer, so an assistant notice posted before the first
-    // state-transition upsert would otherwise be dropped server-side.
+    // to conversations that don't exist yet. Sessions whose id arrives late
+    // (codex thread_ids) get this via journalFlushForSession, but claude
+    // sessions know their id at spawn and never buffer, so an assistant
+    // notice posted before the first state-transition upsert would otherwise
+    // be dropped server-side.
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
@@ -959,6 +961,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  // Pre-assign the session id for fresh spawns (same trick as iv-mode below):
+  // claudeSessionId is then known synchronously, so RPC start can answer with
+  // a convo_id immediately and journal publishes never buffer for the init
+  // event. Resumes keep --resume semantics (see planSessionIdentity).
+  const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
   const args = [
     '--print',
     '--verbose',
@@ -994,9 +1001,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (printModel) {
     args.push('--model', printModel);
   }
-  if (resumeSessionId) {
-    args.push('--resume', resumeSessionId);
-  }
+  args.push(...identity.cliArgs);
 
   debug(`Spawning claude with args: ${args.join(' ')}`);
   debug(`Working directory: ${cwd}`);
@@ -1044,8 +1049,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
     restartCount: 0,
-    claudeSessionId: resumeSessionId || null,
-    journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || resumeSessionId || null,
+    claudeSessionId: identity.sessionId,
+    journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -1487,7 +1492,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  const sessionId = resumeSessionId || randomUUID();
+  const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
+  const sessionId = identity.sessionId;
   const model = options.model === null
     ? undefined
     : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
@@ -1511,16 +1517,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     },
   };
 
-  // The CLI rejects --session-id + --resume together unless --fork-session
-  // is also passed. For fresh sessions we pre-assign --session-id so we know
-  // the transcript path before spawn; for resumes we pass --resume only and
-  // rely on the already-known sessionId for the transcript path.
-  const claudeArgs = [];
-  if (resumeSessionId) {
-    claudeArgs.push('--resume', resumeSessionId);
-  } else {
-    claudeArgs.push('--session-id', sessionId);
-  }
+  // Fresh sessions pre-assign --session-id so the transcript path is known
+  // before spawn; resumes pass --resume only. The exclusivity rule lives in
+  // planSessionIdentity.
+  const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     '--dangerously-skip-permissions',
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
@@ -2583,7 +2583,10 @@ function handleClaudeEvent(session, event) {
   const capturedModel = modelFromEvent(event);
   if (capturedModel) session.currentModel = capturedModel;
 
-  // Capture session ID from any event that carries it.
+  // Capture session ID from any event that carries it. Claude sessions
+  // pre-assign their id at spawn (planSessionIdentity), so for them this is
+  // a defensive fallback; it still does real work for sessions whose id is
+  // only learned from the stream.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
     if (!session.journalConvoId) session.journalConvoId = event.session_id;
@@ -2592,13 +2595,11 @@ function handleClaudeEvent(session, event) {
     journalFlushForSession(session);
   }
 
-  // Lazy-construct subagent watcher once we know the session id. Print-mode
-  // resumed sessions get the watcher built eagerly in createSession() (since
-  // claudeSessionId is already populated at spawn); fresh print-mode
-  // sessions only learn their id when the first event with `session_id`
-  // arrives, so the watcher is constructed here. iv-mode constructs its
-  // watcher up front. Decoupled from the id-capture block above so future
-  // refactors can't silently lose the watcher on either spawn path.
+  // Lazy-construct subagent watcher once we know the session id. All claude
+  // spawn paths pre-assign the id and build the watcher eagerly now, so this
+  // is a safety net for any session whose id arrived late. Decoupled from
+  // the id-capture block above so future refactors can't silently lose the
+  // watcher on either spawn path.
   if (session.claudeSessionId && !session.subagentWatcher) {
     setupSubagentWatcher(session, session.workdir, session.claudeSessionId);
   }
@@ -4502,10 +4503,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
-      // In iv-mode claudeSessionId is known immediately, so persist mcpExtras
-      // now — otherwise a bridge restart before the first transcript-driven
-      // persist would lose the user's opt-in. Print-mode sessions get their
-      // claudeSessionId asynchronously and pick this up on the first persist.
+      // claudeSessionId is known immediately (pre-assigned in both modes),
+      // so persist mcpExtras now — otherwise a bridge restart before the
+      // first transcript-driven persist would lose the user's opt-in.
       if (mcpExtras.length > 0 && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
