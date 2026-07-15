@@ -141,6 +141,35 @@ describe('createSubagentConvoTracker', () => {
     expect(publisher.calls.publishStatus.at(-1).status.task_ref).toBe('toolu_task_abc');
   });
 
+  it('a nested Task ref (from a subagent stream) never pollutes the parent FIFO', () => {
+    // Parent launches Task A; while agent-a runs it spawns a nested Task.
+    tracker.noteTaskStarted('toolu_parent_a');
+    tracker.discover('agent-a', { label: 'A', agentType: null });
+    tracker.noteTaskStarted('toolu_nested', { nested: true });
+    // Parent launches Task B; its child must pair to the PARENT's ref, not the
+    // nested one (a nested Task's tool_result never surfaces in the parent
+    // stream, so its ref could never be consumed — it would only mis-pair
+    // siblings and let a parent tool_result finish the wrong child).
+    tracker.noteTaskStarted('toolu_parent_b');
+    tracker.discover('agent-nested', { label: 'N', agentType: null });
+    tracker.discover('agent-b', { label: 'B', agentType: null });
+
+    // Discovery order is not knowable, so the surviving guarantee is weaker but
+    // exact: the nested ref appears in NO child's status, and the remaining
+    // parent ref still pairs FIFO (here to the next discovery, agent-nested —
+    // the acknowledged best-effort mispairing, without the nested cascade).
+    const nested = publisher.calls.publishStatus.find(s => s.convoId === 'parent-uuid:sub:agent-nested');
+    expect(nested.status.task_ref).toBe('toolu_parent_b');
+    expect(publisher.calls.publishStatus.some(s => s.status.task_ref === 'toolu_nested')).toBe(false);
+    // agent-b pairs nothing — an empty status frame is skipped entirely.
+    expect(publisher.calls.publishStatus.some(s => s.convoId === 'parent-uuid:sub:agent-b')).toBe(false);
+
+    // The nested ref finishes nothing.
+    publisher.calls.upsertConvo.length = 0;
+    tracker.noteTaskResult('toolu_nested');
+    expect(publisher.calls.upsertConvo).toHaveLength(0);
+  });
+
   it('associates pending Task tool_use_ids to children FIFO', () => {
     tracker.noteTaskStarted('toolu_1');
     tracker.noteTaskStarted('toolu_2');

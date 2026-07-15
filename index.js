@@ -2539,12 +2539,15 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
 
     for (const block of content) {
       if (block.type !== 'tool_use') continue;
-      // A subagent spawning its own subagent: pair the nested Task's id and
-      // trigger another discovery burst so the nested agent-<id>.jsonl gets a
-      // tail. One-level watcher architecture — the nested agent attaches as a
+      // A subagent spawning its own subagent: trigger another discovery burst
+      // so the nested agent-<id>.jsonl gets a tail. nested:true keeps this
+      // Task's id OUT of the parent FIFO — its tool_result lands in this
+      // subagent's transcript, never the parent stream, so pairing it would
+      // only skew siblings' task_refs and done-marking (see subagent-convos).
+      // One-level watcher architecture — the nested agent attaches as a
       // direct child of this parent session (see the PR notes on nesting).
       if ((block.name === 'Task' || block.name === 'Agent') && session.subagentWatcher) {
-        session.subagentConvos.noteTaskStarted(block.id);
+        session.subagentConvos.noteTaskStarted(block.id, { nested: true });
         session.subagentWatcher.notifyTaskStarted();
       }
       if ((block.name === 'Edit' || block.name === 'Write' || block.name === 'MultiEdit')
