@@ -41,6 +41,34 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.transcribe).not.toHaveBeenCalled();
   });
 
+  it('passes the caption through to the block builder', async () => {
+    // The caption is the whole point of staging attachments in the composer:
+    // it has to survive the router hop or claude gets the picture with no
+    // idea what was asked about it.
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' })),
+    });
+
+    await route(session, {
+      type: 'image', blobRef: 'img-1', contentType: 'image/png',
+      name: 'x.png', caption: 'what breed is this?',
+    }, ctx);
+
+    const [, buildArgs] = deps.buildSavedBlocks.mock.calls[0];
+    expect(buildArgs.caption).toBe('what breed is this?');
+  });
+
+  it('passes a null caption through for an attachment sent with no message', async () => {
+    const { route, deps } = makeRouter();
+
+    await route(session, {
+      type: 'file', blobRef: 'blob-1', contentType: 'application/pdf', name: 'report.pdf',
+    }, ctx);
+
+    const [, buildArgs] = deps.buildSavedBlocks.mock.calls[0];
+    expect(buildArgs.caption).toBeUndefined();
+  });
+
   it('classifies type:image as an image for the block builder', async () => {
     const { route, deps } = makeRouter({
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' })),

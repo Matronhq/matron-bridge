@@ -4352,14 +4352,22 @@ function safeMediaFilename(name) {
 // claude. Audio is NOT handled here — the caller surfaces transcription
 // progress itself, so it runs transcribeAudio directly. `isImage` selects the
 // image branch by msgtype rather than mime — an image-mime file still falls
-// through the file branch's inline-image sub-case. `ivFilename`/`ivCaption`
-// feed the iv upload annotation; `workdirName` names the SDK-mode save.
-// Returns { blocks, ivHandled } — ivHandled true means the iv branch already
-// folded any caption in, so the caller must not append it again.
+// through the file branch's inline-image sub-case. `ivFilename` names the iv
+// upload; `workdirName` names the SDK-mode save.
+//
+// `caption` is what the user typed alongside the attachment in the composer.
+// BOTH modes fold it in, each in its own idiom: iv mode passes it to the
+// upload annotation (caption above the path), SDK mode leads with it as its
+// own text block. It used to be `ivCaption`, hardcoded `null` by the only
+// caller — so a caption reached this function from nowhere and left for
+// nowhere, and claude never saw one. `ivHandled` went the same way: it was
+// returned to tell a caller not to double-append the caption, but no caller
+// ever read it.
+//
 // `inline` is an optional prepareInlineImage decision governing the base64
 // image block only (downscaled copy / skip); the buffer written to disk and
 // the pending-media mirror always carry the full-resolution original.
-function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, ivCaption, workdirName, inline }) {
+function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, caption, workdirName, inline }) {
   const blocks = [];
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
@@ -4368,7 +4376,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, ivFilename);
     fs.writeFileSync(savePath, buffer);
-    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption: ivCaption }) });
+    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
     // than calling journalMirrorUserMedia now) is what stops a queued
@@ -4379,6 +4387,11 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
     return { blocks, ivHandled: true };
   }
+  // SDK mode: lead with the caption so claude reads the user's words before
+  // the "Image saved to …" bookkeeping and the image itself — the order a
+  // person would say it in. Everything below appends to the same `blocks`
+  // array, i.e. the same single user turn.
+  if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
     // Save image to workdir
     const imgPath = deduplicateFilename(session.workdir, workdirName);
@@ -5901,7 +5914,7 @@ function journalOnText(session, body, { username }) {
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
-  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims }) => {
+  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption }) => {
     const safeName = safeMediaFilename(name);
     // Downscale/skip decision for the INLINE copy only (iv mode never inlines,
     // so don't burn a decode there). The original buffer still goes to disk.
@@ -5916,7 +5929,7 @@ const journalMediaRouter = createJournalMediaRouter({
     }
     return buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
-      ivFilename: safeName, ivCaption: null, workdirName: safeName, inline,
+      ivFilename: safeName, caption, workdirName: safeName, inline,
     }).blocks;
   },
   injectText: (session, text) => sendTextToSession(session, text),

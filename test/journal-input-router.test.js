@@ -725,10 +725,38 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(media).toEqual({
       type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
-      name: 'report.pdf', size: 1234, dims: null,
+      name: 'report.pdf', size: 1234, dims: null, caption: null,
     });
     expect(ctx).toEqual({ username: 'dan' });
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('carries the composer caption off the payload', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'image',
+      payload: {
+        blob_ref: 'img-9', content_type: 'image/png', name: 'shot.png',
+        caption: 'why is this rotated?',
+      },
+    }));
+    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toBe('why is this rotated?');
+  });
+
+  it('treats a blank or non-string caption as absent', () => {
+    // A whitespace-only caption is what an "empty" composer can produce; it
+    // must not reach claude as a blank line above the upload annotation.
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(fileFrame({
+      payload: { blob_ref: 'b1', content_type: 'application/pdf', name: 'r.pdf', caption: '   ' },
+    }));
+    consumer(fileFrame({
+      payload: { blob_ref: 'b2', content_type: 'application/pdf', name: 'r.pdf', caption: 42 },
+    }));
+    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toBeNull();
+    expect(deps.routeMediaToSession.mock.calls[1][1].caption).toBeNull();
   });
 
   it('routes a user image event and passes through image dims', () => {
@@ -742,7 +770,7 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     const [, media] = deps.routeMediaToSession.mock.calls[0];
     expect(media).toEqual({
       type: 'image', blobRef: 'img-9', contentType: 'image/png',
-      name: 'shot.png', size: 55, dims: { w: 800, h: 600 },
+      name: 'shot.png', size: 55, dims: { w: 800, h: 600 }, caption: null,
     });
   });
 
