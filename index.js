@@ -55,7 +55,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -4208,7 +4208,10 @@ async function updateRoomName(roomId, name) {
 
 async function maybeUpdatePinnedSummary(session) {
   if (!genAI) {
-    debug('Skipping summary: genAI not configured');
+    // No Gemini key: no pinned summary, but still name the convo Claude's
+    // own way — its first user message, the same summary `claude --resume`
+    // and /sessions display — instead of leaving the workdir-basename seed.
+    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName });
     return;
   }
 
