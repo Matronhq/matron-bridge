@@ -4211,7 +4211,7 @@ async function maybeUpdatePinnedSummary(session) {
     // No Gemini key: no pinned summary, but still name the convo Claude's
     // own way — its first user message, the same summary `claude --resume`
     // and /sessions display — instead of leaving the workdir-basename seed.
-    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName });
+    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
     return;
   }
 

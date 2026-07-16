@@ -72,4 +72,53 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(applyFallbackTitle(session, d)).toBe(true);
     expect(d.updateRoomName).toHaveBeenCalledWith('!room', '2:ro hi');
   });
+
+  it('never lets angle brackets or reassembled script fragments into the title', () => {
+    const cases = ['<scr<x>ipt>alert time', 'look at <script src=x', 'a <b> c > d'];
+    for (const text of cases) {
+      const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text }] };
+      const d = deps();
+      expect(applyFallbackTitle(session, d)).toBe(true);
+      const title = d.updateRoomName.mock.calls[0][1];
+      expect(title).not.toMatch(/[<>]/);
+    }
+  });
+
+  it('does not clobber a title that is no longer the workdir seed (e.g. a resume summary)', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      _journalTitleHint: '2: fix the folder picker…',
+      chatHistory: [{ role: 'user', text: 'carry on' }],
+    };
+    const d = { ...deps(), workdir: '/home/dan/proj' };
+    expect(applyFallbackTitle(session, d)).toBe(false);
+    expect(d.updateRoomName).not.toHaveBeenCalled();
+  });
+
+  it('does replace the workdir-basename seed title', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      _journalTitleHint: 'proj',
+      chatHistory: [{ role: 'user', text: 'carry on' }],
+    };
+    const d = { ...deps(), workdir: '/home/dan/proj' };
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 carry on');
+  });
+
+  it('skips a tag-only first user message and titles from the next real one', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      chatHistory: [
+        { role: 'user', text: '<ide-selection></ide-selection>' },
+        { role: 'user', text: 'the real prompt' },
+      ],
+    };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 the real prompt');
+  });
 });
