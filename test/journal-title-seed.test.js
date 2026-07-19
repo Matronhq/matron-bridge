@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { seedJournalTitle } from '../lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
   it('titles the convo from the workdir basename when no hint is set', async () => {
@@ -81,5 +81,110 @@ describe('seedJournalTitle (workdir-sourced)', () => {
     expect(ok).toBe(false);
     expect(upsertConvo).not.toHaveBeenCalled();
     expect(session._journalTitleHint).toBe('');
+  });
+});
+
+describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
+  const deps = () => ({ serverLabel: '2', updateRoomName: vi.fn() });
+
+  it('titles the convo from the first user message, same format as the LLM rename', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa1234',
+      chatHistory: [
+        { role: 'user', text: 'fix the folder picker' },
+        { role: 'assistant', text: 'sure' },
+      ],
+    };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 fix the folder picker');
+  });
+
+  it('does nothing until a user message exists, then still applies later', () => {
+    const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'assistant', text: 'hello' }] };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(false);
+    expect(d.updateRoomName).not.toHaveBeenCalled();
+    session.chatHistory.push({ role: 'user', text: 'now do the thing' });
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 now do the thing');
+  });
+
+  it('applies only once per session', () => {
+    const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'first' }] };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(applyFallbackTitle(session, d)).toBe(false);
+    expect(d.updateRoomName).toHaveBeenCalledTimes(1);
+  });
+
+  it('strips tags, collapses whitespace, and truncates to 60 chars with an ellipsis', () => {
+    const long = 'refactor <ide-opened-file></ide-opened-file> the whole\n\n  session   store so that every folder ever used shows up in the picker';
+    const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: long }] };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    const title = d.updateRoomName.mock.calls[0][1];
+    expect(title.startsWith('2:f0 refactor the whole session store')).toBe(true);
+    expect(title.endsWith('…')).toBe(true);
+    expect(title.length).toBe('2:f0 '.length + 61);
+  });
+
+  it('falls back to the room id for the short prefix and survives a missing history', () => {
+    const session = { roomId: '!room', chatHistory: undefined };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(false);
+    session.chatHistory = [{ role: 'user', text: 'hi' }];
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!room', '2:ro hi');
+  });
+
+  it('never lets angle brackets or reassembled script fragments into the title', () => {
+    const cases = ['<scr<x>ipt>alert time', 'look at <script src=x', 'a <b> c > d'];
+    for (const text of cases) {
+      const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text }] };
+      const d = deps();
+      expect(applyFallbackTitle(session, d)).toBe(true);
+      const title = d.updateRoomName.mock.calls[0][1];
+      expect(title).not.toMatch(/[<>]/);
+    }
+  });
+
+  it('does not clobber a title that is no longer the workdir seed (e.g. a resume summary)', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      _journalTitleHint: '2: fix the folder picker…',
+      chatHistory: [{ role: 'user', text: 'carry on' }],
+    };
+    const d = { ...deps(), workdir: '/home/dan/proj' };
+    expect(applyFallbackTitle(session, d)).toBe(false);
+    expect(d.updateRoomName).not.toHaveBeenCalled();
+  });
+
+  it('does replace the workdir-basename seed title', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      _journalTitleHint: 'proj',
+      chatHistory: [{ role: 'user', text: 'carry on' }],
+    };
+    const d = { ...deps(), workdir: '/home/dan/proj' };
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 carry on');
+  });
+
+  it('skips a tag-only first user message and titles from the next real one', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      chatHistory: [
+        { role: 'user', text: '<ide-selection></ide-selection>' },
+        { role: 'user', text: 'the real prompt' },
+      ],
+    };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 the real prompt');
   });
 });
