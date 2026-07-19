@@ -37,6 +37,7 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   isIvSlashPassthrough,
@@ -939,6 +940,18 @@ function journalFlushForSession(session) {
 }
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
+  // A persisted workdir can stop existing between spawns (repo renamed,
+  // worktree pruned). Node reports a missing spawn cwd as `spawn claude
+  // ENOENT`, so degrade to a fallback dir here — before any agent branch —
+  // instead of letting every spawn path discover it the hard way.
+  const guarded = resolveSpawnCwd(expandHome(workdir || DEFAULT_WORKDIR), [DEFAULT_WORKDIR, os.homedir()]);
+  if (guarded.fellBack) {
+    console.warn(`[spawn-guard] workdir ${guarded.missing} no longer exists for ${roomId}; using ${guarded.cwd}`);
+    const wg = notice('warning', `Workdir ${guarded.missing} no longer exists — using ${guarded.cwd} instead. Use !workdir to move the session.`,
+      `Workdir <code>${escapeHtml(String(guarded.missing))}</code> no longer exists — using <code>${escapeHtml(guarded.cwd)}</code> instead. Use <code>!workdir</code> to move the session.`);
+    Promise.resolve(sendToRoom(roomId, wg.plain, wg.html)).catch(() => {});
+  }
+  workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
   if (agent === AGENT_CODEX) {
@@ -1080,6 +1093,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pinnedSummaryEventId: null, // event ID of pinned summary message
     pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
   };
+
+  // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop
+  // of 2026-07-16). Cleanup and the 3-restart cap stay in proc.on('close'),
+  // which still fires after a spawn error; this only reports.
+  attachSpawnErrorHandler(proc, {
+    notify: (msg) => { if (session.sendCallback) session.sendCallback(msg); },
+    log: (msg) => console.error(`[spawn-guard] ${msg} (room ${roomId})`),
+  });
 
   // Parse newline-delimited JSON from stdout
   proc.stdout.on('data', (chunk) => {
