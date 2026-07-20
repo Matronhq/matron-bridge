@@ -4856,7 +4856,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       await updateRoomName(sessionRoomId, roomName);
 
       // Persist immediately — we already know the agent session ID.
-      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId, {
+      // session.workdir, not actualWorkdir: createSession may have degraded a
+      // missing workdir to a fallback, and persisting the missing path would
+      // re-trigger the fallback warning on the next spawn (every other
+      // persistSession site already passes session.workdir).
+      persistSession(sessionRoomId, resumeSessionId, session.workdir, roomId, {
         agent: selectedAgent,
         agentSessions: inheritedAgentSessions,
         journalConvoId: session.journalConvoId,
@@ -4871,10 +4875,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       });
 
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
-      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(actualWorkdir)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(session.workdir)}</code><br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
