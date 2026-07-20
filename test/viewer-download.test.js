@@ -6,6 +6,7 @@ import path from 'node:path';
 let server, port, tmpDir;
 beforeAll(async () => {
   process.env.HMAC_SECRET = 'test-secret';
+  process.env.DOWNLOAD_RATE_LIMIT = '10';
   const { startServer } = await import('../viewer/server.js');
   server = startServer(0);
   await new Promise(r => server.on('listening', r));
@@ -89,5 +90,18 @@ describe('GET /download', () => {
     const cd = res.headers.get('content-disposition');
     expect(cd).not.toContain('"we"');
     expect(cd).not.toContain('\r');
+  });
+
+  // Last in the file: exhausts the shared per-IP budget for this window.
+  it('429s after the per-window request limit', async () => {
+    const { generateDownloadUrl } = await import('../lib/viewer-tokens.js');
+    const filePath = path.join(tmpDir, 'limited.zip');
+    writeFileSync(filePath, Buffer.alloc(8, 3));
+    const url = generateDownloadUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60);
+
+    const statuses = [];
+    for (let i = 0; i < 11; i++) statuses.push((await fetch(url)).status);
+    expect(statuses.filter(s => s === 200).length).toBeLessThanOrEqual(10);
+    expect(statuses.at(-1)).toBe(429);
   });
 });

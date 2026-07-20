@@ -183,7 +183,28 @@ app.get('/view', async (req, res) => {
   }
 });
 
+// Per-IP sliding-window limiter (CodeQL js/missing-rate-limiting): bounds
+// the disk reads a token holder — or a token guesser — can trigger. In-
+// memory is fine here: one viewer process, restart resets are harmless.
+const DOWNLOAD_WINDOW_MS = 60_000;
+const DOWNLOAD_MAX_PER_WINDOW = parseInt(process.env.DOWNLOAD_RATE_LIMIT || '30', 10);
+const downloadHits = new Map();
+function downloadRateLimited(ip) {
+  const now = Date.now();
+  if (downloadHits.size > 1000) {
+    for (const [k, v] of downloadHits) {
+      if (!v.some(t => now - t < DOWNLOAD_WINDOW_MS)) downloadHits.delete(k);
+    }
+  }
+  const hits = (downloadHits.get(ip) || []).filter(t => now - t < DOWNLOAD_WINDOW_MS);
+  const limited = hits.length >= DOWNLOAD_MAX_PER_WINDOW;
+  if (!limited) hits.push(now);
+  downloadHits.set(ip, hits);
+  return limited;
+}
+
 app.get('/download', async (req, res) => {
+  if (downloadRateLimited(req.ip)) return res.status(429).send('Too many requests');
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
