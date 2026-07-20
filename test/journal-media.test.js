@@ -130,6 +130,21 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectBlocks).not.toHaveBeenCalled();
   });
 
+  it('a CAPTIONED attachment that produced no blocks notifies the user (fail-visible, not a silent drop)', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, {
+      type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf', caption: 'look at this',
+    }, ctx);
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't deliver that attachment/));
+  });
+
+  it('an UNcaptioned attachment that produced no blocks drops silently (no notice)', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
   it('an unavailable session (injectBlocks false) publishes an undeliverable notice', async () => {
     const { route, deps } = makeRouter({ injectBlocks: vi.fn(() => false) });
     await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
