@@ -1829,9 +1829,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     } else if (session.sendCallback) {
       session.sendCallback(plainPlan);
     } else {
-      // No Matrix output channel yet — auto-deny so the hook unblocks.
+      // No output channel yet — auto-deny so the hook unblocks.
       const pending = pendingPlanDecisions.get(toolUseId);
-      if (pending) pending.resolve({ decision: 'deny', reason: 'no Matrix output channel for session' });
+      if (pending) pending.resolve({ decision: 'deny', reason: 'no output channel for session' });
     }
   };
 
@@ -5652,7 +5652,7 @@ async function journalRouteTextToSession(session, body) {
     // never silently fall through to Claude as text, never crash.
     notAvailable: (cmdName) => {
       const ctx = journalSessionCommandCtx(session);
-      return ctx.sendReply(`/${cmdName} isn't available from Matron — use this session's Matrix room for that one.`);
+      return ctx.sendReply(`/${cmdName} isn't available from Matron.`);
     },
   });
   if (dispatchedCommand) return;
@@ -5677,7 +5677,7 @@ async function journalRouteTextToSession(session, body) {
     // PTY-desync risk the Matrix path guards against). Notice instead of
     // silently dropping it.
     journalPublishNotice(journalConvoIdFor(session),
-      "That doesn't look like one of the options. Reply with the option number shown, or use the session's Matrix room to send !esc and cancel the menu.");
+      "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.");
     return;
   }
 
