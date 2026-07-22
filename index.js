@@ -54,6 +54,7 @@ import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
+import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
@@ -6083,6 +6084,32 @@ function journalOnPromptReply(session, answer, { username }) {
     });
     return;
   }
+  // Picker taps (/model, /effort, /mode): the router is the single source of
+  // truth for picker-vs-answer. It sets `answer.picker` ONLY when the reply's
+  // target_seq named a picker frame the bridge published AND the choice was one
+  // of that frame's own offered values (lib/journal-input-router.js). We trust
+  // that flag and dispatch to the SAME switch fns the explicit-arg !model /
+  // !effort / !mode handlers call — never re-guessing by value shape, so a
+  // genuine answer whose label merely looks like a picker value is never
+  // hijacked, and a verified picker tap is never swallowed as a prompt answer
+  // (loop #461 / PR review B1 + M1). A picker answers no pending prompt, so
+  // (like the queue-action block above) it emits no "answered:" echo.
+  if (answer?.picker) {
+    if (!session.alive) {
+      journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
+      return;
+    }
+    const ctx = journalSessionCommandCtx(session);
+    handlePickerValue(answer.choice, session.roomId, session, {
+      applyModelSwitch,
+      switchEffortInSession,
+      applyModeSwitch,
+      sendReply: ctx.sendReply,
+      sendHtml: ctx.sendHtml,
+    });
+    return;
+  }
+  // Not a picker command — resolve it as an answer to a pending prompt.
   let label;
   try {
     label = journalRoutePromptReply(session, answer);
