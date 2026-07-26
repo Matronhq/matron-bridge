@@ -130,6 +130,27 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectBlocks).not.toHaveBeenCalled();
   });
 
+  it('an attachment that produced no blocks notifies the user, naming the file (fail-visible, not a silent drop)', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, {
+      type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf', caption: 'look at this',
+    }, ctx);
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't deliver that attachment \(x\.pdf\)/));
+  });
+
+  it('an UNcaptioned attachment that produced no blocks also notifies — the room already showed a success echo', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't deliver that attachment \(x\.pdf\)/));
+  });
+
+  it('an image with no name that produced no blocks notices with the image label and no parenthetical', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, { type: 'image', blobRef: 'i', contentType: 'image/png' }, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', "Couldn't deliver that image to claude.");
+  });
+
   it('an unavailable session (injectBlocks false) publishes an undeliverable notice', async () => {
     const { route, deps } = makeRouter({ injectBlocks: vi.fn(() => false) });
     await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
