@@ -98,9 +98,20 @@ describe('planModeSwitch', () => {
     expect(d.message).toMatch(/starting up/i);
   });
   it('approves a clean switch', () => {
-    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc' }, true);
+    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: true }, true);
     expect(d.ok).toBe(true);
     expect(d.message).toMatch(/interactive/i);
+  });
+  it('refuses switching a provisional (unconfirmed) print session to interactive', () => {
+    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: false }, true);
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/starting up/i);
+  });
+  it('does NOT gate an iv session on _sessionConfirmed (iv confirms via a different path)', () => {
+    // iv->print: current is interactive, so the print-provisional gate is skipped
+    // even though iv never sets _sessionConfirmed.
+    const d = planModeSwitch({ iv: { alive: true }, busy: false, claudeSessionId: 'abc' }, false);
+    expect(d.ok).toBe(true);
   });
 });
 
@@ -116,6 +127,26 @@ describe('planSessionIdentity', () => {
     expect(plan.sessionId).toBe('old-id');
     expect(plan.cliArgs).toEqual(['--resume', 'old-id']);
     expect(minted).toBe(0);
+  });
+  // #136 / loop #459: a fresh print session that crashes BEFORE Claude
+  // persisted a resumable session must respawn with the SAME id via
+  // --session-id (not --resume, which would fail on a never-written session).
+  // presetId reuses the given id without minting and keeps --session-id.
+  it('reuses a presetId via --session-id (no --resume) without minting, when not resuming', () => {
+    let minted = 0;
+    const plan = sessionMode.planSessionIdentity({
+      resumeSessionId: undefined, presetId: 'provisional-id', mintId: () => { minted++; return 'never'; },
+    });
+    expect(plan.sessionId).toBe('provisional-id');
+    expect(plan.cliArgs).toEqual(['--session-id', 'provisional-id']);
+    expect(minted).toBe(0);
+  });
+  it('resumeSessionId wins over presetId (a confirmed session resumes)', () => {
+    const plan = sessionMode.planSessionIdentity({
+      resumeSessionId: 'confirmed-id', presetId: 'provisional-id', mintId: () => 'never',
+    });
+    expect(plan.sessionId).toBe('confirmed-id');
+    expect(plan.cliArgs).toEqual(['--resume', 'confirmed-id']);
   });
 });
 
@@ -134,5 +165,28 @@ describe('createSession id pre-assignment (source inspection)', () => {
   it('no hand-rolled --session-id/--resume args outside the helper', () => {
     expect(src).not.toMatch(/push\('--session-id'/);
     expect(src).not.toMatch(/push\('--resume'/);
+  });
+
+  // #136 / loop #459: the auto-restart must not --resume a session that
+  // crashed before Claude persisted it. Scoped to PRINT mode only — iv-mode
+  // confirms from camel-case `sessionId` transcript records that the snake-case
+  // capture never sees, so gating iv would break its resume-after-persist
+  // (PR review round 2 Blocker 2). Print-mode assertions are therefore singular.
+  it('marks _sessionConfirmed the first time a session_id event arrives', () => {
+    expect(src).toMatch(/if \(event\.session_id\) session\._sessionConfirmed = true;/);
+  });
+  it('the print spawn helper threads presetSessionId into planSessionIdentity (once, print-only)', () => {
+    const calls = src.match(/planSessionIdentity\(\{ resumeSessionId, presetId: options\.presetSessionId/g) || [];
+    expect(calls.length).toBe(1);
+  });
+  it('the print auto-restart uses claudeSessionId only when confirmed, presetSessionId otherwise', () => {
+    const resumeGates = src.match(/session\._sessionConfirmed \? session\.claudeSessionId : null/g) || [];
+    expect(resumeGates.length).toBe(1);
+    const presetGates = src.match(/presetSessionId: session\._sessionConfirmed \? undefined : session\.claudeSessionId/g) || [];
+    expect(presetGates.length).toBe(1);
+  });
+  it('the print constructor inits _sessionConfirmed from resumeSessionId (iv is unconditional --resume)', () => {
+    const inits = src.match(/_sessionConfirmed: !!resumeSessionId/g) || [];
+    expect(inits.length).toBe(1);
   });
 });
