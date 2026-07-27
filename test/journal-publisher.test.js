@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import WebSocket, { WebSocketServer } from 'ws';
 import net from 'net';
 import http from 'node:http';
-import { mkdtempSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
@@ -1159,6 +1159,33 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
     expect(fake.connections[1].helloCursor).toBe(42);
 
     pub2.close();
+    await fake.close();
+  });
+
+  it('exposes startSeq = the persisted cursor at construction (the router ghost-answer boundary)', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    writeFileSync(cursorFile, JSON.stringify({ cursor: 42 }));
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+    // Fixed at construction (loadPersistedCursor runs synchronously); a
+    // prompt_reply targeting seq <= 42 predates this process and is refused.
+    expect(pub.startSeq).toBe(42);
+    pub.close();
+    await fake.close();
+  });
+
+  it('startSeq is null on first boot (no persisted cursor) so the ghost check is disabled', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile(); // never written
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+    expect(pub.startSeq).toBeNull();
+    pub.close();
     await fake.close();
   });
 

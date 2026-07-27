@@ -56,7 +56,7 @@ import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
-import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
+import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -535,8 +535,8 @@ function journalStartSessionForRpc({ workdir, mcpExtras }) {
   const sessionRoomId = newSessionConvoId();
   const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
   const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-  const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-    sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+  const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+    sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
   const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
   session.originRoomId = null;
   session.sendCallback = sessionSendReply;
@@ -637,6 +637,16 @@ function journalPublish(session, method, payload) {
   } else {
     journalBufferPush(session, method, payload);
   }
+}
+
+function emitRelease(convoId, { promptId, action, releasedIds }) {
+  journalPublisher.publishPromptReply(convoId, {
+    kind: 'queued_release',
+    prompt_id: promptId,
+    action,
+    released: releasedIds,
+    at: Date.now(),
+  });
 }
 
 function journalUpsertConvo(session, opts) {
@@ -1259,6 +1269,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
         restarted.queueNotifications = session.queueNotifications;
+        journalInputConsumer.queueRelease.carryForward(
+          journalConvoIdFor(session),
+          journalConvoIdFor(restarted),
+        );
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
         restarted.chatHistory = session.chatHistory;
@@ -1526,6 +1540,7 @@ function handleCodexEvent(session, event) {
 function flushPendingSessionQueue(session) {
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queued = session.queuedMessages;
+  const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
   session.queuedMessages = null;
   const summary = formatQueueSummary(queued);
   if (session.sendHtml) {
@@ -1536,8 +1551,9 @@ function flushPendingSessionQueue(session) {
   } else if (session.sendCallback) {
     session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
   }
-  flushQueue(session, queued);
-  return true;
+  const sent = flushQueue(session, queued, releaseSnapshot);
+  if (sent === true) clearQueueNotifications(session);
+  return sent;
 }
 
 function finishCodexTurn(session, {
@@ -1570,8 +1586,6 @@ function finishCodexTurn(session, {
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   journalStatus(session);
-  if (!preserveQueue) clearQueueNotifications(session);
-
   if (!discardOutput && error && session.alive) {
     const message = `⚠️ ${error}`;
     if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
@@ -1809,6 +1823,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
         restarted.queueNotifications = session.queueNotifications;
+        journalInputConsumer.queueRelease.carryForward(
+          journalConvoIdFor(session),
+          journalConvoIdFor(restarted),
+        );
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
         restarted.chatHistory = session.chatHistory;
@@ -1913,18 +1931,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
     // Flush any queued messages now that claude is free.
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-      const queued = session.queuedMessages;
-      session.queuedMessages = null;
-      const summary = formatQueueSummary(queued);
-      if (session.sendHtml) {
-        session.sendHtml(
-          `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
-          `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
-        );
-      } else if (session.sendCallback) {
-        session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
-      }
-      flushQueue(session, queued);
+      flushPendingSessionQueue(session);
     }
   };
 
@@ -3270,18 +3277,7 @@ function handleClaudeEvent(session, event) {
 
       // Send any queued messages now that Claude is free
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-        const queued = session.queuedMessages;
-        session.queuedMessages = null;
-        if (session.sendHtml) {
-          const summary = formatQueueSummary(queued);
-          const plainMsg = `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`;
-          const htmlMsg = `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`;
-          session.sendHtml(plainMsg, htmlMsg);
-        } else if (session.sendCallback) {
-          const summary = formatQueueSummary(queued);
-          session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
-        }
-        flushQueue(session, queued);
+        flushPendingSessionQueue(session);
       }
 
       break;
@@ -3998,40 +3994,110 @@ function dispatchMergedFlush(session, queued) {
   return true;
 }
 
-function flushQueue(session, queued) {
+function queuedReleaseItemIds(session, queued) {
+  const batchSize = Array.isArray(queued) ? queued.length : 0;
+  return new Set(
+    (session.queueNotifications || [])
+      .slice(0, batchSize)
+      .map(notification => notification?.id)
+      .filter(Boolean),
+  );
+}
+
+function liveQueuedReleaseEntries(convoId, itemIds) {
+  return journalInputConsumer.queueRelease.listLive(convoId)
+    .filter(entry => itemIds.has(entry.itemId));
+}
+
+function snapshotQueuedReleaseBatch(session, queued) {
+  const convoId = journalConvoIdFor(session);
+  return {
+    convoId,
+    entries: liveQueuedReleaseEntries(
+      convoId,
+      queuedReleaseItemIds(session, queued),
+    ),
+  };
+}
+
+function queueReleaseForBatch(session, queued) {
+  const itemIds = queuedReleaseItemIds(session, queued);
+  return {
+    listLive: (convoId) => liveQueuedReleaseEntries(convoId, itemIds),
+    dropItem: (convoId, itemId) => {
+      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+    },
+  };
+}
+
+function finalizeSentQueue(convoId, flushedSnapshot) {
+  const liveByItemId = new Map(
+    journalInputConsumer.queueRelease.listLive(convoId)
+      .map(entry => [entry.itemId, entry]),
+  );
+  for (const { itemId } of flushedSnapshot || []) {
+    const liveEntry = liveByItemId.get(itemId);
+    if (!liveEntry) continue;
+    emitRelease(convoId, {
+      promptId: liveEntry.promptId,
+      action: 'send',
+      releasedIds: [itemId],
+    });
+    journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+    liveByItemId.delete(itemId);
+  }
+}
+
+function restoreQueuedBatch(session, queued) {
+  const pending = session.queuedMessages || [];
+  if (pending === queued) return;
+  session.queuedMessages = [...queued, ...pending];
+}
+
+function flushQueue(session, queued, releaseSnapshot = null) {
+  const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
   if (session.agent === AGENT_CODEX && session.busy) {
     // Claude's stream-json stdin can accept a forced follow-up while the
     // current process is alive; codex exec cannot. Preserve the detached
     // batch, interrupt the active child, and let finishCodexTurn dispatch it
     // after that child has exited and released the adapter's process slot.
-    session.queuedMessages = [...(session.queuedMessages || []), ...queued];
+    restoreQueuedBatch(session, queued);
     session._codexInterrupted = true;
-    if (session.codex?.interrupt('SIGINT')) return;
+    if (session.codex?.interrupt('SIGINT')) return 'deferred';
     session._codexInterrupted = false;
     console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
-    return;
+    return false;
   }
   if (!dispatchMergedFlush(session, queued)) {
-    console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
-    // Every one of these entries was acknowledged with a success-style
-    // "📨 Queued" tile when it queued, so dropping them with only a
-    // server-side log leaves the user believing they were delivered — the
-    // reachable form of the misleading-success bug PR #150 fixed for
-    // undeliverable attachments. Tell them — but only when the session is
-    // actually gone. dispatchMergedFlush also fails while the session is
-    // ALIVE (iv non-text-only queue, Codex validation/spawn failure, stdin
-    // write error), and each of those paths has already surfaced its
-    // specific reason via reportSessionSendFailure; adding "the session
-    // ended" on top would be duplicate and wrong (Bugbot, PR #158).
-    // journalPublishNotice already no-ops on a falsy convo id and fails
-    // open like every journal call.
+    // dispatchMergedFlush fails in two distinct situations that must NOT be
+    // handled the same way:
+    //   1. The session is gone (dead / auto-stopped). There is nothing to
+    //      retry against, so retaining would strand the batch forever. Every
+    //      entry was acknowledged with a success-style "📨 Queued" tile, so a
+    //      silent server-side drop leaves the user believing it was delivered
+    //      (the misleading-success bug PR #150 fixed for attachments, #161 for
+    //      queued messages). Notify + drop — matching merged master.
+    //   2. The session is ALIVE but refused this flush (iv non-text-only
+    //      queue, Codex validation/spawn failure, stdin write error). Each of
+    //      those already surfaced its specific reason via
+    //      reportSessionSendFailure, and the session is still there to retry
+    //      against, so retain the batch for a later flush rather than dropping.
     if (!session.alive || session._autoStopped) {
+      console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
+      // journalPublishNotice already no-ops on a falsy convo id and fails
+      // open like every journal call.
       const count = Array.isArray(queued) ? queued.length : 0;
       journalPublishNotice(journalConvoIdFor(session), count > 1
         ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
         : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+      return false;
     }
+    restoreQueuedBatch(session, queued);
+    console.log(`[QUEUE] could not send queued message(s); kept ${queued.length} queued message(s) for retry (room ${session.roomId})`);
+    return false;
   }
+  finalizeSentQueue(snapshot.convoId, snapshot.entries);
+  return true;
 }
 
 function splitMessage(text) {
@@ -4441,11 +4507,11 @@ function sweepToolStreams(session) {
 // session.sendButtonMessage closures; the journal publishes structured
 // prompts and ignores them. Retiring the whole fallback-text plumbing is a
 // tracked follow-up.
-async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _fallbackHtml) {
+async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _fallbackHtml, payload = null) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const journalSession = sessions.get(roomId);
   if (journalSession) {
-    journalPublish(journalSession, 'publishPrompt', { question: prompt, options: buttons, mode });
+    journalPublish(journalSession, 'publishPrompt', payload || { question: prompt, options: buttons, mode });
     return true;
   }
   return null;
@@ -4769,8 +4835,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
       const session = createSession(sessionRoomId, workdir, undefined, { agent: selectedAgent, mcpExtras });
       session.originRoomId = roomId;
@@ -5029,8 +5095,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
       // Inherit the resumed session's previously persisted extras unless the
       // user is explicitly overriding via the command line; this lets a
@@ -5152,8 +5218,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
       const session = createSession(sessionRoomId, resolved, undefined, { agent: selectedAgent, mcpExtras: workdirExtras });
       session.originRoomId = roomId;
@@ -6083,6 +6149,12 @@ async function journalRouteTextToSession(session, body) {
       flushQueue,
       stripQueueNotificationLinks: clearQueueNotifications,
       editMessage: null,
+      queueRelease: queueReleaseForBatch(
+        session,
+        session.queuedMessages || [],
+      ),
+      convoId: journalConvoIdFor(session),
+      emitRelease,
     });
     if (handledMagicWord) return;
     // Queue like a Matrix message would, but marked journal-origin so the
@@ -6102,6 +6174,9 @@ async function journalRouteTextToSession(session, body) {
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
       htmlEscape: escapeHtml,
+      queueRelease: journalInputConsumer.queueRelease,
+      convoId: journalConvoIdFor(session),
+      fullText: trimmed,
     });
     return;
   }
@@ -6263,7 +6338,7 @@ const journalMediaRouter = createJournalMediaRouter({
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = [...blocks];
   if (!mirrorToJournal) markJournalOrigin(entry);
@@ -6277,6 +6352,9 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) 
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
       htmlEscape: escapeHtml,
+      queueRelease: journalInputConsumer.queueRelease,
+      convoId: journalConvoIdFor(session),
+      fullText,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
@@ -6295,27 +6373,27 @@ function journalOnPromptReply(session, answer, { username }) {
   // cursor's ~1s debounce window must not replay it on restart. The frame's
   // seq was recorded before onEvent fired; force it to disk now.
   journalPublisher.flushCursor();
-  // Queue-tile buttons (✕ Cancel / ⚡ Send now): a Matron card tap arrives
-  // here as a prompt_reply whose `choice` carries the option VALUE
-  // (`interrupt` / `cancel:<n>` — the app's .buttonResponse channel sends
-  // values), the same wire constants a Matrix button tap posts. Run the
-  // SAME extracted implementation the Matrix button_response handler uses.
-  // Feedback ("⚡ Sending …" / "✕ Cancelled …") comes from the handler via
-  // the journal-mirroring ctx.sendReply, so the "answered:" echo below must
-  // not also fire — and a queue action is never a pending-prompt answer, so
-  // journalRoutePromptReply must not see it (its unmatched path could
-  // otherwise disturb real pending-prompt state).
-  if (isQueueActionValue(answer?.choice)) {
-    const ctx = journalSessionCommandCtx(session);
-    handleQueueActionValue(answer.choice, session, {
-      sendReply: ctx.sendReply,
-      formatQueueSummary,
+  // The router proves queue-card provenance from target_seq membership before
+  // calling us. Re-resolve the live registry entry here, where the session
+  // arrays and queue mutation seams are available. An ordinary prompt choice
+  // named "send" or "cancel" remains an ordinary answer because its seq is
+  // unknown to this registry.
+  const convoId = journalConvoIdFor(session);
+  const queuedRelease = journalInputConsumer.queueRelease.classifyBySeq(
+    convoId,
+    answer?.target_seq,
+  );
+  if (queuedRelease.state === 'live') {
+    resolveQueueReleaseTap(answer.choice, session, {
       flushQueue,
-      // 'interrupt' needs this to clear session.queueNotifications on a full
-      // flush (see clearQueueNotifications above); 'cancel:<n>' doesn't use
-      // it — its notif splice is unconditional. No editMessage: Matrix tile
-      // edits are gone with outbound Matrix sends (Task 3).
       stripQueueNotificationLinks: clearQueueNotifications,
+      entry: queuedRelease.entry,
+      convoId,
+      queueRelease: queueReleaseForBatch(
+        session,
+        session.queuedMessages || [],
+      ),
+      emitRelease,
     });
     return;
   }
@@ -6326,9 +6404,9 @@ function journalOnPromptReply(session, answer, { username }) {
   // that flag and dispatch to the SAME switch fns the explicit-arg !model /
   // !effort / !mode handlers call — never re-guessing by value shape, so a
   // genuine answer whose label merely looks like a picker value is never
-  // hijacked, and a verified picker tap is never swallowed as a prompt answer
-  // (loop #461 / PR review B1 + M1). A picker answers no pending prompt, so
-  // (like the queue-action block above) it emits no "answered:" echo.
+  // hijacked, and a verified picker tap is never swallowed as a prompt answer.
+  // A picker answers no pending prompt, so (like the queue-action block above)
+  // it emits no "answered:" echo.
   if (answer?.picker) {
     if (!session.alive) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
@@ -6477,6 +6555,21 @@ const journalInputConsumer = createJournalInputConsumer({
     journalPublishNotice(convoId,
       "That prompt has been superseded by a newer one — your answer wasn't delivered. Check the latest prompt and answer that instead.");
   },
+  noticeQueuedReleaseIgnored: (convoId, { reason } = {}) => {
+    // A tap on a queued-message card the bridge couldn't action. Never a
+    // silent no-op — the user pressed a button and expects a result.
+    journalPublishNotice(convoId, reason === 'tombstoned'
+      ? "That queued message was already sent or cancelled — nothing to do."
+      : "That action isn't available for this queued message anymore.");
+  },
+  noticeGhostPromptReply: (convoId) => {
+    // The tapped card is from before the bridge restarted; its session is
+    // gone, so we refuse rather than risk answering a different open prompt.
+    journalPublishNotice(convoId,
+      "That prompt is from before this bridge restarted and can no longer be answered. Check the latest prompt and answer that instead.");
+  },
+  processStartSeq: journalPublisher.startSeq,
+  emitRelease,
   log: console,
 });
 
@@ -6500,7 +6593,14 @@ function journalHandleInboundEvent(frame) {
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
   const convoId = journalConvoIdFor(session);
-  if (convoId) journalInputConsumer.evictConvo(convoId);
+  if (convoId) {
+    journalInputConsumer.evictConvo(convoId, {
+      clearQueue: () => {
+        session.queuedMessages = null;
+        session.queueNotifications = [];
+      },
+    });
+  }
 }
 
 // Plan approval for the `build` keyword — the Matrix handler's original
@@ -6623,8 +6723,8 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
-  newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
   hydrateAgentState(newSession, prev);
 
   const shortId = resumeSessionId ? resumeSessionId.slice(0, 8) : 'new';
@@ -6884,8 +6984,9 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
         const queued = session.queuedMessages || [];
+        const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
         session.queuedMessages = null;
-        clearQueueNotifications(session);
+        let sent = true;
         if (queued.length > 0) {
           const summary = formatQueueSummary(queued);
           if (session.sendHtml) {
@@ -6895,10 +6996,19 @@ const apiServer = createServer(async (req, res) => {
           } else if (session.sendCallback) {
             session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
           }
-          flushQueue(session, queued);
+          sent = flushQueue(session, queued, releaseSnapshot);
+          if (sent === true) clearQueueNotifications(session);
         }
-        res.writeHead(200);
-        res.end(JSON.stringify({ ok: true, flushed: queued.length }));
+        if (sent === true) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true, flushed: queued.length }));
+        } else {
+          const retained = Array.isArray(session.queuedMessages)
+            ? session.queuedMessages.length
+            : queued.length;
+          res.writeHead(409);
+          res.end(JSON.stringify({ ok: false, flushed: 0, retained }));
+        }
 
 
       } else if (url.pathname === '/cancel-queued') {
@@ -6920,12 +7030,32 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'No queued message at that index' }));
           return;
         }
-        queue.splice(index, 1);
-        // Keep queueNotifications in lockstep with queuedMessages at this
-        // index — no Matrix tile to edit anymore (Task 3), but the arrays
-        // must still shrink together or a later cancel misaligns.
+        // Preserve Array#splice's historical coercion for numeric indexes
+        // while resolving the exact slot it will remove to a stable id.
+        const queueIndex = Math.trunc(index);
         const notifs = session.queueNotifications || [];
-        if (index < notifs.length) notifs.splice(index, 1);
+        const itemId = notifs[queueIndex]?.id;
+        const convoId = journalConvoIdFor(session);
+        const releaseEntry = itemId
+          ? journalInputConsumer.queueRelease.listLive(convoId)
+            .find(entry => entry.itemId === itemId)
+          : null;
+        const cancelled = releaseEntry
+          ? cancelQueuedItem(session, {
+              itemId,
+              promptId: releaseEntry.promptId,
+              convoId,
+              queueRelease: journalInputConsumer.queueRelease,
+              emitRelease,
+            })
+          : false;
+        if (!cancelled) {
+          // Legacy queue entries have no durable item id. Preserve their
+          // positional cancellation behavior while keeping both arrays in
+          // lockstep.
+          queue.splice(queueIndex, 1);
+          if (queueIndex < notifs.length) notifs.splice(queueIndex, 1);
+        }
         const remaining = queue.length;
         if (remaining === 0) session.queuedMessages = null;
         if (session.sendCallback) {
@@ -7345,12 +7475,16 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   });
   next.sendCallback = sendReply;
   next.sendHtml = sendHtml;
-  next.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  next.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
   next.originRoomId = originRoomId;
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;
   next.queueNotifications = existing.queueNotifications;
+  journalInputConsumer.queueRelease.carryForward(
+    journalConvoIdFor(existing),
+    journalConvoIdFor(next),
+  );
   next.showWorking = existing.showWorking;
   next.showBashOutput = existing.showBashOutput;
   next.chatHistory = existing.chatHistory;
@@ -7381,7 +7515,6 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // already queued behind it. They belong to the logical conversation, not
   // the killed child, so dispatch them through the idle replacement now.
   if (next.agent === AGENT_CODEX && next.queuedMessages?.length) {
-    clearQueueNotifications(next);
     flushPendingSessionQueue(next);
   }
   return next;

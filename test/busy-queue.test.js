@@ -1,6 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { dispatchBusyQueueMagicWord, handleBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from '../lib/busy-queue.js';
+import { runInNewContext } from 'vm';
+import {
+  cancelQueuedItem,
+  dispatchBusyQueueMagicWord,
+  handleBusyQueueMagicWord,
+  notifyQueuedMessage,
+  resolveQueueReleaseTap,
+} from '../lib/busy-queue.js';
 
 // Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
 // send/interrupt/!interrupt (flush now) and cancel (pop last) handling is
@@ -41,7 +48,7 @@ function matrixDeps(overrides = {}) {
     sendReply: vi.fn(async () => {}),
     sendHtml: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
-    flushQueue: vi.fn(),
+    flushQueue: vi.fn(() => true),
     stripQueueNotificationLinks: vi.fn(),
     editMessage: vi.fn(async () => {}),
     ...overrides,
@@ -73,7 +80,7 @@ function journalDeps(overrides = {}) {
   const deps = {
     sendReply: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
-    flushQueue: vi.fn(),
+    flushQueue: vi.fn(() => true),
     editMessage: vi.fn(async () => {}),
   };
   deps.stripQueueNotificationLinks = realisticStrip(deps);
@@ -115,7 +122,10 @@ describe('handleBusyQueueMagicWord — send/interrupt (Matrix pin, full seams)',
     const order = [];
     const deps = matrixDeps({
       sendHtml: vi.fn(async () => order.push('summary')),
-      flushQueue: vi.fn(() => order.push('flush')),
+      flushQueue: vi.fn(() => {
+        order.push('flush');
+        return true;
+      }),
     });
 
     await handleBusyQueueMagicWord(session, 'send', deps);
@@ -219,6 +229,56 @@ describe('handleBusyQueueMagicWord — send/interrupt (journal seams)', () => {
     session.queueNotifications.push({ eventId: '$evC', plain: '📨 Queued (1): C' });
     expect(session.queueNotifications[0].eventId).toBe('$evC');
     expect(session.queuedMessages).toHaveLength(session.queueNotifications.length);
+  });
+
+  it('captures live release identities before detaching and passes them to the shared flush finalizer', async () => {
+    const session = makeSession();
+    const entries = [
+      { promptId: 'pr_first', itemId: 'pr_first::0' },
+      { promptId: 'pr_second', itemId: 'pr_second::0' },
+    ];
+    const queueRelease = { listLive: vi.fn(() => entries) };
+    const deps = journalDeps({
+      queueRelease,
+      convoId: 'convo-1',
+    });
+
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(queueRelease.listLive).toHaveBeenCalledWith('convo-1');
+    expect(deps.flushQueue).toHaveBeenCalledWith(session, expect.any(Array), {
+      convoId: 'convo-1',
+      entries,
+    });
+  });
+
+  it('keeps notification identities actionable when dispatch is rejected', async () => {
+    const session = makeSession();
+    const deps = journalDeps({ flushQueue: vi.fn(() => false) });
+
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(deps.stripQueueNotificationLinks).not.toHaveBeenCalled();
+    expect(session.queueNotifications).toHaveLength(2);
+  });
+
+  it('does not clear a notification queued while the detached batch awaits its summary', async () => {
+    const session = makeSession();
+    const deps = journalDeps({
+      sendReply: vi.fn(async () => {
+        session.queueNotifications.push({
+          eventId: '$ev3',
+          plain: '📨 Queued (1): third',
+        });
+      }),
+    });
+
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(session.queueNotifications).toEqual([{
+      eventId: '$ev3',
+      plain: '📨 Queued (1): third',
+    }]);
   });
 });
 
@@ -360,7 +420,7 @@ describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
 // only pushed the blocks), and a Matron tap on the tile's buttons was
 // dropped (journalRoutePromptReply only resolves real pending prompts).
 // Both halves are extracted here so the transports share one implementation:
-// notifyQueuedMessage posts the tile, handleQueueActionValue runs the taps.
+// notifyQueuedMessage posts the tile, resolveQueueReleaseTap runs the taps.
 
 describe('notifyQueuedMessage', () => {
   it('button channel: posts the tile with indexed cancel + interrupt values and records the notif', async () => {
@@ -425,83 +485,174 @@ describe('notifyQueuedMessage', () => {
     await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(async () => {}) });
     expect(session.queueNotifications).toEqual([]);
   });
-});
 
-describe('isQueueActionValue', () => {
-  it('matches exactly the bridge-controlled wire values', () => {
-    expect(isQueueActionValue('interrupt')).toBe(true);
-    expect(isQueueActionValue('cancel:0')).toBe(true);
-    expect(isQueueActionValue('cancel:12')).toBe(true);
-    expect(isQueueActionValue('cancel')).toBe(false);
-    expect(isQueueActionValue('cancel:x')).toBe(false);
-    expect(isQueueActionValue('send')).toBe(false);
-    expect(isQueueActionValue('opt_a')).toBe(false);
-    expect(isQueueActionValue(null)).toBe(false);
-    expect(isQueueActionValue(undefined)).toBe(false);
+  // Coverage gap (d): the STRUCTURED registry path — a router queueRelease seam
+  // plus convoId reserves a stable identity synchronously and publishes the
+  // queued_release card payload carrying the full (untruncated) text.
+  it('structured path: reserves a stable id via noteQueued and publishes the queued_release payload with fullText', async () => {
+    const sendButtonMessage = vi.fn(async () => '$tile');
+    const noteQueued = vi.fn();
+    const session = makeSession({ sendButtonMessage, queueNotifications: [] });
+    await notifyQueuedMessage(session, 'trunc…', {
+      sendReply: vi.fn(),
+      htmlEscape: (s) => s,
+      queueRelease: { noteQueued },
+      convoId: 'convo-1',
+      fullText: 'the full untruncated queued message body',
+    });
+
+    // Reservation happened synchronously with a matching prompt/item id.
+    expect(noteQueued).toHaveBeenCalledTimes(1);
+    const { promptId, itemId } = noteQueued.mock.calls[0][1];
+    expect(noteQueued.mock.calls[0][0]).toBe('convo-1');
+    expect(itemId).toBe(`${promptId}::0`);
+
+    // A display slot with the stable id is reserved on the session up front.
+    expect(session.queueNotifications).toEqual([
+      { eventId: '$tile', plain: '📨 Queued (2): trunc…', id: itemId },
+    ]);
+
+    // The queued_release payload is the LAST button arg and carries the full
+    // text (not the truncated preview) under the reserved id.
+    const buttonArgs = sendButtonMessage.mock.calls[0];
+    const payload = buttonArgs[buttonArgs.length - 1];
+    expect(payload).toMatchObject({
+      kind: 'queued_release',
+      prompt_id: promptId,
+      items: [{ id: itemId, text: 'the full untruncated queued message body' }],
+      actions: [
+        { id: 'send', intent: 'primary' },
+        { id: 'cancel', intent: 'neutral' },
+      ],
+    });
   });
 });
 
-describe('handleQueueActionValue', () => {
-  it('interrupt: detaches + strips + announces (html preferred) + flushes, returns true', () => {
+
+describe('cancelQueuedItem', () => {
+  it('removes by stable id, drops the registry entry, and emits one cancel release', () => {
+    const session = makeSession({
+      queueNotifications: [
+        { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: 'second', id: 'pr_2::0' },
+      ],
+    });
+    const live = [
+      { promptId: 'pr_1', itemId: 'pr_1::0' },
+      { promptId: 'pr_2', itemId: 'pr_2::0' },
+    ];
+    const queueRelease = {
+      dropItem: vi.fn((_convoId, itemId) => {
+        live.splice(live.findIndex(entry => entry.itemId === itemId), 1);
+      }),
+    };
+    const emitRelease = vi.fn();
+
+    expect(cancelQueuedItem(session, {
+      itemId: 'pr_2::0',
+      promptId: 'pr_2',
+      convoId: 'convo-1',
+      queueRelease,
+      emitRelease,
+    })).toBe(true);
+
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'first' }]]);
+    expect(session.queueNotifications).toEqual([
+      { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+    ]);
+    expect(live).toEqual([{ promptId: 'pr_1', itemId: 'pr_1::0' }]);
+    expect(queueRelease.dropItem).toHaveBeenCalledWith('convo-1', 'pr_2::0');
+    expect(emitRelease).toHaveBeenCalledWith('convo-1', {
+      promptId: 'pr_2',
+      action: 'cancel',
+      releasedIds: ['pr_2::0'],
+    });
+  });
+
+  it('does nothing when the stable id no longer maps to the queue', () => {
+    const session = makeSession({
+      queueNotifications: [
+        { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: 'second', id: 'pr_2::0' },
+      ],
+    });
+    const queueRelease = { dropItem: vi.fn() };
+    const emitRelease = vi.fn();
+
+    expect(cancelQueuedItem(session, {
+      itemId: 'pr_missing::0',
+      promptId: 'pr_missing',
+      convoId: 'convo-1',
+      queueRelease,
+      emitRelease,
+    })).toBe(false);
+
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(session.queueNotifications).toHaveLength(2);
+    expect(queueRelease.dropItem).not.toHaveBeenCalled();
+    expect(emitRelease).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveQueueReleaseTap', () => {
+  it('interrupt: detaches + strips + flushes without a post-action text line, returns true', () => {
     const session = makeSession();
     const deps = matrixDeps();
-    const handled = handleQueueActionValue('interrupt', session, deps);
+    const handled = resolveQueueReleaseTap('interrupt', session, deps);
     expect(handled).toBe(true);
     expect(session.queuedMessages).toBeNull();
     expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
-    expect(deps.sendHtml).toHaveBeenCalledWith(
-      '⚡ Sending 2 queued messages now:\n  1. [2 entries]',
-      '<b>⚡ Sending 2 queued messages now:</b><ol><li>[2 entries]</li></ol>',
-    );
+    expect(deps.sendHtml).not.toHaveBeenCalled();
+    expect(deps.sendReply).not.toHaveBeenCalled();
     expect(deps.flushQueue).toHaveBeenCalledTimes(1);
     expect(deps.flushQueue.mock.calls[0][1]).toHaveLength(2);
   });
 
-  it('interrupt via journal seams: plain sendReply announcement, same flush', () => {
+  it('interrupt via journal seams: no post-action text line, same flush', () => {
     const session = makeSession();
     const deps = matrixDeps({ sendHtml: null });
-    const handled = handleQueueActionValue('interrupt', session, deps);
+    const handled = resolveQueueReleaseTap('interrupt', session, deps);
     expect(handled).toBe(true);
-    expect(deps.sendReply).toHaveBeenCalledWith('⚡ Sending 2 queued messages now:\n  1. [2 entries]');
+    expect(deps.sendReply).not.toHaveBeenCalled();
     expect(deps.flushQueue).toHaveBeenCalledTimes(1);
   });
 
   it('interrupt on an empty queue is a SILENT no-op (stale-tile tap), still handled', () => {
     const session = makeSession({ queuedMessages: null });
     const deps = matrixDeps();
-    expect(handleQueueActionValue('interrupt', session, deps)).toBe(true);
+    expect(resolveQueueReleaseTap('interrupt', session, deps)).toBe(true);
     expect(deps.sendHtml).not.toHaveBeenCalled();
     expect(deps.sendReply).not.toHaveBeenCalled();
     expect(deps.flushQueue).not.toHaveBeenCalled();
   });
 
-  it('cancel:<n> splices exactly the indexed message AND its tile, edits it, reports remaining', () => {
+  it('cancel:<n> splices exactly the indexed message AND its tile without a post-action text line', () => {
     const session = makeSession();
     const deps = matrixDeps();
-    expect(handleQueueActionValue('cancel:0', session, deps)).toBe(true);
+    expect(resolveQueueReleaseTap('cancel:0', session, deps)).toBe(true);
     expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
     expect(session.queueNotifications).toEqual([{ eventId: '$ev2', plain: '📨 Queued (2): second' }]);
     expect(deps.editMessage).toHaveBeenCalledWith(
       '!room:server', '$ev1', '✕ 📨 Queued (1): first (cancelled)',
     );
-    expect(deps.sendReply).toHaveBeenCalledWith('✕ Cancelled queued message (1 remaining)');
+    expect(deps.sendReply).not.toHaveBeenCalled();
   });
 
-  it('cancel of the last remaining message nulls the queue and says so', () => {
+  it('cancel of the last remaining message nulls the queue without a post-action text line', () => {
     const session = makeSession({
       queuedMessages: [[{ type: 'text', text: 'solo' }]],
       queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
     });
     const deps = matrixDeps();
-    handleQueueActionValue('cancel:0', session, deps);
+    resolveQueueReleaseTap('cancel:0', session, deps);
     expect(session.queuedMessages).toBeNull();
-    expect(deps.sendReply).toHaveBeenCalledWith('✕ Cancelled queued message (queue empty)');
+    expect(deps.sendReply).not.toHaveBeenCalled();
   });
 
   it('cancel with an out-of-range index is a SILENT no-op (stale tile), still handled', () => {
     const session = makeSession();
     const deps = matrixDeps();
-    expect(handleQueueActionValue('cancel:9', session, deps)).toBe(true);
+    expect(resolveQueueReleaseTap('cancel:9', session, deps)).toBe(true);
     expect(session.queuedMessages).toHaveLength(2);
     expect(deps.editMessage).not.toHaveBeenCalled();
     expect(deps.sendReply).not.toHaveBeenCalled();
@@ -510,10 +661,344 @@ describe('handleQueueActionValue', () => {
   it('non-queue values touch nothing and return false', () => {
     const session = makeSession();
     const deps = matrixDeps();
-    expect(handleQueueActionValue('model:opus', session, deps)).toBe(false);
-    expect(handleQueueActionValue('opt_a', session, deps)).toBe(false);
+    expect(resolveQueueReleaseTap('model:opus', session, deps)).toBe(false);
+    expect(resolveQueueReleaseTap('opt_a', session, deps)).toBe(false);
     expect(session.queuedMessages).toHaveLength(2);
     expect(deps.flushQueue).not.toHaveBeenCalled();
+  });
+});
+
+// Coverage gap (a): the STRUCTURED entry path (entry != null), reached in
+// production from the router's stable-id classification. Only the legacy
+// entry==null branches were exercised above.
+describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
+  function entrySession(overrides = {}) {
+    return {
+      roomId: '!room:server',
+      queuedMessages: [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]],
+      queueNotifications: [
+        { id: 'pr_1::0', eventId: '$e1', plain: '📨 Queued (1): a' },
+        { id: 'pr_1::1', eventId: '$e2', plain: '📨 Queued (2): b' },
+      ],
+      ...overrides,
+    };
+  }
+
+  it('send: flushes the WHOLE queue with the live release snapshot and strips notifications on success', () => {
+    const flushQueue = vi.fn(() => true);
+    const stripQueueNotificationLinks = vi.fn();
+    const listLive = vi.fn(() => [
+      { promptId: 'pr_1', itemId: 'pr_1::0' },
+      { promptId: 'pr_1', itemId: 'pr_1::1' },
+    ]);
+    const session = entrySession();
+    const handled = resolveQueueReleaseTap('send', session, {
+      flushQueue,
+      stripQueueNotificationLinks,
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive, dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+    });
+    expect(handled).toBe(true);
+    expect(flushQueue).toHaveBeenCalledTimes(1);
+    // Whole queue (both items), not just the tapped card's item.
+    expect(flushQueue.mock.calls[0][1]).toHaveLength(2);
+    // The release snapshot is the LIVE registry entries, taken before detach.
+    expect(flushQueue.mock.calls[0][2]).toEqual({
+      convoId: 'convo-1',
+      entries: [
+        { promptId: 'pr_1', itemId: 'pr_1::0' },
+        { promptId: 'pr_1', itemId: 'pr_1::1' },
+      ],
+    });
+    expect(session.queuedMessages).toBeNull();
+    expect(stripQueueNotificationLinks).toHaveBeenCalledWith(session);
+  });
+
+  it('send: guard no-ops (returns true, no flush) when the card\'s item ids are not all present in notifications', () => {
+    const flushQueue = vi.fn(() => true);
+    const session = entrySession({
+      queueNotifications: [{ id: 'pr_1::0', eventId: '$e1', plain: 'a' }],
+    });
+    const handled = resolveQueueReleaseTap('send', session, {
+      flushQueue,
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::missing'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+    });
+    expect(handled).toBe(true);
+    expect(flushQueue).not.toHaveBeenCalled();
+    expect(session.queuedMessages).toHaveLength(2); // untouched
+  });
+
+  it('send: RESTORES notifications (does not strip) when the flush is rejected', () => {
+    const flushQueue = vi.fn(() => false);
+    const stripQueueNotificationLinks = vi.fn();
+    const session = entrySession();
+    const handled = resolveQueueReleaseTap('send', session, {
+      flushQueue,
+      stripQueueNotificationLinks,
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+    });
+    expect(handled).toBe(true);
+    expect(flushQueue).toHaveBeenCalledTimes(1);
+    expect(stripQueueNotificationLinks).not.toHaveBeenCalled();
+    // Notifications came back so the card stays actionable for a retry.
+    expect(session.queueNotifications).toEqual([
+      { id: 'pr_1::0', eventId: '$e1', plain: '📨 Queued (1): a' },
+      { id: 'pr_1::1', eventId: '$e2', plain: '📨 Queued (2): b' },
+    ]);
+  });
+
+  it('cancel: drops ONLY the tapped item by stable id and emits its cancel release', () => {
+    const dropItem = vi.fn();
+    const emitRelease = vi.fn();
+    const session = entrySession();
+    const handled = resolveQueueReleaseTap('cancel', session, {
+      flushQueue: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem },
+      emitRelease,
+    });
+    expect(handled).toBe(true);
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'b' }]]);
+    expect(session.queueNotifications).toEqual([{ id: 'pr_1::1', eventId: '$e2', plain: '📨 Queued (2): b' }]);
+    expect(dropItem).toHaveBeenCalledWith('convo-1', 'pr_1::0');
+    expect(emitRelease).toHaveBeenCalledWith('convo-1', {
+      promptId: 'pr_1',
+      action: 'cancel',
+      releasedIds: ['pr_1::0'],
+    });
+  });
+
+  it('an entry present with an unknown action returns false (not handled)', () => {
+    const session = entrySession();
+    const handled = resolveQueueReleaseTap('bogus', session, {
+      flushQueue: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+    });
+    expect(handled).toBe(false);
+    expect(session.queuedMessages).toHaveLength(2);
+  });
+});
+
+describe('queued-release publisher wiring', () => {
+  it('emitRelease publishes exactly one structured prompt_reply per call', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds })');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\n}\n\nfunction journalUpsertConvo', start);
+    expect(end).toBeGreaterThan(start);
+
+    const publishPromptReply = vi.fn();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
+    const emitRelease = runInNewContext(
+      `(${src.slice(start, end + 2)})`,
+      { journalPublisher: { publishPromptReply }, Date },
+    );
+
+    try {
+      emitRelease('convo-1', {
+        promptId: 'pr_123',
+        action: 'cancel',
+        releasedIds: ['pr_123::0'],
+      });
+
+      expect(publishPromptReply).toHaveBeenCalledTimes(1);
+      expect(publishPromptReply).toHaveBeenCalledWith('convo-1', {
+        kind: 'queued_release',
+        prompt_id: 'pr_123',
+        action: 'cancel',
+        released: ['pr_123::0'],
+        at: 1_722_000_000_000,
+      });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('the durable publisher exposes prompt_reply through safePublish', () => {
+    const src = readFileSync(new URL('../lib/journal-publisher.js', import.meta.url), 'utf-8');
+    expect(src).toMatch(
+      /publishPromptReply\(convoId,\s*payload\)\s*\{\s*safePublish\(convoId,\s*['"]prompt_reply['"],\s*payload\);\s*\}/,
+    );
+  });
+
+  it('the router rejects agent-authored release echoes at its user-sender guard', () => {
+    const src = readFileSync(new URL('../lib/journal-input-router.js', import.meta.url), 'utf-8');
+    expect(src).toMatch(
+      /if \(typeof sender !== ['"]string['"] \|\| !sender\.startsWith\(['"]user:['"]\)\) return;/,
+    );
+  });
+});
+
+describe('index.js queued-send finalizer', () => {
+  function loadFlushHarness({ dispatchResult = true } = {}) {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('function queuedReleaseItemIds(');
+    const end = src.indexOf('\nfunction splitMessage(', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+
+    const emitRelease = vi.fn();
+    const dropItem = vi.fn();
+    const journalPublishNotice = vi.fn();
+    const listLive = vi.fn(() => [
+      { promptId: 'pr_1', itemId: 'pr_1::0' },
+      { promptId: 'pr_2', itemId: 'pr_2::0' },
+      { promptId: 'pr_drifted', itemId: 'pr_drifted::0' },
+    ]);
+    const dispatchMergedFlush = vi.fn(() => dispatchResult);
+    const flushQueue = runInNewContext(
+      `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
+      {
+        AGENT_CODEX: 'codex',
+        console: { log: vi.fn() },
+        dispatchMergedFlush,
+        emitRelease,
+        journalConvoIdFor: () => 'convo-1',
+        journalPublishNotice,
+        journalInputConsumer: {
+          queueRelease: { listLive, dropItem },
+        },
+      },
+    );
+    return { flushQueue, emitRelease, dropItem, listLive, dispatchMergedFlush, journalPublishNotice };
+  }
+
+  it('commits every release exactly once, only after merged dispatch accepts the batch', () => {
+    const harness = loadFlushHarness();
+    const queued = [[{ type: 'text', text: 'first' }], [{ type: 'text', text: 'second' }]];
+    const session = {
+      agent: 'claude',
+      busy: false,
+      queuedMessages: null,
+      queueNotifications: [
+        { id: 'pr_1::0' },
+        { id: 'pr_2::0' },
+      ],
+      roomId: '!room',
+    };
+
+    expect(harness.flushQueue(session, queued)).toBe(true);
+    expect(harness.dispatchMergedFlush).toHaveBeenCalledWith(session, queued);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(2);
+    expect(harness.dropItem).toHaveBeenCalledTimes(2);
+    expect(harness.emitRelease).not.toHaveBeenCalledWith(
+      'convo-1',
+      expect.objectContaining({ releasedIds: ['pr_drifted::0'] }),
+    );
+    expect(harness.dispatchMergedFlush.mock.invocationCallOrder[0])
+      .toBeLessThan(harness.emitRelease.mock.invocationCallOrder[0]);
+  });
+
+  it('skips a batch notification whose registry entry is no longer live', () => {
+    const harness = loadFlushHarness();
+    const queued = [[{ type: 'text', text: 'live' }], [{ type: 'text', text: 'stale' }]];
+    const session = {
+      agent: 'claude',
+      busy: false,
+      queuedMessages: null,
+      queueNotifications: [
+        { id: 'pr_1::0' },
+        { id: 'pr_missing::0' },
+      ],
+      roomId: '!room',
+    };
+
+    expect(harness.flushQueue(session, queued)).toBe(true);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(1);
+    expect(harness.emitRelease).toHaveBeenCalledWith('convo-1', {
+      promptId: 'pr_1',
+      action: 'send',
+      releasedIds: ['pr_1::0'],
+    });
+    expect(harness.dropItem).toHaveBeenCalledTimes(1);
+  });
+
+  it('rolls the batch back without emitting or dropping releases when an ALIVE session rejects dispatch', () => {
+    // #161 reconcile: retain-for-retry is reserved for a live session that
+    // refused this flush. A dead/auto-stopped session takes the notify+drop
+    // path instead (covered separately below).
+    const harness = loadFlushHarness({ dispatchResult: false });
+    const queued = [[{ type: 'text', text: 'retry me' }]];
+    const later = [[{ type: 'text', text: 'arrived later' }]];
+    const session = { agent: 'claude', alive: true, busy: false, queuedMessages: later, roomId: '!room' };
+
+    expect(harness.flushQueue(session, queued)).toBe(false);
+    // Chronological order: the batch being retried was queued before `later`.
+    expect(session.queuedMessages).toEqual([...queued, ...later]);
+    expect(harness.emitRelease).not.toHaveBeenCalled();
+    expect(harness.dropItem).not.toHaveBeenCalled();
+  });
+
+  it('notifies and drops (no retain) when a DEAD/auto-stopped session rejects dispatch', () => {
+    // #161: dead-session flush failure must not strand the batch as a
+    // permanent retry; every entry was acknowledged with a "📨 Queued" tile,
+    // so drop it AND tell the user (matching merged master).
+    const harness = loadFlushHarness({ dispatchResult: false });
+    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]];
+    const session = { agent: 'claude', alive: false, busy: false, queuedMessages: null, roomId: '!room' };
+
+    expect(harness.flushQueue(session, queued)).toBe(false);
+    expect(session.queuedMessages).toBeNull(); // dropped, not retained
+    expect(harness.emitRelease).not.toHaveBeenCalled();
+    expect(harness.dropItem).not.toHaveBeenCalled();
+    expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);
+    expect(harness.journalPublishNotice.mock.calls[0][1]).toMatch(/2 queued messages/);
+  });
+
+  it('defers Codex release commitment until the interrupted turn has exited and dispatch succeeds', () => {
+    const harness = loadFlushHarness();
+    const queued = [[{ type: 'text', text: 'send after exit' }]];
+    const snapshot = {
+      convoId: 'convo-1',
+      entries: [{ promptId: 'pr_1', itemId: 'pr_1::0' }],
+    };
+    const session = {
+      agent: 'codex',
+      busy: true,
+      queuedMessages: null,
+      roomId: '!room',
+      codex: { interrupt: vi.fn(() => true) },
+    };
+
+    expect(harness.flushQueue(session, queued, snapshot)).toBe('deferred');
+    expect(session.queuedMessages).toEqual(queued);
+    expect(harness.dispatchMergedFlush).not.toHaveBeenCalled();
+    expect(harness.emitRelease).not.toHaveBeenCalled();
+
+    session.busy = false;
+    session.queuedMessages = null;
+    expect(harness.flushQueue(session, queued, snapshot)).toBe(true);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(1);
+    expect(harness.dropItem).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('index.js /interrupt endpoint — flush status (source inspection)', () => {
+  it('reports rejected or deferred dispatch as retained instead of flushed', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf("} else if (url.pathname === '/interrupt') {");
+    const end = src.indexOf("} else if (url.pathname === '/cancel-queued') {", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = src.slice(start, end);
+
+    expect(body).toMatch(/sent = flushQueue\(session, queued, releaseSnapshot\)/);
+    expect(body).toMatch(/if \(sent === true\)[\s\S]*res\.writeHead\(200\)/);
+    expect(body).toMatch(/else \{[\s\S]*res\.writeHead\(409\)/);
+    expect(body).toMatch(/JSON\.stringify\(\{ ok: false, flushed: 0, retained \}\)/);
   });
 });
 
@@ -550,12 +1035,59 @@ describe('index.js flushQueue drop path — undelivered notice wiring (source in
   // duplicate AND factually wrong second message.
   it('the "session ended" notice fires only when the session is actually dead/auto-stopped', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('[QUEUE] dropped queued message(s)');
-    expect(start).toBeGreaterThan(-1);
-    const window = src.slice(start, start + 1200);
-    const gate = window.indexOf('if (!session.alive || session._autoStopped)');
-    const notice = window.indexOf('journalPublishNotice(journalConvoIdFor(session)');
+    const drop = src.indexOf('[QUEUE] dropped queued message(s)');
+    expect(drop).toBeGreaterThan(-1);
+    // The drop log AND the "session ended" notice both sit inside a
+    // dead/auto-stopped gate: the gate opens before the drop log, and the
+    // notice follows the log inside the same branch.
+    const gate = src.lastIndexOf('if (!session.alive || session._autoStopped)', drop);
     expect(gate).toBeGreaterThan(-1);
-    expect(notice).toBeGreaterThan(gate); // notice sits inside the dead-session gate
+    expect(gate).toBeLessThan(drop);
+    const window = src.slice(gate, drop + 1200);
+    expect(window).toMatch(/journalPublishNotice\(journalConvoIdFor\(session\)/);
+  });
+});
+
+describe('#165 index.js prompt-reply handler — value-shape classification retired (source inspection)', () => {
+  it('index.js never classifies a queue tap by value shape (no isQueueReleaseTap usage)', () => {
+    // The #165 label-hijack fix: a genuine answer whose label is literally
+    // `interrupt` or `cancel:2` must NOT be dropped by a value-shape guard.
+    // Queue taps are proven by target_seq membership only, so index.js must
+    // not reference the retired value-shape predicate at all.
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    expect(src).not.toMatch(/isQueueReleaseTap/);
+  });
+
+  it('a seq-unclassified, non-picker reply is delivered to the ordinary answer resolver, not dropped', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('function journalOnPromptReply(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    expect(start).toBeGreaterThan(-1);
+    const body = src.slice(start, end);
+    // Only a 'live' queued-release seq is intercepted as a queue action; every
+    // other reply — including one whose label is literally `interrupt` /
+    // `cancel:2` — flows through to journalRoutePromptReply and the "answered:"
+    // echo. No value-shape early-return sits between classify and route.
+    expect(body).toMatch(/queuedRelease\.state === 'live'/);
+    expect(body).toMatch(/journalRoutePromptReply\(session, answer\)/);
+    expect(body).toMatch(/answered: /);
+    expect(body).not.toMatch(/isQueueReleaseTap/);
+  });
+});
+
+describe('index.js /cancel-queued endpoint — release registry wiring (source inspection)', () => {
+  it('resolves the positional entry to its stable id and uses cancelQueuedItem', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf("} else if (url.pathname === '/cancel-queued') {");
+    const end = src.indexOf("} else if (url.pathname === '/message') {", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = src.slice(start, end);
+
+    expect(body).toMatch(/const queueIndex = Math\.trunc\(index\)/);
+    expect(body).toMatch(/const itemId = notifs\[queueIndex\]\?\.id/);
+    expect(body).toMatch(/queueRelease\.listLive\(convoId\)/);
+    expect(body).toMatch(/cancelQueuedItem\(session, \{/);
+    expect(body).toMatch(/\bemitRelease\b/);
   });
 });
