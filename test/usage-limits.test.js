@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseUsageLimits, parseResetsAt, formatLimits } from '../lib/usage-limits.js';
+import { parseUsageLimits, parseResetsAt, resetsAtMs, deriveLimitId, formatLimits } from '../lib/usage-limits.js';
 
 // Real `claude -p "/usage" --output-format text` output (subscription account).
 // Note the middot separator (·) is the literal character Claude Code emits.
@@ -38,10 +38,16 @@ describe('parseUsageLimits', () => {
     const { ok, lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
     expect(ok).toBe(true);
     expect(lines).toEqual([
-      { label: 'Session', percent: 39, resets: 'Jul 9, 12:59am (UTC)', resets_at: '2026-07-09T00:59:00.000Z' },
-      { label: 'Week (all models)', percent: 66, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
-      { label: 'Week (Fable)', percent: 100, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
+      { id: 'session', label: 'Session', percent: 39, resets: 'Jul 9, 12:59am (UTC)', resets_at: '2026-07-09T00:59:00.000Z' },
+      { id: 'week_all', label: 'Week (all models)', percent: 66, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
+      { id: 'week_fable', label: 'Week (Fable)', percent: 100, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
     ]);
+    // resets_at is the ISO-8601 string form; no resets_at_ms sibling (dropped as
+    // redundant — clients derive the epoch via Date.parse(resets_at)).
+    for (const l of lines) {
+      expect(typeof l.resets_at).toBe('string');
+      expect('resets_at_ms' in l).toBe(false);
+    }
   });
 
   it('does not include the intro line or the "what\'s contributing" breakdown', () => {
@@ -64,19 +70,22 @@ describe('parseUsageLimits', () => {
     expect(parseUsageLimits(undefined)).toEqual({ ok: false, lines: [] });
   });
 
-  it('adds resets_at to lines when the reset text parses', () => {
+  it('adds resets_at (ISO) to lines when the reset text parses, with no resets_at_ms sibling', () => {
     const { lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
     expect(lines.map((l) => l.resets_at)).toEqual([
       '2026-07-09T00:59:00.000Z',
       '2026-07-12T18:59:00.000Z',
       '2026-07-12T18:59:00.000Z',
     ]);
+    // resets_at_ms was dropped as redundant; never emitted.
+    for (const l of lines) expect('resets_at_ms' in l).toBe(false);
   });
 
-  it('omits resets_at when the reset text does not parse', () => {
+  it('omits resets_at (and never emits resets_at_ms) when the reset text does not parse', () => {
     const { lines } = parseUsageLimits('Current session: 39% used · resets soon\n');
     expect(lines).toHaveLength(1);
     expect('resets_at' in lines[0]).toBe(false);
+    expect('resets_at_ms' in lines[0]).toBe(false);
   });
 
   it('parses the "at" + local IANA zone format to UTC timestamps', () => {
@@ -84,10 +93,143 @@ describe('parseUsageLimits', () => {
     expect(ok).toBe(true);
     expect(lines).toEqual([
       // BST is UTC+1: 12:19am Jul 15 London = 11:19pm Jul 14 UTC.
-      { label: 'Session', percent: 23, resets: 'Jul 15 at 12:19am (Europe/London)', resets_at: '2026-07-14T23:19:00.000Z' },
-      { label: 'Week (all models)', percent: 13, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
-      { label: 'Week (Fable)', percent: 21, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
+      { id: 'session', label: 'Session', percent: 23, resets: 'Jul 15 at 12:19am (Europe/London)', resets_at: '2026-07-14T23:19:00.000Z' },
+      { id: 'week_all', label: 'Week (all models)', percent: 13, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
+      { id: 'week_fable', label: 'Week (Fable)', percent: 21, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
     ]);
+  });
+
+  it('derives a stable machine id per limit line', () => {
+    const { lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
+    expect(lines.map((l) => l.id)).toEqual(['session', 'week_all', 'week_fable']);
+  });
+
+  // Real output when the Fable weekly bucket is at 0% — Claude prints that line
+  // with NO "· resets …" tail. The parser must still keep it (id/label/percent)
+  // and omit resets/resets_at, while the with-resets session and week-all lines
+  // in the SAME parse are unchanged.
+  it('parses a Fable 0%-used line that has no resets clause', () => {
+    const ZERO_FABLE_SAMPLE = `Current session: 25% used · resets Jul 26, 8:59pm (America/New_York)
+Current week (all models): 24% used · resets Aug 1, 4:59am (America/New_York)
+Current week (Fable): 0% used
+`;
+    const { ok, lines } = parseUsageLimits(ZERO_FABLE_SAMPLE, new Date('2026-07-26T12:00:00Z'));
+    expect(ok).toBe(true);
+    expect(lines.map((l) => l.id)).toEqual(['session', 'week_all', 'week_fable']);
+
+    // week_fable: kept, percent 0, no resets fields at all.
+    const fable = lines[2];
+    expect(fable).toEqual({ id: 'week_fable', label: 'Week (Fable)', percent: 0 });
+    expect('resets' in fable).toBe(false);
+    expect('resets_at' in fable).toBe(false);
+    expect('resets_at_ms' in fable).toBe(false);
+
+    // Regression guard: the two with-resets lines parse identically to before —
+    // same percent and same resets_at the optional group must not disturb.
+    expect(lines[0]).toEqual({
+      id: 'session', label: 'Session', percent: 25,
+      resets: 'Jul 26, 8:59pm (America/New_York)',
+      resets_at: '2026-07-27T00:59:00.000Z',
+    });
+    expect(lines[1]).toEqual({
+      id: 'week_all', label: 'Week (all models)', percent: 24,
+      resets: 'Aug 1, 4:59am (America/New_York)',
+      resets_at: '2026-08-01T08:59:00.000Z',
+    });
+  });
+});
+
+describe('resetsAtMs', () => {
+  const now = new Date('2026-07-08T00:00:00Z');
+
+  it('returns the epoch-ms number for a parseable reset', () => {
+    expect(resetsAtMs('Jul 9, 12:59am (UTC)', now)).toBe(Date.parse('2026-07-09T00:59:00.000Z'));
+  });
+
+  it('returns null on unparseable input, matching parseResetsAt', () => {
+    expect(resetsAtMs('soon', now)).toBeNull();
+    expect(resetsAtMs('', now)).toBeNull();
+    expect(resetsAtMs(null, now)).toBeNull();
+  });
+
+  it('parseResetsAt is the ISO wrapper over the same instant', () => {
+    const ms = resetsAtMs('Jul 12, 6:59pm (UTC)', now);
+    expect(parseResetsAt('Jul 12, 6:59pm (UTC)', now)).toBe(new Date(ms).toISOString());
+  });
+});
+
+describe('deriveLimitId', () => {
+  it('maps the session line to plain session', () => {
+    expect(deriveLimitId('session')).toBe('session');
+    expect(deriveLimitId('Session')).toBe('session');
+  });
+
+  it('maps the all-models weekly line to week_all', () => {
+    expect(deriveLimitId('week (all models)')).toBe('week_all');
+  });
+
+  it('canonicalizes "all models" to week_all whether or not it is parenthesized', () => {
+    // Wording drift: Claude may drop the parens. Both must yield the SAME id so
+    // one semantic never forks into week_all vs week_all_models (MAJOR 1).
+    expect(deriveLimitId('week (all models)')).toBe('week_all');
+    expect(deriveLimitId('week all models')).toBe('week_all');
+    expect(deriveLimitId('Week (all models)')).toBe('week_all');
+    expect(deriveLimitId('week (all models)')).toBe(deriveLimitId('week all models'));
+  });
+
+  it('maps a named weekly line to week_<slug>', () => {
+    expect(deriveLimitId('week (Fable)')).toBe('week_fable');
+    expect(deriveLimitId('week (Sonnet 5)')).toBe('week_sonnet_5');
+    expect(deriveLimitId('week (Claude Opus 4.8)')).toBe('week_claude_opus_4_8');
+  });
+
+  it('slugs the whole suffix when a weekly line has no parentheses (wording drift)', () => {
+    // Distinct future weekly wordings must NOT all collapse to week_other.
+    expect(deriveLimitId('week fable')).toBe('week_fable');
+    expect(deriveLimitId('week sonnet 5')).toBe('week_sonnet_5');
+  });
+
+  it('never crashes on unknown / empty / nullish labels', () => {
+    expect(deriveLimitId('week ()')).toBe('week_other');
+    expect(deriveLimitId('something odd')).toBe('something_odd');
+    expect(deriveLimitId('')).toBe('week_other');
+    expect(deriveLimitId(null)).toBe('week_other');
+    expect(deriveLimitId(undefined)).toBe('week_other');
+  });
+});
+
+describe('parseUsageLimits id dedup', () => {
+  it('gives every colliding row a distinct id (identical labels)', () => {
+    // Two identical weekly lines both derive week_other; they are genuinely
+    // indistinguishable, so a positional tiebreak is acceptable — but the ids
+    // must still be unique so clients keyed by id don't clobber one another.
+    const raw = [
+      'Current week (): 10% used · resets soon',
+      'Current week (): 20% used · resets soon',
+    ].join('\n');
+    const { lines } = parseUsageLimits(raw);
+    expect(lines).toHaveLength(2);
+    expect(new Set(lines.map((l) => l.id)).size).toBe(lines.length);
+    for (const l of lines) expect(l.id.startsWith('week_other')).toBe(true);
+  });
+
+  it('maps each DISTINCT label to a stable id regardless of row order', () => {
+    // Two distinct labels that collide on the same base id (week_other). The
+    // disambiguator is a hash of the full label, NOT first-seen order, so
+    // reversing the rows must preserve each label -> id mapping (MAJOR 2).
+    const rowA = 'Current week (!!!): 10% used · resets soon';
+    const rowB = 'Current week (???): 20% used · resets soon';
+
+    const fwd = parseUsageLimits([rowA, rowB].join('\n')).lines;
+    const rev = parseUsageLimits([rowB, rowA].join('\n')).lines;
+
+    // Base id collides -> both are suffixed, and the two ids are distinct.
+    expect(fwd.map((l) => l.id).every((id) => id.startsWith('week_other_'))).toBe(true);
+    expect(new Set(fwd.map((l) => l.id)).size).toBe(2);
+
+    // label -> id is identical in both orderings.
+    const mapOf = (lines) => Object.fromEntries(lines.map((l) => [l.label, l.id]));
+    expect(mapOf(rev)).toEqual(mapOf(fwd));
   });
 });
 
