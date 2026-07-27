@@ -505,6 +505,46 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
     expect(() => consumer.evictConvo(null)).not.toThrow();
     expect(() => consumer.evictConvo(undefined)).not.toThrow();
   });
+
+  it('evictConvo cancels live queue cards before clearing the queue and registry', () => {
+    const order = [];
+    const emitRelease = vi.fn((convoId, release) => {
+      order.push(`release:${release.releasedIds[0]}`);
+      expect(convoId).toBe('convo-1');
+    });
+    const consumer = createJournalInputConsumer(makeDeps({ emitRelease }));
+    consumer.queueRelease.noteQueued('convo-1', {
+      promptId: 'pr_1',
+      itemId: 'pr_1::0',
+    });
+    consumer.queueRelease.noteQueued('convo-1', {
+      promptId: 'pr_2',
+      itemId: 'pr_2::0',
+    });
+
+    consumer.evictConvo('convo-1', {
+      clearQueue: () => order.push('clear'),
+    });
+
+    expect(order).toEqual(['release:pr_1::0', 'release:pr_2::0', 'clear']);
+    expect(emitRelease).toHaveBeenNthCalledWith(1, 'convo-1', {
+      promptId: 'pr_1',
+      action: 'cancel',
+      releasedIds: ['pr_1::0'],
+    });
+    expect(emitRelease).toHaveBeenNthCalledWith(2, 'convo-1', {
+      promptId: 'pr_2',
+      action: 'cancel',
+      releasedIds: ['pr_2::0'],
+    });
+    expect(consumer.queueRelease.listLive('convo-1')).toEqual([]);
+
+    consumer.evictConvo('convo-1', {
+      clearQueue: () => order.push('clear-again'),
+    });
+    expect(emitRelease).toHaveBeenCalledTimes(2);
+    expect(order.at(-1)).toBe('clear-again');
+  });
 });
 
 // Auto-resume seam: the idle reaper silently kills sessions assuming "the
@@ -689,6 +729,18 @@ describe('promptExpectsReply', () => {
 
   it('is false for queue-notification action buttons (cancel/interrupt)', () => {
     expect(promptExpectsReply({ options: [{ id: 'cancel', label: '✕ Cancel' }, { id: 'interrupt', label: '⚡ Send now' }] })).toBe(false);
+  });
+
+  it('is false for a structured queued_release card (kind check, no options array)', () => {
+    // Load-bearing: the queued_release card payload has NO `options` array, so
+    // without the explicit kind short-circuit promptExpectsReply would default
+    // to TRUE, advance the staleness guard on the card's own seq, and then
+    // wrongly refuse the NEXT genuine prompt reply as stale. The kind check
+    // keeps the card non-answerable regardless of its (absent) options.
+    expect(promptExpectsReply({ kind: 'queued_release', prompt_id: 'pr_1', items: [{ id: 'pr_1::0', text: 'hi' }] })).toBe(false);
+    // Even if a future card grows an answerable-looking options array, the kind
+    // wins.
+    expect(promptExpectsReply({ kind: 'queued_release', options: [{ id: 'opt_a', label: 'A' }] })).toBe(false);
   });
 
   it('defaults to true (guard stays active) for unrecognized or missing option shapes', () => {
@@ -882,6 +934,29 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     expect(deps.handleControlCommand).not.toHaveBeenCalled();
   });
 
+  it('retains live queued-card seqs while bounding only resolved tombstones', () => {
+    const consumer = createJournalInputConsumer(makeDeps());
+    const registry = consumer.queueRelease;
+
+    registry.noteQueued('convo-1', { promptId: 'live', itemId: 'live::0' });
+    registry.annotateSeq('convo-1', 1, 'live');
+
+    for (let seq = 2; seq <= 514; seq++) {
+      const promptId = `resolved-${seq}`;
+      const itemId = `${promptId}::0`;
+      registry.noteQueued('convo-1', { promptId, itemId });
+      registry.annotateSeq('convo-1', seq, promptId);
+      registry.dropItem('convo-1', itemId);
+    }
+
+    expect(registry.classifyBySeq('convo-1', 1)).toMatchObject({
+      state: 'live',
+      entry: { prompt_id: 'live', itemIds: ['live::0'], seq: 1 },
+    });
+    expect(registry.classifyBySeq('convo-1', 2)).toEqual({ state: 'unknown' });
+    expect(registry.classifyBySeq('convo-1', 3)).toEqual({ state: 'tombstoned' });
+  });
+
   it('without a routeMediaToSession seam, file/image frames stay pass-through (never looked up or routed)', () => {
     const deps = makeDeps({ routeMediaToSession: undefined });
     const consumer = createJournalInputConsumer(deps);
@@ -892,13 +967,15 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
   });
 });
 
-// Queue-tile taps from Matron arrive as prompt_reply frames whose `choice`
-// carries the tile's option VALUE (`interrupt` / `cancel:<n>`). Their tile
-// never advances the staleness guard (non-answerable, issue #98), so the
-// guard's target_seq comparison would wrongly refuse them whenever ANY
-// answerable prompt has been recorded — the consumer must classify them by
-// value shape and route them around the guard.
-describe('createJournalInputConsumer — queue-action replies bypass the staleness guard', () => {
+// Issue #165: value-shape classification of queue taps is RETIRED. A queue
+// tap is now proven ONLY by target_seq membership in the queued-release
+// registry (see the queued-release describe below). A prompt_reply whose
+// `choice` merely LOOKS like a legacy queue action (`interrupt`, `cancel:2`)
+// but whose target_seq is not a queued-release card is an ORDINARY answer and
+// must be handled exactly like any other answer — delivered when it targets
+// the current prompt, refused as stale when it targets a superseded one. This
+// block is the #165 label-hijack regression for the router path.
+describe('createJournalInputConsumer — queue-action-shaped labels are ordinary answers (#165)', () => {
   function makeDeps(overrides = {}) {
     return {
       isControlConvo: () => false,
@@ -926,29 +1003,41 @@ describe('createJournalInputConsumer — queue-action replies bypass the stalene
     payload: { target_seq: targetSeq, choice, text: null },
   });
 
-  it('an interrupt tap routes even when its target_seq mismatches the latest answerable prompt', () => {
+  it('#165: a genuine answer labeled "interrupt" targeting the CURRENT prompt is delivered, not hijacked', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
-    consumer(answerableFrame(10));           // guard now expects target_seq 10
-    consumer(queueReply(12, 'interrupt'));   // tile at seq 12 — mismatch, but a queue action
+    consumer(answerableFrame(10));            // latest answerable prompt: seq 10
+    consumer(queueReply(10, 'interrupt'));    // genuine answer to THAT prompt
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
     expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
     expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
-      target_seq: 12, choice: 'interrupt', text: null,
+      target_seq: 10, choice: 'interrupt', text: null,
     });
   });
 
-  it('an indexed cancel tap routes the same way', () => {
+  it('#165: a genuine answer labeled "cancel:2" targeting the CURRENT prompt is delivered', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
     consumer(answerableFrame(10));
-    consumer(queueReply(12, 'cancel:0'));
+    consumer(queueReply(10, 'cancel:2'));
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
     expect(deps.routePromptReply).toHaveBeenCalledWith(
       expect.anything(),
-      { target_seq: 12, choice: 'cancel:0', text: null },
+      { target_seq: 10, choice: 'cancel:2', text: null },
       { username: 'dan' },
     );
+  });
+
+  it('a queue-action-shaped label with a mismatched target_seq is refused as stale, like any answer', () => {
+    // No value-shape route-around: `interrupt` with a superseded target_seq is
+    // now treated exactly like `opt_a` below — refused as stale (a notice, not
+    // a silent no-op), never routed around the guard.
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerableFrame(10));
+    consumer(queueReply(12, 'interrupt'));   // target_seq 12 != latest 10, not a queue card
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
   });
 
   it('a NON-queue choice with a mismatched target_seq is still refused as stale', () => {
@@ -969,7 +1058,7 @@ describe('createJournalInputConsumer — queue-action replies bypass the stalene
 // been recorded for the convo. The consumer classifies them by frame
 // provenance — target_seq must name a recorded picker frame and the choice
 // must be among the values that frame offered — and routes them around the
-// guard, exactly like the queue-action block (loop #461).
+// guard (the same seq-provenance principle the queued-release path uses).
 describe('createJournalInputConsumer — picker replies bypass the staleness guard', () => {
   function makeDeps(overrides = {}) {
     return {
@@ -1124,5 +1213,149 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
     expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 12, picker: true });
     expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Coverage gap (b): a full round-trip through onJournalEvent — the bridge's
+// own queued_release card echoes back (agent sender) and records its seq, then
+// user prompt_reply frames exercise the classify intercept: a valid action
+// routes, an unknown action warns + notices, and a post-resolution (tombstoned)
+// tap is dropped with a notice. No value-shape classification anywhere.
+describe('createJournalInputConsumer — queued_release end-to-end', () => {
+  const CONVO = 'convo-1';
+  const PROMPT = 'pr_e2e';
+  const ITEM = 'pr_e2e::0';
+  const CARD_SEQ = 77;
+
+  function makeDeps(overrides = {}) {
+    const warnings = [];
+    return {
+      deps: {
+        isControlConvo: () => false,
+        handleControlCommand: vi.fn(),
+        findSessionByConvoId: vi.fn(() => ({ claudeSessionId: CONVO })),
+        routeTextToSession: vi.fn(),
+        routePromptReply: vi.fn(),
+        noticeUnknownConvo: vi.fn(),
+        noticeStalePromptReply: vi.fn(),
+        noticeQueuedReleaseIgnored: vi.fn(),
+        log: { warn: (m) => warnings.push(m), error: () => {} },
+        ...overrides,
+      },
+      warnings,
+    };
+  }
+
+  // The bridge-authored card echoing back to the router (agent sender).
+  const cardEcho = () => baseFrame({
+    seq: CARD_SEQ, sender: 'agent:dev-2', type: 'prompt',
+    convo_id: CONVO,
+    payload: { kind: 'queued_release', prompt_id: PROMPT, items: [{ id: ITEM, text: 'hi' }] },
+  });
+
+  const tap = (choice) => baseFrame({
+    seq: 200, sender: 'user:dan', type: 'prompt_reply',
+    convo_id: CONVO,
+    payload: { target_seq: CARD_SEQ, choice, text: null },
+  });
+
+  it('records the card seq, routes a valid tap, notices an invalid one, and drops a tombstoned one', () => {
+    const { deps, warnings } = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    // Reserve the live identity (index.js does this from notifyQueuedMessage).
+    consumer.queueRelease.noteQueued(CONVO, { promptId: PROMPT, itemId: ITEM });
+    // The card echoes back → annotateSeq binds CARD_SEQ to the live prompt.
+    consumer(cardEcho());
+
+    // Valid action → classify 'live' → routed to the reply seam, NOT the
+    // ordinary answer echo path.
+    consumer(tap('send'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
+      target_seq: CARD_SEQ, choice: 'send', text: null,
+    });
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+
+    // Unknown action on a known card → warn + user notice, no route.
+    consumer(tap('frobnicate'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // unchanged
+    expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
+    expect(warnings.some(w => /invalid queued_release action/.test(w))).toBe(true);
+
+    // Resolve the card (index.js does this via dropItem after the flush/cancel).
+    consumer.queueRelease.dropItem(CONVO, ITEM);
+
+    // A late/duplicate tap now classifies 'tombstoned' → dropped with a notice,
+    // never falling through to the ordinary answer path.
+    deps.noticeQueuedReleaseIgnored.mockClear();
+    consumer(tap('send'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // still unchanged
+    expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'tombstoned' }));
+  });
+});
+
+// Ghost-answer window (post-restart): a prompt_reply whose target_seq predates
+// this bridge process is answering a prompt whose asking session is gone. Since
+// resolvePromptChoice matches options by case-insensitive label and the
+// queued-release wire values (send/cancel) are common real-prompt labels,
+// routing it to the current prompt could silently answer the WRONG one. Refuse.
+describe('createJournalInputConsumer — ghost-answer refusal (processStartSeq)', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      noticeGhostPromptReply: vi.fn(),
+      processStartSeq: 100,
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const answerable = (seq) => baseFrame({
+    seq, sender: 'agent:dev-2', type: 'prompt',
+    payload: { question: 'ok?', mode: 'pick_one', options: [{ id: 'send', label: 'Send' }] },
+  });
+  const reply = (targetSeq, choice) => baseFrame({
+    seq: 500, type: 'prompt_reply', payload: { target_seq: targetSeq, choice, text: null },
+  });
+
+  it('refuses a reply whose target_seq predates process start, with a notice and no route', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(reply(50, 'send')); // 50 <= processStartSeq 100 → ghost
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeGhostPromptReply).toHaveBeenCalledWith('convo-1', expect.objectContaining({ targetSeq: 50 }));
+  });
+
+  it('refuses even at the exact boundary seq (<= is inclusive)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(reply(100, 'cancel'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeGhostPromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers a reply whose target_seq is after process start (a real current answer)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerable(150));      // current prompt, seq 150 > 100
+    consumer(reply(150, 'send'));   // genuine answer to it
+    expect(deps.noticeGhostPromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 150, choice: 'send' });
+  });
+
+  it('disables the check when processStartSeq is null (first boot)', () => {
+    const deps = makeDeps({ processStartSeq: null });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerable(5));
+    consumer(reply(5, 'send'));
+    expect(deps.noticeGhostPromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
   });
 });
