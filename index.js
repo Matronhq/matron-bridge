@@ -62,7 +62,7 @@ import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.j
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, hostVitalLimits, startCpuSampler, stopCpuSampler } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -808,23 +808,25 @@ function journalStatus(session) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
   if (!convoId) return;
-  // Host CPU/RAM vitals (#526) are host-global, not account- or agent-specific,
-  // so they ride on every frame (Claude and Codex). Sampled once per turn end
-  // here so consecutive CPU samples bracket real wall-clock time (no blocking
-  // sleep). The account rate limits, by contrast, are Claude-account-specific.
-  const hostVitals = hostVitalLimits();
+  // Host CPU/RAM vitals are host-global, not account- or agent-specific, so
+  // they ride on every frame (Claude and Codex) at TOP LEVEL (status.vitals) —
+  // NOT in limits[], which clients render as Claude-account subscription
+  // meters. hostVitals() only READS the sampler cache (the 15s interval owns
+  // sampling); it never samples here.
+  const vitals = hostVitals();
   const isCodex = session.agent === AGENT_CODEX;
   const status = buildSessionStatus({
     model: session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
-    // Codex frames carry only host vitals; Claude frames carry the account
-    // rate limits followed by host vitals.
-    limits: isCodex ? hostVitals : [...(usageLimitsCache.lines || []), ...hostVitals],
+    // Account rate limits are Claude-account-specific; Codex frames carry none,
+    // keeping the Codex limits array empty (buildSessionStatus omits it).
+    limits: isCodex ? [] : (usageLimitsCache.lines || []),
     email: getAccountEmail(),
+    vitals,
   });
   // The shared account email cache is Claude-specific — strip it from Codex
   // frames. (Rate limits are already excluded from the Codex limits array
-  // above; host vitals intentionally remain.)
+  // above; host vitals live at top-level status.vitals and stay on both.)
   if (isCodex) {
     delete status.email;
   }
@@ -7268,10 +7270,12 @@ async function main() {
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
   console.log(`Journal: connecting to ${JOURNAL_WS_URL}`);
-  // Fixed-cadence host-CPU sampler (#526). Owns the baseline so journalStatus's
+  // Fixed-cadence host-CPU sampler. Owns the baseline so journalStatus's
   // many-per-tick reads never corrupt it; .unref()'d so it doesn't hold the
-  // process open. host_cpu appears once the first interval has a valid diff.
-  startCpuSampler();
+  // process open. cpu_pct appears once the first interval has a valid diff.
+  // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
+  // journal frames, so there's nothing to sample for when journal mode is off.
+  if (JOURNAL_ENABLED) startCpuSampler();
 }
 
 main().catch(err => {

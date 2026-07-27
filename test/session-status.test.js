@@ -10,9 +10,10 @@ import {
   contextGaugeText,
   buildSessionStatus,
   emailFromClaudeConfig,
-  hostVitalLimits,
+  hostVitals,
   sampleCpuOnce,
   cpuPercent,
+  cpuSampledAtMs,
   ramPercent,
   startCpuSampler,
   stopCpuSampler,
@@ -178,6 +179,23 @@ describe('buildSessionStatus', () => {
     expect(buildSessionStatus({ model: 'claude-fable-5', email: null })).toEqual({ model: 'claude-fable-5' });
     expect(buildSessionStatus({ model: 'claude-fable-5', email: '' })).toEqual({ model: 'claude-fable-5' });
   });
+
+  it('carries host vitals at top level (status.vitals), never inside limits', () => {
+    const vitals = { cpu_pct: 12, ram_pct: 47, sampled_at_ms: 1_753_000_000_000 };
+    const status = buildSessionStatus({
+      model: 'claude-fable-5',
+      limits: [{ id: 'session', label: 'Session', percent: 39 }],
+      vitals,
+    });
+    expect(status.vitals).toEqual(vitals);
+    // limits[] stays the account-meter list — vitals must not leak into it.
+    expect(status.limits).toEqual([{ id: 'session', label: 'Session', percent: 39 }]);
+  });
+
+  it('omits status.vitals when vitals is null/absent', () => {
+    expect('vitals' in buildSessionStatus({ model: 'claude-fable-5', vitals: null })).toBe(false);
+    expect('vitals' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
+  });
 });
 
 describe('emailFromClaudeConfig', () => {
@@ -195,9 +213,17 @@ describe('emailFromClaudeConfig', () => {
   });
 });
 
-describe('host vitals (#526)', () => {
-  // Burn real CPU so two sampleCpuOnce() calls bracket a non-zero tick window
-  // (jiffy resolution is ~10ms, so ~40ms guarantees accumulated ticks).
+describe('host vitals', () => {
+  // Injected os.cpus()-style tick snapshots so the CPU-diff tests are fully
+  // deterministic instead of racing real jiffy accumulation between two live
+  // os.cpus() reads (the old busyWait approach flaked ~50% on the zero-tick
+  // preservation check — expected 96, got 100). BASE→VALID is a 50%-busy
+  // window: idleDelta 400 / totalDelta 800 → busy 0.5 → 50.
+  const BASE = { idle: 1000, total: 4000 };
+  const VALID = { idle: 1400, total: 4800 };
+
+  // Burn real CPU so two live sampleCpuOnce() calls bracket a non-zero tick
+  // window — used only by the real-path smoke test below.
   const busyWait = (ms) => {
     const end = Date.now() + ms;
     // eslint-disable-next-line no-empty
@@ -212,82 +238,85 @@ describe('host vitals (#526)', () => {
     expect(p).toBeLessThanOrEqual(100);
   });
 
-  it('cpuPercent stays null until a scheduled sample produces a valid diff', () => {
+  it('cpuPercent stays null until a scheduled sample produces a valid diff (deterministic)', () => {
     stopCpuSampler(); // reset module state (clears baseline + cache)
     expect(cpuPercent()).toBeNull();
-    sampleCpuOnce(); // establishes the baseline only — no cached value yet
+    sampleCpuOnce(BASE); // establishes the baseline only — no cached value yet
     expect(cpuPercent()).toBeNull();
+    sampleCpuOnce(VALID); // a real diff populates the cache
+    expect(cpuPercent()).toBe(50);
+  });
+
+  it('cpuPercent populates over a real live sampling window (default snapshot path)', () => {
+    stopCpuSampler();
+    sampleCpuOnce(); // live baseline (default cpuTicks())
     busyWait(40);
-    sampleCpuOnce(); // now a real diff populates the cache
+    sampleCpuOnce(); // live diff
     const v = cpuPercent();
     expect(Number.isInteger(v)).toBe(true);
     expect(v).toBeGreaterThanOrEqual(0);
     expect(v).toBeLessThanOrEqual(100);
   });
 
-  it('hostVitalLimits always includes host_ram with an integer percent', () => {
-    const entries = hostVitalLimits();
-    const ram = entries.find((e) => e.id === 'host_ram');
-    expect(ram).toBeDefined();
-    expect(ram.label).toBe('RAM');
-    expect(Number.isInteger(ram.percent)).toBe(true);
-    // Host vitals never reset — no resets_at/resets fields.
-    expect('resets_at' in ram).toBe(false);
-    expect('resets' in ram).toBe(false);
+  it('hostVitals is a flat snapshot with an integer ram_pct and no limit/reset fields', () => {
+    const v = hostVitals();
+    expect(v).not.toBeNull();
+    expect(Number.isInteger(v.ram_pct)).toBe(true);
+    expect(v.ram_pct).toBeGreaterThanOrEqual(0);
+    expect(v.ram_pct).toBeLessThanOrEqual(100);
+    // It is a top-level object, NOT a limit entry: no id/label/percent/resets.
+    expect('id' in v).toBe(false);
+    expect('label' in v).toBe(false);
+    expect('resets' in v).toBe(false);
+    expect('resets_at' in v).toBe(false);
   });
 
-  it('host entries carry a numeric sampled_at_ms so clients can expire stale replays (#526)', () => {
+  it('hostVitals carries a numeric sampled_at_ms so clients can expire stale replays', () => {
     // The publisher replays the last status frame to new viewers, so an idle
-    // convo would show an arbitrarily old host reading as current without an
-    // age stamp. Both host_cpu and host_ram must carry a numeric sampled_at_ms.
+    // convo would show an arbitrarily old reading as current without an age
+    // stamp. sampled_at_ms is the CPU cache-stamp once the sampler has warmed.
     stopCpuSampler();
-    sampleCpuOnce();  // baseline
-    busyWait(40);
-    sampleCpuOnce();  // cache a valid cpu reading + stamp its sample time
-    const entries = hostVitalLimits();
-
-    const cpu = entries.find((e) => e.id === 'host_cpu');
-    expect(cpu).toBeDefined();
-    expect(typeof cpu.sampled_at_ms).toBe('number');
-    expect(cpu.sampled_at_ms).toBeGreaterThan(0);
-
-    const ram = entries.find((e) => e.id === 'host_ram');
-    expect(ram).toBeDefined();
-    expect(typeof ram.sampled_at_ms).toBe('number');
-    expect(ram.sampled_at_ms).toBeGreaterThan(0);
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID); // cache a valid cpu reading + stamp its sample time
+    const v = hostVitals();
+    expect(v.cpu_pct).toBe(50);
+    expect(typeof v.sampled_at_ms).toBe('number');
+    expect(v.sampled_at_ms).toBeGreaterThan(0);
+    expect(v.sampled_at_ms).toBe(cpuSampledAtMs());
   });
 
-  it('host_cpu is STABLE across two reads in the same tick (no 0/100 collapse)', () => {
-    // Reproduces the re-entrancy blocker: journalStatus fires >1x per tick.
-    // The reader must not mutate the baseline, so a 2nd read in the same tick
-    // returns the same cached value rather than collapsing to a 0-interval
-    // reading of 0 or 100.
+  it('hostVitals falls back to now for sampled_at_ms before the cpu sampler warms', () => {
+    stopCpuSampler(); // cpu_pct + cpuSampledAtMs both null
+    const before = Date.now();
+    const v = hostVitals();
+    expect(v.cpu_pct).toBeNull();
+    expect(typeof v.ram_pct).toBe('number'); // still emits RAM
+    expect(v.sampled_at_ms).toBeGreaterThanOrEqual(before);
+  });
+
+  it('cpu_pct is STABLE across two reads in the same tick (no 0/100 collapse)', () => {
+    // journalStatus fires >1x per tick; the reader (hostVitals) must not mutate
+    // the baseline, so back-to-back reads return the same cached value rather
+    // than collapsing to a 0-interval reading of 0 or 100.
     stopCpuSampler();
-    sampleCpuOnce();        // baseline
-    busyWait(40);
-    sampleCpuOnce();        // cache a real value
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID);
     const cached = cpuPercent();
-    expect(Number.isInteger(cached)).toBe(true);
-
+    expect(cached).toBe(50);
     // Two reads with NO intervening scheduled sample — the many-per-tick case.
-    const a = hostVitalLimits().find((e) => e.id === 'host_cpu');
-    const b = hostVitalLimits().find((e) => e.id === 'host_cpu');
-    expect(a).toBeDefined();
-    expect(b).toBeDefined();
-    expect(a.label).toBe('CPU');
-    expect(a.percent).toBe(cached);
-    expect(b.percent).toBe(cached); // stable, not recomputed to 0/100
+    expect(hostVitals().cpu_pct).toBe(cached);
+    expect(hostVitals().cpu_pct).toBe(cached); // stable, not recomputed to 0/100
   });
 
-  it('a degenerate (zero-tick) sample preserves the prior cached value', () => {
+  it('a degenerate (zero-tick) sample preserves the prior cached value (deterministic)', () => {
     stopCpuSampler();
-    sampleCpuOnce();
-    busyWait(40);
-    sampleCpuOnce();
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID);
     const good = cpuPercent();
-    expect(Number.isInteger(good)).toBe(true);
-    // Back-to-back call in the same tick: ~0 elapsed ticks → must NOT overwrite.
-    sampleCpuOnce();
+    expect(good).toBe(50);
+    // Re-feed the SAME ticks as the last sample: idleDelta = totalDelta = 0 →
+    // the sampler must preserve the cached value, not overwrite with 0/100.
+    sampleCpuOnce(VALID);
     expect(cpuPercent()).toBe(good);
   });
 
@@ -314,15 +343,31 @@ describe('index.js wiring', () => {
     expect(src).toMatch(/import \{[^}]*postCompactContextTokens[^}]*\} from '\.\/lib\/session-status\.js'/);
   });
 
-  it('starts the CPU sampler at boot and stops it on shutdown (#526)', () => {
+  it('starts the CPU sampler at boot (gated on journal-enabled) and stops it on shutdown', () => {
     // main() owns the fixed-cadence sampler so journalStatus only ever reads it.
     const main = src.slice(src.indexOf('async function main('));
     expect(main).toContain('startCpuSampler(');
+    // The sampler only feeds journal frames, so it's gated on JOURNAL_ENABLED —
+    // no os.cpus() polling when nothing consumes it.
+    expect(main).toMatch(/if \(JOURNAL_ENABLED\) startCpuSampler\(/);
     // Both signal handlers tear it down so the interval doesn't leak.
     const sigint = src.slice(src.indexOf("process.on('SIGINT'"));
     expect(sigint).toContain('stopCpuSampler()');
     const sigterm = src.slice(src.indexOf("process.on('SIGTERM'"));
     expect(sigterm).toContain('stopCpuSampler()');
+  });
+
+  it('journalStatus wires host vitals to top-level status.vitals, never into limits[]', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    // vitals ride at top level via the buildSessionStatus vitals param.
+    expect(body).toContain('hostVitals()');
+    expect(body).toMatch(/vitals[,\n]/);
+    // The Codex path passes an empty limits array (no account rate limits) and
+    // never spreads vitals into limits.
+    expect(body).not.toContain('hostVitalLimits');
+    expect(body).toMatch(/limits:\s*isCodex\s*\?\s*\[\]/);
   });
 
   it('defines a journalStatus helper that publishes via publishStatus', () => {
