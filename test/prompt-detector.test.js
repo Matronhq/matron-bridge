@@ -1303,6 +1303,23 @@ describe('isIdleReadyScreen', () => {
     expect(isIdleReadyScreen('N o t   l o g g e d   i n  ·  Run /login')).toBe(true);
   });
 
+  it('is NOT ready for mere conversation text containing "not logged in"', () => {
+    // A resumed session repaints its old transcript into the tail; prose
+    // discussing login states must not release the resume hold. Only the
+    // exact status-footer form (with the · separator and /login command)
+    // counts.
+    expect(isIdleReadyScreen('● The deploy failed because you are not logged in to npm.\n✻ Loading…')).toBe(false);
+    expect(isIdleReadyScreen('● It said "Not logged in" and then continued.')).toBe(false);
+  });
+
+  it('is NOT ready when the logged-out footer sits above the bottom lines (stale scrollback)', () => {
+    const screen = [
+      'Not logged in · Please run /login',
+      'line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+
   it('is NOT ready while the resume-summary picker is showing', () => {
     // The picker shows "Enter to confirm · Esc to cancel" — NOT the idle
     // "bypass permissions" status line — so the resume hold must keep waiting
