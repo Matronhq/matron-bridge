@@ -164,7 +164,7 @@ describe('buildSessionStatus', () => {
     expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 300_000 }).context.pct).toBe(100);
   });
 
-  it('includes the session workdir when known, omits it otherwise (#521)', () => {
+  it('includes the session workdir when known, omits it otherwise', () => {
     expect(buildSessionStatus({ model: 'claude-fable-5', workdir: '/opt/matron/web-journal' })).toEqual({
       model: 'claude-fable-5',
       workdir: '/opt/matron/web-journal',
@@ -220,11 +220,13 @@ describe('index.js wiring', () => {
     expect(body).toContain('publishStatus(');
   });
 
-  it('journalStatus threads the session workdir into the frame (#521)', () => {
+  it('journalStatus threads the resolved session workdir into the frame', () => {
     const start = src.indexOf('function journalStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    expect(body).toContain('workdir: session.workdir');
+    // Resolved to an absolute path (session.workdir can be relative) before it
+    // ships on the status frame.
+    expect(body).toContain('workdir: session.workdir ? path.resolve(session.workdir) : undefined');
   });
 
   it("the print-mode result handler publishes status WITHOUT deriving context from result usage (it's cumulative across the turn's API calls, not a context footprint)", () => {
