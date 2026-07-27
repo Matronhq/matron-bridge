@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
@@ -27,6 +27,7 @@ import {
   modeButtons,
   planModeSwitch,
   planSessionIdentity,
+  shouldRunAccountFlowReturn,
 } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
@@ -451,6 +452,17 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
       };
     if (sameAgent && !state.sessionId && effectiveSessionId) {
       state = { ...state, sessionId: effectiveSessionId };
+    }
+    // An explicit caller override beats the live-session snapshot. The
+    // snapshot branch reads interactiveMode from `!!live.iv` — but the two
+    // callers that pass this field (applyModeSwitch, the /logout exit-0
+    // handler) are announcing a mode CHANGE while the old-mode session is
+    // still live/in the map, so the snapshot silently re-persisted the OLD
+    // mode at the agent level (the level getPersistedAgentState prefers on
+    // resume) and every auto-resume came back interactive: the stuck-mode
+    // bug behind login-flow test rounds 1-4.
+    if (extra?.interactiveMode !== undefined) {
+      state = { ...state, interactiveMode: extra.interactiveMode };
     }
     agentSessions = mergeAgentStates(agentSessions, { [activeAgent]: state });
   }
@@ -1263,16 +1275,19 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           );
         }
       } else {
-        sessions.delete(roomId);
-        journalSessionState(session, 'done');
-        journalActivity(session, 'idle');
-        journalEvictConvoInput(session);
+        // Notice BEFORE teardown: sendToRoom's journal mirror looks the
+        // session up in the map, so a notice sent after sessions.delete()
+        // is silently dropped (same fix as the iv-mode close handler).
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
+        sessions.delete(roomId);
+        journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       }
     }
   });
@@ -1764,6 +1779,15 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
         restarted.sendButtonMessage = session.sendButtonMessage;
+        // Account-flow state must survive the TUI's own exit: /logout makes
+        // claude quit, this branch respawns it (resumed, now logged out), and
+        // the user's next /login should still auto-return to print mode.
+        // A parked /login rides across too — the respawned session enters its
+        // own resume hold, whose watcher types it once the (logged-out) TUI
+        // is ready.
+        restarted._accountFlowReturnToPrint = session._accountFlowReturnToPrint;
+        restarted._accountLogoutPending = session._accountLogoutPending;
+        restarted._postReadySlashCommand = session._postReadySlashCommand;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
         // Carry user-visible state across the restart so the user doesn't
@@ -1786,6 +1810,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
+        // Same hold recreateSession and the auto-resume path use: without it
+        // the copied _postReadySlashCommand is never consumed (the readiness
+        // watcher is what types parked commands), so a /login or /logout
+        // interrupted by a crash silently never ran — and anything the user
+        // sent right after the restart was typed into a still-loading TUI
+        // and dropped (Bugbot, PR #162).
+        enterResumeHold(restarted);
         if (restarted.sendHtml) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
@@ -1795,16 +1826,35 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
-        sessions.delete(roomId);
-        journalSessionState(session, 'done');
-        journalActivity(session, 'idle');
-        journalEvictConvoInput(session);
-        if (session.sendHtml) {
+        // Notices FIRST, teardown second: sendToRoom's journal mirror looks
+        // the session up in the map, so anything sent after
+        // sessions.delete() is silently dropped — which is exactly how the
+        // post-/logout "[Session ended (exit 0)]" vanished in live testing
+        // and the whole logout flow went dark.
+        if (session._accountLogoutPending && exitCode === 0) {
+          // /logout completed: claude logs out and exits cleanly. Persist
+          // print mode ONLY when the bridge borrowed interactive mode for
+          // this flow (_accountFlowReturnToPrint) — without that reset every
+          // later auto-resume comes back as a TUI session and the room is
+          // stuck interactive forever (the root cause of the silent /logout
+          // in live-test round 2). A user who chose interactive mode keeps
+          // their preference across the logout (Bugbot, PR #162).
+          if (session._accountFlowReturnToPrint) {
+            persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
+          }
+          const n = notice('info', '👋 Logged out. Send /login when you\'re ready to sign back in.', '👋 Logged out. Send <code>/login</code> when you\'re ready to sign back in.');
+          if (session.sendHtml) session.sendHtml(n.plain, n.html);
+          else if (session.sendCallback) session.sendCallback(n.plain);
+        } else if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
+        sessions.delete(roomId);
+        journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       }
     }
   });
@@ -2158,12 +2208,47 @@ function unwrapUrls(text) {
 // leaks, spinner ticks, task lists, etc. Returns null when nothing
 // useful can be extracted (caller should not send anything in that
 // case rather than dumping the raw screen).
-function formatTuiCueMessage(screen, urls) {
+function formatTuiCueMessage(screen, urls, { hasNewUrls = true } = {}) {
+  // All cue matching runs on the compact form (lowercased, whitespace and
+  // apostrophes removed): the TUI shimmer-animates some of these lines with
+  // per-character escapes, which stripAnsi renders letter-spaced ("P r e s s
+  // E n t e r …") — word-spaced regexes never match those. See
+  // compactScreenText in lib/prompt-detector.js.
+  const compact = compactScreenText(screen);
+  // Press-Enter acknowledgment (e.g. post-login "Login successful.
+  // Press Enter to continue…") — checked BEFORE the OAuth branch: the
+  // success screen still carries the wizard's "use the url below" text and
+  // the OAuth URL in the scrollback above it, and oauth-first ordering
+  // re-rendered a "sign in" card at the exact moment login succeeded
+  // (live-test round 5's post-paste duplicate). The press-enter cue is the
+  // actionable state; older wizard text above it is history.
+  //
+  // Result line: JUST ABOVE the cue line, and only on the strict
+  // login-result tokens. The tail also contains the resumed session's
+  // repainted chat transcript, and a whole-screen search with loose words
+  // ("complete", "finished") kept matching the USER'S OWN old messages —
+  // surfacing a random fragment of prior conversation as a "✅ …" card
+  // (live-test rounds 1 and 2).
+  if (AUTO_ENTER_COMPACT_RE.test(compact)) {
+    const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
+    const cueIdx = lines.findIndex(l => AUTO_ENTER_COMPACT_RE.test(compactScreenText(l)));
+    const nearby = cueIdx >= 0 ? lines.slice(Math.max(0, cueIdx - 4), cueIdx + 1) : [];
+    const resultLine =
+      nearby.find(l => LOGIN_SUCCESS_COMPACT_RE.test(compactScreenText(l))) ||
+      'Claude is continuing…';
+    const display = despaceTuiLine(resultLine);
+    const plain = `✅ ${display}`;
+    const html = `<b>✅ ${escapeHtml(display)}</b>`;
+    return { plain, html };
+  }
   // OAuth / "open this URL to sign in" flow. Triggered by /login.
   // Screen layout: "Browser didn't open? Use the url below to sign in
   // (c to copy)" + URL + "Paste code here if prompted >".
-  const isOauth = /browser\s+didn'?t\s+open|use\s+the\s+url|copy\s+the\s+url|paste\s+code\s+here/i.test(screen);
-  if (isOauth && urls.length > 0) {
+  // Gated on hasNewUrls: the card's entire content is the URL, so a
+  // re-render where every URL was already surfaced can only ever be a
+  // duplicate of a card the user already has.
+  const isOauth = /browserdidntopen|usetheurl|copytheurl|pastecodehere/.test(compact);
+  if (isOauth && urls.length > 0 && hasNewUrls) {
     const url = urls[0];
     const plain =
       `🔗 Claude needs you to sign in.\n\n` +
@@ -2176,21 +2261,10 @@ function formatTuiCueMessage(screen, urls) {
       `After authorising, paste the code (the long string after <code>#</code> in the callback URL) back here.`;
     return { plain, html };
   }
-  // Press-Enter acknowledgment (e.g. post-login "Login successful.
-  // Press Enter to continue…"). Extract the result line above the cue.
-  if (/press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i.test(screen)) {
-    const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
-    const resultLine =
-      lines.find(l => /logged\s+in\s+as|login\s+successful|complete[d]?|finished|✅/i.test(l)) ||
-      lines.find(l => l.length > 5 && !/press\s+enter|esc\s+to/i.test(l)) ||
-      'Claude is continuing…';
-    const plain = `✅ ${resultLine}`;
-    const html = `<b>✅ ${escapeHtml(resultLine)}</b>`;
-    return { plain, html };
-  }
   // Generic input cue we couldn't parse — surface a one-liner pointing
-  // at the cue with any URLs, but don't dump the whole screen.
-  if (urls.length > 0) {
+  // at the cue with any URLs, but don't dump the whole screen. Same
+  // hasNewUrls gate as the OAuth card: all-stale URLs = duplicate.
+  if (urls.length > 0 && hasNewUrls) {
     const plain = `Claude is asking you to act on this URL:\n${urls.join('\n')}`;
     const html =
       `<b>Claude is asking you to act on this URL:</b><br/>` +
@@ -2226,14 +2300,21 @@ function handleInteractiveScreenUpdate(session, update) {
   // screen. If the formatter can't make sense of the cue, skip rather
   // than spam a screen-dump full of status chrome.
   const allUrls = extractUrls(unwrappedScreen);
-  const message = formatTuiCueMessage(unwrappedScreen, allUrls);
-  if (!message) {
+  const message = formatTuiCueMessage(unwrappedScreen, allUrls, { hasNewUrls: newUrls.length > 0 });
+  // Auto-Enter decision is independent of message formatting: an
+  // acknowledgment screen the formatter can't summarise must STILL be
+  // acknowledged, or claude sits blocked on a keystroke the user can't see.
+  const compact = compactScreenText(unwrappedScreen);
+  const autoEnter = AUTO_ENTER_COMPACT_RE.test(compact);
+  if (!message && !autoEnter) {
     console.log(`[IV-DEBUG] Free-text TUI cue not parseable, skipping (urls=${newUrls.length}, inputCue=${hasInputCue})`);
     return;
   }
-  console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
-  if (session.sendHtml) session.sendHtml(message.plain, message.html);
-  else if (session.sendCallback) session.sendCallback(message.plain);
+  if (message) {
+    console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
+    if (session.sendHtml) session.sendHtml(message.plain, message.html);
+    else if (session.sendCallback) session.sendCallback(message.plain);
+  }
   // A free-text TUI cue means claude is waiting on the user just like a
   // structured prompt does — clear busy so the user's response (OAuth
   // code, "paste code here" content, etc.) gets typed straight into the
@@ -2253,8 +2334,53 @@ function handleInteractiveScreenUpdate(session, update) {
   // claude, which is confusing UX. We surface the screen content FIRST
   // (so the user sees "Login successful" etc) then send Enter and a
   // small confirmation note.
-  if (AUTO_ENTER_CUE_RE.test(unwrappedScreen)) {
+  if (autoEnter) {
     console.log('[IV-DEBUG] Auto-pressing Enter for "Press Enter to continue" cue');
+    // Close the /login-from-print loop: the bridge forced this session into
+    // interactive mode only so /login (or /logout → /login) could run.
+    // Login success is the natural end of that flow — switch back to print
+    // mode automatically instead of leaving the user to remember
+    // "/mode print". Scheduled BEFORE the Enter keystroke is attempted: a
+    // failed keystroke must not skip the return (Bugbot, PR #162) — the
+    // switch recreates the session anyway, which also unsticks a TUI whose
+    // Enter never landed. Delayed so the TUI paints its idle screen first
+    // (planModeSwitch refuses while the screen is mid-transition). The
+    // success match is scoped to the lines around the press-Enter cue
+    // (loginSuccessNearAutoEnterCue) — stale "Login successful" text in the
+    // repainted-transcript scrollback must not end the flow off a later
+    // unrelated acknowledgment cue. The flag is consumed only on an ACTUAL
+    // successful switch: applyModeSwitch can refuse (busy, pending prompt),
+    // and clearing the flag at scheduling time would strand the session in
+    // interactive mode after promising otherwise — a rare second
+    // login-success screen retrying the switch is the better failure mode.
+    // The scheduled guard prevents timer pile-up if the success screen ever
+    // re-emits before the timer fires.
+    if (session._accountFlowReturnToPrint && !session._accountFlowReturnScheduled
+        && loginSuccessNearAutoEnterCue(unwrappedScreen)) {
+      session._accountFlowReturnScheduled = true;
+      const roomId = session.roomId;
+      setTimeout(() => {
+        session._accountFlowReturnScheduled = false;
+        // Act on whatever session holds the room NOW, not just the object
+        // that scheduled the timer: the iv auto-restart path copies
+        // _accountFlowReturnToPrint onto its replacement session, and an
+        // identity check here would strand that replacement in interactive
+        // mode (Bugbot, PR #162).
+        const current = sessions.get(roomId);
+        if (!shouldRunAccountFlowReturn(current)) return;
+        const sendReply = current.sendCallback || (() => {});
+        const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
+        // applyModeSwitch announces the outcome either way — the switch on
+        // success, refusalAnnouncement on refusal — and returns the
+        // replacement session only when the switch actually happened.
+        const switched = applyModeSwitch(roomId, current, false, {
+          sendReply, sendHtml,
+          announcement: '✅ Logged in successfully — back to normal mode.',
+          refusalAnnouncement: 'Login finished, but I couldn\'t switch back to non-interactive mode automatically — type /mode print when ready.',
+        });
+        if (switched) current._accountFlowReturnToPrint = false;
+      }, LOGIN_RETURN_TO_PRINT_DELAY_MS);
+    }
     try {
       session.iv.sendKeystroke('enter');
     } catch (err) {
@@ -2302,12 +2428,27 @@ function handleUnclassifiedPrompt(session, { screen }) {
   }
 }
 
-// Cues for which the bridge auto-sends Enter on the user's behalf.
-// Kept narrow on purpose — only matches phrasing where claude is
-// explicitly waiting for an acknowledgment keystroke ("press enter to
-// continue" / "press enter to dismiss"). Does NOT match "paste code
-// here" or other prompts that need real input.
-const AUTO_ENTER_CUE_RE = /press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i;
+// AUTO_ENTER_COMPACT_RE / LOGIN_SUCCESS_COMPACT_RE and the cue-window
+// matcher loginSuccessNearAutoEnterCue live in lib/prompt-detector.js
+// (imported above) so their matching rules are unit-testable.
+
+// How long after the auto-Enter to wait before switching a /login-initiated
+// interactive session back to print mode — long enough for the TUI to paint
+// its idle screen so planModeSwitch doesn't refuse the switch.
+const LOGIN_RETURN_TO_PRINT_DELAY_MS = 2500;
+
+// Undo the letter-spacing stripAnsi leaves on shimmer-animated TUI lines
+// ("L o g i n   s u c c e s s f u l .") for display. Only rewrites lines that
+// are mostly single-character tokens; normal prose is untouched. Runs of 2+
+// spaces are word gaps, single spaces are letter gaps.
+function despaceTuiLine(line) {
+  const trimmed = String(line || '').trim();
+  const toks = trimmed.split(/\s+/);
+  if (toks.length < 6) return trimmed;
+  const singles = toks.filter(t => t.length === 1).length;
+  if (singles / toks.length <= 0.6) return trimmed;
+  return trimmed.split(/ {2,}/).map(word => word.replace(/ /g, '')).join(' ');
+}
 
 // --- Structured Question Handling ---
 
@@ -3698,6 +3839,13 @@ function startResumeReadyWatcher(session) {
     if (hardCap) clearTimeout(hardCap);
     iv.removeListener('pty-data', onData);
     session._awaitingInputReady = false;
+    // The hold window accumulated the resume's full-screen transcript repaint
+    // in the prompt detector's buffer. Old chat re-rendered there is a
+    // minefield of phantom prompts — `> hi` user-message lines, numbered
+    // lists inside assistant prose — that classify as menus on the next idle
+    // check (the "hi / 1 agent type available" card). The screen is idle by
+    // definition at release, so nothing real is lost by flushing it.
+    if (iv.detector) iv.detector.reset();
     const outbox = session._resumeOutbox || [];
     session._resumeOutbox = null;
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
@@ -3711,9 +3859,20 @@ function startResumeReadyWatcher(session) {
     // asked to re-run the command.
     const parkedSlash = session._postReadySlashCommand;
     session._postReadySlashCommand = null;
+    // A resume that isn't about to type /logout has no logout in flight:
+    // clear any stale mark copied across a crash-restart (a crash mid-logout
+    // means the logout did NOT complete — a completed one exits 0), so a
+    // later ordinary clean exit isn't misreported as "👋 Logged out"
+    // (Bugbot, PR #162).
+    if (parkedSlash !== '/logout') session._accountLogoutPending = false;
     if (parkedSlash) {
       if (outbox.length > 0) {
         debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
+        // The account flow is abandoned along with the parked command —
+        // don't leave the flags armed to hijack a later unrelated login or
+        // to mislabel an ordinary exit as a logout.
+        session._accountFlowReturnToPrint = false;
+        session._accountLogoutPending = false;
         const note = `Your held message(s) were sent first — type ${parkedSlash} again to continue.`;
         if (session.sendCallback) session.sendCallback(note);
       } else if (session.alive && session.iv && typeof session.iv.sendText === 'function'
@@ -3723,6 +3882,8 @@ function startResumeReadyWatcher(session) {
         // The user was promised the command would run when the TUI was
         // ready; if the session died in the gap, say so instead of going
         // silent.
+        session._accountFlowReturnToPrint = false;
+        session._accountLogoutPending = false;
         const note = `Couldn't run ${parkedSlash} — the session went away before it was ready. Try ${parkedSlash} again.`;
         if (session.sendCallback) session.sendCallback(note);
       }
@@ -5436,22 +5597,68 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // the command instead — startResumeReadyWatcher types it the moment
         // the TUI is idle-ready.
         if (session.iv.alive && session._awaitingInputReady) {
+          const previouslyParked = session._postReadySlashCommand;
           session._postReadySlashCommand = `/${cmdWord}`;
-          await sendReply(`The session is still resuming — /${cmdWord} will run as soon as it's ready.`);
+          // A parked /logout still exits claude when the watcher types it —
+          // without this mark the exit-0 handler falls into the generic
+          // "session ended" branch instead of confirming the logout
+          // (Bugbot, PR #162). Same non-borrowing rule as the immediate
+          // path: _accountFlowReturnToPrint stays whatever the flow that
+          // created this iv session set it to.
+          session._accountLogoutPending = cmdWord === 'logout';
+          if (previouslyParked === `/${cmdWord}`) {
+            await sendReply(`/${cmdWord} is already queued — it will run as soon as the session is ready.`);
+          } else if (previouslyParked) {
+            await sendReply(`Queued /${cmdWord} (replacing the queued ${previouslyParked}) — it will run as soon as the session is ready.`);
+          } else {
+            await sendReply(`The session is still resuming — /${cmdWord} will run as soon as it's ready.`);
+          }
           break;
         }
         if (session.iv.sendText(`/${cmdWord}`) === false) {
           await sendReply(`Could not reach the session TUI — try /restart, then /${cmdWord} again.`);
+          break;
         }
+        // This branch used to be silent on success — the TUI shows the
+        // command running, but a Matron/Matrix user can't see the TUI, so
+        // /logout appeared to do nothing (live-test round 2). Acknowledge,
+        // and mark the /logout so the exit-0 handler confirms it instead of
+        // reporting a generic session end. Deliberately does NOT set
+        // _accountFlowReturnToPrint (Bugbot, PR #162): that flag means the
+        // bridge BORROWED interactive mode from a print session and owes a
+        // switch back — a user who chose interactive mode keeps it after
+        // /login//logout. If this iv session IS a borrowed one, the print
+        // branch below already set the flag and it stays set.
+        // Assignment, not a conditional set: /login must CLEAR a stale
+        // logout mark left by an earlier /logout attempt that never
+        // finished, or a later clean exit would be misreported as a logout.
+        session._accountLogoutPending = cmdWord === 'logout';
+        await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
         break;
       }
-      // Print mode: applyModeSwitch announces the switch itself (or sends
-      // planModeSwitch's refusal — busy, mid-resume, no session id yet — in
-      // which case nothing was promised and nothing is parked).
-      const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml });
+      // Print mode: one concise announcement covering the whole flow — the
+      // mode switch is an implementation detail, so don't narrate it in two
+      // separate messages. On refusal (busy, mid-resume, no session id yet)
+      // applyModeSwitch sends planModeSwitch's own message instead and
+      // nothing is parked.
+      const next = applyModeSwitch(roomId, session, true, {
+        sendReply, sendHtml,
+        announcement: cmdWord === 'logout'
+          ? 'Logging out — switching to interactive mode to complete…'
+          : 'Logging in — switching to interactive mode to complete…',
+      });
       if (next) {
         next._postReadySlashCommand = `/${cmdWord}`;
-        await sendReply(`/${cmdWord} needs the interactive TUI — it will run as soon as the switched session is ready. Type /mode print afterwards to switch back.`);
+        // The bridge (not the user) chose interactive mode here, so it also
+        // owns switching back: when the login-success screen is detected the
+        // session returns to print mode automatically (see the auto-Enter
+        // branch in handleInteractiveScreenUpdate). Survives the TUI's own
+        // exit-and-restart after /logout via the auto-restart copy block.
+        next._accountFlowReturnToPrint = true;
+        // Logout-specific: the parked /logout exits claude; the exit-0
+        // handler uses this to confirm the logout (and, with the flag
+        // above, persist print mode).
+        next._accountLogoutPending = cmdWord === 'logout';
       }
       break;
     }
@@ -7050,17 +7257,25 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
 // planModeSwitch, then persist the choice and restart the session in the new
 // mode (same session id, history preserved). Used by the !mode command and the
 // mode: toggle button.
-function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml }) {
+function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml, announcement, refusalAnnouncement }) {
   if (session.agent === AGENT_CODEX) {
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
   }
   const decision = planModeSwitch(session, wantInteractive);
   if (!decision.ok) {
-    sendReply(decision.message);
+    // `refusalAnnouncement` replaces planModeSwitch's message for flows the
+    // user didn't initiate as a mode switch (the /login auto-return): a bare
+    // "finish the current turn before switching modes" is baffling there,
+    // and sending both lines double-messaged the user (Bugbot, PR #162).
+    sendReply(refusalAnnouncement || decision.message);
     return null;
   }
-  sendReply(decision.message);
+  // `announcement` replaces the generic "Switching to … mode" line on SUCCESS
+  // only. Used by flows where the switch is an implementation detail the user
+  // didn't ask for (/login//logout from print mode) to say what's actually
+  // happening instead of narrating the mechanics.
+  sendReply(announcement || decision.message);
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
   // Return the replacement session so callers can park follow-up work on it
   // (the /login-from-print flow tags _postReadySlashCommand).

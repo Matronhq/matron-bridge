@@ -41,6 +41,25 @@ describe('resolvePromptChoice', () => {
     expect(resolvePromptChoice(options, 'nonsense')).toBeNull();
   });
 
+  it('matches by option value (Matron card taps send the button VALUE as choice)', () => {
+    // iv TUI prompt buttons (lib/prompt-buttons.js) carry value `prompt-opt:<i>`
+    // alongside id `prompt-opt-<i>` — a tap must resolve, not fall through to
+    // "Nothing to answer right now".
+    const ivOptions = [
+      { id: 'prompt-opt-0', label: 'Claude account with subscription', value: 'prompt-opt:0' },
+      { id: 'prompt-opt-1', label: 'Anthropic Console account', value: 'prompt-opt:1' },
+    ];
+    expect(resolvePromptChoice(ivOptions, 'prompt-opt:1')).toEqual({ option: ivOptions[1], index: 1 });
+  });
+
+  it('prefers an id match over a value match when both could apply', () => {
+    const collide = [
+      { id: 'a', label: 'First', value: 'b' },
+      { id: 'b', label: 'Second', value: 'c' },
+    ];
+    expect(resolvePromptChoice(collide, 'b')).toEqual({ option: collide[1], index: 1 });
+  });
+
   it('returns null for null/undefined/empty choice', () => {
     expect(resolvePromptChoice(options, null)).toBeNull();
     expect(resolvePromptChoice(options, undefined)).toBeNull();
