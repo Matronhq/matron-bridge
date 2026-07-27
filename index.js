@@ -15,6 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
+import { projectDirFor, transcriptPathFor } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
@@ -840,6 +841,10 @@ function journalStatus(session) {
     // keeping the Codex limits array empty (buildSessionStatus omits it).
     limits: isCodex ? [] : (usageLimitsCache.lines || []),
     email: getAccountEmail(),
+    // Absolute path for the client's header workdir segment: session.workdir
+    // can be relative (it is passed through from the resume/start args), so
+    // resolve it here rather than shipping a bare relative fragment.
+    workdir: session.workdir ? path.resolve(session.workdir) : undefined,
     vitals,
   });
   // The shared account email cache is Claude-specific — strip it from Codex
@@ -4550,8 +4555,7 @@ async function maybeUpdatePinnedSummary(session) {
 // whole-file getSessionSummary was replaced); this stays here because it
 // depends on DEFAULT_WORKDIR.
 function sessionTranscriptPath(sessionId, workdir) {
-  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
-  return path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+  return transcriptPathFor(workdir || DEFAULT_WORKDIR, sessionId);
 }
 
 // Async, bounded replacement for the old sync getSessionSummary — same
@@ -4567,8 +4571,7 @@ function getSessionSummary(sessionId, workdir) {
  * This prevents sending duplicate tool_results which cause API 400 errors.
  */
 function hasToolResultInHistory(sessionId, workdir, toolUseId) {
-  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
-  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+  const filePath = transcriptPathFor(workdir || DEFAULT_WORKDIR, sessionId);
   try {
     const content = fs.readFileSync(filePath, 'utf-8');
     const lines = content.split('\n');
@@ -4897,12 +4900,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           listPersistedAgentSessions(AGENT_CLAUDE),
           resumeArg,
         ).matches;
-        const inferredClaudeDir = path.join(
-          os.homedir(),
-          '.claude',
-          'projects',
-          resumeWorkdir.replace(/\//g, '-'),
-        );
+        const inferredClaudeDir = projectDirFor(resumeWorkdir);
         const localClaudeMatches = await pathExists(inferredClaudeDir)
           ? matchSessionIdPrefix(await listSessionIdsByMtime(inferredClaudeDir), resumeArg).matches
           : [];
@@ -4948,8 +4946,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         resumeSessionId = resumePersisted.sessionId;
         actualWorkdir = resumePersisted.workdir || resumeWorkdir;
       } else {
-        const encodedPath = resumeWorkdir.replace(/\//g, '-');
-        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+        const projectDir = projectDirFor(resumeWorkdir);
 
         // Async id resolution (issue #102): metadata is statted once per
         // transcript and sorted without synchronous work in the comparator.
@@ -4985,8 +4982,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             resumeSessionId = matchId;
             resumePersisted = foundEntry;
           } else if (matchId && foundEntry?.workdir) {
-            const altEncoded = foundEntry.workdir.replace(/\//g, '-');
-            const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
+            const altDir = projectDirFor(foundEntry.workdir);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
             if (await pathExists(altFile)) {
               resumeSessionId = foundEntry.sessionId;
@@ -5270,8 +5266,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (selectedAgent === AGENT_CODEX) {
         items = listPersistedAgentSessions(AGENT_CODEX, workdir).slice(0, 15);
       } else {
-        const encodedPath = workdir.replace(/\//g, '-');
-        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+        const projectDir = projectDirFor(workdir);
         if (!(await pathExists(projectDir))) {
           await sendReply('No Claude sessions found for this workdir.');
           break;
