@@ -1473,3 +1473,31 @@ describe('loginSuccessNearAutoEnterCue', () => {
     expect(loginSuccessNearAutoEnterCue('just some ordinary output')).toBe(false);
   });
 });
+
+describe('loginSuccessNearAutoEnterCue (wrapped cue)', () => {
+  it('finds a press-Enter cue wrapped across two lines', () => {
+    // Narrow terminals can wrap the cue; the auto-Enter decision matches the
+    // whole compacted screen so it still fires — the success locator must
+    // agree or the flow never returns to print mode.
+    const screen = [
+      ' Login successful. Logged in as pat@example.com',
+      ' Press Enter',
+      ' to continue…',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('still rejects stale success text far above a wrapped cue', () => {
+    const screen = [
+      'transcript: the login successful message from before',
+      'more transcript',
+      'more transcript',
+      'more transcript',
+      'more transcript',
+      'A new version is available.',
+      'Press Enter',
+      'to dismiss',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(false);
+  });
+});

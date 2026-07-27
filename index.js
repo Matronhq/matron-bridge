@@ -1786,6 +1786,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // own resume hold, whose watcher types it once the (logged-out) TUI
         // is ready.
         restarted._accountFlowReturnToPrint = session._accountFlowReturnToPrint;
+        restarted._accountLogoutPending = session._accountLogoutPending;
         restarted._postReadySlashCommand = session._postReadySlashCommand;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
@@ -1823,15 +1824,17 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // sessions.delete() is silently dropped — which is exactly how the
         // post-/logout "[Session ended (exit 0)]" vanished in live testing
         // and the whole logout flow went dark.
-        if (session._accountFlowReturnToPrint && exitCode === 0) {
-          // /logout completed: claude logs out and exits cleanly. The
-          // account flow ran in interactive mode (and persisted
-          // interactiveMode: true when it switched); without resetting it
-          // here every later auto-resume comes back as a TUI session and
-          // the room is stuck interactive forever — the root cause of the
-          // silent /logout in live-test round 2. Persist print so the next
-          // message resumes in the bridge's native mode.
-          persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
+        if (session._accountLogoutPending && exitCode === 0) {
+          // /logout completed: claude logs out and exits cleanly. Persist
+          // print mode ONLY when the bridge borrowed interactive mode for
+          // this flow (_accountFlowReturnToPrint) — without that reset every
+          // later auto-resume comes back as a TUI session and the room is
+          // stuck interactive forever (the root cause of the silent /logout
+          // in live-test round 2). A user who chose interactive mode keeps
+          // their preference across the logout (Bugbot, PR #162).
+          if (session._accountFlowReturnToPrint) {
+            persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
+          }
           const n = notice('info', '👋 Logged out. Send /login when you\'re ready to sign back in.', '👋 Logged out. Send <code>/login</code> when you\'re ready to sign back in.');
           if (session.sendHtml) session.sendHtml(n.plain, n.html);
           else if (session.sendCallback) session.sendCallback(n.plain);
@@ -3850,8 +3853,10 @@ function startResumeReadyWatcher(session) {
       if (outbox.length > 0) {
         debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
         // The account flow is abandoned along with the parked command —
-        // don't leave the flag armed to hijack a later unrelated login.
+        // don't leave the flags armed to hijack a later unrelated login or
+        // to mislabel an ordinary exit as a logout.
         session._accountFlowReturnToPrint = false;
+        session._accountLogoutPending = false;
         const note = `Your held message(s) were sent first — type ${parkedSlash} again to continue.`;
         if (session.sendCallback) session.sendCallback(note);
       } else if (session.alive && session.iv && typeof session.iv.sendText === 'function'
@@ -3862,6 +3867,7 @@ function startResumeReadyWatcher(session) {
         // ready; if the session died in the gap, say so instead of going
         // silent.
         session._accountFlowReturnToPrint = false;
+        session._accountLogoutPending = false;
         const note = `Couldn't run ${parkedSlash} — the session went away before it was ready. Try ${parkedSlash} again.`;
         if (session.sendCallback) session.sendCallback(note);
       }
@@ -5577,12 +5583,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (session.iv.alive && session._awaitingInputReady) {
           const previouslyParked = session._postReadySlashCommand;
           session._postReadySlashCommand = `/${cmdWord}`;
-          // A parked account command owns the same bridge-run flow as the
-          // immediate-send path below — without this flag a parked /logout
-          // exits into the generic "session ended" branch instead of
-          // persisting print mode and confirming the logout (Bugbot,
-          // PR #162).
-          session._accountFlowReturnToPrint = true;
+          // A parked /logout still exits claude when the watcher types it —
+          // without this mark the exit-0 handler falls into the generic
+          // "session ended" branch instead of confirming the logout
+          // (Bugbot, PR #162). Same non-borrowing rule as the immediate
+          // path: _accountFlowReturnToPrint stays whatever the flow that
+          // created this iv session set it to.
+          session._accountLogoutPending = cmdWord === 'logout';
           if (previouslyParked === `/${cmdWord}`) {
             await sendReply(`/${cmdWord} is already queued — it will run as soon as the session is ready.`);
           } else if (previouslyParked) {
@@ -5599,11 +5606,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // This branch used to be silent on success — the TUI shows the
         // command running, but a Matron/Matrix user can't see the TUI, so
         // /logout appeared to do nothing (live-test round 2). Acknowledge,
-        // and treat the account flow as bridge-owned exactly like the
-        // print branch below: after /logout claude exits and the exit-0
-        // handler uses this flag to persist print mode + tell the user;
-        // after /login the success screen triggers the auto-return.
-        session._accountFlowReturnToPrint = true;
+        // and mark the /logout so the exit-0 handler confirms it instead of
+        // reporting a generic session end. Deliberately does NOT set
+        // _accountFlowReturnToPrint (Bugbot, PR #162): that flag means the
+        // bridge BORROWED interactive mode from a print session and owes a
+        // switch back — a user who chose interactive mode keeps it after
+        // /login//logout. If this iv session IS a borrowed one, the print
+        // branch below already set the flag and it stays set.
+        if (cmdWord === 'logout') session._accountLogoutPending = true;
         await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
         break;
       }
@@ -5626,6 +5636,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // branch in handleInteractiveScreenUpdate). Survives the TUI's own
         // exit-and-restart after /logout via the auto-restart copy block.
         next._accountFlowReturnToPrint = true;
+        // Logout-specific: the parked /logout exits claude; the exit-0
+        // handler uses this to confirm the logout (and, with the flag
+        // above, persist print mode).
+        next._accountLogoutPending = cmdWord === 'logout';
       }
       break;
     }
