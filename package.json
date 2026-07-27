@@ -16,13 +16,13 @@
     "ci": "npm run lint && npm run check && npm test && npm run audit:high"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.112.3",
+    "@anthropic-ai/sdk": "^0.115.0",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "diff": "^9.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "express-rate-limit": "^8.6.0",
+    "express-rate-limit": "^8.6.1",
     "node-pty": "^1.0.0",
     "sharp": "^0.35.3",
     "ws": "^8.21.0",
