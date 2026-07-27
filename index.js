@@ -7058,6 +7058,18 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
   const sessionId = existing.claudeSessionId;
+  // PR #151's pre-init resume gate, extended to this shared teardown path:
+  // --resume only a session Claude actually persisted (confirmed on init,
+  // session._sessionConfirmed). The /model and /mode planners already refuse
+  // unconfirmed print sessions before calling here, but !restart doesn't — a
+  // restart during the pre-init window would --resume an id Claude never
+  // wrote, which fails ("No conversation found") and terminates the
+  // conversation. Respawn with the SAME id via --session-id (presetSessionId
+  // below) instead, keeping the convo/journal identity for a clean fresh
+  // spawn. Print-mode Claude only: iv sessions confirm via camel-case
+  // transcript records and Codex never sets the flag, so gating either would
+  // wrongly force every recreate onto a fresh spawn and lose history.
+  const preInitPrint = existing.agent === AGENT_CLAUDE && !existing.iv && !existing._sessionConfirmed;
   const workdir = existing.workdir;
   const originRoomId = existing.originRoomId;
   sessions.delete(roomId);
@@ -7071,13 +7083,14 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // ref onto the new session's journal. No-op when nothing was streaming.
   journalStreamClear(existing);
   killSession(existing, 'SIGTERM', { preserveQueue: true });
-  const next = createSession(roomId, workdir, sessionId, {
+  const next = createSession(roomId, workdir, preInitPrint ? null : sessionId, {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
     journalConvoId: existing.journalConvoId,
     // Carry the good title across the swap so the re-seed adopts it instead of
     // clobbering it with the repo basename (title-revert bug).
     journalTitleHint: existing._journalTitleHint,
+    presetSessionId: preInitPrint ? sessionId : undefined,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
     // this a /mode toggle or /restart would resume on the stale persisted/

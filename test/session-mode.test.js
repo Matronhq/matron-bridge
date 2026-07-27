@@ -189,4 +189,21 @@ describe('createSession id pre-assignment (source inspection)', () => {
     const inits = src.match(/_sessionConfirmed: !!resumeSessionId/g) || [];
     expect(inits.length).toBe(1);
   });
+
+  // PR #151 follow-up: !restart goes through recreateSession, which passed
+  // existing.claudeSessionId as the resume id UNCONDITIONALLY — a !restart
+  // during the pre-init window hit the exact never-written-id --resume
+  // failure the auto-restart path guards. The /model and /mode planners
+  // refuse unconfirmed sessions before calling recreateSession, so the gate
+  // inside it only changes the !restart path.
+  it('recreateSession gates the pre-init respawn on _sessionConfirmed, print-mode Claude only', () => {
+    // Unconfirmed print → no resume id, same id threaded as presetSessionId
+    // (--session-id). Confirmed (or iv / Codex, which never set the flag) →
+    // resume exactly as before.
+    expect(src).toMatch(/const preInitPrint = existing\.agent === AGENT_CLAUDE && !existing\.iv && !existing\._sessionConfirmed;/);
+    const resumeGates = src.match(/createSession\(roomId, workdir, preInitPrint \? null : sessionId, \{/g) || [];
+    expect(resumeGates.length).toBe(1);
+    const presetGates = src.match(/presetSessionId: preInitPrint \? sessionId : undefined,/g) || [];
+    expect(presetGates.length).toBe(1);
+  });
 });
