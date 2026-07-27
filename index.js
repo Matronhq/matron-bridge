@@ -2293,17 +2293,34 @@ function handleInteractiveScreenUpdate(session, update) {
     // "/mode print". Delayed so the TUI paints its idle screen first
     // (planModeSwitch refuses while the screen is mid-transition), and
     // re-checked against the live session map in case anything replaced the
-    // session in the gap.
-    if (session._accountFlowReturnToPrint && LOGIN_SUCCESS_COMPACT_RE.test(compact)) {
-      session._accountFlowReturnToPrint = false;
+    // session in the gap. The flag is consumed only on an ACTUAL successful
+    // switch (Bugbot, PR #162): applyModeSwitch can refuse (busy, pending
+    // prompt), and clearing the flag at scheduling time would strand the
+    // session in interactive mode after promising otherwise — a rare second
+    // login-success screen retrying the switch is the better failure mode.
+    // The scheduled guard prevents timer pile-up if the success screen ever
+    // re-emits before the timer fires.
+    if (session._accountFlowReturnToPrint && !session._accountFlowReturnScheduled
+        && LOGIN_SUCCESS_COMPACT_RE.test(compact)) {
+      session._accountFlowReturnScheduled = true;
       const roomId = session.roomId;
       setTimeout(() => {
+        session._accountFlowReturnScheduled = false;
         const current = sessions.get(roomId);
+        // Session replaced or dead: the flow this flag belonged to is over —
+        // nothing to switch and nobody to promise anything to.
         if (!current || current !== session || !current.alive || !current.iv) return;
         const sendReply = current.sendCallback || (() => {});
         const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
-        sendReply('✅ Login complete — switching back to non-interactive mode.');
-        applyModeSwitch(roomId, current, false, { sendReply, sendHtml });
+        // applyModeSwitch announces the switch (or its own refusal reason)
+        // itself; it returns the replacement session only when the switch
+        // actually happened.
+        const switched = applyModeSwitch(roomId, current, false, { sendReply, sendHtml });
+        if (switched) {
+          current._accountFlowReturnToPrint = false;
+        } else {
+          sendReply('Login finished, but I couldn\'t switch back to non-interactive mode automatically — type /mode print when ready.');
+        }
       }, LOGIN_RETURN_TO_PRINT_DELAY_MS);
     }
   }
