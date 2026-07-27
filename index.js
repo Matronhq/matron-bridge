@@ -2197,37 +2197,27 @@ function unwrapUrls(text) {
 // leaks, spinner ticks, task lists, etc. Returns null when nothing
 // useful can be extracted (caller should not send anything in that
 // case rather than dumping the raw screen).
-function formatTuiCueMessage(screen, urls) {
+function formatTuiCueMessage(screen, urls, { hasNewUrls = true } = {}) {
   // All cue matching runs on the compact form (lowercased, whitespace and
   // apostrophes removed): the TUI shimmer-animates some of these lines with
   // per-character escapes, which stripAnsi renders letter-spaced ("P r e s s
   // E n t e r …") — word-spaced regexes never match those. See
   // compactScreenText in lib/prompt-detector.js.
   const compact = compactScreenText(screen);
-  // OAuth / "open this URL to sign in" flow. Triggered by /login.
-  // Screen layout: "Browser didn't open? Use the url below to sign in
-  // (c to copy)" + URL + "Paste code here if prompted >".
-  const isOauth = /browserdidntopen|usetheurl|copytheurl|pastecodehere/.test(compact);
-  if (isOauth && urls.length > 0) {
-    const url = urls[0];
-    const plain =
-      `🔗 Claude needs you to sign in.\n\n` +
-      `Open this URL in your browser:\n${url}\n\n` +
-      `After authorising, paste the code (the long string after \`#\` in the callback URL) back here.`;
-    const html =
-      `<b>🔗 Claude needs you to sign in.</b><br/><br/>` +
-      `Open this URL in your browser:<br/>` +
-      `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a><br/><br/>` +
-      `After authorising, paste the code (the long string after <code>#</code> in the callback URL) back here.`;
-    return { plain, html };
-  }
   // Press-Enter acknowledgment (e.g. post-login "Login successful.
-  // Press Enter to continue…"). Extract the result line from JUST ABOVE the
-  // cue line, and only on the strict login-result tokens. The screen tail
-  // also contains the resumed session's repainted chat transcript, and a
-  // whole-screen search with loose words ("complete", "finished") kept
-  // matching the USER'S OWN old messages — surfacing a random fragment of
-  // prior conversation as a "✅ …" card (live-test rounds 1 and 2).
+  // Press Enter to continue…") — checked BEFORE the OAuth branch: the
+  // success screen still carries the wizard's "use the url below" text and
+  // the OAuth URL in the scrollback above it, and oauth-first ordering
+  // re-rendered a "sign in" card at the exact moment login succeeded
+  // (live-test round 5's post-paste duplicate). The press-enter cue is the
+  // actionable state; older wizard text above it is history.
+  //
+  // Result line: JUST ABOVE the cue line, and only on the strict
+  // login-result tokens. The tail also contains the resumed session's
+  // repainted chat transcript, and a whole-screen search with loose words
+  // ("complete", "finished") kept matching the USER'S OWN old messages —
+  // surfacing a random fragment of prior conversation as a "✅ …" card
+  // (live-test rounds 1 and 2).
   if (AUTO_ENTER_COMPACT_RE.test(compact)) {
     const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
     const cueIdx = lines.findIndex(l => AUTO_ENTER_COMPACT_RE.test(compactScreenText(l)));
@@ -2240,9 +2230,30 @@ function formatTuiCueMessage(screen, urls) {
     const html = `<b>✅ ${escapeHtml(display)}</b>`;
     return { plain, html };
   }
+  // OAuth / "open this URL to sign in" flow. Triggered by /login.
+  // Screen layout: "Browser didn't open? Use the url below to sign in
+  // (c to copy)" + URL + "Paste code here if prompted >".
+  // Gated on hasNewUrls: the card's entire content is the URL, so a
+  // re-render where every URL was already surfaced can only ever be a
+  // duplicate of a card the user already has.
+  const isOauth = /browserdidntopen|usetheurl|copytheurl|pastecodehere/.test(compact);
+  if (isOauth && urls.length > 0 && hasNewUrls) {
+    const url = urls[0];
+    const plain =
+      `🔗 Claude needs you to sign in.\n\n` +
+      `Open this URL in your browser:\n${url}\n\n` +
+      `After authorising, paste the code (the long string after \`#\` in the callback URL) back here.`;
+    const html =
+      `<b>🔗 Claude needs you to sign in.</b><br/><br/>` +
+      `Open this URL in your browser:<br/>` +
+      `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a><br/><br/>` +
+      `After authorising, paste the code (the long string after <code>#</code> in the callback URL) back here.`;
+    return { plain, html };
+  }
   // Generic input cue we couldn't parse — surface a one-liner pointing
-  // at the cue with any URLs, but don't dump the whole screen.
-  if (urls.length > 0) {
+  // at the cue with any URLs, but don't dump the whole screen. Same
+  // hasNewUrls gate as the OAuth card: all-stale URLs = duplicate.
+  if (urls.length > 0 && hasNewUrls) {
     const plain = `Claude is asking you to act on this URL:\n${urls.join('\n')}`;
     const html =
       `<b>Claude is asking you to act on this URL:</b><br/>` +
@@ -2278,7 +2289,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // screen. If the formatter can't make sense of the cue, skip rather
   // than spam a screen-dump full of status chrome.
   const allUrls = extractUrls(unwrappedScreen);
-  const message = formatTuiCueMessage(unwrappedScreen, allUrls);
+  const message = formatTuiCueMessage(unwrappedScreen, allUrls, { hasNewUrls: newUrls.length > 0 });
   // Auto-Enter decision is independent of message formatting: an
   // acknowledgment screen the formatter can't summarise must STILL be
   // acknowledged, or claude sits blocked on a keystroke the user can't see.
