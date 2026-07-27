@@ -321,14 +321,31 @@ describe('classifyScreen — arrow-menu', () => {
     expect(r.options.map(o => o.label)).toEqual(['Option A', 'Option B', 'Option C']);
   });
 
-  it('detects > selection marker', () => {
+  it('does NOT treat ASCII > as an arrow-menu marker (transcript user-message prefix)', () => {
+    // Claude's TUI renders past USER messages as `> hi` — a resume's
+    // full-screen repaint is full of these, and treating `>` as a selection
+    // marker turned chat history into phantom menus (the "hi / 1 agent type
+    // available" card in the /login flow). Real menus always use ❯/▶/►.
     const screen = [
       'Pick:',
       '> First',
       '  Second',
     ].join('\n');
-    const r = classifyScreen(screen);
-    expect(r.kind).toBe('arrow-menu');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('does NOT misread a resumed transcript (`> hi` + status line) as an arrow-menu', () => {
+    // Regression: the exact shape that surfaced a garbage prompt card during
+    // the /login flow — the tail of an assistant message, the user's own
+    // `> hi`, and claude's "1 agent type available" startup status line.
+    const screen = [
+      'run through it (or if anything misbehaves) and I\'ll',
+      'verify each step in the bridge logs.',
+      '',
+      '> hi',
+      '  1 agent type available',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
   });
 
   it('does NOT misread a folded-paste input box as an arrow-menu', () => {
@@ -991,6 +1008,32 @@ describe('PromptDetector', () => {
     det.feed('Browser didn\'t open? Use the url below to sign in\nhttps://claude.ai/oauth?x=1\nPaste code here if prompted >');
     await new Promise(r => setTimeout(r, 120));
     det.feed('Login successful. Press Enter to continue…');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(2);
+  });
+
+  it('suppresses a re-render whose long URL was truncated mid-repaint', async () => {
+    // After the user pastes their OAuth code the wizard repaints; a partial
+    // capture can cut the URL's query tail, and a full-vs-truncated pair must
+    // not read as two different sign-in screens (duplicate card in chat).
+    const base = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code';
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed(`Claude needs you to sign in.\nOpen this URL: ${base}&state=abc123\nPaste code here >`);
+    await new Promise(r => setTimeout(r, 120));
+    det.feed(`Claude needs you to sign in.\nOpen this URL: ${base.slice(0, 100)}\nPaste code here >`);
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+  });
+
+  it('still emits for a genuinely different URL under the same cue', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Open this URL: https://claude.ai/first\nPaste code here >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Open this URL: https://claude.ai/second\nPaste code here >');
     await new Promise(r => setTimeout(r, 120));
     expect(updates).toHaveLength(2);
   });

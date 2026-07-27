@@ -2315,7 +2315,10 @@ function handleInteractiveScreenUpdate(session, update) {
         // applyModeSwitch announces the switch (or its own refusal reason)
         // itself; it returns the replacement session only when the switch
         // actually happened.
-        const switched = applyModeSwitch(roomId, current, false, { sendReply, sendHtml });
+        const switched = applyModeSwitch(roomId, current, false, {
+          sendReply, sendHtml,
+          announcement: 'Login finished — switching back.',
+        });
         if (switched) {
           current._accountFlowReturnToPrint = false;
         } else {
@@ -3784,6 +3787,13 @@ function startResumeReadyWatcher(session) {
     if (hardCap) clearTimeout(hardCap);
     iv.removeListener('pty-data', onData);
     session._awaitingInputReady = false;
+    // The hold window accumulated the resume's full-screen transcript repaint
+    // in the prompt detector's buffer. Old chat re-rendered there is a
+    // minefield of phantom prompts — `> hi` user-message lines, numbered
+    // lists inside assistant prose — that classify as menus on the next idle
+    // check (the "hi / 1 agent type available" card). The screen is idle by
+    // definition at release, so nothing real is lost by flushing it.
+    if (iv.detector) iv.detector.reset();
     const outbox = session._resumeOutbox || [];
     session._resumeOutbox = null;
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
@@ -5538,10 +5548,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
         break;
       }
-      // Print mode: applyModeSwitch announces the switch itself (or sends
-      // planModeSwitch's refusal — busy, mid-resume, no session id yet — in
-      // which case nothing was promised and nothing is parked).
-      const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml });
+      // Print mode: one concise announcement covering the whole flow — the
+      // mode switch is an implementation detail, so don't narrate it in two
+      // separate messages. On refusal (busy, mid-resume, no session id yet)
+      // applyModeSwitch sends planModeSwitch's own message instead and
+      // nothing is parked.
+      const next = applyModeSwitch(roomId, session, true, {
+        sendReply, sendHtml,
+        announcement: cmdWord === 'logout'
+          ? 'Logging out — switching to interactive mode to complete…'
+          : 'Logging in — switching to interactive mode to complete…',
+      });
       if (next) {
         next._postReadySlashCommand = `/${cmdWord}`;
         // The bridge (not the user) chose interactive mode here, so it also
@@ -5550,7 +5567,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // branch in handleInteractiveScreenUpdate). Survives the TUI's own
         // exit-and-restart after /logout via the auto-restart copy block.
         next._accountFlowReturnToPrint = true;
-        await sendReply(`/${cmdWord} needs the interactive TUI — it will run as soon as the switched session is ready. Once login completes I'll switch back to non-interactive mode automatically.`);
       }
       break;
     }
@@ -7149,7 +7165,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
 // planModeSwitch, then persist the choice and restart the session in the new
 // mode (same session id, history preserved). Used by the !mode command and the
 // mode: toggle button.
-function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml }) {
+function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml, announcement }) {
   if (session.agent === AGENT_CODEX) {
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
@@ -7159,7 +7175,12 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     sendReply(decision.message);
     return null;
   }
-  sendReply(decision.message);
+  // `announcement` replaces the generic "Switching to … mode" line on SUCCESS
+  // only — refusals above always speak with planModeSwitch's own message.
+  // Used by flows where the switch is an implementation detail the user
+  // didn't ask for (/login//logout from print mode) to say what's actually
+  // happening instead of narrating the mechanics.
+  sendReply(announcement || decision.message);
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
   // Return the replacement session so callers can park follow-up work on it
   // (the /login-from-print flow tags _postReadySlashCommand).
