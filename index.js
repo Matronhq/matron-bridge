@@ -1008,7 +1008,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // claudeSessionId is then known synchronously, so RPC start can answer with
   // a convo_id immediately and journal publishes never buffer for the init
   // event. Resumes keep --resume semantics (see planSessionIdentity).
-  // presetSessionId is the pre-init-crash restart path (#136 / loop #459):
+  // presetSessionId is the pre-init-crash restart path (#136 / PR #151):
   // reuse the crashed session's minted id via --session-id, never --resume.
   const identity = planSessionIdentity({ resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID });
   const args = [
@@ -1099,7 +1099,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // confirmed from birth; a fresh/preset spawn is not resumable until Claude
     // reports its id on init (see handleClaudeEvent). Without this, a resumed
     // session that crashes before its first event would wrongly restart via
-    // --session-id on an already-persisted id (#136 / loop #459).
+    // --session-id on an already-persisted id (#136 / PR #151).
     _sessionConfirmed: !!resumeSessionId,
     journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
@@ -1204,7 +1204,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // without the user's --browser opt-in.
         const restarted = createSession(
           roomId, cwd,
-          // #136 / loop #459: --resume only a session Claude actually persisted
+          // #136 / PR #151: --resume only a session Claude actually persisted
           // (confirmed on init, session._sessionConfirmed). A crash BEFORE init
           // never set that flag — the minted id was never written, so --resume
           // would fail and terminate the conversation. Reuse the same id via
@@ -1746,7 +1746,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // a fresh session that crashed before its first persist.
         //
         // Interactive mode restarts with --resume unconditionally (upstream
-        // behavior): the #136 / #459 pre-init-resume guard is print-mode only.
+        // behavior): the #136 / PR #151 pre-init-resume guard is print-mode only.
         // iv sessions confirm their id from camel-case `sessionId` transcript
         // records, which handleClaudeEvent's snake-case `session_id` capture
         // never sees, so a _sessionConfirmed gate here would wrongly force
@@ -2655,7 +2655,7 @@ function handleClaudeEvent(session, event) {
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
     journalFlushForSession(session);
   }
-  // #136 / loop #459: mark the native session confirmed the first time Claude
+  // #136 / PR #151: mark the native session confirmed the first time Claude
   // reports its session_id — proof the process reached init and persisted a
   // *resumable* session. Fresh spawns pre-assign claudeSessionId (so the block
   // above is skipped for them), yet they are NOT resumable until Claude writes

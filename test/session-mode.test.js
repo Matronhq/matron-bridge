@@ -128,7 +128,7 @@ describe('planSessionIdentity', () => {
     expect(plan.cliArgs).toEqual(['--resume', 'old-id']);
     expect(minted).toBe(0);
   });
-  // #136 / loop #459: a fresh print session that crashes BEFORE Claude
+  // #136 / PR #151: a fresh print session that crashes BEFORE Claude
   // persisted a resumable session must respawn with the SAME id via
   // --session-id (not --resume, which would fail on a never-written session).
   // presetId reuses the given id without minting and keeps --session-id.
@@ -167,7 +167,7 @@ describe('createSession id pre-assignment (source inspection)', () => {
     expect(src).not.toMatch(/push\('--resume'/);
   });
 
-  // #136 / loop #459: the auto-restart must not --resume a session that
+  // #136 / PR #151: the auto-restart must not --resume a session that
   // crashed before Claude persisted it. Scoped to PRINT mode only — iv-mode
   // confirms from camel-case `sessionId` transcript records that the snake-case
   // capture never sees, so gating iv would break its resume-after-persist
