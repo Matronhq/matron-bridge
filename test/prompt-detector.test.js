@@ -2,7 +2,7 @@ import { describe, it, test, expect } from 'vitest';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue } from '../lib/prompt-detector.js';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1420,5 +1420,56 @@ describe('classifyScreen — resume-from-summary picker', () => {
       "Don't ask me again",
     ]);
     expect(r.question).toMatch(/recommend resuming from a summary/);
+  });
+});
+
+describe('loginSuccessNearAutoEnterCue', () => {
+  it('matches the real post-login success screen (success line just above the cue)', () => {
+    const screen = [
+      ' Login successful. Logged in as pat@example.com',
+      '',
+      ' Press Enter to continue…',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('matches when success and cue share a single line', () => {
+    expect(loginSuccessNearAutoEnterCue('Login successful. Press Enter to continue…')).toBe(true);
+  });
+
+  it('matches the letter-spaced shimmer rendering of the success screen', () => {
+    const screen = [
+      'L o g i n   s u c c e s s f u l .',
+      'P r e s s   E n t e r   t o   c o n t i n u e …',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('does NOT match stale success text in scrollback above an unrelated cue', () => {
+    // A resumed session repaints its old transcript into the tail. A previous
+    // login's success text sitting well above a later "Press Enter to
+    // dismiss" notice must not read as a fresh login success — a
+    // whole-screen match here is what triggered spurious auto-returns to
+    // print mode (Bugbot, PR #162).
+    const screen = [
+      '> earlier chat about how the login successful message looked',
+      'assistant: yes, it said "Logged in as pat@example.com"',
+      'some more transcript',
+      'and more transcript',
+      'yet more transcript',
+      'still more transcript',
+      'A new version of claude is available.',
+      'Press Enter to dismiss',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(false);
+  });
+
+  it('does NOT match a success screen with no press-Enter cue', () => {
+    expect(loginSuccessNearAutoEnterCue('Login successful. Logged in as pat@example.com')).toBe(false);
+  });
+
+  it('handles empty and cue-less input', () => {
+    expect(loginSuccessNearAutoEnterCue('')).toBe(false);
+    expect(loginSuccessNearAutoEnterCue('just some ordinary output')).toBe(false);
   });
 });

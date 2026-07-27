@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
@@ -27,6 +27,7 @@ import {
   modeButtons,
   planModeSwitch,
   planSessionIdentity,
+  shouldRunAccountFlowReturn,
 } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
@@ -2223,7 +2224,7 @@ function formatTuiCueMessage(screen, urls, { hasNewUrls = true } = {}) {
     const cueIdx = lines.findIndex(l => AUTO_ENTER_COMPACT_RE.test(compactScreenText(l)));
     const nearby = cueIdx >= 0 ? lines.slice(Math.max(0, cueIdx - 4), cueIdx + 1) : [];
     const resultLine =
-      nearby.find(l => /loggedinas|loginsuccessful/.test(compactScreenText(l))) ||
+      nearby.find(l => LOGIN_SUCCESS_COMPACT_RE.test(compactScreenText(l))) ||
       'Claude is continuing…';
     const display = despaceTuiLine(resultLine);
     const plain = `✅ ${display}`;
@@ -2339,39 +2340,41 @@ function handleInteractiveScreenUpdate(session, update) {
     // Login success is the natural end of that flow — switch back to print
     // mode automatically instead of leaving the user to remember
     // "/mode print". Delayed so the TUI paints its idle screen first
-    // (planModeSwitch refuses while the screen is mid-transition), and
-    // re-checked against the live session map in case anything replaced the
-    // session in the gap. The flag is consumed only on an ACTUAL successful
-    // switch (Bugbot, PR #162): applyModeSwitch can refuse (busy, pending
-    // prompt), and clearing the flag at scheduling time would strand the
-    // session in interactive mode after promising otherwise — a rare second
-    // login-success screen retrying the switch is the better failure mode.
-    // The scheduled guard prevents timer pile-up if the success screen ever
-    // re-emits before the timer fires.
+    // (planModeSwitch refuses while the screen is mid-transition). The
+    // success match is scoped to the lines around the press-Enter cue
+    // (loginSuccessNearAutoEnterCue) — stale "Login successful" text in the
+    // repainted-transcript scrollback must not end the flow off a later
+    // unrelated acknowledgment cue (Bugbot, PR #162). The flag is consumed
+    // only on an ACTUAL successful switch: applyModeSwitch can refuse (busy,
+    // pending prompt), and clearing the flag at scheduling time would strand
+    // the session in interactive mode after promising otherwise — a rare
+    // second login-success screen retrying the switch is the better failure
+    // mode. The scheduled guard prevents timer pile-up if the success screen
+    // ever re-emits before the timer fires.
     if (session._accountFlowReturnToPrint && !session._accountFlowReturnScheduled
-        && LOGIN_SUCCESS_COMPACT_RE.test(compact)) {
+        && loginSuccessNearAutoEnterCue(unwrappedScreen)) {
       session._accountFlowReturnScheduled = true;
       const roomId = session.roomId;
       setTimeout(() => {
         session._accountFlowReturnScheduled = false;
+        // Act on whatever session holds the room NOW, not just the object
+        // that scheduled the timer: the iv auto-restart path copies
+        // _accountFlowReturnToPrint onto its replacement session, and an
+        // identity check here would strand that replacement in interactive
+        // mode (Bugbot, PR #162).
         const current = sessions.get(roomId);
-        // Session replaced or dead: the flow this flag belonged to is over —
-        // nothing to switch and nobody to promise anything to.
-        if (!current || current !== session || !current.alive || !current.iv) return;
+        if (!shouldRunAccountFlowReturn(current)) return;
         const sendReply = current.sendCallback || (() => {});
         const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
-        // applyModeSwitch announces the switch (or its own refusal reason)
-        // itself; it returns the replacement session only when the switch
-        // actually happened.
+        // applyModeSwitch announces the outcome either way — the switch on
+        // success, refusalAnnouncement on refusal — and returns the
+        // replacement session only when the switch actually happened.
         const switched = applyModeSwitch(roomId, current, false, {
           sendReply, sendHtml,
           announcement: '✅ Logged in successfully — back to normal mode.',
+          refusalAnnouncement: 'Login finished, but I couldn\'t switch back to non-interactive mode automatically — type /mode print when ready.',
         });
-        if (switched) {
-          current._accountFlowReturnToPrint = false;
-        } else {
-          sendReply('Login finished, but I couldn\'t switch back to non-interactive mode automatically — type /mode print when ready.');
-        }
+        if (switched) current._accountFlowReturnToPrint = false;
       }, LOGIN_RETURN_TO_PRINT_DELAY_MS);
     }
   }
@@ -2412,21 +2415,9 @@ function handleUnclassifiedPrompt(session, { screen }) {
   }
 }
 
-// Cues for which the bridge auto-sends Enter on the user's behalf.
-// Kept narrow on purpose — only matches phrasing where claude is
-// explicitly waiting for an acknowledgment keystroke ("press enter to
-// continue" / "press enter to dismiss"). Does NOT match "paste code
-// here" or other prompts that need real input. Tested against the
-// compact screen form (compactScreenText) because the post-login line
-// is shimmer-animated and arrives letter-spaced after ANSI strip —
-// the old word-spaced regex never fired on exactly the screen this
-// exists for, leaving the user to send !enter by hand.
-const AUTO_ENTER_COMPACT_RE = /pressenterto(continue|dismiss|acknowledge|proceed)/;
-
-// Compact-form signals that the press-Enter acknowledgment is a LOGIN
-// SUCCESS screen — used to finish the /login-from-print flow (auto-return
-// to non-interactive mode, see _accountFlowReturnToPrint).
-const LOGIN_SUCCESS_COMPACT_RE = /loginsuccessful|loggedinas/;
+// AUTO_ENTER_COMPACT_RE / LOGIN_SUCCESS_COMPACT_RE and the cue-window
+// matcher loginSuccessNearAutoEnterCue live in lib/prompt-detector.js
+// (imported above) so their matching rules are unit-testable.
 
 // How long after the auto-Enter to wait before switching a /login-initiated
 // interactive session back to print mode — long enough for the TUI to paint
@@ -3858,6 +3849,9 @@ function startResumeReadyWatcher(session) {
     if (parkedSlash) {
       if (outbox.length > 0) {
         debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
+        // The account flow is abandoned along with the parked command —
+        // don't leave the flag armed to hijack a later unrelated login.
+        session._accountFlowReturnToPrint = false;
         const note = `Your held message(s) were sent first — type ${parkedSlash} again to continue.`;
         if (session.sendCallback) session.sendCallback(note);
       } else if (session.alive && session.iv && typeof session.iv.sendText === 'function'
@@ -3867,6 +3861,7 @@ function startResumeReadyWatcher(session) {
         // The user was promised the command would run when the TUI was
         // ready; if the session died in the gap, say so instead of going
         // silent.
+        session._accountFlowReturnToPrint = false;
         const note = `Couldn't run ${parkedSlash} — the session went away before it was ready. Try ${parkedSlash} again.`;
         if (session.sendCallback) session.sendCallback(note);
       }
@@ -5582,6 +5577,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (session.iv.alive && session._awaitingInputReady) {
           const previouslyParked = session._postReadySlashCommand;
           session._postReadySlashCommand = `/${cmdWord}`;
+          // A parked account command owns the same bridge-run flow as the
+          // immediate-send path below — without this flag a parked /logout
+          // exits into the generic "session ended" branch instead of
+          // persisting print mode and confirming the logout (Bugbot,
+          // PR #162).
+          session._accountFlowReturnToPrint = true;
           if (previouslyParked === `/${cmdWord}`) {
             await sendReply(`/${cmdWord} is already queued — it will run as soon as the session is ready.`);
           } else if (previouslyParked) {
@@ -7223,19 +7224,22 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
 // planModeSwitch, then persist the choice and restart the session in the new
 // mode (same session id, history preserved). Used by the !mode command and the
 // mode: toggle button.
-function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml, announcement }) {
+function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml, announcement, refusalAnnouncement }) {
   if (session.agent === AGENT_CODEX) {
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
   }
   const decision = planModeSwitch(session, wantInteractive);
   if (!decision.ok) {
-    sendReply(decision.message);
+    // `refusalAnnouncement` replaces planModeSwitch's message for flows the
+    // user didn't initiate as a mode switch (the /login auto-return): a bare
+    // "finish the current turn before switching modes" is baffling there,
+    // and sending both lines double-messaged the user (Bugbot, PR #162).
+    sendReply(refusalAnnouncement || decision.message);
     return null;
   }
   // `announcement` replaces the generic "Switching to … mode" line on SUCCESS
-  // only — refusals above always speak with planModeSwitch's own message.
-  // Used by flows where the switch is an implementation detail the user
+  // only. Used by flows where the switch is an implementation detail the user
   // didn't ask for (/login//logout from print mode) to say what's actually
   // happening instead of narrating the mechanics.
   sendReply(announcement || decision.message);

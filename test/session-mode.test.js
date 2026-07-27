@@ -207,3 +207,36 @@ describe('createSession id pre-assignment (source inspection)', () => {
     expect(presetGates.length).toBe(1);
   });
 });
+
+describe('shouldRunAccountFlowReturn', () => {
+  const owed = { alive: true, iv: {}, _accountFlowReturnToPrint: true };
+
+  it('runs for an alive interactive session that owes a return to print', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn(owed)).toBe(true);
+  });
+
+  it('runs for a REPLACEMENT session carrying the copied flag (no identity requirement)', () => {
+    // The iv auto-restart path copies _accountFlowReturnToPrint onto the new
+    // session object; the timer must honor it even though it is not the
+    // object that scheduled the timer.
+    const replacement = { ...owed };
+    expect(sessionMode.shouldRunAccountFlowReturn(replacement)).toBe(true);
+  });
+
+  it('is a no-op when the room has no session', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn(undefined)).toBe(false);
+    expect(sessionMode.shouldRunAccountFlowReturn(null)).toBe(false);
+  });
+
+  it('is a no-op for a dead session', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn({ ...owed, alive: false })).toBe(false);
+  });
+
+  it('is a no-op once the session is back in print mode', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn({ ...owed, iv: null })).toBe(false);
+  });
+
+  it('is a no-op when the flow was already consumed or abandoned', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn({ ...owed, _accountFlowReturnToPrint: false })).toBe(false);
+  });
+});
