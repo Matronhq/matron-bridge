@@ -173,6 +173,15 @@ describe('deriveLimitId', () => {
     expect(deriveLimitId('week (all models)')).toBe('week_all');
   });
 
+  it('canonicalizes "all models" to week_all whether or not it is parenthesized', () => {
+    // Wording drift: Claude may drop the parens. Both must yield the SAME id so
+    // one semantic never forks into week_all vs week_all_models (MAJOR 1).
+    expect(deriveLimitId('week (all models)')).toBe('week_all');
+    expect(deriveLimitId('week all models')).toBe('week_all');
+    expect(deriveLimitId('Week (all models)')).toBe('week_all');
+    expect(deriveLimitId('week (all models)')).toBe(deriveLimitId('week all models'));
+  });
+
   it('maps a named weekly line to week_<slug>', () => {
     expect(deriveLimitId('week (Fable)')).toBe('week_fable');
     expect(deriveLimitId('week (Sonnet 5)')).toBe('week_sonnet_5');
@@ -181,7 +190,6 @@ describe('deriveLimitId', () => {
 
   it('slugs the whole suffix when a weekly line has no parentheses (wording drift)', () => {
     // Distinct future weekly wordings must NOT all collapse to week_other.
-    expect(deriveLimitId('week all models')).toBe('week_all_models');
     expect(deriveLimitId('week fable')).toBe('week_fable');
     expect(deriveLimitId('week sonnet 5')).toBe('week_sonnet_5');
   });
@@ -196,18 +204,37 @@ describe('deriveLimitId', () => {
 });
 
 describe('parseUsageLimits id dedup', () => {
-  it('disambiguates two lines that derive the same id', () => {
-    // Two unparseable-parenthetical weekly lines both derive week_other; the
-    // dedup guard must give the second a distinct id so clients keyed by id
-    // don't clobber one with the other.
+  it('gives every colliding row a distinct id (identical labels)', () => {
+    // Two identical weekly lines both derive week_other; they are genuinely
+    // indistinguishable, so a positional tiebreak is acceptable — but the ids
+    // must still be unique so clients keyed by id don't clobber one another.
     const raw = [
       'Current week (): 10% used · resets soon',
       'Current week (): 20% used · resets soon',
     ].join('\n');
     const { lines } = parseUsageLimits(raw);
     expect(lines).toHaveLength(2);
-    expect(lines.map((l) => l.id)).toEqual(['week_other', 'week_other_2']);
     expect(new Set(lines.map((l) => l.id)).size).toBe(lines.length);
+    for (const l of lines) expect(l.id.startsWith('week_other')).toBe(true);
+  });
+
+  it('maps each DISTINCT label to a stable id regardless of row order', () => {
+    // Two distinct labels that collide on the same base id (week_other). The
+    // disambiguator is a hash of the full label, NOT first-seen order, so
+    // reversing the rows must preserve each label -> id mapping (MAJOR 2).
+    const rowA = 'Current week (!!!): 10% used · resets soon';
+    const rowB = 'Current week (???): 20% used · resets soon';
+
+    const fwd = parseUsageLimits([rowA, rowB].join('\n')).lines;
+    const rev = parseUsageLimits([rowB, rowA].join('\n')).lines;
+
+    // Base id collides -> both are suffixed, and the two ids are distinct.
+    expect(fwd.map((l) => l.id).every((id) => id.startsWith('week_other_'))).toBe(true);
+    expect(new Set(fwd.map((l) => l.id)).size).toBe(2);
+
+    // label -> id is identical in both orderings.
+    const mapOf = (lines) => Object.fromEntries(lines.map((l) => [l.label, l.id]));
+    expect(mapOf(rev)).toEqual(mapOf(fwd));
   });
 });
 

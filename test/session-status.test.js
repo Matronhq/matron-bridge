@@ -236,6 +236,27 @@ describe('host vitals (#526)', () => {
     expect('resets' in ram).toBe(false);
   });
 
+  it('host entries carry a numeric sampled_at_ms so clients can expire stale replays (#526)', () => {
+    // The publisher replays the last status frame to new viewers, so an idle
+    // convo would show an arbitrarily old host reading as current without an
+    // age stamp. Both host_cpu and host_ram must carry a numeric sampled_at_ms.
+    stopCpuSampler();
+    sampleCpuOnce();  // baseline
+    busyWait(40);
+    sampleCpuOnce();  // cache a valid cpu reading + stamp its sample time
+    const entries = hostVitalLimits();
+
+    const cpu = entries.find((e) => e.id === 'host_cpu');
+    expect(cpu).toBeDefined();
+    expect(typeof cpu.sampled_at_ms).toBe('number');
+    expect(cpu.sampled_at_ms).toBeGreaterThan(0);
+
+    const ram = entries.find((e) => e.id === 'host_ram');
+    expect(ram).toBeDefined();
+    expect(typeof ram.sampled_at_ms).toBe('number');
+    expect(ram.sampled_at_ms).toBeGreaterThan(0);
+  });
+
   it('host_cpu is STABLE across two reads in the same tick (no 0/100 collapse)', () => {
     // Reproduces the re-entrancy blocker: journalStatus fires >1x per tick.
     // The reader must not mutate the baseline, so a 2nd read in the same tick
