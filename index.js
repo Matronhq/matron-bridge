@@ -53,6 +53,7 @@ import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
+import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
@@ -376,7 +377,11 @@ function loadPersistedSessions() {
 
 function savePersistedSessions(data) {
   try {
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    // Atomic replace (PR #151 follow-up): this file is rewritten on every
+    // message, and loadPersistedSessions treats a corrupt file as {} — so a
+    // truncating in-place write that dies mid-rewrite silently drops every
+    // persisted session, and the next persist overwrites the evidence.
+    atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
     console.error('Failed to save sessions file:', e.message);
   }
