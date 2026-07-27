@@ -2336,31 +2336,25 @@ function handleInteractiveScreenUpdate(session, update) {
   // small confirmation note.
   if (autoEnter) {
     console.log('[IV-DEBUG] Auto-pressing Enter for "Press Enter to continue" cue');
-    try {
-      session.iv.sendKeystroke('enter');
-    } catch (err) {
-      console.error('[IV-DEBUG] Auto-Enter failed:', err.message);
-      return;
-    }
-    const note = '↵ (auto-pressed Enter to continue)';
-    if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
-    else if (session.sendCallback) session.sendCallback(note);
     // Close the /login-from-print loop: the bridge forced this session into
     // interactive mode only so /login (or /logout → /login) could run.
     // Login success is the natural end of that flow — switch back to print
     // mode automatically instead of leaving the user to remember
-    // "/mode print". Delayed so the TUI paints its idle screen first
+    // "/mode print". Scheduled BEFORE the Enter keystroke is attempted: a
+    // failed keystroke must not skip the return (Bugbot, PR #162) — the
+    // switch recreates the session anyway, which also unsticks a TUI whose
+    // Enter never landed. Delayed so the TUI paints its idle screen first
     // (planModeSwitch refuses while the screen is mid-transition). The
     // success match is scoped to the lines around the press-Enter cue
     // (loginSuccessNearAutoEnterCue) — stale "Login successful" text in the
     // repainted-transcript scrollback must not end the flow off a later
-    // unrelated acknowledgment cue (Bugbot, PR #162). The flag is consumed
-    // only on an ACTUAL successful switch: applyModeSwitch can refuse (busy,
-    // pending prompt), and clearing the flag at scheduling time would strand
-    // the session in interactive mode after promising otherwise — a rare
-    // second login-success screen retrying the switch is the better failure
-    // mode. The scheduled guard prevents timer pile-up if the success screen
-    // ever re-emits before the timer fires.
+    // unrelated acknowledgment cue. The flag is consumed only on an ACTUAL
+    // successful switch: applyModeSwitch can refuse (busy, pending prompt),
+    // and clearing the flag at scheduling time would strand the session in
+    // interactive mode after promising otherwise — a rare second
+    // login-success screen retrying the switch is the better failure mode.
+    // The scheduled guard prevents timer pile-up if the success screen ever
+    // re-emits before the timer fires.
     if (session._accountFlowReturnToPrint && !session._accountFlowReturnScheduled
         && loginSuccessNearAutoEnterCue(unwrappedScreen)) {
       session._accountFlowReturnScheduled = true;
@@ -2387,6 +2381,15 @@ function handleInteractiveScreenUpdate(session, update) {
         if (switched) current._accountFlowReturnToPrint = false;
       }, LOGIN_RETURN_TO_PRINT_DELAY_MS);
     }
+    try {
+      session.iv.sendKeystroke('enter');
+    } catch (err) {
+      console.error('[IV-DEBUG] Auto-Enter failed:', err.message);
+      return;
+    }
+    const note = '↵ (auto-pressed Enter to continue)';
+    if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
+    else if (session.sendCallback) session.sendCallback(note);
   }
 }
 
