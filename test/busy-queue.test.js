@@ -537,8 +537,25 @@ describe('index.js flushQueue drop path — undelivered notice wiring (source in
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
     const start = src.indexOf('[QUEUE] dropped queued message(s)');
     expect(start).toBeGreaterThan(-1);
-    const window = src.slice(start, start + 800);
+    const window = src.slice(start, start + 1200);
     expect(window).toMatch(/journalPublishNotice\(journalConvoIdFor\(session\)/);
     expect(window).toMatch(/queued message/); // undelivered wording mentions the queue
+  });
+
+  // Bugbot on PR #158: dispatchMergedFlush also returns false while the
+  // session is still ALIVE (iv non-text-only queue, Codex validation/spawn
+  // failure, stdin write error) — paths that already surface their specific
+  // reason via reportSessionSendFailure. The "session ended" notice must be
+  // reserved for the session actually being gone, or those users get a
+  // duplicate AND factually wrong second message.
+  it('the "session ended" notice fires only when the session is actually dead/auto-stopped', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('[QUEUE] dropped queued message(s)');
+    expect(start).toBeGreaterThan(-1);
+    const window = src.slice(start, start + 1200);
+    const gate = window.indexOf('if (!session.alive || session._autoStopped)');
+    const notice = window.indexOf('journalPublishNotice(journalConvoIdFor(session)');
+    expect(gate).toBeGreaterThan(-1);
+    expect(notice).toBeGreaterThan(gate); // notice sits inside the dead-session gate
   });
 });

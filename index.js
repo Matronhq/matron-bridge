@@ -3836,17 +3836,25 @@ function flushQueue(session, queued) {
     return;
   }
   if (!dispatchMergedFlush(session, queued)) {
-    console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
+    console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
     // Every one of these entries was acknowledged with a success-style
     // "📨 Queued" tile when it queued, so dropping them with only a
     // server-side log leaves the user believing they were delivered — the
     // reachable form of the misleading-success bug PR #150 fixed for
-    // undeliverable attachments. Tell them. journalPublishNotice already
-    // no-ops on a falsy convo id and fails open like every journal call.
-    const count = Array.isArray(queued) ? queued.length : 0;
-    journalPublishNotice(journalConvoIdFor(session), count > 1
-      ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
-      : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+    // undeliverable attachments. Tell them — but only when the session is
+    // actually gone. dispatchMergedFlush also fails while the session is
+    // ALIVE (iv non-text-only queue, Codex validation/spawn failure, stdin
+    // write error), and each of those paths has already surfaced its
+    // specific reason via reportSessionSendFailure; adding "the session
+    // ended" on top would be duplicate and wrong (Bugbot, PR #158).
+    // journalPublishNotice already no-ops on a falsy convo id and fails
+    // open like every journal call.
+    if (!session.alive || session._autoStopped) {
+      const count = Array.isArray(queued) ? queued.length : 0;
+      journalPublishNotice(journalConvoIdFor(session), count > 1
+        ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
+        : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+    }
   }
 }
 
