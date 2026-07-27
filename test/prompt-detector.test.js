@@ -970,6 +970,30 @@ describe('PromptDetector', () => {
     expect(prompts).toHaveLength(1);
     expect(unclassified).toHaveLength(0);
   });
+
+  it('emits screen-update for the letter-spaced post-login "Press Enter to continue" screen', async () => {
+    // The TUI shimmer-animates this line with per-character escapes, which
+    // stripAnsi renders letter-spaced — the old word-spaced cue regex never
+    // matched it, so no screen-update fired and the user had to send !enter.
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Login successful.\n P r e s s   E n t e r   t o   c o n t i n u e …');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+    expect(updates[0].hasInputCue).toBe(true);
+  });
+
+  it('distinguishes the paste-code cue from the press-enter cue across renders', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Browser didn\'t open? Use the url below to sign in\nhttps://claude.ai/oauth?x=1\nPaste code here if prompted >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Login successful. Press Enter to continue…');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(2);
+  });
 });
 
 describe('looksLikeUnclassifiedMenu', () => {
@@ -1267,6 +1291,16 @@ describe('isIdleReadyScreen', () => {
     // their whitespace-stripped forms.
     expect(isIdleReadyScreen('⏵⏵bypasspermissionson (shift+tabtocycle)')).toBe(true);
     expect(isIdleReadyScreen('⏵⏵bypasspermissionson·esctointerrupt')).toBe(false);
+  });
+
+  it('returns true for the logged-out screen (parked /login must not wait for the hardcap)', () => {
+    // A `claude --resume` spawned while logged out never paints the normal
+    // idle footer — without the logged-out token, a parked /login only ran at
+    // the 120s hardcap while the user's retries bounced off "still resuming".
+    expect(isIdleReadyScreen('❯ \n──────\nNot logged in · Please run /login')).toBe(true);
+    expect(isIdleReadyScreen('❯ \n──────\nNot logged in · Run /login')).toBe(true);
+    // Letter-spaced render of the same state must also match.
+    expect(isIdleReadyScreen('N o t   l o g g e d   i n  ·  Run /login')).toBe(true);
   });
 
   it('is NOT ready while the resume-summary picker is showing', () => {

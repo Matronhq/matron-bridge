@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
@@ -1764,6 +1764,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
         restarted.sendButtonMessage = session.sendButtonMessage;
+        // Account-flow state must survive the TUI's own exit: /logout makes
+        // claude quit, this branch respawns it (resumed, now logged out), and
+        // the user's next /login should still auto-return to print mode.
+        // A parked /login rides across too — the respawned session enters its
+        // own resume hold, whose watcher types it once the (logged-out) TUI
+        // is ready.
+        restarted._accountFlowReturnToPrint = session._accountFlowReturnToPrint;
+        restarted._postReadySlashCommand = session._postReadySlashCommand;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
         // Carry user-visible state across the restart so the user doesn't
@@ -2159,10 +2167,16 @@ function unwrapUrls(text) {
 // useful can be extracted (caller should not send anything in that
 // case rather than dumping the raw screen).
 function formatTuiCueMessage(screen, urls) {
+  // All cue matching runs on the compact form (lowercased, whitespace and
+  // apostrophes removed): the TUI shimmer-animates some of these lines with
+  // per-character escapes, which stripAnsi renders letter-spaced ("P r e s s
+  // E n t e r …") — word-spaced regexes never match those. See
+  // compactScreenText in lib/prompt-detector.js.
+  const compact = compactScreenText(screen);
   // OAuth / "open this URL to sign in" flow. Triggered by /login.
   // Screen layout: "Browser didn't open? Use the url below to sign in
   // (c to copy)" + URL + "Paste code here if prompted >".
-  const isOauth = /browser\s+didn'?t\s+open|use\s+the\s+url|copy\s+the\s+url|paste\s+code\s+here/i.test(screen);
+  const isOauth = /browserdidntopen|usetheurl|copytheurl|pastecodehere/.test(compact);
   if (isOauth && urls.length > 0) {
     const url = urls[0];
     const plain =
@@ -2178,14 +2192,15 @@ function formatTuiCueMessage(screen, urls) {
   }
   // Press-Enter acknowledgment (e.g. post-login "Login successful.
   // Press Enter to continue…"). Extract the result line above the cue.
-  if (/press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i.test(screen)) {
+  if (AUTO_ENTER_COMPACT_RE.test(compact)) {
     const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
     const resultLine =
-      lines.find(l => /logged\s+in\s+as|login\s+successful|complete[d]?|finished|✅/i.test(l)) ||
-      lines.find(l => l.length > 5 && !/press\s+enter|esc\s+to/i.test(l)) ||
+      lines.find(l => /loggedinas|loginsuccessful|complete|finished|✅/.test(compactScreenText(l))) ||
+      lines.find(l => l.length > 5 && !/pressenter|escto/.test(compactScreenText(l))) ||
       'Claude is continuing…';
-    const plain = `✅ ${resultLine}`;
-    const html = `<b>✅ ${escapeHtml(resultLine)}</b>`;
+    const display = despaceTuiLine(resultLine);
+    const plain = `✅ ${display}`;
+    const html = `<b>✅ ${escapeHtml(display)}</b>`;
     return { plain, html };
   }
   // Generic input cue we couldn't parse — surface a one-liner pointing
@@ -2227,13 +2242,20 @@ function handleInteractiveScreenUpdate(session, update) {
   // than spam a screen-dump full of status chrome.
   const allUrls = extractUrls(unwrappedScreen);
   const message = formatTuiCueMessage(unwrappedScreen, allUrls);
-  if (!message) {
+  // Auto-Enter decision is independent of message formatting: an
+  // acknowledgment screen the formatter can't summarise must STILL be
+  // acknowledged, or claude sits blocked on a keystroke the user can't see.
+  const compact = compactScreenText(unwrappedScreen);
+  const autoEnter = AUTO_ENTER_COMPACT_RE.test(compact);
+  if (!message && !autoEnter) {
     console.log(`[IV-DEBUG] Free-text TUI cue not parseable, skipping (urls=${newUrls.length}, inputCue=${hasInputCue})`);
     return;
   }
-  console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
-  if (session.sendHtml) session.sendHtml(message.plain, message.html);
-  else if (session.sendCallback) session.sendCallback(message.plain);
+  if (message) {
+    console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
+    if (session.sendHtml) session.sendHtml(message.plain, message.html);
+    else if (session.sendCallback) session.sendCallback(message.plain);
+  }
   // A free-text TUI cue means claude is waiting on the user just like a
   // structured prompt does — clear busy so the user's response (OAuth
   // code, "paste code here" content, etc.) gets typed straight into the
@@ -2253,7 +2275,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // claude, which is confusing UX. We surface the screen content FIRST
   // (so the user sees "Login successful" etc) then send Enter and a
   // small confirmation note.
-  if (AUTO_ENTER_CUE_RE.test(unwrappedScreen)) {
+  if (autoEnter) {
     console.log('[IV-DEBUG] Auto-pressing Enter for "Press Enter to continue" cue');
     try {
       session.iv.sendKeystroke('enter');
@@ -2264,6 +2286,26 @@ function handleInteractiveScreenUpdate(session, update) {
     const note = '↵ (auto-pressed Enter to continue)';
     if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
     else if (session.sendCallback) session.sendCallback(note);
+    // Close the /login-from-print loop: the bridge forced this session into
+    // interactive mode only so /login (or /logout → /login) could run.
+    // Login success is the natural end of that flow — switch back to print
+    // mode automatically instead of leaving the user to remember
+    // "/mode print". Delayed so the TUI paints its idle screen first
+    // (planModeSwitch refuses while the screen is mid-transition), and
+    // re-checked against the live session map in case anything replaced the
+    // session in the gap.
+    if (session._accountFlowReturnToPrint && LOGIN_SUCCESS_COMPACT_RE.test(compact)) {
+      session._accountFlowReturnToPrint = false;
+      const roomId = session.roomId;
+      setTimeout(() => {
+        const current = sessions.get(roomId);
+        if (!current || current !== session || !current.alive || !current.iv) return;
+        const sendReply = current.sendCallback || (() => {});
+        const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
+        sendReply('✅ Login complete — switching back to non-interactive mode.');
+        applyModeSwitch(roomId, current, false, { sendReply, sendHtml });
+      }, LOGIN_RETURN_TO_PRINT_DELAY_MS);
+    }
   }
 }
 
@@ -2306,8 +2348,35 @@ function handleUnclassifiedPrompt(session, { screen }) {
 // Kept narrow on purpose — only matches phrasing where claude is
 // explicitly waiting for an acknowledgment keystroke ("press enter to
 // continue" / "press enter to dismiss"). Does NOT match "paste code
-// here" or other prompts that need real input.
-const AUTO_ENTER_CUE_RE = /press\s+enter\s+to\s+(continue|dismiss|acknowledge|proceed)/i;
+// here" or other prompts that need real input. Tested against the
+// compact screen form (compactScreenText) because the post-login line
+// is shimmer-animated and arrives letter-spaced after ANSI strip —
+// the old word-spaced regex never fired on exactly the screen this
+// exists for, leaving the user to send !enter by hand.
+const AUTO_ENTER_COMPACT_RE = /pressenterto(continue|dismiss|acknowledge|proceed)/;
+
+// Compact-form signals that the press-Enter acknowledgment is a LOGIN
+// SUCCESS screen — used to finish the /login-from-print flow (auto-return
+// to non-interactive mode, see _accountFlowReturnToPrint).
+const LOGIN_SUCCESS_COMPACT_RE = /loginsuccessful|loggedinas/;
+
+// How long after the auto-Enter to wait before switching a /login-initiated
+// interactive session back to print mode — long enough for the TUI to paint
+// its idle screen so planModeSwitch doesn't refuse the switch.
+const LOGIN_RETURN_TO_PRINT_DELAY_MS = 2500;
+
+// Undo the letter-spacing stripAnsi leaves on shimmer-animated TUI lines
+// ("L o g i n   s u c c e s s f u l .") for display. Only rewrites lines that
+// are mostly single-character tokens; normal prose is untouched. Runs of 2+
+// spaces are word gaps, single spaces are letter gaps.
+function despaceTuiLine(line) {
+  const trimmed = String(line || '').trim();
+  const toks = trimmed.split(/\s+/);
+  if (toks.length < 6) return trimmed;
+  const singles = toks.filter(t => t.length === 1).length;
+  if (singles / toks.length <= 0.6) return trimmed;
+  return trimmed.split(/ {2,}/).map(word => word.replace(/ /g, '')).join(' ');
+}
 
 // --- Structured Question Handling ---
 
@@ -5436,8 +5505,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // the command instead — startResumeReadyWatcher types it the moment
         // the TUI is idle-ready.
         if (session.iv.alive && session._awaitingInputReady) {
+          const previouslyParked = session._postReadySlashCommand;
           session._postReadySlashCommand = `/${cmdWord}`;
-          await sendReply(`The session is still resuming — /${cmdWord} will run as soon as it's ready.`);
+          if (previouslyParked === `/${cmdWord}`) {
+            await sendReply(`/${cmdWord} is already queued — it will run as soon as the session is ready.`);
+          } else if (previouslyParked) {
+            await sendReply(`Queued /${cmdWord} (replacing the queued ${previouslyParked}) — it will run as soon as the session is ready.`);
+          } else {
+            await sendReply(`The session is still resuming — /${cmdWord} will run as soon as it's ready.`);
+          }
           break;
         }
         if (session.iv.sendText(`/${cmdWord}`) === false) {
@@ -5451,7 +5527,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml });
       if (next) {
         next._postReadySlashCommand = `/${cmdWord}`;
-        await sendReply(`/${cmdWord} needs the interactive TUI — it will run as soon as the switched session is ready. Type /mode print afterwards to switch back.`);
+        // The bridge (not the user) chose interactive mode here, so it also
+        // owns switching back: when the login-success screen is detected the
+        // session returns to print mode automatically (see the auto-Enter
+        // branch in handleInteractiveScreenUpdate). Survives the TUI's own
+        // exit-and-restart after /logout via the auto-restart copy block.
+        next._accountFlowReturnToPrint = true;
+        await sendReply(`/${cmdWord} needs the interactive TUI — it will run as soon as the switched session is ready. Once login completes I'll switch back to non-interactive mode automatically.`);
       }
       break;
     }
