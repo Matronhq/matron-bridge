@@ -1027,6 +1027,21 @@ describe('PromptDetector', () => {
     expect(updates).toHaveLength(1);
   });
 
+  it('suppresses a wizard repaint whose cue phrase flapped within the oauth family', async () => {
+    // After the user pastes their code the wizard repaints: "Paste code
+    // here" can scroll away while "use the url below" remains. Both are the
+    // SAME sign-in screen — per-phrase cue tokens made the dedup signature
+    // flap and re-sent the card (live-test round 2).
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Browser didn\'t open? Use the url below to sign in\nhttps://claude.ai/oauth?x=1\nPaste code here if prompted >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Use the url below to sign in\nhttps://claude.ai/oauth?x=1');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+  });
+
   it('still emits for a genuinely different URL under the same cue', async () => {
     const det = new PromptDetector({ idleMs: 40 });
     const updates = [];

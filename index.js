@@ -1263,16 +1263,19 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           );
         }
       } else {
-        sessions.delete(roomId);
-        journalSessionState(session, 'done');
-        journalActivity(session, 'idle');
-        journalEvictConvoInput(session);
+        // Notice BEFORE teardown: sendToRoom's journal mirror looks the
+        // session up in the map, so a notice sent after sessions.delete()
+        // is silently dropped (same fix as the iv-mode close handler).
         if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
+        sessions.delete(roomId);
+        journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       }
     }
   });
@@ -1803,16 +1806,33 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
-        sessions.delete(roomId);
-        journalSessionState(session, 'done');
-        journalActivity(session, 'idle');
-        journalEvictConvoInput(session);
-        if (session.sendHtml) {
+        // Notices FIRST, teardown second: sendToRoom's journal mirror looks
+        // the session up in the map, so anything sent after
+        // sessions.delete() is silently dropped — which is exactly how the
+        // post-/logout "[Session ended (exit 0)]" vanished in live testing
+        // and the whole logout flow went dark.
+        if (session._accountFlowReturnToPrint && exitCode === 0) {
+          // /logout completed: claude logs out and exits cleanly. The
+          // account flow ran in interactive mode (and persisted
+          // interactiveMode: true when it switched); without resetting it
+          // here every later auto-resume comes back as a TUI session and
+          // the room is stuck interactive forever — the root cause of the
+          // silent /logout in live-test round 2. Persist print so the next
+          // message resumes in the bridge's native mode.
+          persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
+          const n = notice('info', '👋 Logged out. Send /login when you\'re ready to sign back in.', '👋 Logged out. Send <code>/login</code> when you\'re ready to sign back in.');
+          if (session.sendHtml) session.sendHtml(n.plain, n.html);
+          else if (session.sendCallback) session.sendCallback(n.plain);
+        } else if (session.sendHtml) {
           const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
+        sessions.delete(roomId);
+        journalSessionState(session, 'done');
+        journalActivity(session, 'idle');
+        journalEvictConvoInput(session);
       }
     }
   });
@@ -2191,12 +2211,18 @@ function formatTuiCueMessage(screen, urls) {
     return { plain, html };
   }
   // Press-Enter acknowledgment (e.g. post-login "Login successful.
-  // Press Enter to continue…"). Extract the result line above the cue.
+  // Press Enter to continue…"). Extract the result line from JUST ABOVE the
+  // cue line, and only on the strict login-result tokens. The screen tail
+  // also contains the resumed session's repainted chat transcript, and a
+  // whole-screen search with loose words ("complete", "finished") kept
+  // matching the USER'S OWN old messages — surfacing a random fragment of
+  // prior conversation as a "✅ …" card (live-test rounds 1 and 2).
   if (AUTO_ENTER_COMPACT_RE.test(compact)) {
     const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
+    const cueIdx = lines.findIndex(l => AUTO_ENTER_COMPACT_RE.test(compactScreenText(l)));
+    const nearby = cueIdx >= 0 ? lines.slice(Math.max(0, cueIdx - 4), cueIdx + 1) : [];
     const resultLine =
-      lines.find(l => /loggedinas|loginsuccessful|complete|finished|✅/.test(compactScreenText(l))) ||
-      lines.find(l => l.length > 5 && !/pressenter|escto/.test(compactScreenText(l))) ||
+      nearby.find(l => /loggedinas|loginsuccessful/.test(compactScreenText(l))) ||
       'Claude is continuing…';
     const display = despaceTuiLine(resultLine);
     const plain = `✅ ${display}`;
@@ -5545,7 +5571,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
         if (session.iv.sendText(`/${cmdWord}`) === false) {
           await sendReply(`Could not reach the session TUI — try /restart, then /${cmdWord} again.`);
+          break;
         }
+        // This branch used to be silent on success — the TUI shows the
+        // command running, but a Matron/Matrix user can't see the TUI, so
+        // /logout appeared to do nothing (live-test round 2). Acknowledge,
+        // and treat the account flow as bridge-owned exactly like the
+        // print branch below: after /logout claude exits and the exit-0
+        // handler uses this flag to persist print mode + tell the user;
+        // after /login the success screen triggers the auto-return.
+        session._accountFlowReturnToPrint = true;
+        await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
         break;
       }
       // Print mode: one concise announcement covering the whole flow — the
