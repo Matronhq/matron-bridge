@@ -452,6 +452,17 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
     if (sameAgent && !state.sessionId && effectiveSessionId) {
       state = { ...state, sessionId: effectiveSessionId };
     }
+    // An explicit caller override beats the live-session snapshot. The
+    // snapshot branch reads interactiveMode from `!!live.iv` — but the two
+    // callers that pass this field (applyModeSwitch, the /logout exit-0
+    // handler) are announcing a mode CHANGE while the old-mode session is
+    // still live/in the map, so the snapshot silently re-persisted the OLD
+    // mode at the agent level (the level getPersistedAgentState prefers on
+    // resume) and every auto-resume came back interactive: the stuck-mode
+    // bug behind login-flow test rounds 1-4.
+    if (extra?.interactiveMode !== undefined) {
+      state = { ...state, interactiveMode: extra.interactiveMode };
+    }
     agentSessions = mergeAgentStates(agentSessions, { [activeAgent]: state });
   }
   data[String(roomId)] = {
@@ -2343,7 +2354,7 @@ function handleInteractiveScreenUpdate(session, update) {
         // actually happened.
         const switched = applyModeSwitch(roomId, current, false, {
           sendReply, sendHtml,
-          announcement: 'Login finished — switching back.',
+          announcement: '✅ Logged in successfully — back to normal mode.',
         });
         if (switched) {
           current._accountFlowReturnToPrint = false;
