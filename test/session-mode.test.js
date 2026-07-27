@@ -128,7 +128,7 @@ describe('planSessionIdentity', () => {
     expect(plan.cliArgs).toEqual(['--resume', 'old-id']);
     expect(minted).toBe(0);
   });
-  // #136 / loop #459: a fresh print session that crashes BEFORE Claude
+  // #136 / PR #151: a fresh print session that crashes BEFORE Claude
   // persisted a resumable session must respawn with the SAME id via
   // --session-id (not --resume, which would fail on a never-written session).
   // presetId reuses the given id without minting and keeps --session-id.
@@ -167,7 +167,7 @@ describe('createSession id pre-assignment (source inspection)', () => {
     expect(src).not.toMatch(/push\('--resume'/);
   });
 
-  // #136 / loop #459: the auto-restart must not --resume a session that
+  // #136 / PR #151: the auto-restart must not --resume a session that
   // crashed before Claude persisted it. Scoped to PRINT mode only — iv-mode
   // confirms from camel-case `sessionId` transcript records that the snake-case
   // capture never sees, so gating iv would break its resume-after-persist
@@ -188,5 +188,22 @@ describe('createSession id pre-assignment (source inspection)', () => {
   it('the print constructor inits _sessionConfirmed from resumeSessionId (iv is unconditional --resume)', () => {
     const inits = src.match(/_sessionConfirmed: !!resumeSessionId/g) || [];
     expect(inits.length).toBe(1);
+  });
+
+  // PR #151 follow-up: !restart goes through recreateSession, which passed
+  // existing.claudeSessionId as the resume id UNCONDITIONALLY — a !restart
+  // during the pre-init window hit the exact never-written-id --resume
+  // failure the auto-restart path guards. The /model and /mode planners
+  // refuse unconfirmed sessions before calling recreateSession, so the gate
+  // inside it only changes the !restart path.
+  it('recreateSession gates the pre-init respawn on _sessionConfirmed, print-mode Claude only', () => {
+    // Unconfirmed print → no resume id, same id threaded as presetSessionId
+    // (--session-id). Confirmed (or iv / Codex, which never set the flag) →
+    // resume exactly as before.
+    expect(src).toMatch(/const preInitPrint = existing\.agent === AGENT_CLAUDE && !existing\.iv && !existing\._sessionConfirmed;/);
+    const resumeGates = src.match(/createSession\(roomId, workdir, preInitPrint \? null : sessionId, \{/g) || [];
+    expect(resumeGates.length).toBe(1);
+    const presetGates = src.match(/presetSessionId: preInitPrint \? sessionId : undefined,/g) || [];
+    expect(presetGates.length).toBe(1);
   });
 });

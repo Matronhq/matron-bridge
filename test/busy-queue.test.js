@@ -527,3 +527,18 @@ describe('index.js journal busy caller — queued-tile notification wiring (sour
     expect(window).toMatch(/sendReply: ctx\.sendReply/);
   });
 });
+
+describe('index.js flushQueue drop path — undelivered notice wiring (source inspection)', () => {
+  // PR #150 follow-up: every queued entry was acknowledged with a
+  // success-style "📨 Queued" tile, so a flush that drops the queue (session
+  // dead / auto-stopped) must tell the user — a server-side console.log alone
+  // leaves them believing the messages were delivered.
+  it('a dropped queue publishes a journal notice, not just a server-side log', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('[QUEUE] dropped queued message(s)');
+    expect(start).toBeGreaterThan(-1);
+    const window = src.slice(start, start + 800);
+    expect(window).toMatch(/journalPublishNotice\(journalConvoIdFor\(session\)/);
+    expect(window).toMatch(/queued message/); // undelivered wording mentions the queue
+  });
+});

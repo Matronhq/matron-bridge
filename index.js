@@ -53,6 +53,7 @@ import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
+import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
@@ -376,7 +377,11 @@ function loadPersistedSessions() {
 
 function savePersistedSessions(data) {
   try {
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    // Atomic replace (PR #151 follow-up): this file is rewritten on every
+    // message, and loadPersistedSessions treats a corrupt file as {} — so a
+    // truncating in-place write that dies mid-rewrite silently drops every
+    // persisted session, and the next persist overwrites the evidence.
+    atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
     console.error('Failed to save sessions file:', e.message);
   }
@@ -1003,7 +1008,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // claudeSessionId is then known synchronously, so RPC start can answer with
   // a convo_id immediately and journal publishes never buffer for the init
   // event. Resumes keep --resume semantics (see planSessionIdentity).
-  // presetSessionId is the pre-init-crash restart path (#136 / loop #459):
+  // presetSessionId is the pre-init-crash restart path (#136 / PR #151):
   // reuse the crashed session's minted id via --session-id, never --resume.
   const identity = planSessionIdentity({ resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID });
   const args = [
@@ -1094,7 +1099,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // confirmed from birth; a fresh/preset spawn is not resumable until Claude
     // reports its id on init (see handleClaudeEvent). Without this, a resumed
     // session that crashes before its first event would wrongly restart via
-    // --session-id on an already-persisted id (#136 / loop #459).
+    // --session-id on an already-persisted id (#136 / PR #151).
     _sessionConfirmed: !!resumeSessionId,
     journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
@@ -1199,7 +1204,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // without the user's --browser opt-in.
         const restarted = createSession(
           roomId, cwd,
-          // #136 / loop #459: --resume only a session Claude actually persisted
+          // #136 / PR #151: --resume only a session Claude actually persisted
           // (confirmed on init, session._sessionConfirmed). A crash BEFORE init
           // never set that flag — the minted id was never written, so --resume
           // would fail and terminate the conversation. Reuse the same id via
@@ -1741,7 +1746,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // a fresh session that crashed before its first persist.
         //
         // Interactive mode restarts with --resume unconditionally (upstream
-        // behavior): the #136 / #459 pre-init-resume guard is print-mode only.
+        // behavior): the #136 / PR #151 pre-init-resume guard is print-mode only.
         // iv sessions confirm their id from camel-case `sessionId` transcript
         // records, which handleClaudeEvent's snake-case `session_id` capture
         // never sees, so a _sessionConfirmed gate here would wrongly force
@@ -2650,7 +2655,7 @@ function handleClaudeEvent(session, event) {
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
     journalFlushForSession(session);
   }
-  // #136 / loop #459: mark the native session confirmed the first time Claude
+  // #136 / PR #151: mark the native session confirmed the first time Claude
   // reports its session_id — proof the process reached init and persisted a
   // *resumable* session. Fresh spawns pre-assign claudeSessionId (so the block
   // above is skipped for them), yet they are NOT resumable until Claude writes
@@ -3832,6 +3837,16 @@ function flushQueue(session, queued) {
   }
   if (!dispatchMergedFlush(session, queued)) {
     console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
+    // Every one of these entries was acknowledged with a success-style
+    // "📨 Queued" tile when it queued, so dropping them with only a
+    // server-side log leaves the user believing they were delivered — the
+    // reachable form of the misleading-success bug PR #150 fixed for
+    // undeliverable attachments. Tell them. journalPublishNotice already
+    // no-ops on a falsy convo id and fails open like every journal call.
+    const count = Array.isArray(queued) ? queued.length : 0;
+    journalPublishNotice(journalConvoIdFor(session), count > 1
+      ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
+      : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
   }
 }
 
@@ -7053,6 +7068,18 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
   const sessionId = existing.claudeSessionId;
+  // PR #151's pre-init resume gate, extended to this shared teardown path:
+  // --resume only a session Claude actually persisted (confirmed on init,
+  // session._sessionConfirmed). The /model and /mode planners already refuse
+  // unconfirmed print sessions before calling here, but !restart doesn't — a
+  // restart during the pre-init window would --resume an id Claude never
+  // wrote, which fails ("No conversation found") and terminates the
+  // conversation. Respawn with the SAME id via --session-id (presetSessionId
+  // below) instead, keeping the convo/journal identity for a clean fresh
+  // spawn. Print-mode Claude only: iv sessions confirm via camel-case
+  // transcript records and Codex never sets the flag, so gating either would
+  // wrongly force every recreate onto a fresh spawn and lose history.
+  const preInitPrint = existing.agent === AGENT_CLAUDE && !existing.iv && !existing._sessionConfirmed;
   const workdir = existing.workdir;
   const originRoomId = existing.originRoomId;
   sessions.delete(roomId);
@@ -7066,13 +7093,14 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // ref onto the new session's journal. No-op when nothing was streaming.
   journalStreamClear(existing);
   killSession(existing, 'SIGTERM', { preserveQueue: true });
-  const next = createSession(roomId, workdir, sessionId, {
+  const next = createSession(roomId, workdir, preInitPrint ? null : sessionId, {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
     journalConvoId: existing.journalConvoId,
     // Carry the good title across the swap so the re-seed adopts it instead of
     // clobbering it with the repo basename (title-revert bug).
     journalTitleHint: existing._journalTitleHint,
+    presetSessionId: preInitPrint ? sessionId : undefined,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
     // this a /mode toggle or /restart would resume on the stale persisted/
