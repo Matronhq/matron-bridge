@@ -128,7 +128,7 @@ describe('planSessionIdentity', () => {
     expect(plan.cliArgs).toEqual(['--resume', 'old-id']);
     expect(minted).toBe(0);
   });
-  // #136 / loop #459: a fresh print session that crashes BEFORE Claude
+  // #136 / PR #151: a fresh print session that crashes BEFORE Claude
   // persisted a resumable session must respawn with the SAME id via
   // --session-id (not --resume, which would fail on a never-written session).
   // presetId reuses the given id without minting and keeps --session-id.
@@ -167,7 +167,7 @@ describe('createSession id pre-assignment (source inspection)', () => {
     expect(src).not.toMatch(/push\('--resume'/);
   });
 
-  // #136 / loop #459: the auto-restart must not --resume a session that
+  // #136 / PR #151: the auto-restart must not --resume a session that
   // crashed before Claude persisted it. Scoped to PRINT mode only — iv-mode
   // confirms from camel-case `sessionId` transcript records that the snake-case
   // capture never sees, so gating iv would break its resume-after-persist
@@ -188,5 +188,79 @@ describe('createSession id pre-assignment (source inspection)', () => {
   it('the print constructor inits _sessionConfirmed from resumeSessionId (iv is unconditional --resume)', () => {
     const inits = src.match(/_sessionConfirmed: !!resumeSessionId/g) || [];
     expect(inits.length).toBe(1);
+  });
+
+  // PR #151 follow-up: !restart goes through recreateSession, which passed
+  // existing.claudeSessionId as the resume id UNCONDITIONALLY — a !restart
+  // during the pre-init window hit the exact never-written-id --resume
+  // failure the auto-restart path guards. The /model and /mode planners
+  // refuse unconfirmed sessions before calling recreateSession, so the gate
+  // inside it only changes the !restart path.
+  it('recreateSession gates the pre-init respawn on _sessionConfirmed, print-mode Claude only', () => {
+    // Unconfirmed print → no resume id, same id threaded as presetSessionId
+    // (--session-id). Confirmed (or iv / Codex, which never set the flag) →
+    // resume exactly as before.
+    expect(src).toMatch(/const preInitPrint = existing\.agent === AGENT_CLAUDE && !existing\.iv && !existing\._sessionConfirmed;/);
+    const resumeGates = src.match(/createSession\(roomId, workdir, preInitPrint \? null : sessionId, \{/g) || [];
+    expect(resumeGates.length).toBe(1);
+    const presetGates = src.match(/presetSessionId: preInitPrint \? sessionId : undefined,/g) || [];
+    expect(presetGates.length).toBe(1);
+  });
+});
+
+describe('shouldRunAccountFlowReturn', () => {
+  const owed = { alive: true, iv: {}, _accountFlowReturnToPrint: true };
+
+  it('runs for an alive interactive session that owes a return to print', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn(owed)).toBe(true);
+  });
+
+  it('runs for a REPLACEMENT session carrying the copied flag (no identity requirement)', () => {
+    // The iv auto-restart path copies _accountFlowReturnToPrint onto the new
+    // session object; the timer must honor it even though it is not the
+    // object that scheduled the timer.
+    const replacement = { ...owed };
+    expect(sessionMode.shouldRunAccountFlowReturn(replacement)).toBe(true);
+  });
+
+  it('is a no-op when the room has no session', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn(undefined)).toBe(false);
+    expect(sessionMode.shouldRunAccountFlowReturn(null)).toBe(false);
+  });
+
+  it('is a no-op for a dead session', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn({ ...owed, alive: false })).toBe(false);
+  });
+
+  it('is a no-op once the session is back in print mode', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn({ ...owed, iv: null })).toBe(false);
+  });
+
+  it('is a no-op when the flow was already consumed or abandoned', () => {
+    expect(sessionMode.shouldRunAccountFlowReturn({ ...owed, _accountFlowReturnToPrint: false })).toBe(false);
+  });
+});
+
+describe('account-flow flag hygiene (source inspection)', () => {
+  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+
+  it('the iv crash-restart enters the resume hold so parked commands run', () => {
+    expect(src).toMatch(/enterResumeHold\(restarted\);/);
+  });
+
+  it('the readiness watcher clears a stale logout mark unless it is about to type /logout', () => {
+    expect(src).toMatch(/if \(parkedSlash !== '\/logout'\) session\._accountLogoutPending = false;/);
+  });
+
+  it('iv account branches assign (not conditionally set) the logout mark, and never arm the return-to-print flag', () => {
+    const assigns = src.match(/session\._accountLogoutPending = cmdWord === 'logout';/g) || [];
+    expect(assigns.length).toBe(2);
+    // _accountFlowReturnToPrint means "the bridge borrowed iv mode from a
+    // print session" — only the print branch may arm it (on the replacement
+    // session), never the already-interactive branches.
+    const arms = src.match(/session\._accountFlowReturnToPrint = true;/g) || [];
+    expect(arms.length).toBe(0);
+    const nextArms = src.match(/next\._accountFlowReturnToPrint = true;/g) || [];
+    expect(nextArms.length).toBe(1);
   });
 });
