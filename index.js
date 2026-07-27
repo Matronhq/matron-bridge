@@ -1810,6 +1810,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
+        // Same hold recreateSession and the auto-resume path use: without it
+        // the copied _postReadySlashCommand is never consumed (the readiness
+        // watcher is what types parked commands), so a /login or /logout
+        // interrupted by a crash silently never ran — and anything the user
+        // sent right after the restart was typed into a still-loading TUI
+        // and dropped (Bugbot, PR #162).
+        enterResumeHold(restarted);
         if (restarted.sendHtml) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
@@ -3849,6 +3856,12 @@ function startResumeReadyWatcher(session) {
     // asked to re-run the command.
     const parkedSlash = session._postReadySlashCommand;
     session._postReadySlashCommand = null;
+    // A resume that isn't about to type /logout has no logout in flight:
+    // clear any stale mark copied across a crash-restart (a crash mid-logout
+    // means the logout did NOT complete — a completed one exits 0), so a
+    // later ordinary clean exit isn't misreported as "👋 Logged out"
+    // (Bugbot, PR #162).
+    if (parkedSlash !== '/logout') session._accountLogoutPending = false;
     if (parkedSlash) {
       if (outbox.length > 0) {
         debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
@@ -5613,7 +5626,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // switch back — a user who chose interactive mode keeps it after
         // /login//logout. If this iv session IS a borrowed one, the print
         // branch below already set the flag and it stays set.
-        if (cmdWord === 'logout') session._accountLogoutPending = true;
+        // Assignment, not a conditional set: /login must CLEAR a stale
+        // logout mark left by an earlier /logout attempt that never
+        // finished, or a later clean exit would be misreported as a logout.
+        session._accountLogoutPending = cmdWord === 'logout';
         await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
         break;
       }
