@@ -31,6 +31,10 @@ import {
   shouldRunAccountFlowReturn,
 } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
+// formatDuration aliased: index.js has its own uptime formatDuration (no
+// day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
+// reads "7d", not "168h".
+import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore } from './lib/timer-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
@@ -137,6 +141,10 @@ const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 // Durable folder history for the picker (`recent_folders` RPC) — outlives
 // the session records above, which stale-resume cleanup deletes.
 const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json');
+// /timer scheduled messages — persisted separately from the session store so
+// a pending timer outlives the idle reaper, session restarts, and full
+// bridge restarts (re-armed in main() via timerStore.init()).
+const TIMERS_FILE = path.join(os.homedir(), '.matron-bridge-timers.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -5401,6 +5409,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
+        `/timer <duration> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact); /timer lists, /timer cancel <id|all> cancels\n` +
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
@@ -5442,6 +5451,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
+          ['/timer &lt;duration&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
           ['/tools', 'List available tools'],
           ['/help', 'Show this help message'],
         ]) +
@@ -5840,6 +5850,61 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       } catch (e) {
         await sendReply(`Couldn't fetch usage limits: ${e.message}`);
       }
+      break;
+    }
+
+    case '!timer': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session to set a timer.');
+        break;
+      }
+      const convoId = journalConvoIdFor(session);
+      if (!convoId) {
+        // Fresh print-mode sessions only learn their convo id from the first
+        // transcript event — without one the timer would have no address to
+        // fire into (or auto-resume) later.
+        await sendReply("This session doesn't have a conversation id yet — send one message first, then set the timer.");
+        break;
+      }
+      // Slice (don't rejoin parts): the scheduled message must keep the
+      // user's original spacing.
+      const parsed = parseTimerCommand(text.slice(parts[0].length));
+      if (parsed.kind === 'error') {
+        await sendReply(parsed.message);
+        break;
+      }
+      if (parsed.kind === 'set') {
+        const record = timerStore.add({ convoId, roomId, text: parsed.message, delayMs: parsed.delayMs });
+        const at = parsed.delayMs >= 24 * 3600 * 1000
+          ? new Date(record.fireAt).toLocaleString()
+          : new Date(record.fireAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        await sendReply(
+          `⏰ Timer #${record.id} set — will send "${parsed.message}" in ${formatTimerDuration(parsed.delayMs)} (at ${at}). ` +
+          `It survives session restarts and idle reaping. /timer lists, /timer cancel ${record.id} cancels.`);
+        break;
+      }
+      if (parsed.kind === 'cancel') {
+        const cancelled = timerStore.cancel(convoId, parsed.which);
+        if (!cancelled.length) {
+          await sendReply(parsed.which === 'all'
+            ? 'No timers set for this conversation.'
+            : `No timer #${parsed.which} in this conversation. /timer lists the active ones.`);
+          break;
+        }
+        await sendReply(cancelled.length === 1
+          ? `🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`
+          : `🚫 Cancelled ${cancelled.length} timers.`);
+        break;
+      }
+      // 'list'
+      const active = timerStore.listForConvo(convoId);
+      if (!active.length) {
+        await sendReply('No timers set. Usage: /timer <duration> <message> — e.g. /timer 2h hey, or /timer 30m /compact.');
+        break;
+      }
+      const lines = active.map(t => `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
+      await sendReply(`⏰ Timers for this conversation:\n${lines.join('\n')}\n\n/timer cancel <id|all> to cancel.`);
       break;
     }
 
@@ -6523,6 +6588,49 @@ function journalResumeConvo(convoId) {
   }
   return null;
 }
+
+// --- /timer scheduled messages ---
+//
+// A timer coming due. The record was already removed + persisted by the
+// store before this runs (see lib/timer-command.js — a crash mid-delivery
+// must lose the fire, never replay it). Delivery routes through
+// journalRouteTextToSession, so the scheduled text behaves exactly like a
+// message the user typed at fire time: bridge commands (/status, /stop)
+// dispatch, TUI slash commands (/compact) pass through, busy sessions
+// queue. If the idle reaper (or a bridge restart) took the session down in
+// the meantime, revive it through the SAME journalResumeConvo path an
+// ordinary inbound Matron message uses — that's what lets a 2h timer
+// outlive the 1h idle reap. The notice below is the chat's visible record
+// of the send: journalRouteTextToSession's delivery paths all skip the
+// journal mirror (they assume the client already has its own send row,
+// which a timer-fired message never does).
+async function fireTimer(record) {
+  let session = findSessionByClaudeSessionId(record.convoId);
+  if (!session || !session.alive) session = journalResumeConvo(record.convoId);
+  if (!session) {
+    journalPublishNotice(record.convoId,
+      `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`);
+    return;
+  }
+  journalPublishNotice(journalConvoIdFor(session), `⏰ Timer #${record.id}: sending "${record.text}"`);
+  await journalRouteTextToSession(session, record.text);
+}
+
+const timerStore = createTimerStore({
+  load: () => (fs.existsSync(TIMERS_FILE) ? JSON.parse(fs.readFileSync(TIMERS_FILE, 'utf-8')) : null),
+  // Atomic replace, same rationale as savePersistedSessions: a truncating
+  // in-place write that dies mid-rewrite would silently drop every timer.
+  save: (data) => atomicWriteFileSync(TIMERS_FILE, JSON.stringify(data, null, 2)),
+  now: Date.now,
+  setTimer: (fn, delay) => setTimeout(fn, delay),
+  clearTimer: (handle) => clearTimeout(handle),
+  onFire: (record) => {
+    fireTimer(record).catch((e) => {
+      try { console.warn(`[timer] #${record.id} delivery failed: ${e.message}`); } catch { /* logging must never throw */ }
+    });
+  },
+  log: (msg) => { try { console.warn(`[timer] ${msg}`); } catch { /* logging must never throw */ } },
+});
 
 // Assembled once, after every dependency above is defined, and invoked from
 // journalHandleInboundEvent (the `function` declaration wired into
@@ -7673,6 +7781,10 @@ async function main() {
   } else {
     console.log('Session idle timeout: disabled');
   }
+  // Re-arm persisted /timer schedules (overdue ones fire after a short
+  // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
+  const rearmed = timerStore.init();
+  if (rearmed > 0) console.log(`Re-armed ${rearmed} persisted timer(s) from ${TIMERS_FILE}`);
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
   console.log(`Journal: connecting to ${JOURNAL_WS_URL}`);
