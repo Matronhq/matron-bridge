@@ -526,6 +526,61 @@ describe('notifyQueuedMessage', () => {
       ],
     });
   });
+
+  // A client that predates `kind: 'queued_release'` renders the classic
+  // {question, options, mode} prompt shape. Without a mirrored `options`
+  // array the card degrades to a free-text answer box whose reply the router
+  // refuses as an invalid queue action — a functionally dead card. The
+  // option VALUES must be exactly the wire action ids the router accepts
+  // ('send' / 'cancel', journal-input-router QUEUED_RELEASE_ACTIONS).
+  it('structured path: payload mirrors actions as classic prompt options so older clients render tappable buttons', async () => {
+    const sendButtonMessage = vi.fn(async () => '$tile');
+    const session = makeSession({ sendButtonMessage, queueNotifications: [] });
+    await notifyQueuedMessage(session, 'trunc…', {
+      sendReply: vi.fn(),
+      queueRelease: { noteQueued: vi.fn() },
+      convoId: 'convo-1',
+      fullText: 'full body',
+    });
+
+    const buttonArgs = sendButtonMessage.mock.calls[0];
+    const payload = buttonArgs[buttonArgs.length - 1];
+    expect(payload.mode).toBe('pick_one');
+    expect(payload.options).toEqual([
+      { id: 'send', label: payload.actions[0].label, value: 'send' },
+      { id: 'cancel', label: payload.actions[1].label, value: 'cancel' },
+    ]);
+  });
+
+  // "Send ALL queued messages … cancel this one?" is honest with several
+  // queued but absurd for the common single-message case. The wording is
+  // count-aware; the wire action ids never change.
+  it('structured path: question and labels are singular with one queued message, "all N" with several', async () => {
+    async function payloadFor(queuedMessages) {
+      const sendButtonMessage = vi.fn(async () => '$tile');
+      const session = makeSession({ sendButtonMessage, queueNotifications: [], queuedMessages });
+      await notifyQueuedMessage(session, 'p', {
+        sendReply: vi.fn(),
+        queueRelease: { noteQueued: vi.fn() },
+        convoId: 'convo-1',
+      });
+      const buttonArgs = sendButtonMessage.mock.calls[0];
+      return buttonArgs[buttonArgs.length - 1];
+    }
+
+    const single = await payloadFor([[{ type: 'text', text: 'only' }]]);
+    expect(single.question).toBe('Send this queued message now, or cancel it?');
+    expect(single.actions.map(a => a.label)).toEqual(['⚡ Send now', '✕ Cancel']);
+
+    const several = await payloadFor([
+      [{ type: 'text', text: 'a' }],
+      [{ type: 'text', text: 'b' }],
+      [{ type: 'text', text: 'c' }],
+    ]);
+    expect(several.question).toBe('Send all 3 queued messages now, or cancel this one?');
+    expect(several.actions.map(a => a.label)).toEqual(['⚡ Send all now', '✕ Cancel this']);
+    expect(several.actions.map(a => a.id)).toEqual(['send', 'cancel']);
+  });
 });
 
 
