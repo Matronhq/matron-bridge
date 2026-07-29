@@ -34,7 +34,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 // formatDuration aliased: index.js has its own uptime formatDuration (no
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
-import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore } from './lib/timer-command.js';
+import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton } from './lib/timer-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
@@ -5883,12 +5883,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       if (parsed.kind === 'set') {
         const record = timerStore.add({ convoId, roomId, text: parsed.message, delayMs: parsed.delayMs });
+        // Wall-clock rendering includes the timezone name ("12:26 AM UTC") —
+        // the server's clock is rarely the user's, so a bare time is
+        // ambiguous. Same-day timers show just the time; >=24h adds the date.
         const at = parsed.delayMs >= 24 * 3600 * 1000
-          ? new Date(record.fireAt).toLocaleString()
-          : new Date(record.fireAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        await sendReply(
+          ? new Date(record.fireAt).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
+          : new Date(record.fireAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+        const summary =
           `⏰ Timer #${record.id} set — will send "${parsed.message}" in ${formatTimerDuration(parsed.delayMs)} (at ${at}). ` +
-          `It survives session restarts and idle reaping. /timer lists, /timer cancel ${record.id} cancels.`);
+          `It survives session restarts and idle reaping.`;
+        if (session.sendButtonMessage) {
+          // Confirmation card with a Cancel button. The tap round-trips as a
+          // seq-proven picker reply (timer:cancel:<id> -> lib/picker-dispatch.js
+          // -> cancelTimerFromButton); /timer cancel <id> stays the typed path.
+          await session.sendButtonMessage(summary, [timerCancelButton(record.id)], 'pick_one', summary, escapeHtml(summary));
+        } else {
+          await sendReply(`${summary} /timer lists, /timer cancel ${record.id} cancels.`);
+        }
         break;
       }
       if (parsed.kind === 'cancel') {
@@ -6480,7 +6491,11 @@ function journalOnPromptReply(session, answer, { username }) {
   // A picker answers no pending prompt, so (like the queue-action block above)
   // it emits no "answered:" echo.
   if (answer?.picker) {
-    if (!session.alive) {
+    // Timer-cancel taps skip the alive gate: like the !timer command itself
+    // (PR #171), cancelling only needs the convo-scoped store, and the timer
+    // may well outlive the session process it was set from.
+    const isTimerTap = typeof answer.choice === 'string' && answer.choice.startsWith('timer:');
+    if (!session.alive && !isTimerTap) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
     }
@@ -6489,6 +6504,7 @@ function journalOnPromptReply(session, answer, { username }) {
       applyModelSwitch,
       switchEffortInSession,
       applyModeSwitch,
+      cancelTimer: cancelTimerFromButton,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
     });
@@ -6638,6 +6654,21 @@ const timerStore = createTimerStore({
   },
   log: (msg) => { try { console.warn(`[timer] ${msg}`); } catch { /* logging must never throw */ } },
 });
+
+// A tap on a set-confirmation card's Cancel button (value timer:cancel:<id>,
+// dispatched via lib/picker-dispatch.js). Same convo scoping and feedback as
+// the typed `/timer cancel <id>` path in handleCommand — a tap on a timer
+// that already fired (or was cancelled by text in the meantime) gets the
+// "no such timer" reply rather than a silent no-op.
+function cancelTimerFromButton(session, timerId, sendReply) {
+  const convoId = journalConvoIdFor(session);
+  const cancelled = convoId ? timerStore.cancel(convoId, timerId) : [];
+  if (!cancelled.length) {
+    sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
+    return;
+  }
+  sendReply(`🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`);
+}
 
 // Assembled once, after every dependency above is defined, and invoked from
 // journalHandleInboundEvent (the `function` declaration wired into

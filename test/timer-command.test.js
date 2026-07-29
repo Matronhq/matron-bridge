@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   parseDuration, formatDuration, parseTimerCommand, createTimerStore,
-  MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
+  timerCancelButton, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
 } from '../lib/timer-command.js';
 
 describe('parseDuration', () => {
@@ -79,6 +79,19 @@ describe('parseTimerCommand', () => {
     expect(parseTimerCommand('30d hello').kind).toBe('error');
     expect(parseTimerCommand('2h').kind).toBe('error');
     expect(MIN_TIMER_MS).toBeLessThan(MAX_TIMER_MS);
+  });
+});
+
+describe('timerCancelButton', () => {
+  it('emits the picker-convention shape the router and dispatcher key on', () => {
+    // id prefix `timer-` -> non-answerable frame (journal-input-router
+    // PICKER_OPTION_ID); value -> what a Matron tap sends back as the
+    // prompt_reply choice (picker-dispatch TIMER_CANCEL_ARG).
+    expect(timerCancelButton(12)).toEqual({
+      id: 'timer-cancel-12',
+      label: '🚫 Cancel timer',
+      value: 'timer:cancel:12',
+    });
   });
 });
 
