@@ -5855,7 +5855,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!timer': {
       const session = sessions.get(roomId);
-      if (!session || !session.alive) {
+      // Deliberately NO session.alive gate (Bugbot, PR #171): timers are
+      // persisted per-convo and outlive the session process, so every
+      // subcommand only needs a resolvable convo id. In the window between
+      // an idle reap and the process-close handler removing the map entry,
+      // the session object is still here but dead — list/cancel must keep
+      // working on it, and a timer SET on it is fine too (fireTimer
+      // auto-resumes a dead session at delivery time anyway).
+      if (!session) {
         await sendReply('No active session. Start a session to set a timer.');
         break;
       }

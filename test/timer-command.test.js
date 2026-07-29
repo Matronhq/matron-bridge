@@ -177,22 +177,27 @@ describe('createTimerStore', () => {
     expect(b.id).toBe(a.id + 1);
   });
 
-  it('init re-arms persisted timers with remaining delay and fires overdue ones after the grace', () => {
+  it('init re-arms persisted timers with remaining delay and graces ONLY overdue ones', () => {
     const fired = [];
     const persisted = {
       nextId: 7,
       timers: [
         { id: 3, convoId: 'c1', roomId: 'r1', fireAt: 1_000_000 + 30_000, text: 'future', createdAt: 0 },
+        // Due sooner than the grace window — must still fire at its stored
+        // fireAt, NOT be pushed out to the grace (Bugbot, PR #171).
+        { id: 4, convoId: 'c1', roomId: 'r1', fireAt: 1_000_000 + 2_000, text: 'near-due', createdAt: 0 },
         { id: 5, convoId: 'c1', roomId: 'r1', fireAt: 1_000_000 - 999_999, text: 'overdue', createdAt: 0 },
       ],
     };
     const h = makeStore({ persisted, onFire: (r) => fired.push(r.text) });
-    expect(h.store.init()).toBe(2);
+    expect(h.store.init()).toBe(3);
 
-    h.tick(OVERDUE_GRACE_MS);
-    expect(fired).toEqual(['overdue']);
+    h.tick(2_000);
+    expect(fired).toEqual(['near-due']);
+    h.tick(OVERDUE_GRACE_MS - 2_000);
+    expect(fired).toEqual(['near-due', 'overdue']);
     h.tick(30_000 - OVERDUE_GRACE_MS);
-    expect(fired).toEqual(['overdue', 'future']);
+    expect(fired).toEqual(['near-due', 'overdue', 'future']);
 
     // nextId carried over — new ids don't collide with persisted ones.
     expect(h.store.add({ convoId: 'c1', text: 'new', delayMs: 60_000 }).id).toBe(7);
