@@ -721,10 +721,13 @@ describe('promptExpectsReply', () => {
     expect(promptExpectsReply({ options: [{ id: 'prompt-opt-0', label: 'Yes' }, { id: 'prompt-opt-1', label: 'No' }] })).toBe(true);
   });
 
-  it('is false for model/effort/mode pickers', () => {
+  it('is false for model/effort/mode pickers and timer confirmation cards', () => {
     expect(promptExpectsReply({ options: [{ id: 'model-sonnet', label: 'Sonnet' }] })).toBe(false);
     expect(promptExpectsReply({ options: [{ id: 'effort-high', label: 'High' }] })).toBe(false);
     expect(promptExpectsReply({ options: [{ id: 'mode-print', label: 'Print' }] })).toBe(false);
+    // Load-bearing for /timer: the set card must not advance the staleness
+    // guard, or setting a timer would make the NEXT genuine reply "stale".
+    expect(promptExpectsReply({ options: [{ id: 'timer-cancel-5', label: '🚫 Cancel timer' }] })).toBe(false);
   });
 
   it('is false for queue-notification action buttons (cancel/interrupt)', () => {
@@ -1097,6 +1100,8 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     ['model:sonnet', [{ id: 'model-sonnet', value: 'model:sonnet' }]],
     ['effort:high', [{ id: 'effort-high', value: 'effort:high' }]],
     ['mode:print', [{ id: 'mode-print', value: 'mode:print' }]],
+    // The /timer set-confirmation card's Cancel button rides the same path.
+    ['timer:cancel:5', [{ id: 'timer-cancel-5', value: 'timer:cancel:5' }]],
   ])(
     'a %s tap whose target_seq identifies its picker frame routes (flagged picker) even past a later answerable prompt',
     (choice, opts) => {
