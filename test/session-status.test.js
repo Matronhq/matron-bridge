@@ -10,6 +10,8 @@ import {
   contextGaugeText,
   buildSessionStatus,
   emailFromClaudeConfig,
+  statusRepaintDue,
+  STATUS_REPAINT_MS,
   hostVitals,
   sampleCpuOnce,
   cpuPercent,
@@ -478,5 +480,67 @@ describe('index.js wiring', () => {
     const jEnd = src.indexOf('\nfunction ', jStart + 1);
     const jBody = src.slice(jStart, jEnd);
     expect(jBody).toContain('email: getAccountEmail()');
+  });
+});
+
+// Header liveness (Dan, 2026-08-02): the status frame used to publish at turn
+// end only, so a brand-new chat showed a bare header until its first turn
+// completed — and a long tool-heavy turn left the gauge stale for its whole
+// duration. Now the frame is seeded at spawn (whatever is known pre-turn) and
+// repainted mid-turn from assistant-event usage, throttled by wall clock.
+describe('statusRepaintDue', () => {
+  it('is due when nothing was ever published', () => {
+    expect(statusRepaintDue(undefined, 1000)).toBe(true);
+    expect(statusRepaintDue(null, 1000)).toBe(true);
+  });
+  it('suppresses repaints inside the throttle window', () => {
+    expect(statusRepaintDue(10_000, 10_000 + STATUS_REPAINT_MS - 1)).toBe(false);
+  });
+  it('is due once the window has elapsed', () => {
+    expect(statusRepaintDue(10_000, 10_000 + STATUS_REPAINT_MS)).toBe(true);
+  });
+  it('honors a custom interval', () => {
+    expect(statusRepaintDue(10_000, 10_500, 1000)).toBe(false);
+    expect(statusRepaintDue(10_000, 11_000, 1000)).toBe(true);
+  });
+});
+
+describe('index.js header-liveness wiring', () => {
+  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+
+  it('journalStatus stamps _statusPublishedAt only when a frame actually goes out', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    // The stamp must sit with the publish, after every early return (no
+    // convo id / empty status), so throttled callers aren't starved by
+    // frames that never went out.
+    const stampAt = body.indexOf('session._statusPublishedAt');
+    const publishAt = body.indexOf('publishStatus(');
+    expect(stampAt).toBeGreaterThan(-1);
+    expect(publishAt).toBeGreaterThan(-1);
+    expect(stampAt).toBeGreaterThan(body.lastIndexOf('return;'));
+  });
+
+  it('all three spawn branches seed the header via journalSpawnStatus', () => {
+    // Definition + print + iv + codex call sites.
+    const calls = src.match(/journalSpawnStatus\(/g) || [];
+    expect(calls.length).toBe(4);
+    // The helper publishes now and repaints when the limits refresh lands.
+    const start = src.indexOf('function journalSpawnStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toContain('journalStatus(session)');
+    expect(body).toContain('refreshUsageLimits(');
+  });
+
+  it('the assistant-event context capture repaints the header, throttled', () => {
+    expect(src).toMatch(/statusRepaintDue\(session\._statusPublishedAt, Date\.now\(\)\)/);
+  });
+
+  it('the print init capture repaints so the model lands before the first turn ends', () => {
+    const at = src.indexOf('session.initData = event;');
+    expect(at).toBeGreaterThan(-1);
+    expect(src.slice(at, at + 600)).toContain('journalStatus(session);');
   });
 });

@@ -70,7 +70,7 @@ import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.j
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -873,6 +873,31 @@ function journalStatus(session) {
   }
   if (Object.keys(status).length === 0) return;
   journalPublisher.publishStatus(convoId, status);
+  // Stamp AFTER the early returns so the mid-turn throttle
+  // (statusRepaintDue) is only ever held back by frames that actually went
+  // out — a skipped publish must not eat the next repaint window.
+  session._statusPublishedAt = Date.now();
+}
+
+// Seed the Matron header at spawn instead of leaving it blank until the first
+// turn ends (Dan, 2026-08-02: new chats showed no model/context/usage for
+// their whole first turn). Publishes whatever is known pre-turn — model when
+// one was chosen, workdir, account email, cached limits, host vitals; the
+// context gauge genuinely needs a turn and joins later (buildSessionStatus
+// omits absent parts, clients keep what they last rendered). Also kicks the
+// throttled limits refresh so the usage bars land shortly after a fresh
+// bridge boot instead of waiting for the first turn end — same
+// repaint-when-it-lands pattern as the result-event site. Fails soft
+// everywhere: journalStatus skips without a convo id, publishStatus drops
+// frames while the journal socket is down.
+function journalSpawnStatus(session) {
+  journalStatus(session);
+  const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
+  if (refresh) {
+    refresh.then((updated) => {
+      if (updated && session.alive) journalStatus(session);
+    });
+  }
 }
 
 // Stream in-progress assistant text to viewing Matron clients as an ephemeral
@@ -1023,6 +1048,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
     journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
+    journalSpawnStatus(codexSession);
     return codexSession;
   }
   const interactive = resolveInteractive({
@@ -1033,6 +1059,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (interactive) {
     const ivSession = createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
     journalSeedTitle(ivSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
+    journalSpawnStatus(ivSession);
     return ivSession;
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
@@ -1340,6 +1367,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
 
   sessions.set(roomId, session);
   journalSeedTitle(session, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
+  journalSpawnStatus(session);
   return session;
 }
 
@@ -2861,7 +2889,15 @@ function handleClaudeEvent(session, event) {
       // turn's API calls (see lib/session-status.js), which is how the gauge
       // once read 2m/1m.
       const assistantCtxTokens = contextTokensFromAssistantEvent(event);
-      if (assistantCtxTokens) session._lastContextTokens = assistantCtxTokens;
+      if (assistantCtxTokens) {
+        session._lastContextTokens = assistantCtxTokens;
+        // Live header: repaint mid-turn so a long tool-heavy turn doesn't
+        // leave the gauge stale until its result event — wall-clock
+        // throttled (see statusRepaintDue) because assistant events can
+        // arrive in bursts. Serves BOTH modes: iv transcript events route
+        // through this same handler.
+        if (statusRepaintDue(session._statusPublishedAt, Date.now())) journalStatus(session);
+      }
 
       const content = event.message?.content;
       if (!Array.isArray(content)) break;
@@ -3296,6 +3332,11 @@ function handleClaudeEvent(session, event) {
         session.initData = event;
         debug('Captured init data: model=%s, tools=%d, mcp=%d',
           event.model, event.tools?.length, event.mcp_servers?.length);
+        // The spawn-time frame (journalSpawnStatus) omits the model when none
+        // was explicitly chosen — init is the moment the CLI's actual model
+        // becomes known, so repaint here rather than making the header wait
+        // for the first turn end. Unthrottled: init fires once per spawn.
+        journalStatus(session);
       } else if (event.subtype === 'compact' || event.subtype === 'context_compaction') {
         // Cooldown: don't send compaction messages more than once per 60s
         const now = Date.now();
