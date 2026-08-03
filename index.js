@@ -5736,8 +5736,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // provisional-session gate — but its "try /mode again in a moment"
       // wording is a dead end here (a chat nobody messages never confirms;
       // the /logout-crash-loop bug started as exactly this switch sneaking
-      // through). Say what actually unblocks the flow instead.
-      if (session.agent === AGENT_CLAUDE && !session._sessionConfirmed) {
+      // through). Say what actually unblocks the flow instead. Busy is
+      // excluded (Bugbot, PR #173): a first turn in flight means a message
+      // WAS sent and confirmation is seconds away — "send any message first"
+      // would gaslight that user, so let planModeSwitch's busy gate answer
+      // with "finish or interrupt the current turn" instead.
+      if (session.agent === AGENT_CLAUDE && !session._sessionConfirmed && !session.busy) {
         await sendReply(`/${cmdWord} needs a conversation that has started — this chat hasn't had a reply yet. Send any message first, then /${cmdWord}.`);
         break;
       }

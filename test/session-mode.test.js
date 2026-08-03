@@ -262,6 +262,12 @@ describe('createSession id pre-assignment (source inspection)', () => {
     expect(inits.length).toBe(1);
     expect(src).not.toMatch(/_sessionConfirmed: !!resumeSessionId/);
   });
+  it('the zero-turn /login//logout guard yields to the busy refusal when a first turn is in flight (Bugbot, PR #173)', () => {
+    // Busy + unconfirmed means a message WAS sent — "send any message first"
+    // would be wrong, so the guard must exclude busy and let planModeSwitch's
+    // busy gate ("finish or interrupt the current turn") answer instead.
+    expect(src).toMatch(/if \(session\.agent === AGENT_CLAUDE && !session\._sessionConfirmed && !session\.busy\) \{\s*\n\s*await sendReply\(`\/\$\{cmdWord\} needs a conversation that has started/);
+  });
 
   // PR #151 follow-up: !restart goes through recreateSession, which passed
   // existing.claudeSessionId as the resume id UNCONDITIONALLY — a !restart
