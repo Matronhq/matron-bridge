@@ -148,6 +148,73 @@ describe('planSessionIdentity', () => {
     expect(plan.sessionId).toBe('confirmed-id');
     expect(plan.cliArgs).toEqual(['--resume', 'confirmed-id']);
   });
+
+  // /logout-crash-loop bug: a room can persist a session id Claude never
+  // wrote a transcript for (a zero-turn chat — init events fire at spawn,
+  // before the transcript exists). --resume on such an id exits 1 ("No
+  // conversation found"), and the auto-restart/auto-resume paths retried it
+  // forever. When the caller supplies a transcriptExists predicate, a
+  // resume whose transcript is missing is demoted to a fresh spawn on the
+  // SAME id (--session-id), preserving convo/journal identity.
+  it('demotes a resume whose transcript is missing to --session-id on the same id', () => {
+    const checked = [];
+    const plan = sessionMode.planSessionIdentity({
+      resumeSessionId: 'ghost-id', mintId: () => 'never',
+      transcriptExists: (id) => { checked.push(id); return false; },
+    });
+    expect(checked).toEqual(['ghost-id']);
+    expect(plan.sessionId).toBe('ghost-id');
+    expect(plan.cliArgs).toEqual(['--session-id', 'ghost-id']);
+    expect(plan.resumed).toBe(false);
+  });
+  it('a demoted resume id wins over presetId (identity is the resume id)', () => {
+    const plan = sessionMode.planSessionIdentity({
+      resumeSessionId: 'ghost-id', presetId: 'provisional-id', mintId: () => 'never',
+      transcriptExists: () => false,
+    });
+    expect(plan.sessionId).toBe('ghost-id');
+    expect(plan.cliArgs).toEqual(['--session-id', 'ghost-id']);
+  });
+  it('honors a resume whose transcript exists', () => {
+    const plan = sessionMode.planSessionIdentity({
+      resumeSessionId: 'real-id', mintId: () => 'never',
+      transcriptExists: () => true,
+    });
+    expect(plan.cliArgs).toEqual(['--resume', 'real-id']);
+    expect(plan.resumed).toBe(true);
+  });
+  it('keeps legacy resume behavior when no predicate is supplied', () => {
+    const plan = sessionMode.planSessionIdentity({ resumeSessionId: 'old-id', mintId: () => 'never' });
+    expect(plan.cliArgs).toEqual(['--resume', 'old-id']);
+    expect(plan.resumed).toBe(true);
+  });
+  it('fresh and preset plans report resumed:false', () => {
+    expect(sessionMode.planSessionIdentity({ mintId: () => 'uuid-1' }).resumed).toBe(false);
+    expect(sessionMode.planSessionIdentity({ presetId: 'p-1', mintId: () => 'never' }).resumed).toBe(false);
+  });
+});
+
+// /logout-crash-loop bug, root cause: _sessionConfirmed was set by ANY event
+// carrying session_id — but claude emits `system` events (init, hook_started/
+// hook_response) at spawn, BEFORE any transcript exists. A zero-turn session
+// was therefore marked resumable, and /logout's print→interactive switch
+// spawned `claude --resume <id>` into "No conversation found" (exit 1) on a
+// loop. Only turn-bearing events prove the transcript is on disk.
+describe('eventConfirmsSession', () => {
+  it('rejects system events (init and hooks fire pre-transcript at spawn)', () => {
+    expect(sessionMode.eventConfirmsSession({ type: 'system', subtype: 'init', session_id: 'x' })).toBe(false);
+    expect(sessionMode.eventConfirmsSession({ type: 'system', subtype: 'hook_started', session_id: 'x' })).toBe(false);
+  });
+  it('accepts turn-bearing events carrying a session_id', () => {
+    for (const type of ['assistant', 'user', 'result', 'stream_event']) {
+      expect(sessionMode.eventConfirmsSession({ type, session_id: 'x' })).toBe(true);
+    }
+  });
+  it('rejects events without a session_id, and non-objects', () => {
+    expect(sessionMode.eventConfirmsSession({ type: 'assistant' })).toBe(false);
+    expect(sessionMode.eventConfirmsSession(null)).toBe(false);
+    expect(sessionMode.eventConfirmsSession(undefined)).toBe(false);
+  });
 });
 
 // Wiring guard: index.js can't be imported in-process (it starts the bridge),
@@ -172,11 +239,16 @@ describe('createSession id pre-assignment (source inspection)', () => {
   // confirms from camel-case `sessionId` transcript records that the snake-case
   // capture never sees, so gating iv would break its resume-after-persist
   // (PR review round 2 Blocker 2). Print-mode assertions are therefore singular.
-  it('marks _sessionConfirmed the first time a session_id event arrives', () => {
-    expect(src).toMatch(/if \(event\.session_id\) session\._sessionConfirmed = true;/);
+  it('marks _sessionConfirmed only on turn-bearing events (eventConfirmsSession, not raw session_id)', () => {
+    expect(src).toMatch(/if \(eventConfirmsSession\(event\)\) session\._sessionConfirmed = true;/);
+    expect(src).not.toMatch(/if \(event\.session_id\) session\._sessionConfirmed = true;/);
+  });
+  it('both spawn paths guard --resume with a transcriptExists predicate', () => {
+    const guards = src.match(/transcriptExists: \(id\) => fs\.existsSync\(transcriptPathFor\(cwd, id\)\)/g) || [];
+    expect(guards.length).toBe(2);
   });
   it('the print spawn helper threads presetSessionId into planSessionIdentity (once, print-only)', () => {
-    const calls = src.match(/planSessionIdentity\(\{ resumeSessionId, presetId: options\.presetSessionId/g) || [];
+    const calls = src.match(/planSessionIdentity\(\{\s*resumeSessionId,\s*presetId: options\.presetSessionId/g) || [];
     expect(calls.length).toBe(1);
   });
   it('the print auto-restart uses claudeSessionId only when confirmed, presetSessionId otherwise', () => {
@@ -185,9 +257,16 @@ describe('createSession id pre-assignment (source inspection)', () => {
     const presetGates = src.match(/presetSessionId: session\._sessionConfirmed \? undefined : session\.claudeSessionId/g) || [];
     expect(presetGates.length).toBe(1);
   });
-  it('the print constructor inits _sessionConfirmed from resumeSessionId (iv is unconditional --resume)', () => {
-    const inits = src.match(/_sessionConfirmed: !!resumeSessionId/g) || [];
+  it('the print constructor inits _sessionConfirmed from the identity plan (a demoted resume is NOT confirmed)', () => {
+    const inits = src.match(/_sessionConfirmed: identity\.resumed/g) || [];
     expect(inits.length).toBe(1);
+    expect(src).not.toMatch(/_sessionConfirmed: !!resumeSessionId/);
+  });
+  it('the zero-turn /login//logout guard yields to the busy refusal when a first turn is in flight (Bugbot, PR #173)', () => {
+    // Busy + unconfirmed means a message WAS sent — "send any message first"
+    // would be wrong, so the guard must exclude busy and let planModeSwitch's
+    // busy gate ("finish or interrupt the current turn") answer instead.
+    expect(src).toMatch(/if \(session\.agent === AGENT_CLAUDE && !session\._sessionConfirmed && !session\.busy\) \{\s*\n\s*await sendReply\(`\/\$\{cmdWord\} needs a conversation that has started/);
   });
 
   // PR #151 follow-up: !restart goes through recreateSession, which passed

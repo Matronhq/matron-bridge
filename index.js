@@ -28,6 +28,7 @@ import {
   modeButtons,
   planModeSwitch,
   planSessionIdentity,
+  eventConfirmsSession,
   shouldRunAccountFlowReturn,
 } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
@@ -1055,7 +1056,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // event. Resumes keep --resume semantics (see planSessionIdentity).
   // presetSessionId is the pre-init-crash restart path (#136 / PR #151):
   // reuse the crashed session's minted id via --session-id, never --resume.
-  const identity = planSessionIdentity({ resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID });
+  // transcriptExists demotes a resume whose transcript was never written
+  // (a zero-turn chat) to a fresh spawn on the same id — see
+  // planSessionIdentity (/logout-crash-loop bug).
+  const identity = planSessionIdentity({
+    resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
+    transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
+  });
   const args = [
     '--print',
     '--verbose',
@@ -1140,12 +1147,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: identity.sessionId,
-    // A resume targets an already-persisted (resumable) session, so it is
-    // confirmed from birth; a fresh/preset spawn is not resumable until Claude
-    // reports its id on init (see handleClaudeEvent). Without this, a resumed
+    // A real resume targets a transcript that exists on disk (identity.resumed
+    // — a resume whose transcript is missing was demoted to a fresh spawn), so
+    // it is confirmed from birth; a fresh/preset/demoted spawn is not
+    // resumable until a turn-bearing event proves the transcript was written
+    // (see eventConfirmsSession in handleClaudeEvent). Without this, a resumed
     // session that crashes before its first event would wrongly restart via
     // --session-id on an already-persisted id (#136 / PR #151).
-    _sessionConfirmed: !!resumeSessionId,
+    _sessionConfirmed: identity.resumed,
     journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
     _agentHistoryCursor: 0,
@@ -1617,7 +1626,17 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
+  // transcriptExists demotes a resume whose transcript was never written to a
+  // fresh --session-id spawn on the same id (see planSessionIdentity). This is
+  // what breaks the /logout crash loop's second half: the iv auto-restart and
+  // journal auto-resume paths resume unconditionally, so a room persisted with
+  // a zero-turn session id used to respawn `claude --resume <never-written>`
+  // (exit 1) forever. Demotion spawns a fresh TUI on the same id instead —
+  // nothing to resume means nothing to lose.
+  const identity = planSessionIdentity({
+    resumeSessionId, mintId: randomUUID,
+    transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
+  });
   const sessionId = identity.sessionId;
   const model = options.model === null
     ? undefined
@@ -1797,12 +1816,15 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
         //
-        // Interactive mode restarts with --resume unconditionally (upstream
-        // behavior): the #136 / PR #151 pre-init-resume guard is print-mode only.
-        // iv sessions confirm their id from camel-case `sessionId` transcript
-        // records, which handleClaudeEvent's snake-case `session_id` capture
-        // never sees, so a _sessionConfirmed gate here would wrongly force
-        // every iv restart onto --session-id and break resume-after-persist.
+        // Interactive mode restarts pass --resume here unconditionally (iv
+        // sessions never set _sessionConfirmed, so a flag gate would wrongly
+        // force every iv restart onto --session-id and break
+        // resume-after-persist). The never-written-transcript case is instead
+        // caught inside the spawn: planSessionIdentity's transcriptExists
+        // check demotes a resume with no transcript on disk to a fresh
+        // --session-id spawn on the same id (/logout-crash-loop bug — this
+        // exact path used to retry `claude --resume <never-written>` 3× and
+        // die).
         const restarted = createSession(roomId, cwd, session.claudeSessionId, {
           agent: session.agent,
           model: session.currentModel || undefined,
@@ -2826,14 +2848,16 @@ function handleClaudeEvent(session, event) {
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
     journalFlushForSession(session);
   }
-  // #136 / PR #151: mark the native session confirmed the first time Claude
-  // reports its session_id — proof the process reached init and persisted a
-  // *resumable* session. Fresh spawns pre-assign claudeSessionId (so the block
-  // above is skipped for them), yet they are NOT resumable until Claude writes
-  // the session on init. A pre-init crash (SIGKILL/OOM/spawn failure) never
-  // sets this flag, so the auto-restart branches respawn with --session-id
-  // (same id, fresh) instead of --resume on a session Claude never wrote.
-  if (event.session_id) session._sessionConfirmed = true;
+  // #136 / PR #151: mark the native session confirmed the first time an event
+  // proves the transcript exists on disk. NOT any session_id event: `system`
+  // events (init, hook_started/hook_response) fire at spawn BEFORE Claude has
+  // written anything — confirming off those let a zero-turn chat pass the
+  // mode-switch gate and /logout crash-looped on `claude --resume` of a
+  // transcript that was never written. Only turn-bearing events count (see
+  // eventConfirmsSession). A session that never runs a turn stays
+  // unconfirmed, so restarts respawn it with --session-id (same id, fresh)
+  // instead of --resume.
+  if (eventConfirmsSession(event)) session._sessionConfirmed = true;
 
   // Lazy-construct subagent watcher once we know the session id. All claude
   // spawn paths pre-assign the id and build the watcher eagerly now, so this
@@ -5715,6 +5739,20 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // finished, or a later clean exit would be misreported as a logout.
         session._accountLogoutPending = cmdWord === 'logout';
         await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
+        break;
+      }
+      // Zero-turn print chat: nothing has confirmed the transcript exists, so
+      // the interactive switch below would be refused by planModeSwitch's
+      // provisional-session gate — but its "try /mode again in a moment"
+      // wording is a dead end here (a chat nobody messages never confirms;
+      // the /logout-crash-loop bug started as exactly this switch sneaking
+      // through). Say what actually unblocks the flow instead. Busy is
+      // excluded (Bugbot, PR #173): a first turn in flight means a message
+      // WAS sent and confirmation is seconds away — "send any message first"
+      // would gaslight that user, so let planModeSwitch's busy gate answer
+      // with "finish or interrupt the current turn" instead.
+      if (session.agent === AGENT_CLAUDE && !session._sessionConfirmed && !session.busy) {
+        await sendReply(`/${cmdWord} needs a conversation that has started — this chat hasn't had a reply yet. Send any message first, then /${cmdWord}.`);
         break;
       }
       // Print mode: one concise announcement covering the whole flow — the
