@@ -512,14 +512,30 @@ describe('index.js header-liveness wiring', () => {
     const start = src.indexOf('function journalStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    // The stamp must sit with the publish, after every early return (no
-    // convo id / empty status), so throttled callers aren't starved by
-    // frames that never went out.
+    // The stamp must sit after every early return (no convo id / empty
+    // status) AND be gated on publishStatus's return value, so throttled
+    // callers aren't starved by frames that never went out — including
+    // frames the socket layer dropped (journal down, unserializable).
     const stampAt = body.indexOf('session._statusPublishedAt');
-    const publishAt = body.indexOf('publishStatus(');
     expect(stampAt).toBeGreaterThan(-1);
-    expect(publishAt).toBeGreaterThan(-1);
     expect(stampAt).toBeGreaterThan(body.lastIndexOf('return;'));
+    expect(body).toMatch(/if \(journalPublisher\.publishStatus\(convoId, status\)\) \{\s*\n\s*session\._statusPublishedAt = Date\.now\(\);/);
+  });
+
+  it('publishStatus reports whether the frame actually went out', () => {
+    // The throttle fix above only works if the publisher tells the truth:
+    // every drop path (closed socket, unserializable payload, send throw,
+    // noop publisher) must return an explicit false and the send path an
+    // explicit true — a bare `return` on a new drop path would still be
+    // falsy today, but the explicit contract keeps future edits honest.
+    const pubSrc = readFileSync(fileURLToPath(new URL('../lib/journal-publisher.js', import.meta.url)), 'utf-8');
+    expect(pubSrc).toContain('publishStatus() { return false; }'); // noop publisher
+    const start = pubSrc.indexOf('publishStatus(convoId, status)');
+    const bodyEnd = pubSrc.indexOf('respondRpc(', start);
+    const pubBody = pubSrc.slice(start, bodyEnd);
+    expect(pubBody).toContain('return true;');
+    expect(pubBody).toContain('return false;');
+    expect(pubBody).not.toMatch(/^\s*return;\s*$/m);
   });
 
   it('all three spawn branches seed the header via journalSpawnStatus', () => {

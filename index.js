@@ -872,11 +872,13 @@ function journalStatus(session) {
     delete status.email;
   }
   if (Object.keys(status).length === 0) return;
-  journalPublisher.publishStatus(convoId, status);
-  // Stamp AFTER the early returns so the mid-turn throttle
-  // (statusRepaintDue) is only ever held back by frames that actually went
-  // out — a skipped publish must not eat the next repaint window.
-  session._statusPublishedAt = Date.now();
+  // Stamp only when the frame actually left the bridge — a publish dropped
+  // by the socket layer (journal down, unserializable) must not eat the next
+  // repaint window, or the header stays stale for a full throttle interval
+  // after the socket comes back.
+  if (journalPublisher.publishStatus(convoId, status)) {
+    session._statusPublishedAt = Date.now();
+  }
 }
 
 // Seed the Matron header at spawn instead of leaving it blank until the first
