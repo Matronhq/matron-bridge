@@ -35,7 +35,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 // formatDuration aliased: index.js has its own uptime formatDuration (no
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
-import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton } from './lib/timer-command.js';
+import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton } from './lib/timer-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
@@ -5974,10 +5974,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           `⏰ Timer #${record.id} set — will send "${parsed.message}" in ${formatTimerDuration(parsed.delayMs)} (at ${at}). ` +
           `It survives session restarts and idle reaping.`;
         if (session.sendButtonMessage) {
-          // Confirmation card with a Cancel button. The tap round-trips as a
-          // seq-proven picker reply (timer:cancel:<id> -> lib/picker-dispatch.js
-          // -> cancelTimerFromButton); /timer cancel <id> stays the typed path.
-          await session.sendButtonMessage(summary, [timerCancelButton(record.id)], 'pick_one', summary, escapeHtml(summary));
+          // Confirmation card with Send-now + Cancel buttons. Taps round-trip
+          // as seq-proven picker replies (timer:send:<id> / timer:cancel:<id>
+          // -> lib/picker-dispatch.js -> sendTimerNowFromButton /
+          // cancelTimerFromButton); /timer cancel <id> stays the typed path.
+          await session.sendButtonMessage(
+            summary,
+            [timerSendNowButton(record.id), timerCancelButton(record.id)],
+            'pick_one', summary, escapeHtml(summary));
         } else {
           await sendReply(`${summary} /timer lists, /timer cancel ${record.id} cancels.`);
         }
@@ -6586,6 +6590,7 @@ function journalOnPromptReply(session, answer, { username }) {
       switchEffortInSession,
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
+      sendTimerNow: sendTimerNowFromButton,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
     });
@@ -6749,6 +6754,20 @@ function cancelTimerFromButton(session, timerId, sendReply) {
     return;
   }
   sendReply(`🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`);
+}
+
+// A tap on the same card's Send-now button (value timer:send:<id>): deliver
+// the scheduled message immediately instead of waiting out the delay. The
+// store's fireNow routes through the SAME fire path as a natural expiry, so
+// delivery gets the "⏰ Timer #N: sending …" notice and the auto-resume
+// behavior for free — no extra success reply needed here. Only the
+// nothing-matched case (already fired / cancelled elsewhere) speaks.
+function sendTimerNowFromButton(session, timerId, sendReply) {
+  const convoId = journalConvoIdFor(session);
+  const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;
+  if (!fired) {
+    sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
+  }
 }
 
 // Assembled once, after every dependency above is defined, and invoked from

@@ -8,6 +8,7 @@ describe('handlePickerValue', () => {
       switchEffortInSession: vi.fn(),
       applyModeSwitch: vi.fn(),
       cancelTimer: vi.fn(),
+      sendTimerNow: vi.fn(),
       sendReply: vi.fn(),
       sendHtml: vi.fn(),
     };
@@ -56,13 +57,24 @@ describe('handlePickerValue', () => {
     expect(s.applyModeSwitch).not.toHaveBeenCalled();
   });
 
+  it('dispatches timer:send:<id> to sendTimerNow(session, numericId, sendReply)', () => {
+    const s = seams();
+    const session = { id: 'sess' };
+    expect(handlePickerValue('timer:send:7', 'room-1', session, s)).toBe(true);
+    expect(s.sendTimerNow).toHaveBeenCalledWith(session, 7, s.sendReply);
+    expect(s.cancelTimer).not.toHaveBeenCalled();
+  });
+
   it('returns false for malformed timer values (bad verb, non-numeric or missing id)', () => {
     const s = seams();
     expect(handlePickerValue('timer:cancel:abc', 'room-1', {}, s)).toBe(false);
     expect(handlePickerValue('timer:cancel:', 'room-1', {}, s)).toBe(false);
     expect(handlePickerValue('timer:cancel', 'room-1', {}, s)).toBe(false);
     expect(handlePickerValue('timer:snooze:3', 'room-1', {}, s)).toBe(false);
+    expect(handlePickerValue('timer:send:abc', 'room-1', {}, s)).toBe(false);
+    expect(handlePickerValue('timer:send:', 'room-1', {}, s)).toBe(false);
     expect(s.cancelTimer).not.toHaveBeenCalled();
+    expect(s.sendTimerNow).not.toHaveBeenCalled();
   });
 
   it('returns false and dispatches nothing for a non-picker value', () => {
