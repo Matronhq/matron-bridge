@@ -2,12 +2,20 @@ import { describe, it, expect, vi } from 'vitest';
 import { seedJournalTitle, applyFallbackTitle } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
-  it('titles the convo from the workdir basename when no hint is set', async () => {
+  it('titles the convo from the server label + workdir basename when no hint is set', async () => {
+    const session = { _journalTitleHint: undefined };
+    const upsertConvo = vi.fn();
+    const ok = await seedJournalTitle(session, { workdir: '/home/dan/yearbook-app', serverLabel: '2', upsertConvo, warn: () => {} });
+    expect(ok).toBe(true);
+    expect(upsertConvo).toHaveBeenCalledWith(session, { title: '2: yearbook-app' });
+  });
+
+  it('seeds the bare basename when no server label is given', async () => {
     const session = { _journalTitleHint: undefined };
     const upsertConvo = vi.fn();
     const ok = await seedJournalTitle(session, { workdir: '/home/dan/yearbook-app', upsertConvo, warn: () => {} });
     expect(ok).toBe(true);
-    expect(upsertConvo).toHaveBeenCalledWith(session, { title: expect.stringContaining('yearbook-app') });
+    expect(upsertConvo).toHaveBeenCalledWith(session, { title: 'yearbook-app' });
   });
 
   it('does not overwrite an existing title hint', async () => {
@@ -162,7 +170,19 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(d.updateRoomName).not.toHaveBeenCalled();
   });
 
-  it('does replace the workdir-basename seed title', () => {
+  it('does replace the labeled workdir seed title', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      _journalTitleHint: '2: proj',
+      chatHistory: [{ role: 'user', text: 'carry on' }],
+    };
+    const d = { ...deps(), workdir: '/home/dan/proj' };
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 carry on');
+  });
+
+  it('still replaces the legacy bare-basename seed from sessions persisted before labeling', () => {
     const session = {
       roomId: '!abc',
       claudeSessionId: 'f0aa',
