@@ -164,6 +164,7 @@ describe('Codex restart reconciliation', () => {
 
     await Promise.resolve(); // bridge boot completes before this session appears
     const registered = registerCodexWatcherForLiveSession(liveSessions, 'late-room', {}, {
+      env: { MATRON_CODEX_VIZ: '1' },
       WatcherClass: ExistingWatcher,
     });
     await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
