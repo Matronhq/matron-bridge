@@ -82,15 +82,24 @@ The release-registry bookkeeping needs no change: `queuedReleaseItemIds`
 already does `notifications.slice(0, batchSize)`, i.e. it was written against
 exactly this "the batch is a prefix of the queue" invariant.
 
-Sites:
+Sites — every path that hands a batch to `flushQueue`:
 
 - `flushPendingSessionQueue` (`index.js`) — the turn-end flush.
 - `handleBusyQueueMagicWord`'s `send` (`lib/busy-queue.js`) — typed
   `send`/`interrupt`.
-- `resolveQueueReleaseTap`'s `send` (`lib/busy-queue.js`) — Matron card tap.
+- `resolveQueueReleaseTap`'s `send` and its legacy `interrupt` branch
+  (`lib/busy-queue.js`) — Matron card tap.
+- the `/interrupt` HTTP endpoint (`index.js`).
 
-`lib/busy-queue.js` receives the split as an injected seam, matching how
-`flushQueue` / `formatQueueSummary` already ride in.
+`lib/busy-queue.js` owns a local `splitFlushBatch(session)` over the two
+arrays; `index.js` splits inline and scopes its release-registry seams to the
+batch via `pendingFlushBatch(session)` (otherwise `finalizeSentQueue` would
+emit `send` releases for messages still waiting in the queue).
+
+`resolveQueueReleaseTap` gains a `notify` seam, wired to `journalPublishNotice`.
+A card tap has no reply text of its own — the durable `queued_release`
+prompt_reply is the record — and the one thing that record cannot express is
+"I sent only the `/compact` and held the rest".
 
 ### Waiting for the compaction — no new machinery
 
@@ -127,9 +136,17 @@ followed, after the boundary, by the normal
 > ⚡ Sending `/compact` now — the other 2 messages will follow once compaction
 > finishes.
 
-Button **labels and card payload shape are unchanged**. Only reply text
-differs, so shipped clients render exactly as they do today and the honesty
-lives in text rather than in a changed client-visible shape.
+**Card payload shape is unchanged** — action ids and values stay `send` /
+`cancel`, so every shipped client renders and routes the card exactly as it
+does today.
+
+The jumping card's label *strings* do change, and deliberately: with a queue
+behind it the existing logic would label it "⚡ Send all now", which is now
+false — tapping it sends only the compact. It gets the single-item labels
+("⚡ Send now" / "✕ Cancel") and a question that says where the rest went.
+This is a small deviation from the originally-presented "labels unchanged"; the
+compatibility promise was about the payload shape, and leaving a label that
+misdescribes what the button does is worse than changing prose.
 
 ## Edge cases
 
@@ -155,7 +172,14 @@ lives in text rather than in a changed client-visible shape.
   `compact`, empty, non-text entries; `compactBatchSize` for
   `[compact]`, `[compact, other]`, `[other, compact]`, `[]`.
 - `test/busy-queue.test.js`: compact-in-queue cases for both `send` paths —
-  one entry flushed, remainder and its notifications left in lockstep,
-  reply copy reports the deferred count.
+  one entry flushed, remainder and its notifications left in lockstep, reply
+  copy reports the deferred count, a failed flush restores the compact to the
+  front, a tap on a *non*-compact card still sends the compact first, and the
+  no-compact / lone-compact / empty-queue cases stay byte-identical to today.
+  Plus tile cases for the jump copy, the front insert, and the single-item
+  labels with unchanged action ids/values.
+- `test/busy-queue.test.js` (source inspection, matching the existing pins in
+  that file): `flushPendingSessionQueue`'s split, its deferred retention, and
+  that it retires only the flushed batch's notifications.
 - `test/queue-flush.test.js`: a case pinning that a single compact entry
   merges to exactly one text block (`planQueueFlush` itself is unchanged).
