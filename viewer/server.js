@@ -385,6 +385,42 @@ app.get('/sensitive', async (req, res) => {
   }
 });
 
+// Direct-download variant of /sensitive: the browser saves the content as a
+// file on click — no page, no button. Requires dl:true in the token (same
+// discriminator pattern as /view vs /download) so a page token can't be
+// replayed here. One-time-vs-multi-use is the bridge API's call; this route
+// just relays whatever it serves.
+app.get('/sensitive-download', downloadLimiter, async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  if (!data || data.dl !== true || !data.sensitiveId) {
+    return res.status(403).send('Invalid or expired token');
+  }
+
+  try {
+    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/sensitive/${data.sensitiveId}`);
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      const safeErr = (err.error || 'Unknown error').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return res.status(resp.status).type('html').send(
+        `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Error</title><style>body{margin:0;background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{text-align:center;padding:40px;}h2{color:#f85149;}</style></head><body><div class="card"><h2>⚠️ Error</h2><p>${safeErr}</p></div></body></html>`
+      );
+    }
+
+    const { label, content, filename } = await resp.json();
+    // sensitiveFilename output is [A-Za-z0-9._-] only, so it is header-safe.
+    res.set('Content-Type', 'application/octet-stream');
+    res.set('Content-Disposition', `attachment; filename="${sensitiveFilename(label, filename)}"`);
+    res.send(content);
+  } catch (err) {
+    console.error('Sensitive download fetch error:', err);
+    res.status(500).send('Failed to reach bridge API');
+  }
+});
+
 function scriptJsonString(value) {
   return JSON.stringify(String(value)).replace(/[<>&\u2028\u2029]/g, char => {
     switch (char) {

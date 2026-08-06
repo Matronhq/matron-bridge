@@ -359,12 +359,18 @@ function generateSecretLink(secretId, label, roomId) {
   return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
 
-function generateSensitiveLink(sensitiveId, label, ttl) {
+function generateSensitiveLink(sensitiveId, label, ttl, { download = false } = {}) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   const exp = Math.floor((Date.now() + ttl * 1000) / 1000);
-  const payload = Buffer.from(JSON.stringify({ sensitiveId, label, exp })).toString('base64url');
+  // dl discriminates the direct-download route (viewer /sensitive-download)
+  // from the page route, mirroring the /view vs /download token scheme.
+  const payloadObj = download
+    ? { sensitiveId, label, dl: true, exp }
+    : { sensitiveId, label, exp };
+  const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
-  return `${VIEWER_BASE_URL}/sensitive?token=${payload}.${sig}`;
+  const route = download ? 'sensitive-download' : 'sensitive';
+  return `${VIEWER_BASE_URL}/${route}?token=${payload}.${sig}`;
 }
 
 
@@ -7033,22 +7039,25 @@ const apiServer = createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Sensitive data has expired' }));
       return;
     }
-    if (s.viewed) {
+    if (s.oneTime && s.viewed) {
       res.writeHead(403);
       res.end(JSON.stringify({ error: 'Sensitive data has already been viewed (one-time link)' }));
       return;
     }
 
-    // Mark as viewed and return content
+    // Multi-use shares stay retrievable until expiresAt (cleanup is the
+    // expiry timeout scheduled at creation); one-time shares are consumed.
     s.viewed = true;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ label: s.label, content: s.content, filename: s.filename }));
 
-    // Delete after 1 minute to allow time for the page to render, but prevent repeated access
-    setTimeout(() => {
-      pendingSensitiveData.delete(sensitiveId);
-      debug(`Cleaned up viewed sensitive data: ${sensitiveId}`);
-    }, 60000);
+    if (s.oneTime) {
+      // Delete after 1 minute to allow time for the page to render, but prevent repeated access
+      setTimeout(() => {
+        pendingSensitiveData.delete(sensitiveId);
+        debug(`Cleaned up viewed sensitive data: ${sensitiveId}`);
+      }, 60000);
+    }
     return;
   }
 
@@ -7139,7 +7148,7 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/share-sensitive') {
-        const { label, content, ttl, roomId, filename } = data;
+        const { label, content, ttl, roomId, filename, oneTime, download } = data;
         if (!label || !content || !roomId) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'label, content, and roomId are required' }));
@@ -7151,7 +7160,7 @@ const apiServer = createServer(async (req, res) => {
         const expiresAt = Date.now() + ttlSeconds * 1000;
 
         // Generate secure link before storing data — if viewer is misconfigured, don't leak sensitive content in memory
-        const link = generateSensitiveLink(sensitiveId, label, ttlSeconds);
+        const link = generateSensitiveLink(sensitiveId, label, ttlSeconds, { download: download === true });
         if (!link) {
           res.writeHead(500);
           res.end(JSON.stringify({ error: 'Viewer not configured (missing HMAC_SECRET or VIEWER_BASE_URL)' }));
@@ -7164,6 +7173,9 @@ const apiServer = createServer(async (req, res) => {
           // Suggested download filename; the viewer sanitizes it to a safe
           // basename before use.
           filename: typeof filename === 'string' ? filename.slice(0, 128) : undefined,
+          // One-time (consumed on first fetch) unless explicitly opted out;
+          // multi-use shares serve until expiresAt.
+          oneTime: oneTime !== false,
           viewed: false,
           expiresAt,
         });
@@ -7171,12 +7183,14 @@ const apiServer = createServer(async (req, res) => {
         // Send notification to user in Matrix chat
         const activeSession = sessions.get(roomId);
 
+        const verb = download === true ? 'Download' : 'View';
+        const linkKind = oneTime !== false ? 'one-time link' : 'link';
         if (activeSession && activeSession.sendHtml) {
-          const plain = `🔐 Secure data: ${label} — View: ${link}`;
-          const html = `🔐 Secure data: <b>${escapeHtml(label)}</b> — <a href="${link}">View</a> (one-time link, expires at ${new Date(expiresAt).toISOString()})`;
+          const plain = `🔐 Secure data: ${label} — ${verb}: ${link}`;
+          const html = `🔐 Secure data: <b>${escapeHtml(label)}</b> — <a href="${link}">${verb}</a> (${linkKind}, expires at ${new Date(expiresAt).toISOString()})`;
           activeSession.sendHtml(plain, html);
         } else if (activeSession && activeSession.sendCallback) {
-          activeSession.sendCallback(`🔐 Secure data: ${label} — ${link} (one-time link, expires at ${new Date(expiresAt).toISOString()})`);
+          activeSession.sendCallback(`🔐 Secure data: ${label} — ${link} (${linkKind}, expires at ${new Date(expiresAt).toISOString()})`);
         }
 
         // Schedule cleanup after expiry

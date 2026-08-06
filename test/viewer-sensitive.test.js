@@ -123,3 +123,48 @@ describe('GET /sensitive', () => {
     expect(html).toContain('not found or already viewed');
   });
 });
+
+// Direct-download links: the browser saves the file on click, no page or
+// button. Tokens carry dl:true (same discriminator pattern as /download vs
+// /view) so a page token can't be replayed as a raw download or vice versa.
+describe('GET /sensitive-download', () => {
+  async function fetchDownload(payload) {
+    const token = sensitiveToken(payload);
+    return fetch(`http://127.0.0.1:${port}/sensitive-download?token=${encodeURIComponent(token)}`);
+  }
+
+  it('serves the content as an attachment with the resolved filename', async () => {
+    apiResponse = {
+      status: 200,
+      body: { label: 'Setup script', content: '#!/bin/sh\necho hi\n', filename: 'setup.sh' },
+    };
+    const res = await fetchDownload({ sensitiveId: 'abc', label: 'Setup script', dl: true });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-disposition')).toBe('attachment; filename="setup.sh"');
+    expect(await res.text()).toBe('#!/bin/sh\necho hi\n');
+  });
+
+  it('derives the filename from the label when the API sends none', async () => {
+    apiResponse = {
+      status: 200,
+      body: { label: 'install-jack.sh — dev-j setup', content: 'x' },
+    };
+    const res = await fetchDownload({ sensitiveId: 'abc', label: 'install-jack.sh — dev-j setup', dl: true });
+    expect(res.headers.get('content-disposition')).toBe('attachment; filename="install-jack.sh"');
+  });
+
+  it('rejects a page token without the dl flag', async () => {
+    apiResponse = { status: 200, body: { label: 'x', content: 'y' } };
+    const res = await fetchDownload({ sensitiveId: 'abc', label: 'x' });
+    expect(res.status).toBe(403);
+  });
+
+  it('surfaces bridge API errors as an error page, not an empty download', async () => {
+    apiResponse = { status: 410, body: { error: 'Sensitive data has expired' } };
+    const res = await fetchDownload({ sensitiveId: 'old', label: 'x', dl: true });
+    expect(res.status).toBe(410);
+    const html = await res.text();
+    expect(html).toContain('has expired');
+    expect(res.headers.get('content-disposition')).toBeNull();
+  });
+});

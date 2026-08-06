@@ -66,13 +66,18 @@ server.tool(
     content: z.string().describe('The sensitive data to share securely'),
     ttl: z.number().optional().describe('Time-to-live in seconds (default: 3600 = 1 hour, max: 86400 = 24 hours)'),
     filename: z.string().optional().describe('Suggested filename for the viewer\'s Download button, e.g. "install.sh". Falls back to a name derived from the label.'),
+    download: z.boolean().optional().describe('If true, the link downloads the content directly as a file instead of showing a page.'),
+    one_time: z.boolean().optional().describe('Default true: the link is consumed on first use. Set false for a multi-use link that works until the ttl expires (use with a short ttl).'),
   },
-  async ({ label, content, ttl, filename }) => {
+  async ({ label, content, ttl, filename, download, one_time }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/share-sensitive`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, content, ttl: ttl || 3600, roomId: ROOM_ID, filename }),
+        body: JSON.stringify({
+          label, content, ttl: ttl || 3600, roomId: ROOM_ID, filename,
+          download: download === true, oneTime: one_time !== false,
+        }),
       });
 
       if (!postRes.ok) {
@@ -81,10 +86,13 @@ server.tool(
       }
 
       const { url, expiresAt } = await postRes.json();
+      const usage = one_time !== false
+        ? 'can only be viewed once'
+        : 'can be used repeatedly until it expires';
       return {
         content: [{
           type: 'text',
-          text: `Secure link created for "${label}":\n${url}\n\nThis link expires at ${new Date(expiresAt).toISOString()} and can only be viewed once.`
+          text: `Secure link created for "${label}":\n${url}\n\nThis link expires at ${new Date(expiresAt).toISOString()} and ${usage}.`
         }]
       };
     } catch (err) {
