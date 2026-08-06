@@ -1,14 +1,17 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import http from 'node:http';
 import crypto from 'node:crypto';
 
-// /sensitive proxies the bridge API and renders a one-time page. These tests
-// stub the bridge API and drive the real viewer server, mirroring
-// viewer-view.test.js. The download affordance is client-side (Blob from the
-// already-fetched content), so the one-time semantics stay at the API layer.
+// One-time sensitive links are click-through: GET /sensitive and
+// /sensitive-download serve a shell page with NO secret in it (browser
+// prefetch, Safe Browsing, and Matrix URL previewers all GET links, and any
+// of those used to consume the one-time view before the user saw it). The
+// secret moves only on POST /sensitive/reveal. These tests stub the bridge
+// API and drive the real viewer server, mirroring viewer-view.test.js.
 
 let server, port, apiServer, apiPort;
 let apiResponse; // set per-test: { status, body }
+let apiCalls; // count of bridge-API hits — GETs of the shell must not add any
 
 function sensitiveToken(payload, secret = 'test-secret') {
   const body = Buffer.from(JSON.stringify({
@@ -21,6 +24,7 @@ function sensitiveToken(payload, secret = 'test-secret') {
 
 beforeAll(async () => {
   apiServer = http.createServer((req, res) => {
+    apiCalls++;
     res.writeHead(apiResponse.status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(apiResponse.body));
   });
@@ -40,9 +44,22 @@ afterAll(() => {
   apiServer?.close();
 });
 
-async function fetchSensitive(payload) {
+beforeEach(() => {
+  apiCalls = 0;
+});
+
+async function getPage(route, payload) {
   const token = sensitiveToken(payload);
-  return fetch(`http://127.0.0.1:${port}/sensitive?token=${encodeURIComponent(token)}`);
+  return fetch(`http://127.0.0.1:${port}${route}?token=${encodeURIComponent(token)}`);
+}
+
+async function postReveal(payload) {
+  const token = sensitiveToken(payload);
+  return fetch(`http://127.0.0.1:${port}/sensitive/reveal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
 }
 
 describe('sensitiveFilename', () => {
@@ -68,80 +85,78 @@ describe('sensitiveFilename', () => {
   });
 });
 
-describe('GET /sensitive', () => {
-  it('renders a download button with the resolved filename', async () => {
+describe('GET /sensitive (shell page)', () => {
+  it('serves the shell without touching the one-time store', async () => {
     apiResponse = {
       status: 200,
-      body: { label: 'Setup script', content: '#!/bin/sh\necho hi\n', filename: 'setup.sh' },
+      body: { label: 'Setup script', content: 'SECRET-CONTENT', filename: 'setup.sh' },
     };
-    const res = await fetchSensitive({ sensitiveId: 'abc', label: 'Setup script' });
+    const res = await getPage('/sensitive', { sensitiveId: 'abc', label: 'Setup script' });
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain('Download');
-    expect(html).toContain('"setup.sh"');
-    expect(html).toContain('echo hi');
+    expect(html).toContain('Setup script');
+    expect(html).toContain('/sensitive/reveal');
+    // The whole point: no secret in the GET response, no store consumption.
+    expect(html).not.toContain('SECRET-CONTENT');
+    expect(apiCalls).toBe(0);
   });
 
-  it('derives the download filename from the label when the API sends none', async () => {
-    apiResponse = {
-      status: 200,
-      body: { label: 'install-christina.sh — dev-c setup', content: 'x' },
-    };
-    const res = await fetchSensitive({ sensitiveId: 'abc', label: 'install-christina.sh — dev-c setup' });
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain('"install-christina.sh"');
+  it('is safe to GET repeatedly (prefetchers, previews)', async () => {
+    apiResponse = { status: 200, body: { label: 'x', content: 'y' } };
+    for (let i = 0; i < 3; i++) {
+      const res = await getPage('/sensitive', { sensitiveId: 'abc', label: 'x' });
+      expect(res.status).toBe(200);
+    }
+    expect(apiCalls).toBe(0);
   });
 
-  it('HTML-escapes hostile content and label', async () => {
-    apiResponse = {
-      status: 200,
-      body: { label: '<img src=x onerror=alert(1)>', content: '<script>alert(2)</script>' },
-    };
-    const res = await fetchSensitive({ sensitiveId: 'abc', label: 'x' });
+  it('HTML-escapes a hostile label', async () => {
+    const res = await getPage('/sensitive', {
+      sensitiveId: 'abc',
+      label: '<img src=x onerror=alert(1)>',
+    });
     const html = await res.text();
     expect(html).not.toContain('<img src=x');
-    expect(html).not.toContain('<script>alert(2)');
-    expect(html).toContain('&lt;script&gt;alert(2)');
+    expect(html).toContain('&lt;img src=x');
   });
 
-  it('a hostile filename cannot break out of the inline script', async () => {
-    apiResponse = {
-      status: 200,
-      body: { label: 'x', content: 'y', filename: '</script><script>alert(3)</script>.sh' },
-    };
-    const res = await fetchSensitive({ sensitiveId: 'abc', label: 'x' });
-    const html = await res.text();
-    expect(html).not.toContain('</script><script>alert(3)');
-  });
-
-  it('still surfaces bridge API errors as an error page', async () => {
-    apiResponse = { status: 404, body: { error: 'Sensitive data not found or already viewed' } };
-    const res = await fetchSensitive({ sensitiveId: 'gone', label: 'x' });
-    expect(res.status).toBe(404);
-    const html = await res.text();
-    expect(html).toContain('not found or already viewed');
+  it('rejects a token without a sensitiveId', async () => {
+    const res = await getPage('/sensitive', { label: 'x' });
+    expect(res.status).toBe(400);
   });
 });
 
-// Direct-download links: the browser saves the file on click, no page or
-// button. Tokens carry dl:true (same discriminator pattern as /download vs
-// /view) so a page token can't be replayed as a raw download or vice versa.
-describe('GET /sensitive-download', () => {
-  async function fetchDownload(payload) {
-    const token = sensitiveToken(payload);
-    return fetch(`http://127.0.0.1:${port}/sensitive-download?token=${encodeURIComponent(token)}`);
-  }
+describe('GET /sensitive-download (shell page)', () => {
+  it('serves the download-mode shell without touching the store', async () => {
+    apiResponse = { status: 200, body: { label: 'x', content: 'SECRET-CONTENT' } };
+    const res = await getPage('/sensitive-download', { sensitiveId: 'abc', label: 'x', dl: true });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('/sensitive/reveal');
+    expect(html).not.toContain('SECRET-CONTENT');
+    expect(apiCalls).toBe(0);
+  });
 
-  it('serves the content as an attachment with the resolved filename', async () => {
+  it('rejects a page token without the dl flag', async () => {
+    const res = await getPage('/sensitive-download', { sensitiveId: 'abc', label: 'x' });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /sensitive/reveal', () => {
+  it('relays the content with the resolved filename', async () => {
     apiResponse = {
       status: 200,
       body: { label: 'Setup script', content: '#!/bin/sh\necho hi\n', filename: 'setup.sh' },
     };
-    const res = await fetchDownload({ sensitiveId: 'abc', label: 'Setup script', dl: true });
+    const res = await postReveal({ sensitiveId: 'abc', label: 'Setup script' });
     expect(res.status).toBe(200);
-    expect(res.headers.get('content-disposition')).toBe('attachment; filename="setup.sh"');
-    expect(await res.text()).toBe('#!/bin/sh\necho hi\n');
+    expect(await res.json()).toEqual({
+      label: 'Setup script',
+      content: '#!/bin/sh\necho hi\n',
+      filename: 'setup.sh',
+    });
+    expect(apiCalls).toBe(1);
   });
 
   it('derives the filename from the label when the API sends none', async () => {
@@ -149,22 +164,37 @@ describe('GET /sensitive-download', () => {
       status: 200,
       body: { label: 'install-jack.sh — dev-j setup', content: 'x' },
     };
-    const res = await fetchDownload({ sensitiveId: 'abc', label: 'install-jack.sh — dev-j setup', dl: true });
-    expect(res.headers.get('content-disposition')).toBe('attachment; filename="install-jack.sh"');
+    const res = await postReveal({ sensitiveId: 'abc', label: 'install-jack.sh — dev-j setup' });
+    expect((await res.json()).filename).toBe('install-jack.sh');
   });
 
-  it('rejects a page token without the dl flag', async () => {
+  it('sanitizes a hostile filename to a safe basename', async () => {
+    apiResponse = {
+      status: 200,
+      body: { label: 'x', content: 'y', filename: '../../</script>evil.sh' },
+    };
+    const res = await postReveal({ sensitiveId: 'abc', label: 'x' });
+    const { filename } = await res.json();
+    expect(filename).not.toContain('/');
+    expect(filename).not.toContain('<');
+  });
+
+  it('accepts a dl-flavoured token too', async () => {
     apiResponse = { status: 200, body: { label: 'x', content: 'y' } };
-    const res = await fetchDownload({ sensitiveId: 'abc', label: 'x' });
-    expect(res.status).toBe(403);
+    const res = await postReveal({ sensitiveId: 'abc', label: 'x', dl: true });
+    expect(res.status).toBe(200);
   });
 
-  it('surfaces bridge API errors as an error page, not an empty download', async () => {
-    apiResponse = { status: 410, body: { error: 'Sensitive data has expired' } };
-    const res = await fetchDownload({ sensitiveId: 'old', label: 'x', dl: true });
-    expect(res.status).toBe(410);
-    const html = await res.text();
-    expect(html).toContain('has expired');
-    expect(res.headers.get('content-disposition')).toBeNull();
+  it('relays bridge API errors as JSON with the upstream status', async () => {
+    apiResponse = { status: 403, body: { error: 'Sensitive data has already been viewed (one-time link)' } };
+    const res = await postReveal({ sensitiveId: 'gone', label: 'x' });
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toContain('already been viewed');
+  });
+
+  it('rejects a token without a sensitiveId', async () => {
+    const res = await postReveal({ label: 'x' });
+    expect(res.status).toBe(403);
+    expect(apiCalls).toBe(0);
   });
 });

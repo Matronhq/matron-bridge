@@ -136,10 +136,16 @@ export function sensitiveFilename(label, filename) {
   return `${slug || 'sensitive-data'}.txt`;
 }
 
-function renderSensitiveData(label, content, filename) {
-  const escaped = escapeHtml(content);
+// Shell page for one-time sensitive data. Deliberately contains NO secret:
+// browsers, Safe Browsing, and Matrix URL previewers all GET links before or
+// as the user clicks them, and with a one-time store the prefetch used to BE
+// the view ("already been viewed" before the user ever saw it). The secret
+// only moves on POST /sensitive/reveal, which nothing automated sends —
+// mode 'view' shows it in-page, mode 'download' saves it straight to a file.
+function renderSensitiveShell(label, token, mode) {
   const labelEscaped = escapeHtml(label);
-  const filenameJson = scriptJsonString(filename);
+  const tokenJson = scriptJsonString(token);
+  const modeJson = scriptJsonString(mode);
 
   return `<!DOCTYPE html>
 <html>
@@ -152,55 +158,96 @@ function renderSensitiveData(label, content, filename) {
     .header { padding: 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
     .label { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
     .warning { color: #f85149; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+    .note { color: #8b949e; font-size: 13px; margin-top: 8px; }
     .content { padding: 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; position: relative; }
     .content pre { margin: 0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; }
     .btns { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; }
-    .btns button { padding: 6px 12px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 12px; cursor: pointer; }
-    .btns button:hover { background: #2ea043; }
+    button { padding: 10px 24px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #2ea043; }
+    .btns button { padding: 6px 12px; font-size: 12px; font-weight: 400; }
     .btns button.copied { background: #1f6feb; }
     .dl-btn { background: #1f6feb !important; }
     .dl-btn:hover { background: #388bfd !important; }
+    .error { color: #f85149; }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="label">🔐 ${labelEscaped}</div>
-    <div class="warning">⚠️ This is a one-time link. Once you close this page, the data will be permanently deleted.</div>
+    <div class="warning">⚠️ This is a one-time link.</div>
+    <div class="note">Nothing has been revealed yet — the data is fetched only when you press the button below.</div>
   </div>
-  <div class="content">
-    <div class="btns">
-      <button class="dl-btn" onclick="downloadFile()">Download</button>
-      <button class="copy-btn" onclick="copyToClipboard()">Copy</button>
-    </div>
-    <pre id="content">${escaped}</pre>
+  <div class="content" id="box">
+    <button id="go"></button>
   </div>
   <script>
-    // Filename resolved server-side; the blob is built from the already-
-    // rendered content, so downloading never re-fetches the one-time data.
-    const DOWNLOAD_FILENAME = ${filenameJson};
-    function downloadFile() {
-      const content = document.getElementById('content').textContent;
+    const TOKEN = ${tokenJson};
+    const MODE = ${modeJson};
+    const box = document.getElementById('box');
+    const go = document.getElementById('go');
+    go.textContent = MODE === 'download' ? 'Download' : 'Reveal';
+
+    function saveBlob(content, filename) {
       const blob = new Blob([content], { type: 'application/octet-stream' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = DOWNLOAD_FILENAME;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(a.href);
     }
-    function copyToClipboard() {
-      const content = document.getElementById('content').textContent;
-      navigator.clipboard.writeText(content).then(() => {
-        const btn = document.querySelector('.copy-btn');
-        btn.textContent = 'Copied!';
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.textContent = 'Copy';
-          btn.classList.remove('copied');
-        }, 2000);
+
+    function showRevealed(data) {
+      box.textContent = '';
+      const btns = document.createElement('div');
+      btns.className = 'btns';
+      const dl = document.createElement('button');
+      dl.className = 'dl-btn';
+      dl.textContent = 'Download';
+      dl.onclick = () => saveBlob(data.content, data.filename);
+      const cp = document.createElement('button');
+      cp.className = 'copy-btn';
+      cp.textContent = 'Copy';
+      cp.onclick = () => navigator.clipboard.writeText(data.content).then(() => {
+        cp.textContent = 'Copied!';
+        cp.classList.add('copied');
+        setTimeout(() => { cp.textContent = 'Copy'; cp.classList.remove('copied'); }, 2000);
       });
+      btns.append(dl, cp);
+      const pre = document.createElement('pre');
+      pre.textContent = data.content;
+      box.append(btns, pre);
     }
+
+    go.onclick = async () => {
+      go.disabled = true;
+      try {
+        const res = await fetch('/sensitive/reveal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: TOKEN }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          box.textContent = '';
+          const p = document.createElement('p');
+          p.className = 'error';
+          p.textContent = '⚠️ ' + (data.error || 'Failed to retrieve the data');
+          box.append(p);
+          return;
+        }
+        if (MODE === 'download') {
+          saveBlob(data.content, data.filename);
+          box.textContent = 'Saved as ' + data.filename + '. You can close this tab.';
+        } else {
+          showRevealed(data);
+        }
+      } catch (e) {
+        go.disabled = false;
+        alert('Failed to retrieve the data: ' + e.message);
+      }
+    };
   </script>
 </body>
 </html>`;
@@ -358,7 +405,10 @@ app.post('/secret', async (req, res) => {
   }
 });
 
-app.get('/sensitive', async (req, res) => {
+// Both sensitive GET routes serve only the no-secret shell page — the GET
+// must be safe to repeat (prefetchers, Safe Browsing, URL previewers), so the
+// one-time consumption happens exclusively in POST /sensitive/reveal below.
+app.get('/sensitive', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
@@ -366,58 +416,53 @@ app.get('/sensitive', async (req, res) => {
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.sensitiveId || !data.label) return res.status(400).send('Invalid sensitive data token');
 
-  try {
-    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/sensitive/${data.sensitiveId}`);
-
-    if (!resp.ok) {
-      const err = await resp.json();
-      const safeErr = (err.error || 'Unknown error').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      return res.status(resp.status).type('html').send(
-        `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Error</title><style>body{margin:0;background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{text-align:center;padding:40px;}h2{color:#f85149;}</style></head><body><div class="card"><h2>⚠️ Error</h2><p>${safeErr}</p></div></body></html>`
-      );
-    }
-
-    const { label, content, filename } = await resp.json();
-    res.type('html').send(renderSensitiveData(label, content, sensitiveFilename(label, filename)));
-  } catch (err) {
-    console.error('Sensitive data fetch error:', err);
-    res.status(500).send('Failed to reach bridge API');
-  }
+  res.type('html').send(renderSensitiveShell(data.label, token, 'view'));
 });
 
-// Direct-download variant of /sensitive: the browser saves the content as a
-// file on click — no page, no button. Requires dl:true in the token (same
-// discriminator pattern as /view vs /download) so a page token can't be
-// replayed here. One-time-vs-multi-use is the bridge API's call; this route
-// just relays whatever it serves.
-app.get('/sensitive-download', downloadLimiter, async (req, res) => {
+// Direct-download variant: same shell, but the click saves straight to a file
+// instead of rendering the content. Requires dl:true in the token (same
+// discriminator pattern as /view vs /download) so the two link flavours stay
+// distinct in chat even though both now land on a click-through page.
+app.get('/sensitive-download', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
   const data = verifyToken(token);
-  if (!data || data.dl !== true || !data.sensitiveId) {
+  if (!data || data.dl !== true || !data.sensitiveId || !data.label) {
     return res.status(403).send('Invalid or expired token');
+  }
+
+  res.type('html').send(renderSensitiveShell(data.label, token, 'download'));
+});
+
+// The only place the secret actually moves. POST-only so nothing automated
+// triggers it (link previewers and browser prefetch send GETs); called by the
+// shell page's button handler. Accepts both token flavours. Responds JSON —
+// the shell renders content/errors client-side via textContent.
+app.post('/sensitive/reveal', downloadLimiter, async (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'Missing token' });
+
+  const data = verifyToken(token);
+  if (!data || !data.sensitiveId) {
+    return res.status(403).json({ error: 'Invalid or expired token' });
   }
 
   try {
     const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/sensitive/${data.sensitiveId}`);
 
     if (!resp.ok) {
-      const err = await resp.json();
-      const safeErr = (err.error || 'Unknown error').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      return res.status(resp.status).type('html').send(
-        `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Error</title><style>body{margin:0;background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{text-align:center;padding:40px;}h2{color:#f85149;}</style></head><body><div class="card"><h2>⚠️ Error</h2><p>${safeErr}</p></div></body></html>`
-      );
+      const err = await resp.json().catch(() => ({}));
+      return res.status(resp.status).json({ error: err.error || 'Unknown error' });
     }
 
     const { label, content, filename } = await resp.json();
-    // sensitiveFilename output is [A-Za-z0-9._-] only, so it is header-safe.
-    res.set('Content-Type', 'application/octet-stream');
-    res.set('Content-Disposition', `attachment; filename="${sensitiveFilename(label, filename)}"`);
-    res.send(content);
+    // sensitiveFilename output is [A-Za-z0-9._-] only — safe for the client
+    // to hand to the browser's download attribute.
+    res.json({ label, content, filename: sensitiveFilename(label, filename) });
   } catch (err) {
-    console.error('Sensitive download fetch error:', err);
-    res.status(500).send('Failed to reach bridge API');
+    console.error('Sensitive data fetch error:', err);
+    res.status(500).json({ error: 'Failed to reach bridge API' });
   }
 });
 
