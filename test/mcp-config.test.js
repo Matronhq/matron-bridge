@@ -254,13 +254,14 @@ describe('effectiveExtras', () => {
 });
 
 describe('resolveDefaultExtras', () => {
-  it('enables share by default and disables it with the kill-switch', () => {
-    expect(resolveDefaultExtras(undefined)).toEqual(['share']);
+  it('disables share by default and enables it only with the opt-in flag', () => {
+    expect(resolveDefaultExtras(undefined)).toEqual([]);
     expect(resolveDefaultExtras('0')).toEqual([]);
-    expect(effectiveExtras([], resolveDefaultExtras('0'))).toEqual([]);
+    expect(resolveDefaultExtras('1')).toEqual(['share']);
+    expect(effectiveExtras([], resolveDefaultExtras('1'))).toEqual(['share']);
   });
 
-  it('keeps an explicitly requested share extra when the kill-switch is on', () => {
-    expect(effectiveExtras(['share'], resolveDefaultExtras('0'))).toEqual(['share']);
+  it('keeps an explicitly requested share extra even when the default is off', () => {
+    expect(effectiveExtras(['share'], resolveDefaultExtras(undefined))).toEqual(['share']);
   });
 });

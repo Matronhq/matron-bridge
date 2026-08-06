@@ -76,6 +76,7 @@ import {
   parseShowFileUploadTimeoutMs,
   shareAgentMedia,
 } from './lib/show-file.js';
+import { processShowFile } from './lib/show-file-handler.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
@@ -185,6 +186,9 @@ const TIMERS_FILE = path.join(os.homedir(), '.matron-bridge-timers.json');
 // Per opt-in combination we write a separate generated file (`.mcp-config-
 // generated[.<extras>].json`) and pass its path to claude. Each browser stack
 // is ~400M resident, so defaulting to none keeps lightweight sessions lean.
+// `share` is likewise opt-in: OFF unless SHOW_FILE_DEFAULT_ON=1 is set in the
+// bridge's environment (the operator launch path sets it so operator sessions
+// keep show_file), or a session passes `--share`.
 const RAW_MCP_CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
 const DEFAULT_MCP_EXTRAS = resolveDefaultExtras(process.env.SHOW_FILE_DEFAULT_ON);
 const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
@@ -233,8 +237,10 @@ const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
 const SHOW_FILE_MAX_IN_FLIGHT = 2;
 const SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION = 1;
 const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYTES;
-let showFileInFlight = 0;
-let showFileReservedBytes = 0;
+// Mutable global concurrency/byte budget, shared with processShowFile (which
+// reserves before an upload and releases in its finally). An object so the
+// extracted handler can mutate it by reference.
+const showFileBudget = { inFlight: 0, reservedBytes: 0 };
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
@@ -7783,6 +7789,10 @@ const apiServer = createServer(async (req, res) => {
       auditShowFile({ result: 'request-too-large' });
       res.writeHead(413, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'request body too large' }));
+      // Stop the client streaming into an already-answered socket; without
+      // this the 'data' handler keeps firing (guarded, but the bytes still
+      // arrive) after we've committed the 413.
+      req.destroy();
       return;
     }
     body += chunk;
@@ -7791,106 +7801,30 @@ const apiServer = createServer(async (req, res) => {
     if (showFileBodyTooLarge) return;
 
     if (url.pathname === '/show-file') {
-      let filePath;
-      let session;
-      let budgetHeld = false;
-      try {
-        let data;
-        try {
-          data = JSON.parse(body);
-        } catch (error) {
-          auditShowFile({ result: 'invalid-json', error });
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'invalid JSON' }));
-          return;
-        }
-        const validationError = validateShowFileBody(data);
-        filePath = typeof data?.path === 'string' ? data.path : undefined;
-        if (validationError) {
-          auditShowFile({ result: validationError.reason, filePath });
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: validationError.error }));
-          return;
-        }
-        const { caption, token } = data;
-
-        for (const candidate of sessions.values()) {
-          if (candidate.showFileToken && candidate.showFileToken === token) {
-            session = candidate;
-            break;
-          }
-        }
-        if (!session) {
-          auditShowFile({ result: 'invalid-token', filePath });
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'invalid token' }));
-          return;
-        }
-
-        if ((session._showFileInFlight || 0) >= SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION
-            || showFileInFlight >= SHOW_FILE_MAX_IN_FLIGHT
-            || showFileReservedBytes + SHOW_FILE_MAX_BYTES > SHOW_FILE_GLOBAL_BYTE_BUDGET) {
-          auditShowFile({ result: 'saturated', roomId: session.roomId, filePath });
-          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
-          res.end(JSON.stringify({ error: 'saturated' }));
-          return;
-        }
-        session._showFileInFlight = (session._showFileInFlight || 0) + 1;
-        showFileInFlight += 1;
-        showFileReservedBytes += SHOW_FILE_MAX_BYTES;
-        budgetHeld = true;
-
-        const result = await shareAgentMedia({
-          filePath,
-          caption,
-          pinnedRoots: session.showFilePinnedRoots,
+      const { status, headers, body: resBody } = await processShowFile({
+        body,
+        sessions,
+        budget: showFileBudget,
+        limits: {
+          maxInFlightPerSession: SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION,
+          maxInFlight: SHOW_FILE_MAX_IN_FLIGHT,
           maxBytes: SHOW_FILE_MAX_BYTES,
+          globalByteBudget: SHOW_FILE_GLOBAL_BYTE_BUDGET,
           uploadTimeoutMs: SHOW_FILE_UPLOAD_TIMEOUT_MS,
-          deps: {
-            validateAndOpen,
-            FileLinkDenied,
-            uploadMedia: journalPublisher.uploadMedia,
-            publish: (method, payload) => journalPublish(session, method, payload),
-          },
-        });
-
-        if (result.ok) {
-          auditShowFile({
-            result: 'ok',
-            roomId: session.roomId,
-            realPath: result.realPath,
-            kind: result.kind,
-            size: result.size,
-            media_id: result.media_id,
-            sha256: result.sha256,
-          });
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            ok: true,
-            media_id: result.media_id,
-            kind: result.kind,
-          }));
-          return;
-        }
-
-        auditShowFile({
-          result: result.denied,
-          roomId: session.roomId,
-          filePath,
-        });
-        res.writeHead(denialToStatus(result.denied), { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: result.denied }));
-      } catch (error) {
-        auditShowFile({ result: 'internal-error', roomId: session?.roomId, filePath, error });
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'internal error' }));
-      } finally {
-        if (budgetHeld) {
-          session._showFileInFlight -= 1;
-          showFileInFlight -= 1;
-          showFileReservedBytes -= SHOW_FILE_MAX_BYTES;
-        }
-      }
+        },
+        deps: {
+          validateShowFileBody,
+          auditShowFile,
+          shareAgentMedia,
+          validateAndOpen,
+          FileLinkDenied,
+          uploadMedia: journalPublisher.uploadMedia,
+          journalPublish,
+          denialToStatus,
+        },
+      });
+      res.writeHead(status, { 'Content-Type': 'application/json', ...(headers || {}) });
+      res.end(JSON.stringify(resBody));
       return;
     }
 
