@@ -3,6 +3,7 @@ dotenv.config({ override: true });
 import { spawn } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
+import { createSendAttachmentHandler } from './lib/send-attachment.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -7041,6 +7042,12 @@ const pendingPlanDecisions = new Map();
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
+const handleSendAttachment = createSendAttachmentHandler({
+  sessions,
+  publisher: journalPublisher,
+  journalConvoIdFor,
+});
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -7138,6 +7145,13 @@ const apiServer = createServer(async (req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId }));
+        return;
+      }
+
+      if (url.pathname === '/send-attachment') {
+        const { status, body: resBody } = await handleSendAttachment(data);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
         return;
       }
 
