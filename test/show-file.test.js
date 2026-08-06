@@ -48,6 +48,7 @@ describe('shareAgentMedia', () => {
     expect(deps.validateAndOpen).toHaveBeenCalledWith('/work/chart.PNG', {
       allowedRoots: { pinned: true },
       maxBytes: 50 * 1024 * 1024,
+      strictSnapshot: true,
     });
     expect(deps.uploadMedia).toHaveBeenCalledWith({
       bytes: content,
