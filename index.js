@@ -14,6 +14,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
+import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
@@ -7155,6 +7156,15 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
 
+        // A stale/mistyped roomId would post the notification into another
+        // chat (or nowhere) — refuse before storing anything.
+        const target = resolveShareTarget(sessions, roomId);
+        if (!target.ok) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: target.error }));
+          return;
+        }
+
         const sensitiveId = randomUUID();
         const ttlSeconds = Math.min(Math.max(ttl || 3600, 60), 86400); // Min 1 min, max 24 hours, default 1 hour
         const expiresAt = Date.now() + ttlSeconds * 1000;
@@ -7200,7 +7210,13 @@ const apiServer = createServer(async (req, res) => {
         }, ttlSeconds * 1000);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ url: link, expiresAt: new Date(expiresAt).toISOString() }));
+        res.end(JSON.stringify({
+          url: link,
+          expiresAt: new Date(expiresAt).toISOString(),
+          // Which chat the courtesy notification was posted in — callers
+          // should surface this so a wrong-but-live room is caught at once.
+          notified: target.description,
+        }));
         return;
       }
 

@@ -85,14 +85,15 @@ server.tool(
         return { content: [{ type: 'text', text: `Error creating secure link: ${err}` }] };
       }
 
-      const { url, expiresAt } = await postRes.json();
+      const { url, expiresAt, notified } = await postRes.json();
       const usage = one_time !== false
         ? 'can only be viewed once'
         : 'can be used repeatedly until it expires';
+      const notice = notified ? `\nNotification posted in ${notified} — verify that is the current chat.` : '';
       return {
         content: [{
           type: 'text',
-          text: `Secure link created for "${label}":\n${url}\n\nThis link expires at ${new Date(expiresAt).toISOString()} and ${usage}.`
+          text: `Secure link created for "${label}":\n${url}\n\nThis link expires at ${new Date(expiresAt).toISOString()} and ${usage}.${notice}`
         }]
       };
     } catch (err) {
