@@ -7042,7 +7042,7 @@ const apiServer = createServer(async (req, res) => {
     // Mark as viewed and return content
     s.viewed = true;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ label: s.label, content: s.content }));
+    res.end(JSON.stringify({ label: s.label, content: s.content, filename: s.filename }));
 
     // Delete after 1 minute to allow time for the page to render, but prevent repeated access
     setTimeout(() => {
@@ -7139,7 +7139,7 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/share-sensitive') {
-        const { label, content, ttl, roomId } = data;
+        const { label, content, ttl, roomId, filename } = data;
         if (!label || !content || !roomId) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'label, content, and roomId are required' }));
@@ -7161,6 +7161,9 @@ const apiServer = createServer(async (req, res) => {
         pendingSensitiveData.set(sensitiveId, {
           label,
           content,
+          // Suggested download filename; the viewer sanitizes it to a safe
+          // basename before use.
+          filename: typeof filename === 'string' ? filename.slice(0, 128) : undefined,
           viewed: false,
           expiresAt,
         });

@@ -65,13 +65,14 @@ server.tool(
     label: z.string().describe('Short description of the sensitive data, e.g. "Gemini API Key" or "Database Password"'),
     content: z.string().describe('The sensitive data to share securely'),
     ttl: z.number().optional().describe('Time-to-live in seconds (default: 3600 = 1 hour, max: 86400 = 24 hours)'),
+    filename: z.string().optional().describe('Suggested filename for the viewer\'s Download button, e.g. "install.sh". Falls back to a name derived from the label.'),
   },
-  async ({ label, content, ttl }) => {
+  async ({ label, content, ttl, filename }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/share-sensitive`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, content, ttl: ttl || 3600, roomId: ROOM_ID }),
+        body: JSON.stringify({ label, content, ttl: ttl || 3600, roomId: ROOM_ID, filename }),
       });
 
       if (!postRes.ok) {

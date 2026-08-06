@@ -114,9 +114,32 @@ function renderSecretSuccess() {
 </html>`;
 }
 
-function renderSensitiveData(label, content) {
+// Resolve the name the browser saves sensitive content under. Explicit
+// filename wins; otherwise a filename-looking token in the label; otherwise
+// a label slug. Always reduced to a safe basename (no separators, no leading
+// dot) — the value comes from the bridge API but ends up in an <a download>
+// attribute and on the user's disk.
+export function sensitiveFilename(label, filename) {
+  const sanitize = (name) =>
+    String(name).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[._]+/, '').slice(0, 128);
+  if (filename) {
+    const clean = sanitize(filename);
+    if (clean) return clean;
+  }
+  const inLabel = String(label ?? '').match(/[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])/);
+  if (inLabel) {
+    const clean = sanitize(inLabel[0]);
+    if (clean) return clean;
+  }
+  const slug = String(label ?? '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  return `${slug || 'sensitive-data'}.txt`;
+}
+
+function renderSensitiveData(label, content, filename) {
   const escaped = escapeHtml(content);
   const labelEscaped = escapeHtml(label);
+  const filenameJson = scriptJsonString(filename);
 
   return `<!DOCTYPE html>
 <html>
@@ -131,9 +154,12 @@ function renderSensitiveData(label, content) {
     .warning { color: #f85149; font-size: 13px; display: flex; align-items: center; gap: 8px; }
     .content { padding: 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; position: relative; }
     .content pre { margin: 0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; }
-    .copy-btn { position: absolute; top: 12px; right: 12px; padding: 6px 12px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 12px; cursor: pointer; }
-    .copy-btn:hover { background: #2ea043; }
-    .copy-btn.copied { background: #1f6feb; }
+    .btns { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; }
+    .btns button { padding: 6px 12px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 12px; cursor: pointer; }
+    .btns button:hover { background: #2ea043; }
+    .btns button.copied { background: #1f6feb; }
+    .dl-btn { background: #1f6feb !important; }
+    .dl-btn:hover { background: #388bfd !important; }
   </style>
 </head>
 <body>
@@ -142,10 +168,27 @@ function renderSensitiveData(label, content) {
     <div class="warning">⚠️ This is a one-time link. Once you close this page, the data will be permanently deleted.</div>
   </div>
   <div class="content">
-    <button class="copy-btn" onclick="copyToClipboard()">Copy</button>
+    <div class="btns">
+      <button class="dl-btn" onclick="downloadFile()">Download</button>
+      <button class="copy-btn" onclick="copyToClipboard()">Copy</button>
+    </div>
     <pre id="content">${escaped}</pre>
   </div>
   <script>
+    // Filename resolved server-side; the blob is built from the already-
+    // rendered content, so downloading never re-fetches the one-time data.
+    const DOWNLOAD_FILENAME = ${filenameJson};
+    function downloadFile() {
+      const content = document.getElementById('content').textContent;
+      const blob = new Blob([content], { type: 'application/octet-stream' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = DOWNLOAD_FILENAME;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(a.href);
+    }
     function copyToClipboard() {
       const content = document.getElementById('content').textContent;
       navigator.clipboard.writeText(content).then(() => {
@@ -334,8 +377,8 @@ app.get('/sensitive', async (req, res) => {
       );
     }
 
-    const { label, content } = await resp.json();
-    res.type('html').send(renderSensitiveData(label, content));
+    const { label, content, filename } = await resp.json();
+    res.type('html').send(renderSensitiveData(label, content, sensitiveFilename(label, filename)));
   } catch (err) {
     console.error('Sensitive data fetch error:', err);
     res.status(500).send('Failed to reach bridge API');
