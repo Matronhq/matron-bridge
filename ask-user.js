@@ -126,7 +126,7 @@ server.tool(
 
 server.tool(
   'send_attachment',
-  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
+  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory, and attachments are capped at 50 MB. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
   {
     path: z.string().describe('Path to the file — absolute, or relative to the session working directory'),
     caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body'),

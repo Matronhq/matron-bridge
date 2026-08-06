@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'path';
-import { mkdtempSync, writeFileSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from 'fs';
+import { realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { classifyContentType, createSendAttachmentHandler } from '../lib/send-attachment.js';
 
@@ -76,8 +77,14 @@ describe('createSendAttachmentHandler', () => {
     const { handler, workdir, uploads } = makeFixture();
     const res = await handler({ roomId: '!room1', path: 'report.pdf' });
     expect(res.status).toBe(200);
+    // The handler stats/uploads the realpath-resolved target (see the
+    // symlink-guard fix below), so the expected filePath is realpath(workdir)
+    // too — on macOS tmpdir() itself is a symlink (/var -> /private/var), so
+    // this can differ from the raw `workdir` string even though it's the
+    // same file.
+    const realWorkdir = await realpath(workdir);
     expect(uploads).toEqual([{
-      filePath: path.join(workdir, 'report.pdf'),
+      filePath: path.join(realWorkdir, 'report.pdf'),
       contentType: 'application/pdf',
       name: 'report.pdf',
     }]);
@@ -149,5 +156,91 @@ describe('createSendAttachmentHandler', () => {
     const { handler } = makeFixture();
     expect((await handler({ path: 'x.png' })).status).toBe(400);
     expect((await handler({ roomId: '!room1' })).status).toBe(400);
+  });
+
+  it('rejects non-string roomId/path instead of throwing', async () => {
+    const { handler } = makeFixture();
+    expect((await handler({ roomId: 123, path: 'x.png' })).status).toBe(400);
+    expect((await handler({ roomId: '!room1', path: 42 })).status).toBe(400);
+    expect((await handler({ roomId: '!room1', path: { evil: true } })).status).toBe(400);
+  });
+
+  it('fails closed for a session with no workdir, even for an absolute path', async () => {
+    const { sessions, publisher } = makeFixture();
+    sessions.set('!room2', {}); // no workdir at all
+    const handler = createSendAttachmentHandler({ sessions, publisher, journalConvoIdFor: () => 'convo-abc' });
+    const res = await handler({ roomId: '!room2', path: '/etc/hosts' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/working directory/i);
+  });
+
+  it('rejects zero-byte files', async () => {
+    const { handler, workdir } = makeFixture();
+    writeFileSync(path.join(workdir, 'empty.txt'), '');
+    const res = await handler({ roomId: '!room1', path: 'empty.txt' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/empty/i);
+  });
+
+  it('rejects a directory as not a regular file', async () => {
+    const { handler, workdir } = makeFixture();
+    mkdirSync(path.join(workdir, 'adir'));
+    const res = await handler({ roomId: '!room1', path: 'adir' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/not a regular file/i);
+  });
+
+  it('accepts an absolute path that resolves inside the workdir', async () => {
+    const { handler, workdir } = makeFixture();
+    const res = await handler({ roomId: '!room1', path: path.join(workdir, 'shot.png') });
+    expect(res.status).toBe(200);
+    expect(res.body.kind).toBe('image');
+  });
+
+  it('falls back to the classified content-type and stat size when the publisher omits them', async () => {
+    const { sessions, workdir, published } = makeFixture();
+    const publisher = {
+      uploadMedia: async () => ({ media_id: 'blob-999', content_type: null, size: undefined }),
+      publishImage: (convoId, payload) => published.push({ kind: 'image', convoId, payload }),
+      publishFile: (convoId, payload) => published.push({ kind: 'file', convoId, payload }),
+    };
+    const handler = createSendAttachmentHandler({ sessions, publisher, journalConvoIdFor: () => 'convo-abc' });
+    const res = await handler({ roomId: '!room1', path: 'shot.png' });
+    expect(res.status).toBe(200);
+    expect(published[0].payload.content_type).toBe('image/png'); // fell back to classifyContentType
+    expect(published[0].payload.size).toBe(4); // fell back to stat().size — shot.png fixture is 4 bytes
+    void workdir;
+  });
+
+  describe('symlink escapes', () => {
+    it('refuses a symlink that points at a sensitive file outside the workdir', async () => {
+      const { handler, workdir, uploads } = makeFixture();
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'send-attach-outside-'));
+      mkdirSync(path.join(outsideDir, 'secrets'));
+      writeFileSync(path.join(outsideDir, 'secrets', 'id_rsa'), '-----BEGIN PRIVATE KEY-----');
+      // Innocent-looking name INSIDE the workdir, but it's a symlink to a
+      // sensitive file OUTSIDE the workdir. checkFileLink checks sensitivity
+      // before containment, so a target that is both sensitive-named and
+      // outside the workdir is refused for being sensitive; if it were
+      // outside-but-not-sensitive-named it would be refused as
+      // 'outside-workdir' instead (see the directory-escape test below).
+      symlinkSync(path.join(outsideDir, 'secrets', 'id_rsa'), path.join(workdir, 'innocent.txt'));
+
+      const res = await handler({ roomId: '!room1', path: 'innocent.txt' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/share_sensitive_data/);
+      expect(uploads).toEqual([]); // uploadMedia was never called
+    });
+
+    it('refuses a directory symlink that escapes the workdir', async () => {
+      const { handler, workdir } = makeFixture();
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'send-attach-outside-'));
+      writeFileSync(path.join(outsideDir, 'plain.txt'), 'not sensitive');
+      symlinkSync(outsideDir, path.join(workdir, 'linkdir'));
+
+      const res = await handler({ roomId: '!room1', path: 'linkdir/plain.txt' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/outside/i);
+    });
   });
 });

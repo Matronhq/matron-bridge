@@ -7150,6 +7150,7 @@ const apiServer = createServer(async (req, res) => {
 
       if (url.pathname === '/send-attachment') {
         const { status, body: resBody } = await handleSendAttachment(data);
+        debug(`send-attachment ${status} ${data?.path} ${resBody.kind || resBody.error || ''}`);
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(resBody));
         return;
