@@ -222,41 +222,6 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenCalledTimes(1);
   });
 
-  it('carryForward moves pending to the new key', () => {
-    const { delivery, injectTurn } = makeDelivery();
-    const session = { alive: true, busy: true };
-    delivery.deliver(session, 'old', msg());
-    delivery.deliver(session, 'old', msg({ body: 'second' }));
-    delivery.carryForward('old', 'new');
-    expect(delivery.pendingCount('old')).toBe(0);
-    expect(delivery.pendingCount('new')).toBe(2);
-    session.busy = false;
-    expect(delivery.flush(session, 'old')).toBe(false);
-    expect(delivery.flush(session, 'new')).toBe(true);
-    expect(injectTurn).toHaveBeenCalledTimes(1);
-  });
-
-  it('carryForward into a non-empty destination merges instead of clobbering', () => {
-    const { delivery, injectTurn } = makeDelivery();
-    const session = { alive: true, busy: true };
-    delivery.deliver(session, 'old', msg({ body: 'from old' }));
-    delivery.deliver(session, 'new', msg({ body: 'already at new' }));
-    delivery.carryForward('old', 'new');
-    expect(delivery.pendingCount('old')).toBe(0);
-    expect(delivery.pendingCount('new')).toBe(2);
-    session.busy = false;
-    expect(delivery.flush(session, 'new')).toBe(true);
-    const text = injectTurn.mock.calls[0][1];
-    expect(text).toContain('already at new');
-    expect(text).toContain('from old');
-  });
-
-  it('carryForward with nothing pending is a no-op', () => {
-    const { delivery } = makeDelivery();
-    delivery.carryForward('ghost', 'new');
-    expect(delivery.pendingCount('new')).toBe(0);
-  });
-
   it('dropSession clears pending without delivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: true };

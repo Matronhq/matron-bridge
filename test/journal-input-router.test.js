@@ -1582,8 +1582,11 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // (the new turn's own end seam picks it up) — one gate per seam family.
     expect(src.match(/flushPendingSessionQueue\(session\) === true/g) || []).toHaveLength(3);
     // The parked-slash release path must not append a room block onto the
-    // just-typed slash command (I3).
-    expect(src).toMatch(/if \(!parkedSlash\) maybeFlushRoomDelivery\(session\);/);
+    // just-typed slash command (Task 6 review I3) — but ONLY when the slash
+    // was actually typed; the couldn't-run/held-messages branches typed
+    // nothing and must still flush (whole-branch review, M4).
+    expect(src).toMatch(/if \(!parkedSlashTyped\) maybeFlushRoomDelivery\(session\);/);
+    expect(src).toMatch(/parkedSlashTyped = true;\s*\n\s*debug\(`typed parked /);
   });
 
   it('terminal teardown drops the pending room inbox with the session', () => {

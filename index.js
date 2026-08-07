@@ -65,7 +65,7 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
-import { createAgentRooms } from './lib/agent-rooms.js';
+import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites } from './lib/agent-invites.js';
 import { createRoomDelivery } from './lib/room-delivery.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
@@ -4013,6 +4013,11 @@ function startResumeReadyWatcher(session) {
     // later ordinary clean exit isn't misreported as "👋 Logged out"
     // (Bugbot, PR #162).
     if (parkedSlash !== '/logout') session._accountLogoutPending = false;
+    // Set ONLY where sendText actually typed the parked command: the other
+    // parked branches (held messages won, session died) typed nothing, so
+    // there is no pending Enter for a room flush to garble — suppressing the
+    // flush there would just strand the inbox (whole-branch review, M4).
+    let parkedSlashTyped = false;
     if (parkedSlash) {
       if (outbox.length > 0) {
         debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
@@ -4025,6 +4030,7 @@ function startResumeReadyWatcher(session) {
         if (session.sendCallback) session.sendCallback(note);
       } else if (session.alive && session.iv && typeof session.iv.sendText === 'function'
                  && session.iv.sendText(parkedSlash) !== false) {
+        parkedSlashTyped = true;
         debug(`typed parked ${parkedSlash} into ready TUI`);
       } else {
         // The user was promised the command would run when the TUI was
@@ -4052,13 +4058,14 @@ function startResumeReadyWatcher(session) {
       // inbox (isBusy counts _awaitingInputReady). With no held user message
       // there is no turn — and so no turn-end seam — to flush them, so flush
       // here; when something WAS sent, that turn's end seam flushes instead.
-      // EXCEPT when a parked slash command was just typed into the ready TUI
-      // (the `parkedSlash && outbox empty` sub-branch above): a back-to-back
-      // sendText would cancel its pending Enter and submit `/login` and the
-      // room block as ONE garbled line (Task 6 review, I3). The composite
+      // EXCEPT when a parked slash command was ACTUALLY typed into the ready
+      // TUI just now: a back-to-back sendText would cancel its pending Enter
+      // and submit `/login` and the room block as ONE garbled line (Task 6
+      // review, I3). The couldn't-run branch typed nothing, so it flushes
+      // like any other dead-end (whole-branch review, M4). The composite
       // gate inside maybeFlushRoomDelivery also skips if a TUI prompt opened
       // mid-hold.
-      if (!parkedSlash) maybeFlushRoomDelivery(session);
+      if (!parkedSlashTyped) maybeFlushRoomDelivery(session);
     }
   };
 
@@ -6888,6 +6895,22 @@ const agentRooms = createAgentRooms({
   log: console,
 });
 
+// Inbound join_requests for rooms this bridge OWNS, held OUTSIDE the rooms
+// registry: agentRooms.record() merges, so recording a third party's request
+// would clobber state 'pending' over an already-'joined' owned room and
+// repoint peerDeviceId at the newcomer — refusing the newcomer then flips
+// the SHARED record terminal and kills routing to the real peer forever
+// (whole-branch review, C1). roomId -> { deviceId, at }; read by the
+// agent-chat handlers via the pendingPeerFor seam; in-memory only (an
+// unanswered request is re-issuable and lapses with the invite TTL anyway).
+const pendingJoinRequests = new Map();
+function pendingPeerFor(roomId) {
+  const entry = pendingJoinRequests.get(roomId);
+  if (!entry) return null;
+  if (Date.now() - entry.at > INVITE_TTL_MS) { pendingJoinRequests.delete(roomId); return null; }
+  return entry.deviceId;
+}
+
 // A session that can't act on new input RIGHT NOW. `busy` covers a running
 // turn; `_awaitingInputReady` covers the post-resume input hold, whose
 // sendToSession branch buffers into _resumeOutbox and returns true WITHOUT
@@ -6951,7 +6974,10 @@ function journalOnRoomFrame(room, frame) {
     body = typeof payload.body === 'string' ? payload.body.trim() : '';
   } else {
     const kind = frame.type === 'image' ? 'image' : 'file';
-    body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.caption ? `: ${payload.caption}` : ''}]`;
+    // Carry the blob_ref (whole-branch review, M1): the name alone gives the
+    // receiving agent nothing to fetch. Same rendering as agent_chat_read's
+    // attachment lines (lib/agent-chat.js shapeMessages).
+    body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.blob_ref ? ` (blob ${payload.blob_ref})` : ''}${payload.caption ? `: ${payload.caption}` : ''}]`;
   }
   if (!body) return;
   // Self-heal for a stranded pending inbox (Task 6 review, I4): several
@@ -7013,14 +7039,22 @@ function journalInjectInviteRequest(frame) {
     });
     return;
   }
-  agentRooms.record(frame.room_id, {
-    role: isJoin ? 'owner' : 'guest',
-    state: 'pending',
-    sessionRoomId: session.roomId,
-    peerDeviceId: frame.from_device_id, peerName: frame.from_name || null,
-    topic: frame.topic || null,
-    title: room?.title || null,
-  });
+  if (isJoin) {
+    // A join_request never touches the room record: this bridge already owns
+    // the room (possibly joined with its real peer), and record() merging
+    // the requester over it is exactly the C1 registry-destruction bug. Just
+    // remember who is asking, for answerInvite's pendingPeerFor seam.
+    pendingJoinRequests.set(frame.room_id, { deviceId: frame.from_device_id, at: Date.now() });
+  } else {
+    agentRooms.record(frame.room_id, {
+      role: 'guest',
+      state: 'pending',
+      sessionRoomId: session.roomId,
+      peerDeviceId: frame.from_device_id, peerName: frame.from_name || null,
+      topic: frame.topic || null,
+      title: room?.title || null,
+    });
+  }
   agentInvites.ack({ roomId: frame.room_id, peerDeviceId: isJoin ? frame.from_device_id : null, sessionState: sessionOccupiedForRoomDelivery(session) ? 'busy' : 'idle' });
   const who = frame.from_name ? `"${frame.from_name}"` : `device ${frame.from_device_id}`;
   const ask = isJoin
@@ -7134,9 +7168,22 @@ function journalHandleInboundEvent(frame) {
 // Hoisted function declaration — the exit handlers are defined earlier in
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
-  // Terminal teardown drops any pending room-message inbox with the session:
-  // there is no live session left to coalesce into, and the room content is
-  // durable in the journal (agent_chat_read recovers it). Auto-restart and
+  // Terminal teardown leaves this session's joined rooms too: an orphaned
+  // 'joined' entry stays bound to a dead session key forever — isActive
+  // true, every peer frame dropped at debug level, noticeUnknownConvo
+  // suppressed by the known-room guard: a permanent silent black hole
+  // (whole-branch review, I4). Tell the peer (fire-and-forget — there is no
+  // one left to report a failure to; an owner's leave is rejected
+  // server-side, a journal gap noted in the PR) and mark the binding left.
+  for (const r of agentRooms.forSession(session?.roomId)) {
+    if (r.state === 'joined') {
+      agentInvites.leave({ roomId: r.roomId }).catch(() => {});
+      agentRooms.setState(r.roomId, 'left');
+    }
+  }
+  // …and drops any pending room-message inbox with the session: there is no
+  // live session left to coalesce into, and the room content is durable in
+  // the journal (agent_chat_read recovers it). Auto-restart and
   // recreateSession never come through here AND keep the same session.roomId
   // key, so a surviving session's pending inbox rides across untouched.
   roomDelivery.dropSession(session?.roomId);
@@ -7316,6 +7363,12 @@ const agentChatHandlers = createAgentChatHandlers({
   rooms: agentRooms,
   invites: agentInvites,
   awaitRoomMessage,
+  // Owner-side join_request seam (C1) — who is asking to join an owned room,
+  // held outside the rooms registry (see pendingJoinRequests above).
+  pendingPeerFor,
+  clearPendingPeer: (roomId) => pendingJoinRequests.delete(roomId),
+  // chatJoin's own-session-convo guard (I2).
+  journalConvoIdFor,
   serverLabel: SERVER_LABEL,
   log: console,
 });

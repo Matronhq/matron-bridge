@@ -39,18 +39,24 @@ function makeFixture(overrides = {}) {
     invite: vi.fn(async (args) => { calls.push({ call: 'invite', args }); return overrides.inviteOutcome ?? { kind: 'accepted', peerDeviceId: 7 }; }),
     join: vi.fn(async (args) => { calls.push({ call: 'join', args }); return overrides.joinOutcome ?? { kind: 'accepted', peerDeviceId: 7 }; }),
     answer: vi.fn(() => true),
-    leave: vi.fn(() => true),
+    leave: vi.fn(async () => overrides.leaveOutcome ?? { kind: 'left' }),
     ...overrides.invites,
   };
-  const sessions = new Map([['!sess', { busy: false, alive: true }]]);
+  const sessions = new Map([['!sess', { busy: false, alive: true, convoId: 'convo-sess' }]]);
+  // The index.js pendingJoinRequests seam: who is join-requesting a room
+  // this bridge owns — held OUTSIDE the rooms registry (C1).
+  const pendingJoin = new Map();
   const log = { warn: vi.fn() };
   const handlers = createAgentChatHandlers({
     sessions, publisher, rooms, invites,
     awaitRoomMessage: overrides.awaitRoomMessage,
+    pendingPeerFor: (roomId) => pendingJoin.get(roomId) ?? null,
+    clearPendingPeer: (roomId) => pendingJoin.delete(roomId),
+    journalConvoIdFor: (s) => s.convoId || null,
     serverLabel: '2',
     log,
   });
-  return { handlers, calls, publisher, rooms, invites, sessions, log };
+  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log };
 }
 
 describe('createAgentChatHandlers', () => {
@@ -217,6 +223,19 @@ describe('createAgentChatHandlers', () => {
       expect(calls.filter((c) => c.call === 'upsertConvo')).toHaveLength(1);
     });
 
+    it('marks a REFUSED room\'s convo ended in the user\'s chat list without expiring the registry (I3)', async () => {
+      const { handlers, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'heads-down' } });
+      const res = await handlers.chatStart(good);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('refused');
+      const upserts = calls.filter((c) => c.call === 'upsertConvo');
+      expect(upserts).toHaveLength(2);
+      expect(upserts[1].opts.sessionState).toBe('ended');
+      // Registry state is onInviteFrame's job ('refused' in production);
+      // the handler must NOT stamp 'expired' over it on this branch.
+      expect(rooms.get(res.body.room_id).state).not.toBe('expired');
+    });
+
     it('maps outcome kinds to tool responses', async () => {
       const table = [
         [{ kind: 'refused', reason: 'busy elsewhere' }, 200, { status: 'refused', reason: 'busy elsewhere' }],
@@ -354,21 +373,94 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.error).toMatch(/nothing to answer/i);
     });
 
-    it('guest accept omits peer_device_id and joins the room', async () => {
-      const { handlers, rooms, invites } = makeFixture();
+    it('guest accept omits peer_device_id, joins the room, and backfills the room so far (I1)', async () => {
+      const events = [
+        { type: 'text', sender: 'agent:mac', ts: 1, payload: { body: 'hi, seen the red build?' } },
+        { type: 'image', sender: 'agent:mac', ts: 2, payload: { name: 'shot.png', blob_ref: 'b9' } },
+      ];
+      const fetchMessages = vi.fn(async () => ({ events }));
+      const { handlers, rooms, invites } = makeFixture({ publisher: { fetchMessages } });
       rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 7 });
       const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(200);
-      expect(res.body).toEqual({ ok: true, room_id: 'room-1' });
+      expect(res.body).toEqual({ ok: true, room_id: 'room-1', messages: [
+        { sender: 'agent:mac', type: 'text', ts: 1, body: 'hi, seen the red build?' },
+        { sender: 'agent:mac', type: 'image', ts: 2, body: '[image "shot.png" (blob b9)]' },
+      ] });
+      expect(fetchMessages).toHaveBeenCalledWith('room-1', { limit: 20 });
       expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: null, accept: true, reason: undefined });
       expect(rooms.get('room-1').state).toBe('joined');
     });
 
-    it('owner answering a join_request names the requester', async () => {
-      const { handlers, rooms, invites } = makeFixture();
-      rooms.record('room-1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 9 });
-      await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+    it('guest accept still joins when the backfill read fails — degrades to a note', async () => {
+      const { handlers, rooms } = makeFixture({ publisher: { fetchMessages: async () => null } });
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true, room_id: 'room-1', note: expect.stringMatching(/agent_chat_read/) });
+      expect(rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('guest refuse does not fetch any backfill', async () => {
+      const fetchMessages = vi.fn(async () => ({ events: [] }));
+      const { handlers, rooms } = makeFixture({ publisher: { fetchMessages } });
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1' });
+      expect(fetchMessages).not.toHaveBeenCalled();
+    });
+
+    it('owner answering a join_request names the requester from the pendingJoinRequests seam, not the room record (C1)', async () => {
+      const { handlers, rooms, invites, pendingJoin } = makeFixture();
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      pendingJoin.set('room-1', 9);
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true, room_id: 'room-1', admitted: true });
       expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: 9, accept: true, reason: undefined });
+      // Admitting a third party never changes the owner's own membership,
+      // and the consumed request is cleared (a second answer has nothing).
+      expect(rooms.get('room-1')).toMatchObject({ state: 'joined', peerDeviceId: 7 });
+      expect(pendingJoin.has('room-1')).toBe(false);
+      expect((await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' })).status).toBe(409);
+    });
+
+    it('REGRESSION (C1): a joined owner room survives a third party\'s refused join_request', async () => {
+      const { handlers, rooms, invites, pendingJoin, calls } = makeFixture();
+      // Owner room joined with peer B (device 7); third party (device 9)
+      // join-requests it — the request is held in the seam, never recorded.
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, peerName: 'dev-2' });
+      pendingJoin.set('room-1', 9);
+      const res = await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1', reason: 'pairwise room' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true, room_id: 'room-1', refused: true });
+      expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: 9, accept: false, reason: 'pairwise room' });
+      // The registry record for peer B is byte-identical: still joined,
+      // still pointing at device 7 — never flipped terminal.
+      expect(rooms.get('room-1')).toMatchObject({ role: 'owner', state: 'joined', peerDeviceId: 7, peerName: 'dev-2' });
+      // …and the owner can still post to B.
+      const send = await handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'still here, B?' });
+      expect(send.status).toBe(200);
+      expect(calls).toContainEqual({ call: 'publishText', convoId: 'room-1', payload: { body: 'still here, B?', from: 'agent' } });
+    });
+
+    it('409s an owner answer when no join request is pending (including its own outbound pending invite)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      rooms.record('room-1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 7 });
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/no pending join request/i);
+      expect(invites.answer).not.toHaveBeenCalled();
+      expect(rooms.get('room-1').state).toBe('pending');
+    });
+
+    it('owner answer keeps the pending join request when the answer op cannot be sent', async () => {
+      const { handlers, rooms, pendingJoin } = makeFixture({ invites: { answer: vi.fn(() => false) } });
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      pendingJoin.set('room-1', 9);
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(502);
+      expect(pendingJoin.get('room-1')).toBe(9); // retryable
+      expect(rooms.get('room-1').state).toBe('joined');
     });
 
     it('refuse carries the reason and marks the room refused', async () => {
@@ -404,6 +496,18 @@ describe('createAgentChatHandlers', () => {
       const { handlers } = makeFixture();
       expect((await handlers.chatJoin({ roomId: '!sess', justification: 'j' })).status).toBe(400);
       expect((await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1' })).status).toBe(400);
+    });
+
+    it('rejects one of this bridge\'s own session convo ids up front — no binding, no join op (I2)', async () => {
+      const { handlers, rooms, invites, calls } = makeFixture();
+      const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'convo-sess', justification: 'bind my own session' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/live session conversation on this bridge/i);
+      // Rejected BEFORE rooms.record: even a pending_quiet outcome can never
+      // leave the hijack binding live for the invite TTL.
+      expect(rooms.get('convo-sess')).toBeNull();
+      expect(calls.filter((c) => c.call === 'record')).toEqual([]);
+      expect(invites.join).not.toHaveBeenCalled();
     });
 
     it('records a pending guest binding, sends the join, maps the outcome', async () => {
@@ -462,11 +566,36 @@ describe('createAgentChatHandlers', () => {
     });
 
     it('502s when the leave frame never left the socket and keeps the state (peer was not told)', async () => {
-      const { handlers, rooms } = makeFixture({ invites: { leave: vi.fn(() => false) } });
+      const { handlers, rooms } = makeFixture({ leaveOutcome: { kind: 'error', code: 'journal_unreachable' } });
       rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
       const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(502);
       expect(res.body.error).toMatch(/peer was not told/i);
+      expect(rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('REGRESSION (C2): the OWNER\'s leave surfaces the journal conflict — no local "left", peer state intact', async () => {
+      // journal participants.js leaveConvo only flips a convo_agents row in
+      // state 'joined'; the owner has no row at all, so the journal answers
+      // fail('conflict','not a joined participant') with ref agent_leave.
+      const { handlers, rooms } = makeFixture({ leaveOutcome: { kind: 'error', code: 'conflict', detail: 'not a joined participant' } });
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/not a joined participant/);
+      expect(res.body.error).toMatch(/peer was not told/i);
+      // NOT terminally marked left: the peer was never told and keeps
+      // publishing — the room must keep routing.
+      expect(rooms.get('room-1')).toMatchObject({ state: 'joined', peerDeviceId: 7 });
+      // …so a send still works.
+      expect((await handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'still in' })).status).toBe(200);
+    });
+
+    it('other journal leave rejections map to 502 and also keep the state', async () => {
+      const { handlers, rooms } = makeFixture({ leaveOutcome: { kind: 'error', code: 'not_found' } });
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(502);
       expect(rooms.get('room-1').state).toBe('joined');
     });
   });
@@ -534,6 +663,20 @@ describe('createAgentChatHandlers', () => {
       ]);
     });
 
+    it('carries an attachment\'s blob_ref so the agent has something to fetch (M1)', async () => {
+      const events = [
+        { type: 'file', sender: 'user:dan', ts: 1, payload: { name: 'notes.pdf', blob_ref: 'blob-7', caption: 'read me' } },
+        { type: 'image', sender: 'agent:mac', ts: 2, payload: { name: 'shot.png', blob_ref: 'blob-8' } },
+      ];
+      const { handlers, rooms } = makeFixture({ publisher: { fetchMessages: async () => ({ events }) } });
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      const res = await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.body.messages).toEqual([
+        { sender: 'user:dan', type: 'file', ts: 1, body: '[file "notes.pdf" (blob blob-7)]', caption: 'read me' },
+        { sender: 'agent:mac', type: 'image', ts: 2, body: '[image "shot.png" (blob blob-8)]' },
+      ]);
+    });
+
     it('clamps the limit to 1..200 and defaults to 50', async () => {
       const fetchMessages = vi.fn(async () => ({ events: [] }));
       const { handlers, rooms } = makeFixture({ publisher: { fetchMessages } });
@@ -594,6 +737,39 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(indexSrc).toMatch(/if \(roomReplyWaiters\.resolve\(frame\.convo_id, \{ from, body \}\)\) return;[\s\S]{0,700}roomDelivery\.deliver\(/);
   });
 
+  it('holds inbound join_requests in pendingJoinRequests, never the rooms registry (C1)', () => {
+    // The isJoin branch of journalInjectInviteRequest must set the seam map;
+    // agentRooms.record may run only on the non-join (guest invite) branch.
+    expect(indexSrc).toMatch(/const pendingJoinRequests = new Map\(\);/);
+    const start = indexSrc.indexOf('function journalInjectInviteRequest(');
+    expect(start).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\nfunction ', start + 1);
+    const body = indexSrc.slice(start, end);
+    expect(body).toMatch(/if \(isJoin\) \{[\s\S]{0,400}pendingJoinRequests\.set\(frame\.room_id, \{ deviceId: frame\.from_device_id/);
+    expect(body).toMatch(/\} else \{[\s\S]{0,200}agentRooms\.record\(frame\.room_id, \{\s*\n\s*role: 'guest',/);
+    expect((body.match(/agentRooms\.record\(/g) || [])).toHaveLength(1);
+    // …and the handlers receive the read/clear seams plus the I2 guard dep.
+    const wiring = indexSrc.slice(indexSrc.indexOf('const agentChatHandlers = createAgentChatHandlers({'));
+    const wiringEnd = wiring.indexOf('});');
+    expect(wiring.slice(0, wiringEnd)).toMatch(/\bpendingPeerFor,/);
+    expect(wiring.slice(0, wiringEnd)).toMatch(/clearPendingPeer: \(roomId\) => pendingJoinRequests\.delete\(roomId\)/);
+    expect(wiring.slice(0, wiringEnd)).toMatch(/\bjournalConvoIdFor,/);
+  });
+
+  it('terminal teardown leaves joined rooms before dropping the inbox (I4)', () => {
+    const start = indexSrc.indexOf('function journalEvictConvoInput(');
+    expect(start).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\nfunction ', start + 1);
+    const body = indexSrc.slice(start, end);
+    // A dead session's joined rooms must not stay routable black holes:
+    // tell the peer, mark left, THEN drop the pending inbox.
+    const loop = body.indexOf('for (const r of agentRooms.forSession(session?.roomId))');
+    const drop = body.indexOf('roomDelivery.dropSession(session?.roomId)');
+    expect(loop).toBeGreaterThan(-1);
+    expect(drop).toBeGreaterThan(loop);
+    expect(body).toMatch(/if \(r\.state === 'joined'\) \{[\s\S]{0,120}agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]{0,120}agentRooms\.setState\(r\.roomId, 'left'\)/);
+  });
+
   it('declares all eight MCP tools in ask-user.js', () => {
     for (const name of TOOLS) {
       expect(askUserSrc).toMatch(new RegExp(`server\\.tool\\(\\s*\\n\\s*'${name}',`));
@@ -630,5 +806,15 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   it('keeps the no-polling etiquette in the tool descriptions', () => {
     expect(askUserSrc).toMatch(/do NOT wait or poll: continue your own work/);
     expect(askUserSrc).toMatch(/replies always arrive as later turns regardless, so never poll/);
+  });
+
+  it('agent_chat_accept renders the owner-admit case and the joined-room backfill (M5, I1)', () => {
+    const block = toolBlock('agent_chat_accept');
+    // An OWNER accepting a third party's join request did not "join" anything.
+    expect(block).toMatch(/if \(data\.admitted\)/);
+    expect(block).toMatch(/Admitted the requesting agent/);
+    // A guest accept surfaces the backfilled opening messages inline.
+    expect(block).toMatch(/data\.messages \|\| \[\]/);
+    expect(block).toMatch(/The room so far:/);
   });
 });

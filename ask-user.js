@@ -160,6 +160,14 @@ function describeRoomOutcome(body) {
   return `Room ${body.room_id}: ${body.status || body.error || 'unknown'}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
 }
 
+// Same sender rendering as live room delivery (index.js journalOnRoomFrame):
+// `box2 (agent)` / `dan`, never raw `agent:box2`. Shared by agent_chat_read
+// and agent_chat_accept's joined-room backfill.
+const senderLabel = (s) => typeof s !== 'string' ? String(s)
+  : s.startsWith('agent:') ? `${s.slice(6)} (agent)`
+    : s.startsWith('user:') ? s.slice(5) : s;
+const messageLine = (m) => `${senderLabel(m.sender)}: ${m.body}${m.caption ? ` — ${m.caption}` : ''}`;
+
 server.tool(
   'agent_roster',
   "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start. Excludes yourself.",
@@ -271,7 +279,16 @@ server.tool(
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_chat_accept failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      return { content: [{ type: 'text', text: `Joined room ${data.room_id}. Messages from it arrive as later turns.` }] };
+      // An OWNER accepting a third party's join request admits the requester
+      // — it does not "join" a room it already owns.
+      if (data.admitted) {
+        return { content: [{ type: 'text', text: `Admitted the requesting agent to your room ${data.room_id}.` }] };
+      }
+      const backlog = (data.messages || []).map(messageLine);
+      const text = `Joined room ${data.room_id}. Messages from it arrive as later turns.`
+        + (backlog.length ? `\nThe room so far:\n${backlog.join('\n')}` : '')
+        + (data.note ? `\n${data.note}` : '');
+      return { content: [{ type: 'text', text }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -372,12 +389,7 @@ server.tool(
       }
       const msgs = data.messages || [];
       if (!msgs.length) return { content: [{ type: 'text', text: `No messages in room ${room_id} yet.` }] };
-      // Same sender rendering as live room delivery (index.js
-      // journalOnRoomFrame): `box2 (agent)` / `dan`, never raw `agent:box2`.
-      const senderLabel = (s) => typeof s !== 'string' ? String(s)
-        : s.startsWith('agent:') ? `${s.slice(6)} (agent)`
-          : s.startsWith('user:') ? s.slice(5) : s;
-      const lines = msgs.map((m) => `${senderLabel(m.sender)}: ${m.body}${m.caption ? ` — ${m.caption}` : ''}`);
+      const lines = msgs.map(messageLine);
       return { content: [{ type: 'text', text: `Last ${msgs.length} messages in room ${room_id}:\n${lines.join('\n')}` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };

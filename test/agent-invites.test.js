@@ -270,10 +270,35 @@ describe('createAgentInvites', () => {
       expect(sendRoomOp).toHaveBeenLastCalledWith({ op: 'agent_invite_answer', room_id: 'r1', accept: true });
     });
 
-    it('leave sends agent_leave and returns the publisher result', () => {
+    it('leave: sendRoomOp false resolves journal_unreachable without waiting', async () => {
       const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
-      expect(inv.leave({ roomId: 'r1' })).toBe(false);
+      await expect(inv.leave({ roomId: 'r1' })).resolves.toEqual({ kind: 'error', code: 'journal_unreachable' });
       expect(sendRoomOp).toHaveBeenCalledWith({ op: 'agent_leave', room_id: 'r1' });
+    });
+
+    it('leave: silence within the error window means the leave took (journal only answers on failure)', async () => {
+      vi.useFakeTimers();
+      const { inv, sendRoomOp } = makeInvites();
+      const p = inv.leave({ roomId: 'r1' });
+      expect(sendRoomOp).toHaveBeenCalledWith({ op: 'agent_leave', room_id: 'r1' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p).resolves.toEqual({ kind: 'left' });
+    });
+
+    it('leave: an op error with ref agent_leave surfaces as the outcome (C2 — the OWNER\'s conflict)', async () => {
+      const { inv } = makeInvites();
+      const p = inv.leave({ roomId: 'r1' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'not a joined participant' });
+      await expect(p).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'not a joined participant' });
+    });
+
+    it('leave: op errors from other families never settle the leave waiter', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p = inv.leave({ roomId: 'r1' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_invite', detail: 'unrelated' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p).resolves.toEqual({ kind: 'left' });
     });
   });
 

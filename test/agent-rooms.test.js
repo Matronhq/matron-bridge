@@ -97,7 +97,7 @@ describe('createAgentRooms', () => {
     expect(rooms.record('r1', { ...REC, peerName: null }).peerName).toBeNull();
   });
 
-  it('drops malformed persisted entries so forSession/rebindSession stay safe', () => {
+  it('drops malformed persisted entries so forSession stays safe', () => {
     const { rooms } = makeStore({
       initial: {
         r1: null,
@@ -108,7 +108,6 @@ describe('createAgentRooms', () => {
       },
     });
     expect(() => rooms.forSession('!sess1')).not.toThrow();
-    expect(() => rooms.rebindSession('!sess1', '!new')).not.toThrow();
     expect(rooms.list().map((r) => r.roomId)).toEqual(['ok']);
     expect(rooms.get('r1')).toBeNull();
   });
@@ -188,49 +187,6 @@ describe('createAgentRooms', () => {
     expect(rooms.setState('r1', 'joined').state).toBe('joined');
   });
 
-  it('rebindSession moves every matching room and persists once per call', () => {
-    const { rooms, save } = makeStore();
-    rooms.record('r1', { role: 'owner', state: 'joined', sessionRoomId: '!old' });
-    rooms.record('r2', { role: 'guest', state: 'pending', sessionRoomId: '!old' });
-    rooms.record('r3', { role: 'owner', state: 'joined', sessionRoomId: '!other' });
-    save.mockClear();
-
-    expect(rooms.rebindSession('!old', '!new')).toBe(2);
-    expect(save).toHaveBeenCalledTimes(1);
-    expect(rooms.get('r1').sessionRoomId).toBe('!new');
-    expect(rooms.get('r2').sessionRoomId).toBe('!new');
-    expect(rooms.get('r3').sessionRoomId).toBe('!other');
-  });
-
-  it('rebindSession preserves role/state/peer fields and createdAt', () => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(1000);
-      const { rooms } = makeStore();
-      rooms.record('r1', {
-        role: 'guest', state: 'joined', sessionRoomId: '!old',
-        peerDeviceId: 7, peerName: 'matron-dev-2', topic: 'ci triage', title: 'CI triage',
-      });
-      vi.setSystemTime(2000);
-      rooms.rebindSession('!old', '!new');
-      expect(rooms.get('r1')).toMatchObject({
-        role: 'guest', state: 'joined', sessionRoomId: '!new',
-        peerDeviceId: 7, peerName: 'matron-dev-2', topic: 'ci triage', title: 'CI triage',
-        createdAt: 1000,
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('rebindSession with no matches returns 0 and does not persist', () => {
-    const { rooms, save } = makeStore();
-    rooms.record('r1', REC);
-    save.mockClear();
-    expect(rooms.rebindSession('!nobody', '!new')).toBe(0);
-    expect(save).not.toHaveBeenCalled();
-  });
-
   it.each([
     ['pending', true],
     ['joined', true],
@@ -299,10 +255,9 @@ describe('createAgentRooms', () => {
     expect(() => {
       rooms.record('r1', REC);
       rooms.setState('r1', 'joined');
-      rooms.rebindSession('!sess1', '!sess2');
       rooms.remove('r1');
     }).not.toThrow();
-    expect(save).toHaveBeenCalledTimes(4);
+    expect(save).toHaveBeenCalledTimes(3);
   });
 
   it('persists on every mutation with the state as of that call', () => {
@@ -314,16 +269,14 @@ describe('createAgentRooms', () => {
     rooms.record('r1', REC);                                 // 1
     rooms.record('r2', { ...REC, sessionRoomId: '!other' }); // 2
     rooms.setState('r1', 'joined');                          // 3
-    rooms.rebindSession('!other', '!moved');                 // 4
-    rooms.remove('r2');                                      // 5
-    expect(save).toHaveBeenCalledTimes(5);
+    rooms.remove('r2');                                      // 4
+    expect(save).toHaveBeenCalledTimes(4);
     expect(Object.keys(snapshots[0])).toEqual(['r1']);
     expect(snapshots[0].r1.state).toBe('pending');
     expect(Object.keys(snapshots[1]).sort()).toEqual(['r1', 'r2']);
     expect(snapshots[2].r1.state).toBe('joined');
     expect(snapshots[2].r2.sessionRoomId).toBe('!other');
-    expect(snapshots[3].r2.sessionRoomId).toBe('!moved');
-    expect(Object.keys(snapshots[4])).toEqual(['r1']);
-    expect(snapshots[4].r1).toMatchObject({ ...REC, state: 'joined' });
+    expect(Object.keys(snapshots[3])).toEqual(['r1']);
+    expect(snapshots[3].r1).toMatchObject({ ...REC, state: 'joined' });
   });
 });
