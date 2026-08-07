@@ -175,8 +175,22 @@ server.tool(
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_roster failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      const convos = (data.conversations || []).map((c) =>
-        `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${c.agent_device_id != null ? ` (agent ${c.agent_device_id})` : ' (no agent)'}${c.summary ? `: ${c.summary}` : ''}`);
+      // Cap the rendering: 30 most recent conversations, summaries clipped
+      // to 200 chars — the roster is a picker, not a transcript.
+      const mine = data.self?.device_id;
+      const convos = (data.conversations || [])
+        .slice()
+        .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0))
+        .slice(0, 30)
+        .map((c) => {
+          // Rows owned by this bridge are listed but are NOT valid
+          // agent_chat_start targets (the bridge rejects self-targets).
+          const agent = c.agent_device_id == null ? ' (no agent)'
+            : (mine != null && c.agent_device_id === mine) ? ' (this bridge — not targetable)'
+              : ` (agent ${c.agent_device_id})`;
+          const summary = c.summary ? `: ${String(c.summary).slice(0, 200)}` : '';
+          return `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${agent}${summary}`;
+        });
       const agents = (data.agents || []).map((a) => `- device ${a.device_id}: ${a.name}`);
       const self = data.self ? `You are "${data.self.name}" (device ${data.self.device_id}).` : 'Your own identity is unknown.';
       return { content: [{ type: 'text', text: `${self}\nOther agents:\n${agents.join('\n') || '- none'}\nConversations:\n${convos.join('\n') || '- none'}` }] };
@@ -215,7 +229,7 @@ server.tool(
 
 server.tool(
   'agent_chat_send',
-  'Send a message into an agent chat room. Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary. Optional wait_seconds (max 60) briefly waits for a quick reply when the peer is idle; replies always arrive as later turns regardless, so never poll.',
+  'Send a message into an agent chat room. Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary. Optional wait_seconds (max 60) blocks your turn for up to that long waiting for a reply — use it only for a short back-and-forth with a peer you know is idle; a busy or unjoined peer will burn the whole wait. Either way, replies always arrive as later turns regardless, so never poll.',
   {
     room_id: z.string().describe('The agent chat room id'),
     message: z.string().describe('The message to post into the room'),
@@ -358,7 +372,12 @@ server.tool(
       }
       const msgs = data.messages || [];
       if (!msgs.length) return { content: [{ type: 'text', text: `No messages in room ${room_id} yet.` }] };
-      const lines = msgs.map((m) => `${m.sender}: ${m.body}${m.caption ? ` — ${m.caption}` : ''}`);
+      // Same sender rendering as live room delivery (index.js
+      // journalOnRoomFrame): `box2 (agent)` / `dan`, never raw `agent:box2`.
+      const senderLabel = (s) => typeof s !== 'string' ? String(s)
+        : s.startsWith('agent:') ? `${s.slice(6)} (agent)`
+          : s.startsWith('user:') ? s.slice(5) : s;
+      const lines = msgs.map((m) => `${senderLabel(m.sender)}: ${m.body}${m.caption ? ` — ${m.caption}` : ''}`);
       return { content: [{ type: 'text', text: `Last ${msgs.length} messages in room ${room_id}:\n${lines.join('\n')}` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };

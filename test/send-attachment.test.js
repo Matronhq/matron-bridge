@@ -253,6 +253,15 @@ describe('createSendAttachmentHandler', () => {
       expect(res.body.error).toMatch(/pending/);
     });
 
+    it('409s an owner who left/was refused/expired — same shared gate as agent_chat_send', async () => {
+      for (const state of ['left', 'refused', 'expired']) {
+        const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state });
+        const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
+        expect(res.status).toBe(409);
+        expect(published).toHaveLength(0);
+      }
+    });
+
     it('400s a non-string chat_room_id', async () => {
       const { handler } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
       expect((await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 42 })).status).toBe(400);

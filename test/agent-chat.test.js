@@ -85,11 +85,16 @@ describe('createAgentChatHandlers', () => {
       ]);
     });
 
-    it('handles a null identity: self is null, agents unfiltered', async () => {
+    it('fails CLOSED on a null identity: self null, agents withheld with a note', async () => {
       const { handlers } = makeFixture({ publisher: { identity: () => null } });
       const res = await handlers.roster({ roomId: '!sess' });
+      expect(res.status).toBe(200);
       expect(res.body.self).toBeNull();
-      expect(res.body.agents).toHaveLength(2);
+      expect(res.body.agents).toEqual([]);
+      expect(res.body.note).toMatch(/identity unknown/i);
+      // Conversations stay listed (informational; chatStart independently
+      // refuses to run without identity).
+      expect(res.body.conversations).toHaveLength(3);
     });
 
     it('502s when the roster fetch fails open with null', async () => {
@@ -163,11 +168,53 @@ describe('createAgentChatHandlers', () => {
       expect(calls[0].opts.title).toBe('mac ↔ dev-2');
     });
 
-    it('falls back to serverLabel when identity is unknown and caps the title at 120 chars', async () => {
+    it('fails CLOSED on a null identity: no room minted, no side effects', async () => {
       const { handlers, calls } = makeFixture({ publisher: { identity: () => null } });
+      const res = await handlers.chatStart(good);
+      expect(res.status).toBe(503);
+      expect(res.body.error).toMatch(/identity unknown/i);
+      expect(calls).toEqual([]);
+    });
+
+    it('caps the title at 120 chars', async () => {
+      const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: 'x'.repeat(300) });
-      expect(calls[0].opts.title.startsWith('2 ↔ dev-2 — xxx')).toBe(true);
+      expect(calls[0].opts.title.startsWith('mac ↔ dev-2 — xxx')).toBe(true);
       expect(calls[0].opts.title).toHaveLength(120);
+    });
+
+    it('400s a non-string topic before any side effect', async () => {
+      const { handlers, calls } = makeFixture();
+      const res = await handlers.chatStart({ ...good, topic: { nested: true } });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/topic must be a string/i);
+      expect(calls).toEqual([]);
+    });
+
+    it('clamps topic and justification to the journal wire caps (200/1000)', async () => {
+      const { handlers, invites } = makeFixture();
+      await handlers.chatStart({ ...good, topic: 't'.repeat(500), justification: 'j'.repeat(5000) });
+      const args = invites.invite.mock.calls[0][0];
+      expect(args.topic).toHaveLength(200);
+      expect(args.justification).toHaveLength(1000);
+    });
+
+    it('cleans up the ghost room on a hard invite error: registry expired, convo marked ended', async () => {
+      const { handlers, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'error', code: 'offline' } });
+      const res = await handlers.chatStart(good);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('offline');
+      expect(rooms.get(res.body.room_id).state).toBe('expired');
+      const upserts = calls.filter((c) => c.call === 'upsertConvo');
+      expect(upserts).toHaveLength(2);
+      expect(upserts[1].opts.sessionState).toBe('ended');
+    });
+
+    it('leaves the room pending on a non-error outcome (no ghost cleanup)', async () => {
+      const { handlers, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+      const res = await handlers.chatStart(good);
+      expect(rooms.get(res.body.room_id).state).toBe('pending');
+      expect(calls.filter((c) => c.call === 'upsertConvo')).toHaveLength(1);
     });
 
     it('maps outcome kinds to tool responses', async () => {
@@ -234,6 +281,25 @@ describe('createAgentChatHandlers', () => {
       const id = joined(f, 'room-1', 'pending', 'owner');
       const res = await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'x' });
       expect(res.status).toBe(200);
+    });
+
+    it('409s an owner who left the room — the owner exemption covers only pending', async () => {
+      const f = makeFixture();
+      const id = joined(f, 'room-1', 'joined', 'owner');
+      await f.handlers.chatLeave({ roomId: '!sess', room_id: id });
+      const res = await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'x' });
+      expect(res.status).toBe(409);
+      expect(f.calls.filter((c) => c.call === 'publishText')).toEqual([]);
+    });
+
+    it('409s an owner whose room was refused or expired', async () => {
+      for (const state of ['refused', 'expired']) {
+        const f = makeFixture();
+        const id = joined(f, 'room-1', state, 'owner');
+        const res = await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'x' });
+        expect(res.status).toBe(409);
+        expect(f.calls.filter((c) => c.call === 'publishText')).toEqual([]);
+      }
     });
 
     it('400s a missing message', async () => {
@@ -315,6 +381,15 @@ describe('createAgentChatHandlers', () => {
       expect(rooms.get('room-1').state).toBe('refused');
     });
 
+    it('400s a non-string reason and clamps an over-length one to the wire cap', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      expect((await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1', reason: { no: 1 } })).status).toBe(400);
+      expect(invites.answer).not.toHaveBeenCalled();
+      await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1', reason: 'r'.repeat(5000) });
+      expect(invites.answer.mock.calls[0][0].reason).toHaveLength(1000);
+    });
+
     it('502s when the answer op cannot be sent and leaves the room pending', async () => {
       const { handlers, rooms } = makeFixture({ invites: { answer: vi.fn(() => false) } });
       rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
@@ -339,6 +414,35 @@ describe('createAgentChatHandlers', () => {
       expect(invites.join).toHaveBeenCalledWith({ roomId: 'room-1', justification: 'user handed me this room' });
       expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
     });
+
+    it('clamps the join justification to the wire cap', async () => {
+      const { handlers, invites } = makeFixture();
+      await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j'.repeat(5000) });
+      expect(invites.join.mock.calls[0][0].justification).toHaveLength(1000);
+    });
+
+    it('404s a room already bound to ANOTHER session and leaves the binding untouched', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      rooms.record('room-owned', { role: 'owner', state: 'joined', sessionRoomId: '!other' });
+      const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-owned', justification: 'gimme' });
+      expect(res.status).toBe(404);
+      expect(invites.join).not.toHaveBeenCalled();
+      expect(rooms.get('room-owned')).toMatchObject({ role: 'owner', state: 'joined', sessionRoomId: '!other' });
+    });
+
+    it('rolls back the speculative binding when the journal rejects the join outright', async () => {
+      const { handlers, rooms } = makeFixture({ joinOutcome: { kind: 'error', code: 'forbidden', detail: 'cannot join own room' } });
+      const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j' });
+      expect(res.status).toBe(502);
+      expect(rooms.get('room-1')).toBeNull();
+    });
+
+    it('does NOT remove a pre-existing same-session binding on a failed re-join', async () => {
+      const { handlers, rooms } = makeFixture({ joinOutcome: { kind: 'error', code: 'forbidden' } });
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'retry' });
+      expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+    });
   });
 
   describe('chatLeave', () => {
@@ -356,6 +460,15 @@ describe('createAgentChatHandlers', () => {
       expect(invites.leave).toHaveBeenCalledWith({ roomId: 'room-1' });
       expect(rooms.get('room-1').state).toBe('left');
     });
+
+    it('502s when the leave frame never left the socket and keeps the state (peer was not told)', async () => {
+      const { handlers, rooms } = makeFixture({ invites: { leave: vi.fn(() => false) } });
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/peer was not told/i);
+      expect(rooms.get('room-1').state).toBe('joined');
+    });
   });
 
   describe('chatRead', () => {
@@ -364,11 +477,36 @@ describe('createAgentChatHandlers', () => {
       expect((await handlers.chatRead({ roomId: '!sess', room_id: 'room-ghost' })).status).toBe(404);
     });
 
-    it('works on a non-joined room (inbox catch-up after refusal/leave)', async () => {
+    it('works on a LEFT room (inbox catch-up after leaving — proven past membership)', async () => {
       const { handlers, rooms } = makeFixture();
       rooms.record('room-1', { role: 'guest', state: 'left', sessionRoomId: '!sess' });
       const res = await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(200);
+    });
+
+    it('404s a never-joined binding: pending, refused, and expired are NOT proven membership', async () => {
+      for (const state of ['pending', 'refused', 'expired']) {
+        const { handlers, rooms, publisher } = makeFixture();
+        const fetchSpy = vi.spyOn(publisher, 'fetchMessages');
+        rooms.record('room-1', { role: 'guest', state, sessionRoomId: '!sess' });
+        const res = await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+        expect(res.status).toBe(404);
+        expect(res.body.error).toMatch(/not a participant/i);
+        expect(fetchSpy).not.toHaveBeenCalled();
+      }
+    });
+
+    it('a chatJoin the journal refused does NOT unlock chatRead (cross-session transcript guard)', async () => {
+      const { handlers } = makeFixture({ joinOutcome: { kind: 'error', code: 'forbidden', detail: 'cannot join own room' } });
+      await handlers.chatJoin({ roomId: '!sess', room_id: 'room-priv', justification: 'let me in' });
+      const res = await handlers.chatRead({ roomId: '!sess', room_id: 'room-priv' });
+      expect(res.status).toBe(404);
+    });
+
+    it('still lets the OWNER read after leaving (owner is proven membership)', async () => {
+      const { handlers, rooms } = makeFixture();
+      rooms.record('room-1', { role: 'owner', state: 'left', sessionRoomId: '!sess' });
+      expect((await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' })).status).toBe(200);
     });
 
     it('502s when the fetch fails open with null', async () => {
@@ -434,24 +572,58 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
   const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
 
-  it('mounts all eight loopback routes on their handlers', () => {
+  it('mounts all eight loopback routes on their handlers via the throw-isolating adapter', () => {
     for (const [route, handler] of ROUTES) {
       expect(indexSrc).toMatch(new RegExp(
-        `url\\.pathname === '${route}'[\\s\\S]{0,120}agentChatHandlers\\.${handler}\\(data\\)`));
+        `url\\.pathname === '${route}'[\\s\\S]{0,120}respondAgentChatRoute\\(res, data, agentChatHandlers\\.${handler},`));
     }
+    // The shared adapter turns a handler throw into that route's own 500 —
+    // never the outer body-parse catch's "Invalid JSON" 400.
+    expect(indexSrc).toMatch(/async function respondAgentChatRoute\(res, data, handler, describe\)/);
+    expect(indexSrc).toMatch(/catch \(e\) \{ status = 500; resBody = \{ error: e\?\.message \|\| 'internal error' \}; \}/);
   });
 
   it('constructs the handlers with the awaitRoomMessage seam fed from journalOnRoomFrame', () => {
     expect(indexSrc).toMatch(/createAgentChatHandlers\(\{/);
     expect(indexSrc).toMatch(/\bawaitRoomMessage,/);
     expect(indexSrc).toMatch(/function awaitRoomMessage\(chatRoomId, ms\)/);
-    // journalOnRoomFrame feeds waiters BEFORE handing to roomDelivery.
-    expect(indexSrc).toMatch(/resolveRoomReplyWaiters\(frame\.convo_id, \{ from, body \}\);\s*\n\s*roomDelivery\.deliver\(/);
+    // A reply consumed by a waiter is the tool result itself: journalOnRoomFrame
+    // must SHORT-CIRCUIT before roomDelivery.deliver, or the same message is
+    // queued and re-delivered as a duplicate injected turn at turn end
+    // (Task 8 review, finding 1).
+    expect(indexSrc).toMatch(/if \(roomReplyWaiters\.resolve\(frame\.convo_id, \{ from, body \}\)\) return;[\s\S]{0,700}roomDelivery\.deliver\(/);
   });
 
   it('declares all eight MCP tools in ask-user.js', () => {
     for (const name of TOOLS) {
       expect(askUserSrc).toMatch(new RegExp(`server\\.tool\\(\\s*\\n\\s*'${name}',`));
+    }
+  });
+
+  // Task 8 review, finding 8b: pin each tool's loopback path and body keys,
+  // not just its name — a tool wired to the wrong route or dropping a param
+  // must fail here.
+  const TOOL_WIRING = [
+    ['agent_roster', '/agent-roster', ['roomId: ROOM_ID']],
+    ['agent_chat_start', '/agent-chat-start', ['roomId: ROOM_ID', 'target_convo_id', 'topic', 'justification', 'message']],
+    ['agent_chat_send', '/agent-chat-send', ['roomId: ROOM_ID', 'room_id', 'message', 'wait_seconds']],
+    ['agent_chat_accept', '/agent-chat-accept', ['roomId: ROOM_ID', 'room_id']],
+    ['agent_chat_refuse', '/agent-chat-refuse', ['roomId: ROOM_ID', 'room_id', 'reason']],
+    ['agent_chat_join', '/agent-chat-join', ['roomId: ROOM_ID', 'room_id', 'justification']],
+    ['agent_chat_leave', '/agent-chat-leave', ['roomId: ROOM_ID', 'room_id']],
+    ['agent_chat_read', '/agent-chat-read', ['roomId: ROOM_ID', 'room_id', 'limit']],
+  ];
+  function toolBlock(name) {
+    const start = askUserSrc.indexOf(`'${name}',`);
+    expect(start, `tool ${name} declared`).toBeGreaterThan(-1);
+    const next = askUserSrc.indexOf('server.tool(', start);
+    return askUserSrc.slice(start, next === -1 ? undefined : next);
+  }
+  it('each tool POSTs to its own loopback path with the expected body keys', () => {
+    for (const [name, path, keys] of TOOL_WIRING) {
+      const block = toolBlock(name);
+      expect(block, `${name} fetches ${path}`).toContain('${BRIDGE_API}' + path + '`');
+      for (const key of keys) expect(block, `${name} body carries ${key}`).toContain(key);
     }
   });
 

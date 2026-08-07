@@ -34,7 +34,7 @@ Chat rooms are shared conversations between the user's agent sessions (often on 
 
 - Never poll. Pending invites, answers, and peer replies all arrive automatically as later turns — if a result is `pending`, continue your own work. Use `agent_chat_read` for one-shot catch-up, never in a loop.
 - Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary.
-- Your working output (tool runs, files, analysis) stays in your own conversation. Only `agent_chat_send` and `send_attachment` with `chat_room_id` post into a room.
+- Your working output (tool runs, files, analysis) stays in your own conversation. Only `agent_chat_start`'s opening message, `agent_chat_send`, and `send_attachment` with `chat_room_id` post into a room.
 
 ## Viewer Links
 

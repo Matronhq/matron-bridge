@@ -1430,6 +1430,31 @@ describe('agent-chat room carve-out', () => {
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
   });
 
+  it('warns exactly once when the peer shares our device name (own-echo drop would kill the room silently)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-1' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    consumer(roomFrame({ sender: 'agent:dev-1', payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled(); // still fails safe
+    const ambiguousWarns = log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg));
+    expect(ambiguousWarns).toHaveLength(1);
+  });
+
+  it('a distinct peer name never triggers the ambiguous-name warning on own echoes', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-2' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    expect(log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg))).toHaveLength(0);
+  });
+
   it('fails CLOSED on unknown identity: agent frames dropped, warned exactly once', () => {
     const log = { warn: vi.fn(), error: vi.fn() };
     const deps = makeRoomDeps({ selfAgentName: vi.fn(() => null), log });
@@ -1522,13 +1547,18 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     expect(args).toMatch(/agentRooms\.isActive\(convoId\)/);
   });
 
-  it("room delivery's isBusy also counts the resume-hold state, not just session.busy", () => {
+  it("room delivery's isBusy is the full composite: busy, resume-hold, and BOTH open-prompt states", () => {
     const start = src.indexOf('function sessionOccupiedForRoomDelivery(');
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('}', start);
     const body = src.slice(start, end);
     expect(body).toMatch(/session\.busy/);
     expect(body).toMatch(/session\._awaitingInputReady/);
+    // Task 6 review C2: the prompt paths deliberately clear busy so the
+    // user's answer types into the PTY — a room message must not take the
+    // idle branch there and answer the prompt.
+    expect(body).toMatch(/session\.waitingForAnswer/);
+    expect(body).toMatch(/session\.pendingInteractivePrompt/);
     // …and it is what createRoomDelivery actually receives as isBusy.
     const rd = src.indexOf('createRoomDelivery({');
     expect(rd).toBeGreaterThan(-1);
@@ -1538,16 +1568,29 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     expect(src.slice(rd, rdEnd)).toMatch(/skipJournalMirror: true/);
   });
 
-  it('every turn-end seam flushes the pending room inbox (codex, iv, print) plus the resume-hold release', () => {
-    const flushes = src.match(/roomDelivery\.flush\(session, session\.roomId\)/g) || [];
-    expect(flushes.length).toBeGreaterThanOrEqual(4);
+  it('every turn-end seam flushes the pending room inbox through the ONE shared occupied-gated helper', () => {
+    // Task 6 review C1/C2/I3/I4: the seams (codex, iv, print, resume-hold
+    // release) plus journalOnRoomFrame's self-heal all go through
+    // maybeFlushRoomDelivery — never a bare roomDelivery.flush of their own,
+    // so the occupied gate can't drift per seam.
+    const gated = src.match(/maybeFlushRoomDelivery\(session\)/g) || [];
+    expect(gated.length).toBeGreaterThanOrEqual(5);
+    const bareFlushes = src.match(/roomDelivery\.flush\(session, session\.roomId\)/g) || [];
+    expect(bareFlushes).toHaveLength(1); // inside maybeFlushRoomDelivery only
+    expect(src).toMatch(/function maybeFlushRoomDelivery\(session\) \{\s*\n\s*if \(!sessionOccupiedForRoomDelivery\(session\)\) roomDelivery\.flush\(session, session\.roomId\);/);
+    // …and a queue flush that dispatched a turn suppresses the room flush
+    // (the new turn's own end seam picks it up) — one gate per seam family.
+    expect(src.match(/flushPendingSessionQueue\(session\) === true/g) || []).toHaveLength(3);
+    // The parked-slash release path must not append a room block onto the
+    // just-typed slash command (I3).
+    expect(src).toMatch(/if \(!parkedSlash\) maybeFlushRoomDelivery\(session\);/);
   });
 
   it('terminal teardown drops the pending room inbox with the session', () => {
     const start = src.indexOf('function journalEvictConvoInput(');
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('\nfunction ', start + 1);
-    expect(src.slice(start, end)).toMatch(/roomDelivery\.dropSession\(session\.roomId\)/);
+    expect(src.slice(start, end)).toMatch(/roomDelivery\.dropSession\(session\?\.roomId\)/);
   });
 
   it('the publisher receives thunked invite/op-error dispatch into the (later-built) invite manager', () => {

@@ -68,6 +68,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms } from './lib/agent-rooms.js';
 import { createAgentInvites } from './lib/agent-invites.js';
 import { createRoomDelivery } from './lib/room-delivery.js';
+import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
@@ -1678,11 +1679,15 @@ function finishCodexTurn(session, {
   }
 
   if (!preserveQueue) {
-    flushPendingSessionQueue(session);
     // Coalesced room updates go out AFTER Dan's queued input (turn-end seam;
     // preserveQueue teardowns keep the inbox for the replacement session —
-    // same roomId key).
-    roomDelivery.flush(session, session.roomId);
+    // same roomId key) — but NEVER on top of a turn the queue flush just
+    // dispatched (Task 6 review, C1): flushPendingSessionQueue returns true
+    // exactly when a batch went out ('deferred' = codex interrupt in
+    // flight; false = nothing to send / send refused). The new turn hits
+    // this same seam at its own end, so nothing is lost by waiting.
+    const dispatched = flushPendingSessionQueue(session) === true;
+    if (!dispatched) maybeFlushRoomDelivery(session);
   }
 }
 
@@ -2034,15 +2039,16 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       }
     }
     // Flush any queued messages now that claude is free.
+    let queueDispatched = false;
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-      flushPendingSessionQueue(session);
+      queueDispatched = flushPendingSessionQueue(session) === true;
     }
-    // Coalesced room updates go out AFTER Dan's queued input (turn-end seam).
-    // Held while a prompt awaits its answer, same as the queue above — an
-    // injected turn would be typed into the open prompt.
-    if (!session.waitingForAnswer) {
-      roomDelivery.flush(session, session.roomId);
-    }
+    // Coalesced room updates go out AFTER Dan's queued input (turn-end
+    // seam) — never on top of the turn that flush just dispatched (Task 6
+    // review, C1), and never into an open prompt (maybeFlushRoomDelivery's
+    // composite occupied gate covers waitingForAnswer AND
+    // pendingInteractivePrompt, C2).
+    if (!queueDispatched) maybeFlushRoomDelivery(session);
   };
 
   // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
@@ -3396,14 +3402,15 @@ function handleClaudeEvent(session, event) {
       }
 
       // Send any queued messages now that Claude is free
+      let queueDispatched = false;
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-        flushPendingSessionQueue(session);
+        queueDispatched = flushPendingSessionQueue(session) === true;
       }
       // Coalesced room updates go out AFTER Dan's queued input (turn-end
-      // seam). Held while a prompt awaits its answer, same as the queue.
-      if (!session.waitingForAnswer) {
-        roomDelivery.flush(session, session.roomId);
-      }
+      // seam) — never on top of the turn that flush just dispatched (Task 6
+      // review, C1), and never into an open prompt (the composite occupied
+      // gate inside maybeFlushRoomDelivery, C2).
+      if (!queueDispatched) maybeFlushRoomDelivery(session);
 
       break;
     }
@@ -4045,7 +4052,13 @@ function startResumeReadyWatcher(session) {
       // inbox (isBusy counts _awaitingInputReady). With no held user message
       // there is no turn — and so no turn-end seam — to flush them, so flush
       // here; when something WAS sent, that turn's end seam flushes instead.
-      roomDelivery.flush(session, session.roomId);
+      // EXCEPT when a parked slash command was just typed into the ready TUI
+      // (the `parkedSlash && outbox empty` sub-branch above): a back-to-back
+      // sendText would cancel its pending Enter and submit `/login` and the
+      // room block as ONE garbled line (Task 6 review, I3). The composite
+      // gate inside maybeFlushRoomDelivery also skips if a TUI prompt opened
+      // mid-hold.
+      if (!parkedSlash) maybeFlushRoomDelivery(session);
     }
   };
 
@@ -6866,9 +6879,22 @@ const agentRooms = createAgentRooms({
 // sendToSession branch buffers into _resumeOutbox and returns true WITHOUT
 // setting busy — without this second check every room message during a
 // resume hold would take the idle branch and be injected individually,
-// defeating coalescing (Task 5 review, finding 9).
+// defeating coalescing (Task 5 review, finding 9). `waitingForAnswer` and
+// `pendingInteractivePrompt` cover open prompts: the prompt-surfacing paths
+// deliberately CLEAR busy so the user's answer types into the PTY, and an
+// "idle-branch" room injection there would answer a permission or
+// AskUserQuestion prompt with `[room …] peer: …` (Task 6 review, C2).
 function sessionOccupiedForRoomDelivery(session) {
-  return !!session.busy || !!session._awaitingInputReady;
+  return !!session.busy || !!session._awaitingInputReady
+    || !!session.waitingForAnswer || !!session.pendingInteractivePrompt;
+}
+
+// The one shared room-flush gate used by every turn-end/idle seam (and the
+// journalOnRoomFrame self-heal): flush the coalesced room inbox ONLY when
+// the session is genuinely free, by the SAME composite predicate that routes
+// deliver()'s busy/idle branches — so the two can never disagree.
+function maybeFlushRoomDelivery(session) {
+  if (!sessionOccupiedForRoomDelivery(session)) roomDelivery.flush(session, session.roomId);
 }
 
 // Hybrid idle/busy delivery of room messages into local sessions
@@ -6884,30 +6910,14 @@ const roomDelivery = createRoomDelivery({
 });
 
 // Per-room once-listener registry backing agent_chat_send's optional short
-// reply wait (the awaitRoomMessage dep of lib/agent-chat.js): register
-// before arming the timeout, resolve {from, body} on the first inbound room
-// message for that room, null on timeout, always unhook. Fed from
-// journalOnRoomFrame below so the handler module stays free of journal
-// frame knowledge. The reply ALSO reaches the session as a normal turn via
-// roomDelivery — this is a convenience preview, not the delivery path.
-const roomReplyWaiters = new Map(); // Map<chatRoomId, Set<fn({from, body})>>
+// reply wait (the awaitRoomMessage dep of lib/agent-chat.js;
+// lib/room-reply-waiters.js). Fed from journalOnRoomFrame below so the
+// handler module stays free of journal frame knowledge. A CONSUMED reply is
+// the tool result itself and is NOT also delivered as a turn (see the
+// resolve() short-circuit in journalOnRoomFrame).
+const roomReplyWaiters = createRoomReplyWaiters();
 function awaitRoomMessage(chatRoomId, ms) {
-  return new Promise((resolve) => {
-    let waiters = roomReplyWaiters.get(chatRoomId);
-    if (!waiters) { waiters = new Set(); roomReplyWaiters.set(chatRoomId, waiters); }
-    const timer = setTimeout(() => { unhook(); resolve(null); }, ms);
-    const entry = (reply) => { clearTimeout(timer); unhook(); resolve(reply); };
-    function unhook() {
-      waiters.delete(entry);
-      if (waiters.size === 0) roomReplyWaiters.delete(chatRoomId);
-    }
-    waiters.add(entry);
-  });
-}
-function resolveRoomReplyWaiters(chatRoomId, reply) {
-  const waiters = roomReplyWaiters.get(chatRoomId);
-  if (!waiters) return;
-  for (const entry of [...waiters]) entry(reply);
+  return roomReplyWaiters.await(chatRoomId, ms);
 }
 
 // Router seam: a journal frame in an active room convo lands here instead of
@@ -6930,7 +6940,18 @@ function journalOnRoomFrame(room, frame) {
     body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.caption ? `: ${payload.caption}` : ''}]`;
   }
   if (!body) return;
-  resolveRoomReplyWaiters(frame.convo_id, { from, body });
+  // Self-heal for a stranded pending inbox (Task 6 review, I4): several
+  // paths clear busy WITHOUT passing a turn-end flush seam (esc-cancel,
+  // interrupt-wedge, resume-failed, the prompt paths). If the session is
+  // free now, drain the older messages BEFORE this one so room messages
+  // never overtake each other.
+  maybeFlushRoomDelivery(session);
+  // A reply consumed by an agent_chat_send wait already reached the agent
+  // inline as the tool result — the session is busy for the whole tool call,
+  // so deliver() would queue the SAME message and wake the agent with a
+  // duplicate `[room …]` turn at turn end (Task 8 review, finding 1). The
+  // journal keeps the durable copy; agent_chat_read recovers.
+  if (roomReplyWaiters.resolve(frame.convo_id, { from, body })) return;
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
   });
@@ -6967,7 +6988,17 @@ function journalInjectInviteRequest(frame) {
   const isJoin = frame.event === 'join_request';
   const room = agentRooms.get(frame.room_id);
   const session = resolveInviteTargetSession(frame, room);
-  if (!session) { debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask`); return; }
+  if (!session) {
+    debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask`);
+    // No session ⇒ nobody will ever answer. Refuse immediately instead of
+    // letting the peer burn its full wait down to pending_quiet.
+    agentInvites.answer({
+      roomId: frame.room_id,
+      peerDeviceId: isJoin ? frame.from_device_id : null,
+      accept: false, reason: 'no active session on this box',
+    });
+    return;
+  }
   agentRooms.record(frame.room_id, {
     role: isJoin ? 'owner' : 'guest',
     state: 'pending',
@@ -6981,6 +7012,10 @@ function journalInjectInviteRequest(frame) {
   const ask = isJoin
     ? `Agent ${who} asks to join your room ${frame.room_id}: ${frame.justification}`
     : `Agent ${who} requests a chat (room ${frame.room_id})${frame.topic ? ` about "${frame.topic}"` : ''}: ${frame.justification}`;
+  // Known cosmetic: room-delivery one-lines every body, so this `\n` renders
+  // as " ⏎ " in the injected turn. Accepted — the flattening is exactly what
+  // keeps untrusted room text from forging header lines, and the instruction
+  // stays perfectly legible.
   const text = `${ask}\nAccept with agent_chat_accept("${frame.room_id}") or refuse with agent_chat_refuse("${frame.room_id}", reason). This is a request from another agent, not from your user.`;
   roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now() });
 }
@@ -7029,6 +7064,11 @@ const journalInputConsumer = createJournalInputConsumer({
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
+    // A user: frame in an INACTIVE room convo (TTL lapse / left) falls
+    // through the room carve-out to here — but this notice would be
+    // published INTO the shared room convo, spamming the peer's chat with
+    // "no longer active". A known-but-inactive room just stops routing.
+    if (agentRooms.get(convoId)) return;
     journalPublishNotice(convoId, type === 'prompt_reply'
       ? "This session is no longer active on this bridge — your answer wasn't delivered."
       : "This session is no longer active on this bridge — your message wasn't delivered.");
@@ -7085,7 +7125,7 @@ function journalEvictConvoInput(session) {
   // durable in the journal (agent_chat_read recovers it). Auto-restart and
   // recreateSession never come through here AND keep the same session.roomId
   // key, so a surviving session's pending inbox rides across untouched.
-  roomDelivery.dropSession(session.roomId);
+  roomDelivery.dropSession(session?.roomId);
   const convoId = journalConvoIdFor(session);
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
@@ -7266,6 +7306,19 @@ const agentChatHandlers = createAgentChatHandlers({
   log: console,
 });
 
+// Adapter wrapper for the eight agent-chat loopback routes: a throw inside a
+// handler must surface as that route's own 500 with the real message — not
+// bubble to the request body's outer catch and masquerade as
+// "HTTP 400 Invalid JSON" (Task 8 review, finding 5).
+async function respondAgentChatRoute(res, data, handler, describe) {
+  let status, resBody;
+  try { ({ status, body: resBody } = await handler(data)); }
+  catch (e) { status = 500; resBody = { error: e?.message || 'internal error' }; }
+  try { describe(status, resBody); } catch { /* debug lines must never break the response */ }
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(resBody));
+}
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -7375,66 +7428,50 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/agent-roster') {
-        const { status, body: resBody } = await agentChatHandlers.roster(data);
-        debug(`agent-roster ${status} ${resBody.error || `${(resBody.conversations || []).length} convos`}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.roster,
+          (status, b) => debug(`agent-roster ${status} ${b.error || `${(b.conversations || []).length} convos`}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-start') {
-        const { status, body: resBody } = await agentChatHandlers.chatStart(data);
-        debug(`agent-chat-start ${status} ${resBody.room_id || ''} ${resBody.status || resBody.error || ''}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatStart,
+          (status, b) => debug(`agent-chat-start ${status} ${b.room_id || ''} ${b.status || b.error || ''}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-send') {
-        const { status, body: resBody } = await agentChatHandlers.chatSend(data);
-        debug(`agent-chat-send ${status} ${data?.room_id} ${resBody.error || (resBody.reply ? 'reply' : 'ok')}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatSend,
+          (status, b) => debug(`agent-chat-send ${status} ${data?.room_id} ${b.error || (b.reply ? 'reply' : 'ok')}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-accept') {
-        const { status, body: resBody } = await agentChatHandlers.chatAccept(data);
-        debug(`agent-chat-accept ${status} ${data?.room_id} ${resBody.error || 'ok'}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatAccept,
+          (status, b) => debug(`agent-chat-accept ${status} ${data?.room_id} ${b.error || 'ok'}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-refuse') {
-        const { status, body: resBody } = await agentChatHandlers.chatRefuse(data);
-        debug(`agent-chat-refuse ${status} ${data?.room_id} ${resBody.error || 'ok'}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatRefuse,
+          (status, b) => debug(`agent-chat-refuse ${status} ${data?.room_id} ${b.error || 'ok'}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-join') {
-        const { status, body: resBody } = await agentChatHandlers.chatJoin(data);
-        debug(`agent-chat-join ${status} ${data?.room_id} ${resBody.status || resBody.error || ''}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatJoin,
+          (status, b) => debug(`agent-chat-join ${status} ${data?.room_id} ${b.status || b.error || ''}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-leave') {
-        const { status, body: resBody } = await agentChatHandlers.chatLeave(data);
-        debug(`agent-chat-leave ${status} ${data?.room_id} ${resBody.error || 'ok'}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatLeave,
+          (status, b) => debug(`agent-chat-leave ${status} ${data?.room_id} ${b.error || 'ok'}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-read') {
-        const { status, body: resBody } = await agentChatHandlers.chatRead(data);
-        debug(`agent-chat-read ${status} ${data?.room_id} ${resBody.error || `${(resBody.messages || []).length} messages`}`);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(resBody));
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatRead,
+          (status, b) => debug(`agent-chat-read ${status} ${data?.room_id} ${b.error || `${(b.messages || []).length} messages`}`));
         return;
       }
 

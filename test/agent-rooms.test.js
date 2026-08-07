@@ -55,8 +55,26 @@ describe('createAgentRooms', () => {
   });
 
   it('resumes from a loaded snapshot', () => {
-    const { rooms } = makeStore({ initial: { r1: { ...REC, createdAt: 1, updatedAt: 1 } } });
+    const { rooms } = makeStore({ initial: { r1: { ...REC, createdAt: 1, updatedAt: Date.now() } } });
     expect(rooms.get('r1')).toMatchObject(REC);
+  });
+
+  it('prunes non-joined entries past the invite TTL at load; joined and fresh entries survive', () => {
+    const now = Date.now();
+    const stale = now - INVITE_TTL_MS - 1;
+    const { rooms } = makeStore({
+      initial: {
+        oldPending: { ...REC, state: 'pending', createdAt: stale, updatedAt: stale },
+        oldLeft: { ...REC, state: 'left', createdAt: stale, updatedAt: stale },
+        oldRefused: { ...REC, state: 'refused', createdAt: stale, updatedAt: stale },
+        oldExpired: { ...REC, state: 'expired', createdAt: stale, updatedAt: stale },
+        noStamp: { ...REC, state: 'pending' }, // missing updatedAt counts as 0 → stale
+        oldJoined: { ...REC, state: 'joined', createdAt: stale, updatedAt: stale },
+        freshPending: { ...REC, state: 'pending', createdAt: now, updatedAt: now },
+        freshLeft: { ...REC, state: 'left', createdAt: now, updatedAt: now },
+      },
+    });
+    expect(rooms.list().map((r) => r.roomId).sort()).toEqual(['freshLeft', 'freshPending', 'oldJoined']);
   });
 
   it('partial re-record keeps previously recorded peer fields', () => {
@@ -86,7 +104,7 @@ describe('createAgentRooms', () => {
         r2: 'junk',
         r3: { role: 'owner', state: 'joined' }, // no sessionRoomId
         r4: [REC],
-        ok: { ...REC, createdAt: 1, updatedAt: 1 },
+        ok: { ...REC, createdAt: 1, updatedAt: Date.now() },
       },
     });
     expect(() => rooms.forSession('!sess1')).not.toThrow();
