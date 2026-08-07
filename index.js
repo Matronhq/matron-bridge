@@ -68,6 +68,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms } from './lib/agent-rooms.js';
 import { createAgentInvites } from './lib/agent-invites.js';
 import { createRoomDelivery } from './lib/room-delivery.js';
+import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize } from './lib/compact-priority.js';
@@ -6882,6 +6883,33 @@ const roomDelivery = createRoomDelivery({
   log: console,
 });
 
+// Per-room once-listener registry backing agent_chat_send's optional short
+// reply wait (the awaitRoomMessage dep of lib/agent-chat.js): register
+// before arming the timeout, resolve {from, body} on the first inbound room
+// message for that room, null on timeout, always unhook. Fed from
+// journalOnRoomFrame below so the handler module stays free of journal
+// frame knowledge. The reply ALSO reaches the session as a normal turn via
+// roomDelivery — this is a convenience preview, not the delivery path.
+const roomReplyWaiters = new Map(); // Map<chatRoomId, Set<fn({from, body})>>
+function awaitRoomMessage(chatRoomId, ms) {
+  return new Promise((resolve) => {
+    let waiters = roomReplyWaiters.get(chatRoomId);
+    if (!waiters) { waiters = new Set(); roomReplyWaiters.set(chatRoomId, waiters); }
+    const timer = setTimeout(() => { unhook(); resolve(null); }, ms);
+    const entry = (reply) => { clearTimeout(timer); unhook(); resolve(reply); };
+    function unhook() {
+      waiters.delete(entry);
+      if (waiters.size === 0) roomReplyWaiters.delete(chatRoomId);
+    }
+    waiters.add(entry);
+  });
+}
+function resolveRoomReplyWaiters(chatRoomId, reply) {
+  const waiters = roomReplyWaiters.get(chatRoomId);
+  if (!waiters) return;
+  for (const entry of [...waiters]) entry(reply);
+}
+
 // Router seam: a journal frame in an active room convo lands here instead of
 // the main-convo input path. Formats the peer's message as a `[room …]` line
 // and hands it to roomDelivery against the room's bound session.
@@ -6902,6 +6930,7 @@ function journalOnRoomFrame(room, frame) {
     body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.caption ? `: ${payload.caption}` : ''}]`;
   }
   if (!body) return;
+  resolveRoomReplyWaiters(frame.convo_id, { from, body });
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
   });
@@ -7224,6 +7253,19 @@ const handleSendAttachment = createSendAttachmentHandler({
   rooms: agentRooms,
 });
 
+// The eight agent-chat room tools (lib/agent-chat.js), mounted below as thin
+// loopback routes in the /send-attachment pattern. awaitRoomMessage is the
+// per-room once-listener seam defined next to journalOnRoomFrame.
+const agentChatHandlers = createAgentChatHandlers({
+  sessions,
+  publisher: journalPublisher,
+  rooms: agentRooms,
+  invites: agentInvites,
+  awaitRoomMessage,
+  serverLabel: SERVER_LABEL,
+  log: console,
+});
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -7327,6 +7369,70 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/send-attachment') {
         const { status, body: resBody } = await handleSendAttachment(data);
         debug(`send-attachment ${status} ${data?.path} ${resBody.kind || resBody.error || ''}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-roster') {
+        const { status, body: resBody } = await agentChatHandlers.roster(data);
+        debug(`agent-roster ${status} ${resBody.error || `${(resBody.conversations || []).length} convos`}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-start') {
+        const { status, body: resBody } = await agentChatHandlers.chatStart(data);
+        debug(`agent-chat-start ${status} ${resBody.room_id || ''} ${resBody.status || resBody.error || ''}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-send') {
+        const { status, body: resBody } = await agentChatHandlers.chatSend(data);
+        debug(`agent-chat-send ${status} ${data?.room_id} ${resBody.error || (resBody.reply ? 'reply' : 'ok')}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-accept') {
+        const { status, body: resBody } = await agentChatHandlers.chatAccept(data);
+        debug(`agent-chat-accept ${status} ${data?.room_id} ${resBody.error || 'ok'}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-refuse') {
+        const { status, body: resBody } = await agentChatHandlers.chatRefuse(data);
+        debug(`agent-chat-refuse ${status} ${data?.room_id} ${resBody.error || 'ok'}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-join') {
+        const { status, body: resBody } = await agentChatHandlers.chatJoin(data);
+        debug(`agent-chat-join ${status} ${data?.room_id} ${resBody.status || resBody.error || ''}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-leave') {
+        const { status, body: resBody } = await agentChatHandlers.chatLeave(data);
+        debug(`agent-chat-leave ${status} ${data?.room_id} ${resBody.error || 'ok'}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-read') {
+        const { status, body: resBody } = await agentChatHandlers.chatRead(data);
+        debug(`agent-chat-read ${status} ${data?.room_id} ${resBody.error || `${(resBody.messages || []).length} messages`}`);
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(resBody));
         return;

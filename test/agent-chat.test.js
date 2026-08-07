@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'fs';
 import { createAgentChatHandlers } from '../lib/agent-chat.js';
 import { createAgentRooms } from '../lib/agent-rooms.js';
 
@@ -408,5 +409,54 @@ describe('createAgentChatHandlers', () => {
       await handlers.chatRead({ roomId: '!sess', room_id: 'room-1', limit: 0 });
       expect(fetchMessages).toHaveBeenLastCalledWith('room-1', { limit: 50 });
     });
+  });
+});
+
+// The loopback routes and MCP tool declarations live in index.js/ask-user.js
+// and can't be imported, so the Task 8 surface is pinned by source
+// inspection — the same technique the index.js wiring pins in
+// busy-queue.test.js use. Handler behavior itself is covered above.
+describe('index.js routes + ask-user.js tools (source inspection)', () => {
+  const ROUTES = [
+    ['/agent-roster', 'roster'],
+    ['/agent-chat-start', 'chatStart'],
+    ['/agent-chat-send', 'chatSend'],
+    ['/agent-chat-accept', 'chatAccept'],
+    ['/agent-chat-refuse', 'chatRefuse'],
+    ['/agent-chat-join', 'chatJoin'],
+    ['/agent-chat-leave', 'chatLeave'],
+    ['/agent-chat-read', 'chatRead'],
+  ];
+  const TOOLS = [
+    'agent_roster', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
+    'agent_chat_refuse', 'agent_chat_join', 'agent_chat_leave', 'agent_chat_read',
+  ];
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
+
+  it('mounts all eight loopback routes on their handlers', () => {
+    for (const [route, handler] of ROUTES) {
+      expect(indexSrc).toMatch(new RegExp(
+        `url\\.pathname === '${route}'[\\s\\S]{0,120}agentChatHandlers\\.${handler}\\(data\\)`));
+    }
+  });
+
+  it('constructs the handlers with the awaitRoomMessage seam fed from journalOnRoomFrame', () => {
+    expect(indexSrc).toMatch(/createAgentChatHandlers\(\{/);
+    expect(indexSrc).toMatch(/\bawaitRoomMessage,/);
+    expect(indexSrc).toMatch(/function awaitRoomMessage\(chatRoomId, ms\)/);
+    // journalOnRoomFrame feeds waiters BEFORE handing to roomDelivery.
+    expect(indexSrc).toMatch(/resolveRoomReplyWaiters\(frame\.convo_id, \{ from, body \}\);\s*\n\s*roomDelivery\.deliver\(/);
+  });
+
+  it('declares all eight MCP tools in ask-user.js', () => {
+    for (const name of TOOLS) {
+      expect(askUserSrc).toMatch(new RegExp(`server\\.tool\\(\\s*\\n\\s*'${name}',`));
+    }
+  });
+
+  it('keeps the no-polling etiquette in the tool descriptions', () => {
+    expect(askUserSrc).toMatch(/do NOT wait or poll: continue your own work/);
+    expect(askUserSrc).toMatch(/replies always arrive as later turns regardless, so never poll/);
   });
 });

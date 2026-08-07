@@ -150,5 +150,221 @@ server.tool(
   }
 );
 
+// --- Agent-to-agent chat rooms ---
+// Thin POST wrappers over the bridge's loopback agent-chat routes. Success
+// text is a short English rendering of the response body; errors surface
+// data.error with an `HTTP <status>` fallback (the send_attachment shape).
+
+// Formats a chatStart/chatJoin outcome body ({room_id, status, reason?, note?, error?}).
+function describeRoomOutcome(body) {
+  return `Room ${body.room_id}: ${body.status || body.error || 'unknown'}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
+}
+
+server.tool(
+  'agent_roster',
+  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start. Excludes yourself.",
+  {},
+  async () => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-roster`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_roster failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      const convos = (data.conversations || []).map((c) =>
+        `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${c.agent_device_id != null ? ` (agent ${c.agent_device_id})` : ' (no agent)'}${c.summary ? `: ${c.summary}` : ''}`);
+      const agents = (data.agents || []).map((a) => `- device ${a.device_id}: ${a.name}`);
+      const self = data.self ? `You are "${data.self.name}" (device ${data.self.device_id}).` : 'Your own identity is unknown.';
+      return { content: [{ type: 'text', text: `${self}\nOther agents:\n${agents.join('\n') || '- none'}\nConversations:\n${convos.join('\n') || '- none'}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_start',
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  {
+    target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
+    topic: z.string().optional().describe('Optional short topic for the room title'),
+    justification: z.string().describe('Why you want to talk to that agent — shown to it with the request'),
+    message: z.string().describe('The opening message posted into the room'),
+  },
+  async ({ target_convo_id, topic, justification, message }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, target_convo_id, topic, justification, message }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: describeRoomOutcome(data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_send',
+  'Send a message into an agent chat room. Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary. Optional wait_seconds (max 60) briefly waits for a quick reply when the peer is idle; replies always arrive as later turns regardless, so never poll.',
+  {
+    room_id: z.string().describe('The agent chat room id'),
+    message: z.string().describe('The message to post into the room'),
+    wait_seconds: z.number().optional().describe('Optionally wait up to this many seconds (max 60) for a quick reply'),
+  },
+  async ({ room_id, message, wait_seconds }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, message, ...(wait_seconds != null ? { wait_seconds } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_send failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      const text = data.reply ? `Reply from ${data.reply.from}: ${data.reply.body}` : (data.note || 'Sent.');
+      return { content: [{ type: 'text', text }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_accept',
+  'Answer a chat request another agent sent you: accept it and join the room.',
+  {
+    room_id: z.string().describe('The room id from the chat request'),
+  },
+  async ({ room_id }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-accept`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_accept failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Joined room ${data.room_id}. Messages from it arrive as later turns.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_refuse',
+  'Answer a chat request another agent sent you: refuse it. The reason is relayed to the caller.',
+  {
+    room_id: z.string().describe('The room id from the chat request'),
+    reason: z.string().optional().describe('Optional short reason, relayed to the requesting agent'),
+  },
+  async ({ room_id, reason }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-refuse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, ...(reason ? { reason } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_refuse failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Refused room ${data.room_id}.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_join',
+  'Ask to join an existing agent chat room by id (e.g. one your user handed you). If the result is pending, do NOT wait or poll: continue your own work — the answer arrives as a later turn.',
+  {
+    room_id: z.string().describe('The room id to join'),
+    justification: z.string().describe('Why you want to join — shown to the room owner'),
+  },
+  async ({ room_id, justification }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, justification }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_join failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: describeRoomOutcome(data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_leave',
+  'Leave an agent chat room. The room and its history remain visible to your user.',
+  {
+    room_id: z.string().describe('The room id to leave'),
+  },
+  async ({ room_id }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-leave`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_leave failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Left room ${room_id}.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_read',
+  'Read recent messages from an agent chat room you participate in — inbox-style catch-up mid-turn. Not a polling tool: new messages arrive as later turns on their own.',
+  {
+    room_id: z.string().describe('The room id to read'),
+    limit: z.number().optional().describe('Max messages to return (default 50, max 200)'),
+  },
+  async ({ room_id, limit }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-read`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, ...(limit != null ? { limit } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_read failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      const msgs = data.messages || [];
+      if (!msgs.length) return { content: [{ type: 'text', text: `No messages in room ${room_id} yet.` }] };
+      const lines = msgs.map((m) => `${m.sender}: ${m.body}${m.caption ? ` — ${m.caption}` : ''}`);
+      return { content: [{ type: 'text', text: `Last ${msgs.length} messages in room ${room_id}:\n${lines.join('\n')}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
