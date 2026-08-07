@@ -1369,7 +1369,8 @@ describe('createJournalInputConsumer — ghost-answer refusal (processStartSeq)'
 // a conversation this bridge participates in as a room are session input even
 // when agent-sent — that's the whole point of a room — so they divert to
 // routeRoomFrame ABOVE the user:* loop guard. Own echoes are dropped by
-// device name; unknown identity fails CLOSED (drop + warn once).
+// device id when both the frame's sender_device_id and our own id are known,
+// by device name otherwise; unknown identity fails CLOSED (drop + warn once).
 describe('agent-chat room carve-out', () => {
   const roomRecord = { sessionRoomId: '!s1:bridge', role: 'guest', state: 'joined', title: 'Test room' };
 
@@ -1473,6 +1474,50 @@ describe('agent-chat room carve-out', () => {
     expect(deps.routeRoomFrame).not.toHaveBeenCalled();
   });
 
+  it('drops an agent frame whose sender_device_id matches our own device id even when the sender NAME differs', () => {
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:someone-else', sender_device_id: 42 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it("routes a SAME-NAMED peer's frame when its sender_device_id differs from ours (no ambiguous-name warning)", () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      selfAgentDeviceId: vi.fn(() => 42),
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-1' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1', sender_device_id: 7 }));
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    expect(log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg))).toHaveLength(0);
+  });
+
+  it('a frame WITHOUT sender_device_id falls back to name logic even when our own id is known', () => {
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' })); // own name, no id → dropped
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    consumer(roomFrame({ sender: 'agent:dev-2' })); // peer name, no id → routes
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it('sender_device_id present but own identity UNKNOWN fails closed via the name path (warnOnceNoIdentity)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      selfAgentDeviceId: vi.fn(() => null),
+      selfAgentName: vi.fn(() => null),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender_device_id: 7 }));
+    consumer(roomFrame({ sender_device_id: 7, payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(log.warn.mock.calls.filter(([msg]) => /identity/.test(msg))).toHaveLength(1);
+  });
+
   it('drops a prompt_reply in a room convo entirely (prompt flows never route through rooms)', () => {
     const deps = makeRoomDeps();
     const consumer = createJournalInputConsumer(deps);
@@ -1535,7 +1580,7 @@ describe('agent-chat room carve-out', () => {
 describe('index.js agent-chat room wiring (source inspection)', () => {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
 
-  it('passes roomFor/routeRoomFrame/selfAgentName to createJournalInputConsumer (before log:)', () => {
+  it('passes roomFor/routeRoomFrame/selfAgentName/selfAgentDeviceId to createJournalInputConsumer (before log:)', () => {
     const start = src.indexOf('createJournalInputConsumer({');
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('log: console,', start);
@@ -1544,6 +1589,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     expect(args).toMatch(/\broomFor\b/);
     expect(args).toMatch(/routeRoomFrame: journalOnRoomFrame/);
     expect(args).toMatch(/selfAgentName: \(\) => journalPublisher\.identity\(\)\?\.name \|\| null/);
+    expect(args).toMatch(/selfAgentDeviceId: \(\) => journalPublisher\.identity\(\)\?\.deviceId \?\? null/);
     expect(args).toMatch(/agentRooms\.isActive\(convoId\)/);
   });
 

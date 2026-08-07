@@ -7142,10 +7142,12 @@ const journalInputConsumer = createJournalInputConsumer({
   emitRelease,
   // Agent-chat room carve-out seams: frames in an ACTIVE room convo become
   // session input (even agent-sent — that's the point of a room); own echoes
-  // are dropped by device name from the journal's hello_ok identity.
+  // are dropped by device id (frame sender_device_id vs hello_ok identity)
+  // when both are known, by device name otherwise.
   roomFor: (convoId) => (agentRooms.isActive(convoId) ? agentRooms.get(convoId) : null),
   routeRoomFrame: journalOnRoomFrame,
   selfAgentName: () => journalPublisher.identity()?.name || null,
+  selfAgentDeviceId: () => journalPublisher.identity()?.deviceId ?? null,
   log: console,
 });
 
