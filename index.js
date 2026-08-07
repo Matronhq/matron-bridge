@@ -65,6 +65,9 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import { createAgentRooms } from './lib/agent-rooms.js';
+import { createAgentInvites } from './lib/agent-invites.js';
+import { createRoomDelivery } from './lib/room-delivery.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize } from './lib/compact-priority.js';
@@ -290,6 +293,12 @@ const toolStreamPumps = new Map();
 function toolStreamKey(convoId, messageRef) {
   return `${convoId}\0${messageRef}`;
 }
+// Agent-chat invite manager (lib/agent-invites.js). Declared before the
+// publisher so its options can reference it as thunks; constructed much
+// later (next to the journal input consumer, where its own deps —
+// journalPublisher, agentRooms, the inject glue — all exist). The thunks
+// only ever fire once the socket is live, long after the assignment.
+let agentInvites = null;
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -307,6 +316,10 @@ const journalPublisher = createJournalPublisher({
   // is — the callback only ever fires once the socket is live, long after
   // module evaluation.
   onRpcRequest: (request) => journalRpcHandler(request),
+  // Agent-chat invite lifecycle (kind:'invite' ephemerals and room-op error
+  // frames) — thunked because agentInvites is constructed later (above).
+  onInviteFrame: (frame) => agentInvites?.onInviteFrame(frame),
+  onOpError: (err) => agentInvites?.onOpError(err),
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -1663,7 +1676,13 @@ function finishCodexTurn(session, {
     else if (session.sendCallback) session.sendCallback(message);
   }
 
-  if (!preserveQueue) flushPendingSessionQueue(session);
+  if (!preserveQueue) {
+    flushPendingSessionQueue(session);
+    // Coalesced room updates go out AFTER Dan's queued input (turn-end seam;
+    // preserveQueue teardowns keep the inbox for the replacement session —
+    // same roomId key).
+    roomDelivery.flush(session, session.roomId);
+  }
 }
 
 // --- Interactive-mode session (MATRON_INTERACTIVE_MODE=1) ---
@@ -2016,6 +2035,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Flush any queued messages now that claude is free.
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
       flushPendingSessionQueue(session);
+    }
+    // Coalesced room updates go out AFTER Dan's queued input (turn-end seam).
+    // Held while a prompt awaits its answer, same as the queue above — an
+    // injected turn would be typed into the open prompt.
+    if (!session.waitingForAnswer) {
+      roomDelivery.flush(session, session.roomId);
     }
   };
 
@@ -3373,6 +3398,11 @@ function handleClaudeEvent(session, event) {
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
         flushPendingSessionQueue(session);
       }
+      // Coalesced room updates go out AFTER Dan's queued input (turn-end
+      // seam). Held while a prompt awaits its answer, same as the queue.
+      if (!session.waitingForAnswer) {
+        roomDelivery.flush(session, session.roomId);
+      }
 
       break;
     }
@@ -4010,6 +4040,11 @@ function startResumeReadyWatcher(session) {
       // send itself failed) — don't leave a typing indicator spinning with
       // no turn behind it.
       session.busy = false;
+      // Room messages that arrived during the hold coalesced into the pending
+      // inbox (isBusy counts _awaitingInputReady). With no held user message
+      // there is no turn — and so no turn-end seam — to flush them, so flush
+      // here; when something WAS sent, that turn's end seam flushes instead.
+      roomDelivery.flush(session, session.roomId);
     }
   };
 
@@ -6814,6 +6849,134 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
   }
 }
 
+// --- Agent-chat rooms (spec: agent chat phase 3) ---
+// Persisted room↔session registry: which journal convos this bridge
+// participates in as agent-chat rooms, and which local session each is bound
+// to. Same atomic-replace persistence rationale as the timer store above.
+const AGENT_ROOMS_FILE = path.join(os.homedir(), '.matron-bridge-agent-rooms.json');
+const agentRooms = createAgentRooms({
+  load: () => (fs.existsSync(AGENT_ROOMS_FILE) ? JSON.parse(fs.readFileSync(AGENT_ROOMS_FILE, 'utf-8')) : null),
+  save: (data) => atomicWriteFileSync(AGENT_ROOMS_FILE, JSON.stringify(data, null, 2)),
+  log: console,
+});
+
+// A session that can't act on new input RIGHT NOW. `busy` covers a running
+// turn; `_awaitingInputReady` covers the post-resume input hold, whose
+// sendToSession branch buffers into _resumeOutbox and returns true WITHOUT
+// setting busy — without this second check every room message during a
+// resume hold would take the idle branch and be injected individually,
+// defeating coalescing (Task 5 review, finding 9).
+function sessionOccupiedForRoomDelivery(session) {
+  return !!session.busy || !!session._awaitingInputReady;
+}
+
+// Hybrid idle/busy delivery of room messages into local sessions
+// (lib/room-delivery.js): idle sessions get one injected turn per message,
+// occupied sessions accumulate a pending inbox flushed as one coalesced
+// turn at the turn-end seams (finishCodexTurn, iv onTurnEnd, print-mode
+// `case 'result'`). skipJournalMirror: the message already lives in the
+// room convo — mirroring it into the session convo would duplicate it.
+const roomDelivery = createRoomDelivery({
+  isBusy: sessionOccupiedForRoomDelivery,
+  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  log: console,
+});
+
+// Router seam: a journal frame in an active room convo lands here instead of
+// the main-convo input path. Formats the peer's message as a `[room …]` line
+// and hands it to roomDelivery against the room's bound session.
+function journalOnRoomFrame(room, frame) {
+  const session = sessions.get(room.sessionRoomId);
+  if (!session || !session.alive) {
+    debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} not live — dropping (agent_chat_read recovers)`);
+    return;
+  }
+  const sender = frame.sender || '';
+  const from = sender.startsWith('agent:') ? `${sender.slice(6)} (agent)` : sender.startsWith('user:') ? sender.slice(5) : sender;
+  const payload = frame.payload || {};
+  let body;
+  if (frame.type === 'text') {
+    body = typeof payload.body === 'string' ? payload.body.trim() : '';
+  } else {
+    const kind = frame.type === 'image' ? 'image' : 'file';
+    body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.caption ? `: ${payload.caption}` : ''}]`;
+  }
+  if (!body) return;
+  roomDelivery.deliver(session, session.roomId, {
+    roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
+  });
+}
+
+// Which local session an inbound invite/join request is FOR.
+// - join_request: the session bound to the room this bridge owns.
+// - request: v1 coarseness — the invite frame carries no target convo/session
+//   address (the caller targeted a conversation; the journal resolved it to
+//   this DEVICE), so with more than one live session the receiving bridge
+//   cannot know which was meant. Route to the most recently active live
+//   session; the request text carries the room id so the agent can hand off.
+//   Fixing this properly means carrying target_convo_id through agent_invite
+//   (a small Phase 3.5 journal addition) — flagged in the PR description.
+function resolveInviteTargetSession(frame, room) {
+  if (frame.event === 'join_request') {
+    const session = room ? sessions.get(room.sessionRoomId) : null;
+    return session && session.alive ? session : null;
+  }
+  let best = null;
+  for (const session of sessions.values()) {
+    if (!session.alive) continue;
+    if (!best || (session.lastActivityAt || 0) > (best.lastActivityAt || 0)) best = session;
+  }
+  return best;
+}
+
+// Inbound invite/join request -> record the room as pending, ack with the
+// target session's state, and surface the request to the agent as a turn
+// (via roomDelivery, so a busy session sees it coalesced at turn end).
+function journalInjectInviteRequest(frame) {
+  // request  -> a peer wants THIS bridge's session to join frame.room_id
+  // join_request -> a peer asks to join a room THIS bridge owns
+  const isJoin = frame.event === 'join_request';
+  const room = agentRooms.get(frame.room_id);
+  const session = resolveInviteTargetSession(frame, room);
+  if (!session) { debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask`); return; }
+  agentRooms.record(frame.room_id, {
+    role: isJoin ? 'owner' : 'guest',
+    state: 'pending',
+    sessionRoomId: session.roomId,
+    peerDeviceId: frame.from_device_id, peerName: frame.from_name || null,
+    topic: frame.topic || null,
+    title: room?.title || null,
+  });
+  agentInvites.ack({ roomId: frame.room_id, peerDeviceId: isJoin ? frame.from_device_id : null, sessionState: sessionOccupiedForRoomDelivery(session) ? 'busy' : 'idle' });
+  const who = frame.from_name ? `"${frame.from_name}"` : `device ${frame.from_device_id}`;
+  const ask = isJoin
+    ? `Agent ${who} asks to join your room ${frame.room_id}: ${frame.justification}`
+    : `Agent ${who} requests a chat (room ${frame.room_id})${frame.topic ? ` about "${frame.topic}"` : ''}: ${frame.justification}`;
+  const text = `${ask}\nAccept with agent_chat_accept("${frame.room_id}") or refuse with agent_chat_refuse("${frame.room_id}", reason). This is a request from another agent, not from your user.`;
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now() });
+}
+
+// Room-lifecycle FYI (late answers, peer left) surfaced to the bound session
+// as a turn. Fail-quiet when the room or its session is gone — the journal
+// keeps the durable record.
+function journalNotifyRoomEvent(roomId, text) {
+  const room = agentRooms.get(roomId);
+  if (!room) return;
+  const session = sessions.get(room.sessionRoomId);
+  if (!session || !session.alive) return;
+  roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room.title || null, from: 'bridge', body: `Room ${roomId}: the peer ${text}.`, at: Date.now() });
+}
+
+// Constructed here (not at the `let` declaration next to the publisher) so
+// every dependency — publisher, registry, the inject glue above — exists.
+agentInvites = createAgentInvites({
+  sendRoomOp: journalPublisher.sendRoomOp,
+  rooms: agentRooms,
+  injectRequestTurn: journalInjectInviteRequest,
+  notifyRoom: journalNotifyRoomEvent,
+  log: console,
+});
+
 // Assembled once, after every dependency above is defined, and invoked from
 // journalHandleInboundEvent (the `function` declaration wired into
 // createJournalPublisher near the top of this file — hoisted, so that
@@ -6860,6 +7023,12 @@ const journalInputConsumer = createJournalInputConsumer({
   },
   processStartSeq: journalPublisher.startSeq,
   emitRelease,
+  // Agent-chat room carve-out seams: frames in an ACTIVE room convo become
+  // session input (even agent-sent — that's the point of a room); own echoes
+  // are dropped by device name from the journal's hello_ok identity.
+  roomFor: (convoId) => (agentRooms.isActive(convoId) ? agentRooms.get(convoId) : null),
+  routeRoomFrame: journalOnRoomFrame,
+  selfAgentName: () => journalPublisher.identity()?.name || null,
   log: console,
 });
 
@@ -6882,6 +7051,12 @@ function journalHandleInboundEvent(frame) {
 // Hoisted function declaration — the exit handlers are defined earlier in
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
+  // Terminal teardown drops any pending room-message inbox with the session:
+  // there is no live session left to coalesce into, and the room content is
+  // durable in the journal (agent_chat_read recovers it). Auto-restart and
+  // recreateSession never come through here AND keep the same session.roomId
+  // key, so a surviving session's pending inbox rides across untouched.
+  roomDelivery.dropSession(session.roomId);
   const convoId = journalConvoIdFor(session);
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
