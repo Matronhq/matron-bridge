@@ -74,7 +74,7 @@ import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -4729,31 +4729,45 @@ async function maybeUpdatePinnedSummary(session) {
       `${m.role}: ${m.text}`
     ).join('\n\n');
 
+    // ROSTER must stay the LAST format line in both variants:
+    // parseTitlePassResponse's multi-line capture stops at the next `KEY:`
+    // line or end-of-text, so a field placed after it would be swallowed.
     const prompt = currentSummary
-      ? `Based on these recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
-      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
+      ? `Based on these recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n3. A 2-3 sentence rolling summary of what this session is working on right now\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\nROSTER: <2-3 sentences describing what this session is working on right now, for other agents deciding whether to contact it>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n3. A 2-3 sentence rolling summary of what this session is working on right now\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\nROSTER: <2-3 sentences describing what this session is working on right now, for other agents deciding whether to contact it>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().trim();
-    const titleMatch = text.match(/TITLE:\s*(.+)/i);
-    const summaryMatch = text.match(/SUMMARY:\s*(.+)/i);
-    const newMatch = text.match(/NEW:\s*(.+)/i);
+    const parsed = parseTitlePassResponse(text);
 
     const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
 
     // Update room name (Element sidebar truncates visually, full name visible on hover)
-    if (titleMatch) {
-      const name = `${SERVER_LABEL}:${sessionShort} ${titleMatch[1].trim().slice(0, 60)}`;
+    if (parsed.title) {
+      const name = `${SERVER_LABEL}:${sessionShort} ${parsed.title.slice(0, 60)}`;
       updateRoomName(session.roomId, name);
+    }
+
+    // Publish the roster summary to the journal so other agents' rosters show
+    // what this session is doing. Don't-clobber analysis: the journal's
+    // COALESCE keeps the existing summary whenever the field is omitted, and
+    // journalUpsertConvo only carries `summary` when this pass actually
+    // produced one. The seed path (lib/journal-title-seed.js), the state-only
+    // path (journalSessionState), and the hint-replay upserts in
+    // journalPublish never carry `summary` — the publisher's omit-don't-null
+    // handling makes that automatic. No fallback summary when Gemini is off:
+    // the roster shows '', which is honest.
+    if (parsed.roster) {
+      journalUpsertConvo(session, { summary: parsed.roster.slice(0, 1000) });
     }
 
     // Build cumulative summary for pinned message
     let updatedSummary = '';
-    if (newMatch && currentSummary) {
-      updatedSummary = `${currentSummary}\n• ${newMatch[1].trim()}`;
-    } else if (summaryMatch && !currentSummary) {
+    if (parsed.added && currentSummary) {
+      updatedSummary = `${currentSummary}\n• ${parsed.added}`;
+    } else if (parsed.summary && !currentSummary) {
       // Only use SUMMARY: for the initial summary, not after compaction
-      updatedSummary = `• ${summaryMatch[1].trim()}`;
+      updatedSummary = `• ${parsed.summary}`;
     } else if (currentSummary) {
       // LLM didn't produce a match — keep the existing summary (e.g. after compaction)
       updatedSummary = currentSummary;

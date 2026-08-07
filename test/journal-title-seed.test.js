@@ -1,5 +1,6 @@
+import { readFileSync } from 'fs';
 import { describe, it, expect, vi } from 'vitest';
-import { seedJournalTitle, applyFallbackTitle } from '../lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
   it('titles the convo from the workdir basename when no hint is set', async () => {
@@ -186,5 +187,72 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 the real prompt');
+  });
+});
+
+describe('parseTitlePassResponse (Gemini title-pass parsing)', () => {
+  it('parses all four fields from a well-formed response', () => {
+    const parsed = parseTitlePassResponse(
+      'TITLE: plan mode fix\nSUMMARY: Fixed the plan-mode toggle.\nNEW: Added a regression test.\nROSTER: Working on the plan-mode toggle in the bridge.');
+    expect(parsed).toEqual({
+      title: 'plan mode fix',
+      summary: 'Fixed the plan-mode toggle.',
+      added: 'Added a regression test.',
+      roster: 'Working on the plan-mode toggle in the bridge.',
+    });
+  });
+
+  it('captures a multi-line ROSTER through to end-of-text', () => {
+    const parsed = parseTitlePassResponse(
+      'TITLE: search backfill\nROSTER: Backfilling the FTS index.\nCurrently fixing ghost rows.\nNext up is trigger coverage.');
+    expect(parsed.title).toBe('search backfill');
+    expect(parsed.roster).toBe('Backfilling the FTS index.\nCurrently fixing ghost rows.\nNext up is trigger coverage.');
+  });
+
+  it('stops the ROSTER capture at the next KEY: line', () => {
+    // The prompt keeps ROSTER as its last format line, but a model that
+    // reorders fields must not have a later key swallowed into the roster.
+    const parsed = parseTitlePassResponse(
+      'ROSTER: First roster line.\nSecond roster line.\nTITLE: out of order\nNEW: something new');
+    expect(parsed.roster).toBe('First roster line.\nSecond roster line.');
+    expect(parsed.title).toBe('out of order');
+    expect(parsed.added).toBe('something new');
+  });
+
+  it('returns null for absent fields (pre-ROSTER responses keep working)', () => {
+    const parsed = parseTitlePassResponse('TITLE: voice note support\nNEW: Wired the recorder.');
+    expect(parsed.title).toBe('voice note support');
+    expect(parsed.added).toBe('Wired the recorder.');
+    expect(parsed.summary).toBeNull();
+    expect(parsed.roster).toBeNull();
+  });
+
+  it('returns all nulls for garbage and non-string input', () => {
+    expect(parseTitlePassResponse('the model rambled with no keys at all')).toEqual({
+      title: null, summary: null, added: null, roster: null,
+    });
+    expect(parseTitlePassResponse(undefined)).toEqual({
+      title: null, summary: null, added: null, roster: null,
+    });
+  });
+});
+
+describe('title-pass wiring in index.js (source inspection)', () => {
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+
+  it('routes the Gemini response through parseTitlePassResponse', () => {
+    expect(indexSrc).toMatch(/const parsed = parseTitlePassResponse\(text\);/);
+  });
+
+  it('asks for ROSTER as the last format line of both prompt variants', () => {
+    // Two prompt variants, each ending its Format: block with the ROSTER
+    // line — the parser's multi-line capture would swallow any field
+    // placed after it.
+    const rosterFormatLines = indexSrc.match(/\\nROSTER: <2-3 sentences[^>]*>\\n\\nNo quotes\./g) || [];
+    expect(rosterFormatLines.length).toBe(2);
+  });
+
+  it('upserts the roster to the journal, sliced to the protocol cap', () => {
+    expect(indexSrc).toMatch(/journalUpsertConvo\(session, \{ summary: parsed\.roster\.slice\(0, 1000\) \}\);/);
   });
 });
