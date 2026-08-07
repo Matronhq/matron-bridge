@@ -1713,8 +1713,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // a zero-turn session id used to respawn `claude --resume <never-written>`
   // (exit 1) forever. Demotion spawns a fresh TUI on the same id instead —
   // nothing to resume means nothing to lose.
+  // presetId matters here for the same reason it does in the print spawn: a
+  // print->interactive switch on an unconfirmed session passes no resume id
+  // (recreateSession's preInitPrint), so without it this would mint a fresh
+  // uuid and the room would silently change claude session id mid-switch —
+  // against the "keeping the convo/journal identity" the caller promises.
   const identity = planSessionIdentity({
-    resumeSessionId, mintId: randomUUID,
+    resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
   const sessionId = identity.sessionId;
@@ -5891,20 +5896,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
         break;
       }
-      // Zero-turn print chat: nothing has confirmed the transcript exists, so
-      // the interactive switch below would be refused by planModeSwitch's
-      // provisional-session gate — but its "try /mode again in a moment"
-      // wording is a dead end here (a chat nobody messages never confirms;
-      // the /logout-crash-loop bug started as exactly this switch sneaking
-      // through). Say what actually unblocks the flow instead. Busy is
-      // excluded (Bugbot, PR #173): a first turn in flight means a message
-      // WAS sent and confirmation is seconds away — "send any message first"
-      // would gaslight that user, so let planModeSwitch's busy gate answer
-      // with "finish or interrupt the current turn" instead.
-      if (session.agent === AGENT_CLAUDE && !session._sessionConfirmed && !session.busy) {
-        await sendReply(`/${cmdWord} needs a conversation that has started — this chat hasn't had a reply yet. Send any message first, then /${cmdWord}.`);
-        break;
-      }
+      // A zero-turn print chat used to be turned away here with "send any
+      // message first": planModeSwitch refused to switch an unconfirmed session
+      // to interactive, so the flow had nowhere to go. That refusal is gone —
+      // recreateSession demotes the unresumable id to a fresh spawn on the same
+      // id — and this guard has to go with it, because "say hi first" is worst
+      // exactly when it bites hardest: a box whose Claude is not logged in
+      // CANNOT complete a turn, so the one instruction we gave was one the user
+      // could not follow. /login is now a legitimate first thing to say.
+      //
       // Print mode: one concise announcement covering the whole flow — the
       // mode switch is an implementation detail, so don't narrate it in two
       // separate messages. On refusal (busy, mid-resume, no session id yet)
@@ -8146,11 +8146,12 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const sessionId = existing.claudeSessionId;
   // PR #151's pre-init resume gate, extended to this shared teardown path:
   // --resume only a session Claude actually persisted (confirmed on init,
-  // session._sessionConfirmed). The /model and /mode planners already refuse
-  // unconfirmed print sessions before calling here, but !restart doesn't — a
-  // restart during the pre-init window would --resume an id Claude never
-  // wrote, which fails ("No conversation found") and terminates the
-  // conversation. Respawn with the SAME id via --session-id (presetSessionId
+  // session._sessionConfirmed). !restart, and now /mode and /login too, can
+  // all arrive here with an unconfirmed print session — planModeSwitch used to
+  // refuse those, until refusing them turned out to be what made /login
+  // impossible on a box that was not logged in. Resuming one would --resume an
+  // id Claude never wrote, which fails ("No conversation found") and terminates
+  // the conversation. Respawn with the SAME id via --session-id (presetSessionId
   // below) instead, keeping the convo/journal identity for a clean fresh
   // spawn. Print-mode Claude only: iv sessions confirm via camel-case
   // transcript records and Codex never sets the flag, so gating either would

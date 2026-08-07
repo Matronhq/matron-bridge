@@ -102,10 +102,29 @@ describe('planModeSwitch', () => {
     expect(d.ok).toBe(true);
     expect(d.message).toMatch(/interactive/i);
   });
-  it('refuses switching a provisional (unconfirmed) print session to interactive', () => {
+  // Used to be refused ("the session is still starting up"), which is what
+  // made /login impossible as the first thing you say to a new chat — and a
+  // box whose Claude is not logged in can never complete the turn that would
+  // confirm the session, so the refusal was unescapable. Safe to allow:
+  // recreateSession's preInitPrint branch respawns on the same id with
+  // --session-id instead of --resume.
+  it('approves switching a provisional (unconfirmed) print session to interactive', () => {
     const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: false }, true);
-    expect(d.ok).toBe(false);
-    expect(d.message).toMatch(/starting up/i);
+    expect(d.ok).toBe(true);
+    expect(d.provisional).toBe(true);
+  });
+  it('does not promise preserved history for a provisional switch (there is none)', () => {
+    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: false }, true);
+    expect(d.message).not.toMatch(/history preserved/i);
+    const confirmed = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: true }, true);
+    expect(confirmed.message).toMatch(/history preserved/i);
+    expect(confirmed.provisional).toBe(false);
+  });
+  // The gates that must still bite — an unconfirmed session is allowed
+  // through, but only once it actually has an id and is not mid-turn.
+  it('still refuses a provisional switch while busy or before an id exists', () => {
+    expect(planModeSwitch({ iv: null, busy: true, claudeSessionId: 'abc', _sessionConfirmed: false }, true).ok).toBe(false);
+    expect(planModeSwitch({ iv: null, busy: false, claudeSessionId: null, _sessionConfirmed: false }, true).ok).toBe(false);
   });
   it('does NOT gate an iv session on _sessionConfirmed (iv confirms via a different path)', () => {
     // iv->print: current is interactive, so the print-provisional gate is skipped
@@ -247,9 +266,13 @@ describe('createSession id pre-assignment (source inspection)', () => {
     const guards = src.match(/transcriptExists: \(id\) => fs\.existsSync\(transcriptPathFor\(cwd, id\)\)/g) || [];
     expect(guards.length).toBe(2);
   });
-  it('the print spawn helper threads presetSessionId into planSessionIdentity (once, print-only)', () => {
+  // Both spawn paths, not just print: a print->interactive switch on an
+  // unconfirmed session reaches the iv spawn with no resume id, so without
+  // presetId there it would mint a new uuid and change the room's claude
+  // session id mid-switch — exactly what recreateSession says it preserves.
+  it('both spawn helpers thread presetSessionId into planSessionIdentity', () => {
     const calls = src.match(/planSessionIdentity\(\{\s*resumeSessionId,\s*presetId: options\.presetSessionId/g) || [];
-    expect(calls.length).toBe(1);
+    expect(calls.length).toBe(2);
   });
   it('the print auto-restart uses claudeSessionId only when confirmed, presetSessionId otherwise', () => {
     const resumeGates = src.match(/session\._sessionConfirmed \? session\.claudeSessionId : null/g) || [];
@@ -262,19 +285,25 @@ describe('createSession id pre-assignment (source inspection)', () => {
     expect(inits.length).toBe(1);
     expect(src).not.toMatch(/_sessionConfirmed: !!resumeSessionId/);
   });
-  it('the zero-turn /login//logout guard yields to the busy refusal when a first turn is in flight (Bugbot, PR #173)', () => {
-    // Busy + unconfirmed means a message WAS sent — "send any message first"
-    // would be wrong, so the guard must exclude busy and let planModeSwitch's
-    // busy gate ("finish or interrupt the current turn") answer instead.
-    expect(src).toMatch(/if \(session\.agent === AGENT_CLAUDE && !session\._sessionConfirmed && !session\.busy\) \{\s*\n\s*await sendReply\(`\/\$\{cmdWord\} needs a conversation that has started/);
+  it('/login no longer demands a first message before it will run', () => {
+    // The "send any message first" guard is gone: planModeSwitch now approves
+    // the provisional switch, so a zero-turn chat reaches the mode switch on
+    // its own. It has to stay gone — an unauthenticated box cannot complete
+    // the turn the old message asked for, which made /login unreachable
+    // precisely when it was the only thing that would help (jack, dev-j).
+    expect(src).not.toMatch(/needs a conversation that has started/);
+    // Busy is still handled, now by planModeSwitch's own refusal rather than
+    // by an exclusion in a guard that no longer exists (Bugbot, PR #173).
+    expect(src).not.toMatch(/!session\._sessionConfirmed && !session\.busy/);
   });
 
   // PR #151 follow-up: !restart goes through recreateSession, which passed
   // existing.claudeSessionId as the resume id UNCONDITIONALLY — a !restart
   // during the pre-init window hit the exact never-written-id --resume
-  // failure the auto-restart path guards. The /model and /mode planners
-  // refuse unconfirmed sessions before calling recreateSession, so the gate
-  // inside it only changes the !restart path.
+  // failure the auto-restart path guards. This gate now carries /mode and
+  // /login as well: since planModeSwitch stopped refusing unconfirmed print
+  // sessions, the demotion below is the only thing keeping those two off a
+  // --resume that cannot work.
   it('recreateSession gates the pre-init respawn on _sessionConfirmed, print-mode Claude only', () => {
     // Unconfirmed print → no resume id, same id threaded as presetSessionId
     // (--session-id). Confirmed (or iv / Codex, which never set the flag) →
