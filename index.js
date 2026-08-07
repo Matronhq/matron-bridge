@@ -3,6 +3,7 @@ dotenv.config({ override: true });
 import { spawn } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
+import { createSendAttachmentHandler } from './lib/send-attachment.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -35,7 +36,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 // formatDuration aliased: index.js has its own uptime formatDuration (no
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
-import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton } from './lib/timer-command.js';
+import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton } from './lib/timer-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
@@ -66,6 +67,7 @@ import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
+import { isCompactCommand, compactBatchSize } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
@@ -1587,20 +1589,42 @@ function handleCodexEvent(session, event) {
 
 function flushPendingSessionQueue(session) {
   if (!session.alive || !session.queuedMessages?.length) return false;
-  const queued = session.queuedMessages;
+  const queue = session.queuedMessages;
+  const notifications = session.queueNotifications || [];
+  // A queued /compact is flushed ALONE, ahead of everything else
+  // (lib/compact-priority.js). batchSize is the whole queue in every other
+  // case, so the non-compact path is byte-for-byte what it always was.
+  const batchSize = compactBatchSize(queue);
+  const queued = queue.slice(0, batchSize);
+  const deferred = queue.slice(batchSize);
+  // Snapshot before detaching: snapshotQueuedReleaseBatch reads the batch's
+  // notifications off session.queueNotifications as a prefix slice, which is
+  // exactly what the batch is.
   const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
-  session.queuedMessages = null;
+  session.queuedMessages = deferred.length ? deferred : null;
   const summary = formatQueueSummary(queued);
+  // Nothing deferred: the familiar "sending N queued messages" list. Deferred:
+  // say WHY the rest didn't go, or the held messages read as swallowed. They
+  // need no nudge to be delivered — the compaction run is its own print-mode
+  // turn, and its `result` event lands right back here (see the result handler
+  // and onTurnEnd, both of which call this function once busy clears).
+  const plainMsg = deferred.length
+    ? `📬 Sending /compact first — the other ${deferred.length} queued message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
+    : `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`;
+  const htmlMsg = deferred.length
+    ? `<b>📬 Sending /compact first</b> — the other ${deferred.length} queued message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
+    : `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`;
   if (session.sendHtml) {
-    session.sendHtml(
-      `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
-      `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
-    );
+    session.sendHtml(plainMsg, htmlMsg);
   } else if (session.sendCallback) {
-    session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
+    session.sendCallback(plainMsg);
   }
   const sent = flushQueue(session, queued, releaseSnapshot);
-  if (sent === true) clearQueueNotifications(session);
+  // Only the flushed batch's notifications retire; the deferred entries keep
+  // theirs, in lockstep with the queue they still describe. A failed flush
+  // keeps all of them, exactly as before — flushQueue's restoreQueuedBatch has
+  // already prepended the batch back onto session.queuedMessages.
+  if (sent === true) session.queueNotifications = notifications.slice(batchSize);
   return sent;
 }
 
@@ -4096,6 +4120,17 @@ function snapshotQueuedReleaseBatch(session, queued) {
   };
 }
 
+// The prefix of session.queuedMessages the NEXT flush will actually send —
+// the whole queue normally, or just a leading /compact when one is jumping
+// (lib/compact-priority.js). Every release-registry seam has to be scoped to
+// that batch: handed the whole queue instead, finalizeSentQueue would emit
+// `send` releases for messages still sitting in the queue, retiring their
+// cards while they wait for the compaction to finish.
+function pendingFlushBatch(session) {
+  const queue = session.queuedMessages || [];
+  return queue.slice(0, compactBatchSize(queue));
+}
+
 function queueReleaseForBatch(session, queued) {
   const itemIds = queuedReleaseItemIds(session, queued);
   return {
@@ -5976,10 +6011,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           `⏰ Timer #${record.id} set — will send "${parsed.message}" in ${formatTimerDuration(parsed.delayMs)} (at ${at}). ` +
           `It survives session restarts and idle reaping.`;
         if (session.sendButtonMessage) {
-          // Confirmation card with a Cancel button. The tap round-trips as a
-          // seq-proven picker reply (timer:cancel:<id> -> lib/picker-dispatch.js
-          // -> cancelTimerFromButton); /timer cancel <id> stays the typed path.
-          await session.sendButtonMessage(summary, [timerCancelButton(record.id)], 'pick_one', summary, escapeHtml(summary));
+          // Confirmation card with Send-now + Cancel buttons. Taps round-trip
+          // as seq-proven picker replies (timer:send:<id> / timer:cancel:<id>
+          // -> lib/picker-dispatch.js -> sendTimerNowFromButton /
+          // cancelTimerFromButton); /timer cancel <id> stays the typed path.
+          await session.sendButtonMessage(
+            summary,
+            [timerSendNowButton(record.id), timerCancelButton(record.id)],
+            'pick_one', summary, escapeHtml(summary));
         } else {
           await sendReply(`${summary} /timer lists, /timer cancel ${record.id} cancels.`);
         }
@@ -6315,10 +6354,7 @@ async function journalRouteTextToSession(session, body) {
       flushQueue,
       stripQueueNotificationLinks: clearQueueNotifications,
       editMessage: null,
-      queueRelease: queueReleaseForBatch(
-        session,
-        session.queuedMessages || [],
-      ),
+      queueRelease: queueReleaseForBatch(session, pendingFlushBatch(session)),
       convoId: journalConvoIdFor(session),
       emitRelease,
     });
@@ -6328,7 +6364,16 @@ async function journalRouteTextToSession(session, body) {
     // already has this text as the client's own send row, and re-mirroring
     // on flush would show a duplicate in Matron (see lib/queue-flush.js).
     if (!session.queuedMessages) session.queuedMessages = [];
-    session.queuedMessages.push(markJournalOrigin([{ type: 'text', text: trimmed }]));
+    // /compact jumps the queue and travels alone (lib/compact-priority.js).
+    // Unshifting is what makes the jump real, and it also gives the flush side
+    // its invariant: a queued compact is always at index 0, so the batch stays
+    // a PREFIX of the queue and queuedMessages/queueNotifications keep
+    // splitting on the same slice. `//compact` escapes this and queues as
+    // ordinary text, same as everywhere else.
+    const compactJump = isCompactCommand(trimmed);
+    const entry = markJournalOrigin([{ type: 'text', text: trimmed }]);
+    if (compactJump) session.queuedMessages.unshift(entry);
+    else session.queuedMessages.push(entry);
     // Post the SAME "📨 Queued" tile a Matrix-origin queue gets (shared
     // notifyQueuedMessage, lib/busy-queue.js). Until this call existed a
     // Matron send queued silently — session.sendButtonMessage both posts
@@ -6343,6 +6388,7 @@ async function journalRouteTextToSession(session, body) {
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText: trimmed,
+      compactJump,
     });
     return;
   }
@@ -6555,11 +6601,13 @@ function journalOnPromptReply(session, answer, { username }) {
       stripQueueNotificationLinks: clearQueueNotifications,
       entry: queuedRelease.entry,
       convoId,
-      queueRelease: queueReleaseForBatch(
-        session,
-        session.queuedMessages || [],
-      ),
+      queueRelease: queueReleaseForBatch(session, pendingFlushBatch(session)),
       emitRelease,
+      // A tap has no reply text of its own — the durable queued_release
+      // prompt_reply is the record. The one thing it can't express is "I sent
+      // only the /compact and held the rest", so a compact split says that
+      // out loud rather than leaving the other cards silently un-actioned.
+      notify: (message) => journalPublishNotice(convoId, message),
     });
     return;
   }
@@ -6588,6 +6636,7 @@ function journalOnPromptReply(session, answer, { username }) {
       switchEffortInSession,
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
+      sendTimerNow: sendTimerNowFromButton,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
     });
@@ -6751,6 +6800,20 @@ function cancelTimerFromButton(session, timerId, sendReply) {
     return;
   }
   sendReply(`🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`);
+}
+
+// A tap on the same card's Send-now button (value timer:send:<id>): deliver
+// the scheduled message immediately instead of waiting out the delay. The
+// store's fireNow routes through the SAME fire path as a natural expiry, so
+// delivery gets the "⏰ Timer #N: sending …" notice and the auto-resume
+// behavior for free — no extra success reply needed here. Only the
+// nothing-matched case (already fired / cancelled elsewhere) speaks.
+function sendTimerNowFromButton(session, timerId, sendReply) {
+  const convoId = journalConvoIdFor(session);
+  const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;
+  if (!fired) {
+    sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
+  }
 }
 
 // Assembled once, after every dependency above is defined, and invoked from
@@ -6981,6 +7044,12 @@ const pendingPlanDecisions = new Map();
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
+const handleSendAttachment = createSendAttachmentHandler({
+  sessions,
+  publisher: journalPublisher,
+  journalConvoIdFor,
+});
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -7078,6 +7147,14 @@ const apiServer = createServer(async (req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId }));
+        return;
+      }
+
+      if (url.pathname === '/send-attachment') {
+        const { status, body: resBody } = await handleSendAttachment(data);
+        debug(`send-attachment ${status} ${data?.path} ${resBody.kind || resBody.error || ''}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
         return;
       }
 
@@ -7212,21 +7289,32 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'No active session for this room' }));
           return;
         }
-        const queued = session.queuedMessages || [];
+        // Same compact-first split as every other flush path (see
+        // flushPendingSessionQueue): a leading /compact goes out alone even
+        // though this endpoint asked for the whole queue.
+        const queue = session.queuedMessages || [];
+        const notifications = session.queueNotifications || [];
+        const batchSize = compactBatchSize(queue);
+        const queued = queue.slice(0, batchSize);
+        const deferred = queue.slice(batchSize);
         const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
-        session.queuedMessages = null;
+        session.queuedMessages = deferred.length ? deferred : null;
         let sent = true;
         if (queued.length > 0) {
           const summary = formatQueueSummary(queued);
+          const plainMsg = deferred.length
+            ? `⚡ Sending /compact now — the other ${deferred.length} message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
+            : `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
           if (session.sendHtml) {
-            const plainMsg = `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
-            const htmlMsg = `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
+            const htmlMsg = deferred.length
+              ? `<b>⚡ Sending /compact now</b> — the other ${deferred.length} message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
+              : `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
             session.sendHtml(plainMsg, htmlMsg);
           } else if (session.sendCallback) {
-            session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
+            session.sendCallback(plainMsg);
           }
           sent = flushQueue(session, queued, releaseSnapshot);
-          if (sent === true) clearQueueNotifications(session);
+          if (sent === true) session.queueNotifications = notifications.slice(batchSize);
         }
         if (sent === true) {
           res.writeHead(200);

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   parseDuration, formatDuration, parseTimerCommand, createTimerStore,
-  timerCancelButton, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
+  timerCancelButton, timerSendNowButton, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
 } from '../lib/timer-command.js';
 
 describe('parseDuration', () => {
@@ -86,11 +86,21 @@ describe('timerCancelButton', () => {
   it('emits the picker-convention shape the router and dispatcher key on', () => {
     // id prefix `timer-` -> non-answerable frame (journal-input-router
     // PICKER_OPTION_ID); value -> what a Matron tap sends back as the
-    // prompt_reply choice (picker-dispatch TIMER_CANCEL_ARG).
+    // prompt_reply choice (picker-dispatch TIMER_ARG).
     expect(timerCancelButton(12)).toEqual({
       id: 'timer-cancel-12',
       label: '🚫 Cancel timer',
       value: 'timer:cancel:12',
+    });
+  });
+});
+
+describe('timerSendNowButton', () => {
+  it('emits the same picker-convention shape with the send verb', () => {
+    expect(timerSendNowButton(12)).toEqual({
+      id: 'timer-send-12',
+      label: '📤 Send now',
+      value: 'timer:send:12',
     });
   });
 });
@@ -180,6 +190,26 @@ describe('createTimerStore', () => {
 
     h.tick(60_000);
     expect(fired).toEqual(['keep']); // cancelled handles were cleared
+  });
+
+  it('fireNow delivers immediately, convo-scoped, removing the record and its handle', () => {
+    const fired = [];
+    const h = makeStore({ onFire: (r) => fired.push(r.text) });
+    const a = h.store.add({ convoId: 'c1', text: 'a', delayMs: 60_000 });
+    h.store.add({ convoId: 'c2', text: 'other', delayMs: 60_000 });
+
+    expect(h.store.fireNow('c2', a.id)).toBeNull(); // wrong convo can't fire it
+    expect(fired).toEqual([]);
+
+    expect(h.store.fireNow('c1', a.id)).toEqual(expect.objectContaining({ id: a.id, text: 'a' }));
+    expect(fired).toEqual(['a']);
+    // Removed + persisted (same fire path as natural expiry) — the armed
+    // timeout was cleared, so ticking past the original delay can't
+    // double-fire, and a repeat tap finds nothing.
+    expect(h.saves.at(-1).timers.map(t => t.text)).toEqual(['other']);
+    expect(h.store.fireNow('c1', a.id)).toBeNull();
+    h.tick(60_000);
+    expect(fired).toEqual(['a', 'other']);
   });
 
   it('ids keep incrementing across cancels (no renumbering races)', () => {

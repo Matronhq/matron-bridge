@@ -847,6 +847,206 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
   });
 });
 
+// A queued /compact is flushed ALONE and ahead of everything else
+// (lib/compact-priority.js). Merging it into the one-message batch the queue
+// normally becomes makes Claude read the following messages as *compaction
+// instructions*, so the split has to hold on every flush path — including the
+// ones where the user explicitly asked for the whole queue.
+describe('compact-first batch split', () => {
+  function compactSession() {
+    return makeSession({
+      queuedMessages: [
+        [{ type: 'text', text: '/compact' }],
+        [{ type: 'text', text: 'first' }],
+        [{ type: 'text', text: 'second' }],
+      ],
+      queueNotifications: [
+        { eventId: '$evC', plain: '📨 Queued: /compact', id: 'pr_c::0' },
+        { eventId: '$ev1', plain: '📨 Queued (2): first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: '📨 Queued (3): second', id: 'pr_2::0' },
+      ],
+    });
+  }
+
+  it('typed send flushes only the compact and holds the rest in lockstep', async () => {
+    const session = compactSession();
+    const deps = journalDeps();
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
+    expect(deps.flushQueue.mock.calls[0][1]).toEqual([[{ type: 'text', text: '/compact' }]]);
+    // Queue and notifications shrink by the same one entry, still aligned.
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: 'first' }],
+      [{ type: 'text', text: 'second' }],
+    ]);
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_1::0', 'pr_2::0']);
+  });
+
+  it('typed send says where the held messages went', async () => {
+    const session = compactSession();
+    const deps = journalDeps();
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    const reply = deps.sendReply.mock.calls[0][0];
+    expect(reply).toContain('/compact');
+    expect(reply).toContain('other 2 messages');
+    expect(reply).toContain('once compaction finishes');
+  });
+
+  it('a failed flush puts the compact back at the front, still ahead of the queue', async () => {
+    const session = compactSession();
+    const deps = journalDeps({ flushQueue: vi.fn(() => false) });
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    // flushQueue's own restoreQueuedBatch is what re-prepends the entry; the
+    // notification half is this module's job and must match it.
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_c::0', 'pr_1::0', 'pr_2::0']);
+  });
+
+  it('a card tap sends only the compact and notifies about the rest', () => {
+    const session = compactSession();
+    const flushQueue = vi.fn(() => true);
+    const notify = vi.fn();
+    const handled = resolveQueueReleaseTap('send', session, {
+      flushQueue,
+      stripQueueNotificationLinks: (s) => { s.queueNotifications = []; },
+      entry: { prompt_id: 'pr_c', itemIds: ['pr_c::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify,
+    });
+
+    expect(handled).toBe(true);
+    expect(flushQueue.mock.calls[0][1]).toEqual([[{ type: 'text', text: '/compact' }]]);
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_1::0', 'pr_2::0']);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain('other 2 messages');
+  });
+
+  it('tapping a NON-compact card still sends the compact first — the merge is what corrupts it', () => {
+    const session = compactSession();
+    const flushQueue = vi.fn(() => true);
+    const handled = resolveQueueReleaseTap('send', session, {
+      flushQueue,
+      entry: { prompt_id: 'pr_2', itemIds: ['pr_2::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify: vi.fn(),
+    });
+
+    expect(handled).toBe(true);
+    expect(flushQueue.mock.calls[0][1]).toEqual([[{ type: 'text', text: '/compact' }]]);
+  });
+
+  it('leaves an ordinary queue completely alone — one merged batch, nothing held', async () => {
+    const session = makeSession();
+    const deps = journalDeps();
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(deps.flushQueue.mock.calls[0][1]).toHaveLength(2);
+    expect(session.queuedMessages).toBe(null);
+    expect(deps.sendReply.mock.calls[0][0]).toContain('Sending 2 queued messages now');
+  });
+
+  it('a compact alone in the queue flushes exactly like any single message', async () => {
+    const session = makeSession({
+      queuedMessages: [[{ type: 'text', text: '/compact' }]],
+      queueNotifications: [{ eventId: '$evC', plain: '📨 Queued (1): /compact', id: 'pr_c::0' }],
+    });
+    const deps = journalDeps();
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(deps.flushQueue.mock.calls[0][1]).toHaveLength(1);
+    expect(session.queuedMessages).toBe(null);
+    expect(deps.sendReply.mock.calls[0][0]).toContain('Sending 1 queued message now');
+  });
+
+  it('still clears stale notifications when the queue is empty', async () => {
+    const session = makeSession({
+      queuedMessages: null,
+      queueNotifications: [{ eventId: '$stale', plain: '📨 Queued (1): gone', id: 'pr_x::0' }],
+    });
+    const deps = journalDeps();
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(session.queueNotifications).toEqual([]);
+    expect(deps.sendReply.mock.calls[0][0]).toBe('⚡ No queued messages to send.');
+  });
+});
+
+describe('notifyQueuedMessage — compact jump tile', () => {
+  it('announces the jump and how many messages are waiting behind it', async () => {
+    const session = {
+      queuedMessages: [
+        [{ type: 'text', text: '/compact' }],
+        [{ type: 'text', text: 'first' }],
+        [{ type: 'text', text: 'second' }],
+      ],
+      queueNotifications: [
+        { eventId: '$ev1', plain: '📨 Queued (1): first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: '📨 Queued (2): second', id: 'pr_2::0' },
+      ],
+    };
+    const sendReply = vi.fn(async () => '$evC');
+    await notifyQueuedMessage(session, '/compact', {
+      sendReply,
+      queueRelease: { noteQueued: vi.fn() },
+      convoId: 'convo-1',
+      compactJump: true,
+    });
+
+    const posted = sendReply.mock.calls[0][0];
+    expect(posted).toContain('jumping ahead of 2 queued messages');
+    expect(posted).toContain('once compaction finishes');
+    // The notification lands at the FRONT, matching where the entry was
+    // unshifted — the arrays are read positionally against each other.
+    expect(session.queueNotifications.map(n => n.plain)[0]).toBe(posted);
+    expect(session.queueNotifications).toHaveLength(3);
+  });
+
+  it('says nothing about jumping when the compact is the only queued message', async () => {
+    const session = { queuedMessages: [[{ type: 'text', text: '/compact' }]], queueNotifications: [] };
+    const sendReply = vi.fn(async () => '$evC');
+    await notifyQueuedMessage(session, '/compact', {
+      sendReply,
+      queueRelease: { noteQueued: vi.fn() },
+      convoId: 'convo-1',
+      compactJump: true,
+    });
+
+    expect(sendReply.mock.calls[0][0]).toBe('📨 Queued (1): /compact');
+  });
+
+  it('gives the jumping card single-message labels — a tap sends only the compact', async () => {
+    const session = {
+      queuedMessages: [
+        [{ type: 'text', text: '/compact' }],
+        [{ type: 'text', text: 'first' }],
+      ],
+      queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): first', id: 'pr_1::0' }],
+      sendButtonMessage: vi.fn(async () => '$evC'),
+    };
+    await notifyQueuedMessage(session, '/compact', {
+      sendReply: vi.fn(async () => '$evC'),
+      queueRelease: { noteQueued: vi.fn() },
+      convoId: 'convo-1',
+      compactJump: true,
+    });
+
+    const payload = session.sendButtonMessage.mock.calls[0][5];
+    expect(payload.actions.map(a => a.label)).toEqual(['⚡ Send now', '✕ Cancel']);
+    // Ids and values are untouched, so shipped clients route the card exactly
+    // as they always have.
+    expect(payload.actions.map(a => a.id)).toEqual(['send', 'cancel']);
+    expect(payload.options.map(o => o.value)).toEqual(['send', 'cancel']);
+    expect(payload.question).toContain('other 1 queued message will be sent once compaction finishes');
+  });
+});
+
 describe('queued-release publisher wiring', () => {
   it('emitRelease publishes exactly one structured prompt_reply per call', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
@@ -1060,11 +1260,57 @@ describe('index.js /interrupt endpoint — flush status (source inspection)', ()
 describe('index.js journal busy caller — queued-tile notification wiring (source inspection)', () => {
   it('the journal busy branch posts the tile via notifyQueuedMessage with the journal ctx sink', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('session.queuedMessages.push(markJournalOrigin(');
+    const start = src.indexOf('const entry = markJournalOrigin([{ type: \'text\', text: trimmed }]);');
     expect(start).toBeGreaterThan(-1);
-    const window = src.slice(start, start + 800);
+    const window = src.slice(start, start + 1200);
     expect(window).toMatch(/notifyQueuedMessage\(session, preview, \{/);
     expect(window).toMatch(/sendReply: ctx\.sendReply/);
+  });
+
+  // The jump is only real if the entry AND its notification move to the front
+  // together — the two arrays are read positionally against each other, so a
+  // queue-front entry with an end-of-list notification mis-targets every later
+  // cancel and every release finalization.
+  it('a compact command unshifts the entry and flags the tile so its notification unshifts too', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('const compactJump = isCompactCommand(trimmed);');
+    expect(start).toBeGreaterThan(-1);
+    const window = src.slice(start, start + 1200);
+    expect(window).toMatch(/if \(compactJump\) session\.queuedMessages\.unshift\(entry\);/);
+    expect(window).toMatch(/else session\.queuedMessages\.push\(entry\);/);
+    expect(window).toMatch(/compactJump,/);
+  });
+});
+
+// The turn-end flush lives in index.js and can't be imported, so its half of
+// the compact-first rule is pinned by source inspection — the same technique
+// the other index.js wiring pins in this file use.
+describe('index.js flushPendingSessionQueue — compact-first split (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const start = src.indexOf('function flushPendingSessionQueue(session) {');
+  const body = src.slice(start, src.indexOf('\n}\n', start));
+
+  it('splits the batch off the front of the queue', () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(body).toMatch(/const batchSize = compactBatchSize\(queue\)/);
+    expect(body).toMatch(/const queued = queue\.slice\(0, batchSize\)/);
+    expect(body).toMatch(/const deferred = queue\.slice\(batchSize\)/);
+  });
+
+  it('leaves the held entries queued rather than dropping them', () => {
+    expect(body).toMatch(/session\.queuedMessages = deferred\.length \? deferred : null/);
+  });
+
+  // The old code cleared queueNotifications wholesale on success. With a
+  // partial flush that would strand the deferred entries' cards, breaking the
+  // positional alignment every later cancel and finalization depends on.
+  it('retires only the flushed batch\'s notifications', () => {
+    expect(body).toMatch(/if \(sent === true\) session\.queueNotifications = notifications\.slice\(batchSize\)/);
+  });
+
+  it('tells the user the rest is waiting on the compaction', () => {
+    expect(body).toMatch(/Sending \/compact first/);
+    expect(body).toMatch(/once compaction finishes/);
   });
 });
 
