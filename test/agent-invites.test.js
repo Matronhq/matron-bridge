@@ -224,33 +224,65 @@ describe('createAgentInvites', () => {
       await expect(p1).resolves.toEqual({ kind: 'left' });
     });
 
-    it('after any stamped error, an UNSTAMPED error settles NOTHING (sticky journalStampsRoomIds)', async () => {
-      // A stamping journal stamps every correlatable error, so an unstamped
-      // one is uncorrelatable — the pre-fix scan would have failed r1 here
-      // (arm order), a false terminal outcome for the wrong room.
+    it('an UNSTAMPED error settles NOTHING while TWO rooms are armed for that ref (ambiguous)', async () => {
+      // Eviction fires a BATCH of agent_leave ops. With two waiters armed for
+      // the same ref an unstamped error names neither, and picking the first
+      // is a coin flip whose wrong side is a false terminal 'left' on a room
+      // that is still joined. Both must run out their own clocks instead.
       vi.useFakeTimers();
       const { inv } = makeInvites();
       const p1 = inv.leave({ roomId: 'r1' });
       const p2 = inv.leave({ roomId: 'r2' });
-      const p3 = inv.leave({ roomId: 'r3' });
-      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'r3 failed', roomId: 'r3' });
-      await expect(p3).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'r3 failed' });
       inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'mystery' });
       await vi.advanceTimersByTimeAsync(5_000);
       await expect(p1).resolves.toEqual({ kind: 'left' });
       await expect(p2).resolves.toEqual({ kind: 'left' });
     });
 
-    it('the sticky flag is journal-level, not ref-level: a stamped invite error mutes a later unstamped leave error', async () => {
+    it('an UNSTAMPED error still settles the ONE room left armed after a stamped error (no capability latch)', async () => {
+      // The rule is AMBIGUITY, not journal capability. A stamped frame proves
+      // nothing about the next frame, so once the batch narrows to a single
+      // armed room the fallback must still correlate — otherwise a journal
+      // that stops stamping (a rollback) turns every leave/accept error into
+      // a silent success for the rest of the process.
       vi.useFakeTimers();
       const { inv } = makeInvites();
-      const pInv = inv.invite({ roomId: 'rA', targetDeviceId: 7, justification: 'j' });
-      inv.onOpError({ code: 'offline', ref: 'agent_invite', detail: 'peer offline', roomId: 'rA' });
-      await expect(pInv).resolves.toEqual({ kind: 'error', code: 'offline', detail: 'peer offline' });
-      const pLeave = inv.leave({ roomId: 'rB' });
-      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'mystery' });
+      const p1 = inv.leave({ roomId: 'r1' });
+      const p2 = inv.leave({ roomId: 'r2' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'r1 failed', roomId: 'r1' });
+      await expect(p1).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'r1 failed' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'r2 failed' });
+      // Advance before asserting so an unsettled p2 reads as a 'left' diff
+      // rather than a hung test.
       await vi.advanceTimersByTimeAsync(5_000);
-      await expect(pLeave).resolves.toEqual({ kind: 'left' });
+      await expect(p2).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'r2 failed' });
+    });
+
+    it('ambiguity is counted per REF: a waiter of another family is not a second match', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const pLeave = inv.leave({ roomId: 'r1' });
+      const pAnswer = inv.answerAwait({ roomId: 'r2', accept: true });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'not a joined participant' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(pLeave).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'not a joined participant' });
+      await expect(pAnswer).resolves.toEqual({ kind: 'answered' });
+    });
+
+    it('an unstamped agent_invite_answer error cannot settle another room\'s in-flight ACCEPT', async () => {
+      // Refuse stays fire-and-forget, so a refusal the journal rejects raises
+      // an op error with no waiter of its own. Widening the ref allow-list let
+      // that frame reach the fallback; the exactly-one rule keeps it from
+      // stealing an unrelated accept (which would falsely expire that room).
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p1 = inv.answerAwait({ roomId: 'r1', accept: true });
+      const p2 = inv.answerAwait({ roomId: 'r2', accept: true });
+      inv.answer({ roomId: 'r3', peerDeviceId: null, accept: false, reason: 'busy' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_invite_answer', detail: 'no such invite' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p1).resolves.toEqual({ kind: 'answered' });
+      await expect(p2).resolves.toEqual({ kind: 'answered' });
     });
   });
 
@@ -385,11 +417,39 @@ describe('createAgentInvites', () => {
     });
 
     it('answerAwait: sendRoomOp false resolves journal_unreachable and cancels the armed waiter', async () => {
-      const { inv } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      vi.useFakeTimers();
+      let sendOk = false;
+      const { inv } = makeInvites({ sendRoomOp: vi.fn(() => sendOk) });
       await expect(inv.answerAwait({ roomId: 'r1', accept: true }))
         .resolves.toEqual({ kind: 'error', code: 'journal_unreachable' });
-      // The abandoned waiter was cancelled: a late error settles into nothing.
-      expect(() => inv.onOpError({ code: 'conflict', ref: 'agent_invite_answer', detail: 'late', roomId: 'r1' })).not.toThrow();
+      // The abandoned r1 waiter was cancelled, so it is not a GHOST second
+      // match under the exactly-one rule: the next unstamped error still
+      // correlates to the one genuinely in-flight accept. Leave the ghost
+      // armed and r2 goes ambiguous — it would report 'answered' for an
+      // accept the journal actually rejected, and join a dead room.
+      sendOk = true;
+      const p2 = inv.answerAwait({ roomId: 'r2', accept: true });
+      inv.onOpError({ code: 'conflict', ref: 'agent_invite_answer', detail: 'invite expired' });
+      // Advance first so an unsettled p2 resolves to its 'answered' timeout
+      // and the failure reads as a diff rather than a hung test.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p2).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'invite expired' });
+    });
+
+    it('answerAwait arms its error waiter BEFORE the send, so a synchronously-drained error still lands', async () => {
+      vi.useFakeTimers();
+      let inv;
+      // The socket can drain the journal's reply into onOpError inside the
+      // same tick as the write; a waiter armed after sendRoomOp misses it and
+      // the caller reports 'answered' for a rejected answer.
+      const sendRoomOp = vi.fn((frame) => {
+        inv.onOpError({ code: 'conflict', ref: 'agent_invite_answer', detail: 'invite expired', roomId: frame.room_id });
+        return true;
+      });
+      ({ inv } = makeInvites({ sendRoomOp }));
+      const p = inv.answerAwait({ roomId: 'r1', accept: true });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'invite expired' });
     });
 
     it('answerAwait: a stamped agent_invite_answer error is the outcome and settles ONLY its own room (Major 1 interplay)', async () => {
@@ -410,17 +470,18 @@ describe('createAgentInvites', () => {
       await expect(p).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'invite expired' });
     });
 
-    it('leave: one error frame settles exactly ONE of several in-flight leave waiters', async () => {
-      // Eviction fires a BATCH of agent_leave ops; a single owner-room
-      // conflict must not fail every leave in the window (scoped re-review,
-      // finding 2). Op errors are 1:1 with ops on an ordered socket.
+    it('leave: an unstamped error frame settles NO leave waiter while two are in flight', async () => {
+      // Eviction fires a BATCH of agent_leave ops; one uncorrelatable
+      // conflict must not be pinned on whichever leave armed first. Both fall
+      // through to their own timeouts. (A stamped frame still settles exactly
+      // its own room — see the roomId-correlated block.)
       vi.useFakeTimers();
       const { inv } = makeInvites();
       const p1 = inv.leave({ roomId: 'r1' });
       const p2 = inv.leave({ roomId: 'r2' });
       inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'not a joined participant' });
-      await expect(p1).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'not a joined participant' });
       await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p1).resolves.toEqual({ kind: 'left' });
       await expect(p2).resolves.toEqual({ kind: 'left' });
     });
   });

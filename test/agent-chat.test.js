@@ -413,12 +413,45 @@ describe('createAgentChatHandlers', () => {
       expect(fetchMessages).not.toHaveBeenCalled();
     });
 
-    it('guest accept rejected with a non-conflict code maps to 502 and still expires the room', async () => {
+    it('guest accept rejected with not_found maps to 502 and still expires the room (also dead)', async () => {
       const { handlers, rooms } = makeFixture({ answerAwaitOutcome: { kind: 'error', code: 'not_found' } });
       rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
       const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/ask for a fresh one/i);
       expect(rooms.get('room-1').state).toBe('expired');
+    });
+
+    it('guest accept rejected with a TRANSIENT code leaves the room pending, never expired (Major 2)', async () => {
+      // Only conflict/not_found prove the invite is dead server-side.
+      // not_ready is a plain reconnect race (the journal answers hello_ok
+      // before it finishes registering the connection) and forbidden is what
+      // answering one's own outstanding join request returns — the invite is
+      // very much alive in both, and expiring it here is unrecoverable: the
+      // room can never leave 'expired' and an inbound answer frame only
+      // transitions out of 'pending'.
+      for (const code of ['not_ready', 'forbidden', 'bad_request', 'internal']) {
+        const { handlers, rooms } = makeFixture({ answerAwaitOutcome: { kind: 'error', code, detail: `${code} detail` } });
+        rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+        const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+        expect(res.status).toBe(502);
+        expect(res.body.error).toMatch(/retry the accept/i);
+        expect(res.body.error).not.toMatch(/ask for a fresh one/i);
+        expect(rooms.get('room-1').state).toBe('pending');
+      }
+    });
+
+    it('a guest accept that failed not_ready is retryable end-to-end (Major 2)', async () => {
+      const answerAwait = vi.fn()
+        .mockResolvedValueOnce({ kind: 'error', code: 'not_ready', detail: 'connection is not ready' })
+        .mockResolvedValueOnce({ kind: 'answered' });
+      const { handlers, rooms } = makeFixture({ invites: { answerAwait } });
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      expect((await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' })).status).toBe(502);
+      const retry = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(retry.status).toBe(200);
+      expect(rooms.get('room-1').state).toBe('joined');
+      expect(answerAwait).toHaveBeenCalledTimes(2);
     });
 
     it('guest accept still joins when the backfill read fails — degrades to a note', async () => {
@@ -533,6 +566,35 @@ describe('createAgentChatHandlers', () => {
       // and the requester can re-ask.
       expect(pendingJoin.has('room-1')).toBe(false);
       expect(rooms.get('room-1')).toMatchObject({ state: 'joined', peerDeviceId: 7 });
+    });
+
+    it('owner ADMIT rejected with not_found also consumes the request (dead server-side)', async () => {
+      const { handlers, pendingJoin, rooms } = makeFixture({ answerAwaitOutcome: { kind: 'error', code: 'not_found', detail: 'no such request' } });
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      pendingJoin.set('room-1', 9);
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(502);
+      expect(pendingJoin.has('room-1')).toBe(false);
+    });
+
+    it('owner ADMIT rejected with a TRANSIENT code keeps the request and is retryable (Major 2)', async () => {
+      // not_ready is a reconnect race, not a dead request: consuming it here
+      // would silently drop a live join request the requester cannot re-ask
+      // for (its row is still 'invited', so a fresh agent_join conflicts).
+      const answerAwait = vi.fn()
+        .mockResolvedValueOnce({ kind: 'error', code: 'not_ready', detail: 'connection is not ready' })
+        .mockResolvedValueOnce({ kind: 'answered' });
+      const { handlers, rooms, pendingJoin } = makeFixture({ invites: { answerAwait } });
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      pendingJoin.set('room-1', 9);
+      const first = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(first.status).toBe(502);
+      expect(first.body.error).toMatch(/retry the admit/i);
+      expect(pendingJoin.get('room-1')).toBe(9);
+      const retry = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual({ ok: true, room_id: 'room-1', admitted: true });
+      expect(pendingJoin.has('room-1')).toBe(false);
     });
 
     it('owner REFUSE stays fire-and-forget: answer(), never answerAwait()', async () => {
