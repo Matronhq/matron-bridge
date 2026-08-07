@@ -1364,3 +1364,325 @@ describe('createJournalInputConsumer — ghost-answer refusal (processStartSeq)'
     expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
   });
 });
+
+// The agent-chat room carve-out (spec: agent chat phase 3, Task 6). Frames in
+// a conversation this bridge participates in as a room are session input even
+// when agent-sent — that's the whole point of a room — so they divert to
+// routeRoomFrame ABOVE the user:* loop guard. Own echoes are dropped by
+// device id when both the frame's sender_device_id and our own id are known,
+// by device name otherwise; unknown identity fails CLOSED (drop + warn once).
+describe('agent-chat room carve-out', () => {
+  const roomRecord = { sessionRoomId: '!s1:bridge', role: 'guest', state: 'joined', title: 'Test room' };
+
+  function makeRoomDeps(overrides = {}) {
+    return {
+      isControlConvo: vi.fn(() => false),
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => ({ claudeSessionId: 'room-1' })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord } : null)),
+      routeRoomFrame: vi.fn(),
+      selfAgentName: vi.fn(() => 'dev-1'),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  function roomFrame(overrides = {}) {
+    return baseFrame({ convo_id: 'room-1', sender: 'agent:dev-2', ...overrides });
+  }
+
+  it('routes an agent text frame in an active room to routeRoomFrame (never the main input path)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    const frame = roomFrame();
+    consumer(frame);
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    const [room, routed] = deps.routeRoomFrame.mock.calls[0];
+    expect(room).toMatchObject({ sessionRoomId: '!s1:bridge' });
+    expect(routed).toBe(frame);
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+  });
+
+  it('routes a USER frame in an active room to routeRoomFrame, not routeTextToSession', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'user:dan' }));
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('routes a media (image/file) frame in an active room even without a routeMediaToSession seam', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ type: 'image', payload: { name: 'cat.png', blob_ref: 'b1' } }));
+    consumer(roomFrame({ type: 'file', payload: { name: 'notes.txt', blob_ref: 'b2' } }));
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it('drops this bridge\'s own echo (sender agent:<self>)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('warns exactly once when the peer shares our device name (own-echo drop would kill the room silently)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-1' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    consumer(roomFrame({ sender: 'agent:dev-1', payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled(); // still fails safe
+    const ambiguousWarns = log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg));
+    expect(ambiguousWarns).toHaveLength(1);
+  });
+
+  it('a distinct peer name never triggers the ambiguous-name warning on own echoes', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-2' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    expect(log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg))).toHaveLength(0);
+  });
+
+  it('fails CLOSED on unknown identity: agent frames dropped, warned exactly once', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({ selfAgentName: vi.fn(() => null), log });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame());
+    consumer(roomFrame({ payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    const identityWarns = log.warn.mock.calls.filter(([msg]) => /identity/.test(msg));
+    expect(identityWarns).toHaveLength(1);
+  });
+
+  it('a missing selfAgentName seam behaves like unknown identity (drop, fail closed)', () => {
+    const deps = makeRoomDeps({ selfAgentName: undefined });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame());
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('drops an agent frame whose sender_device_id matches our own device id even when the sender NAME differs', () => {
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:someone-else', sender_device_id: 42 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it("routes a SAME-NAMED peer's frame when its sender_device_id differs from ours (no ambiguous-name warning)", () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      selfAgentDeviceId: vi.fn(() => 42),
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-1' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1', sender_device_id: 7 }));
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    expect(log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg))).toHaveLength(0);
+  });
+
+  it('a frame WITHOUT sender_device_id falls back to name logic even when our own id is known', () => {
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' })); // own name, no id → dropped
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    consumer(roomFrame({ sender: 'agent:dev-2' })); // peer name, no id → routes
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it('device id 0 is a real id: selfAgentDeviceId 0 + frame sender_device_id 0 drops as own echo', () => {
+    // Pins Number.isInteger over truthiness: with a truthy check, id 0 would
+    // fall back to the name path and this differently-named echo would route.
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 0) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:someone-else', sender_device_id: 0 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('a string-typed sender_device_id warns exactly once and falls back to name matching', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42), log });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1', sender_device_id: '42' })); // own name → dropped via name path
+    consumer(roomFrame({ sender: 'agent:dev-2', sender_device_id: '7' })); // peer name → routes via name path
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    const w = log.warn.mock.calls.filter(([msg]) => /non-integer sender_device_id/.test(msg));
+    expect(w).toHaveLength(1);
+  });
+
+  it('sender_device_id present but own identity UNKNOWN fails closed via the name path (warnOnceNoIdentity)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      selfAgentDeviceId: vi.fn(() => null),
+      selfAgentName: vi.fn(() => null),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender_device_id: 7 }));
+    consumer(roomFrame({ sender_device_id: 7, payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(log.warn.mock.calls.filter(([msg]) => /identity/.test(msg))).toHaveLength(1);
+  });
+
+  it('drops a prompt_reply in a room convo entirely (prompt flows never route through rooms)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'user:dan', type: 'prompt_reply', payload: { target_seq: 3, choice: 'opt_a' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('drops non-input frame types in a room (session_status et al.) without routing', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    for (const type of ['prompt', 'tool_output', 'session_status', 'read_marker', 'convo_meta', 'diff']) {
+      consumer(roomFrame({ type }));
+    }
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('drops a room frame whose sender is neither agent:* nor user:*', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'bridge' }));
+    consumer(roomFrame({ sender: 42 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('an INACTIVE room (roomFor null) falls through to the normal guard: agent frame dropped, user frame routes to the session', () => {
+    const deps = makeRoomDeps({ roomFor: vi.fn(() => null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame()); // agent-sent → loop-prevention filter drops it
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    consumer(roomFrame({ sender: 'user:dan' })); // user-sent → ordinary input
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('a routeRoomFrame that throws is contained (warned, consumer never throws)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({ routeRoomFrame: vi.fn(() => { throw new Error('boom'); }), log });
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(roomFrame())).not.toThrow();
+    expect(log.warn.mock.calls.some(([msg]) => /routeRoomFrame threw: boom/.test(msg))).toBe(true);
+  });
+
+  it('non-room convos are completely unaffected by the seams being present', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame()); // convo-1 — roomFor returns null for it
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+});
+
+// The wiring half of the room carve-out: index.js can't be imported
+// in-process, so pin by source inspection that the consumer actually
+// receives the room seams, that room delivery's isBusy covers BOTH busy and
+// the resume-hold state (sendToSession's _awaitingInputReady branch returns
+// true WITHOUT setting busy — Task 5 review finding 9), and that every
+// turn-end/teardown seam speaks to roomDelivery.
+describe('index.js agent-chat room wiring (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+
+  it('passes roomFor/routeRoomFrame/selfAgentName/selfAgentDeviceId to createJournalInputConsumer (before log:)', () => {
+    const start = src.indexOf('createJournalInputConsumer({');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('log: console,', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/\broomFor\b/);
+    expect(args).toMatch(/routeRoomFrame: journalOnRoomFrame/);
+    expect(args).toMatch(/selfAgentName: \(\) => journalPublisher\.identity\(\)\?\.name \|\| null/);
+    expect(args).toMatch(/selfAgentDeviceId: \(\) => journalPublisher\.identity\(\)\?\.deviceId \?\? null/);
+    expect(args).toMatch(/agentRooms\.isActive\(convoId\)/);
+  });
+
+  it("room delivery's isBusy is the full composite: busy, resume-hold, and BOTH open-prompt states", () => {
+    const start = src.indexOf('function sessionOccupiedForRoomDelivery(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('}', start);
+    const body = src.slice(start, end);
+    expect(body).toMatch(/session\.busy/);
+    expect(body).toMatch(/session\._awaitingInputReady/);
+    // Task 6 review C2: the prompt paths deliberately clear busy so the
+    // user's answer types into the PTY — a room message must not take the
+    // idle branch there and answer the prompt.
+    expect(body).toMatch(/session\.waitingForAnswer/);
+    expect(body).toMatch(/session\.pendingInteractivePrompt/);
+    // …and it is what createRoomDelivery actually receives as isBusy.
+    const rd = src.indexOf('createRoomDelivery({');
+    expect(rd).toBeGreaterThan(-1);
+    const rdEnd = src.indexOf('});', rd);
+    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: sessionOccupiedForRoomDelivery/);
+    // The injected turn must not re-mirror into the session's own convo.
+    expect(src.slice(rd, rdEnd)).toMatch(/skipJournalMirror: true/);
+  });
+
+  it('every turn-end seam flushes the pending room inbox through the ONE shared occupied-gated helper', () => {
+    // Task 6 review C1/C2/I3/I4: the seams (codex, iv, print, resume-hold
+    // release) plus journalOnRoomFrame's self-heal all go through
+    // maybeFlushRoomDelivery — never a bare roomDelivery.flush of their own,
+    // so the occupied gate can't drift per seam.
+    const gated = src.match(/maybeFlushRoomDelivery\(session\)/g) || [];
+    expect(gated.length).toBeGreaterThanOrEqual(5);
+    const bareFlushes = src.match(/roomDelivery\.flush\(session, session\.roomId\)/g) || [];
+    expect(bareFlushes).toHaveLength(1); // inside maybeFlushRoomDelivery only
+    expect(src).toMatch(/function maybeFlushRoomDelivery\(session\) \{\s*\n\s*if \(!sessionOccupiedForRoomDelivery\(session\)\) roomDelivery\.flush\(session, session\.roomId\);/);
+    // …and a queue flush that dispatched a turn suppresses the room flush
+    // (the new turn's own end seam picks it up) — one gate per seam family.
+    expect(src.match(/flushPendingSessionQueue\(session\) === true/g) || []).toHaveLength(3);
+    // The parked-slash release path must not append a room block onto the
+    // just-typed slash command (Task 6 review I3) — but ONLY when the slash
+    // was actually typed; the couldn't-run/held-messages branches typed
+    // nothing and must still flush (whole-branch review, M4).
+    expect(src).toMatch(/if \(!parkedSlashTyped\) maybeFlushRoomDelivery\(session\);/);
+    expect(src).toMatch(/parkedSlashTyped = true;\s*\n\s*debug\(`typed parked /);
+  });
+
+  it('terminal teardown drops the pending room inbox with the session', () => {
+    const start = src.indexOf('function journalEvictConvoInput(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    expect(src.slice(start, end)).toMatch(/roomDelivery\.dropSession\(session\?\.roomId\)/);
+    // Eviction must auto-leave every joined room so the peer's bridge doesn't
+    // keep publishing into a black hole (whole-branch review, I4).
+    expect(src.slice(start, end)).toMatch(/agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]*agentRooms\.setState\(r\.roomId, 'left'\)/);
+  });
+
+  it('an inbound join_request never touches the room record — only the pendingJoinRequests seam (whole-branch review, C1)', () => {
+    const start = src.indexOf('function journalInjectInviteRequest(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toMatch(/if \(isJoin\) \{[^}]*pendingJoinRequests\.set/);
+    // The record() call must live in the non-join else branch only.
+    const isJoinBlock = body.match(/if \(isJoin\) \{[\s\S]*?\n {4}\} else \{/)?.[0] ?? '';
+    expect(isJoinBlock).not.toMatch(/agentRooms\.record/);
+  });
+
+  it('the publisher receives thunked invite/op-error dispatch into the (later-built) invite manager', () => {
+    const start = src.indexOf('createJournalPublisher({');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('});', start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/onInviteFrame: \(frame\) => agentInvites\?\.onInviteFrame\(frame\)/);
+    expect(args).toMatch(/onOpError: \(err\) => agentInvites\?\.onOpError\(err\)/);
+  });
+});

@@ -212,6 +212,69 @@ describe('createSendAttachmentHandler', () => {
     void workdir;
   });
 
+  describe('chat_room_id room target', () => {
+    function makeRoomFixture(roomRecord) {
+      const fx = makeFixture();
+      const rooms = { get: (id) => (id === 'room-1' ? roomRecord : null) };
+      const handler = createSendAttachmentHandler({
+        sessions: fx.sessions, publisher: fx.publisher, rooms,
+        // The room target must not require the session's own convo.
+        journalConvoIdFor: () => null,
+      });
+      return { ...fx, handler };
+    }
+
+    it('publishes into the room convo instead of the session convo', async () => {
+      const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1', caption: 'evidence' });
+      expect(res.status).toBe(200);
+      expect(published).toHaveLength(1);
+      expect(published[0].convoId).toBe('room-1');
+      expect(published[0].payload.caption).toBe('evidence');
+    });
+
+    it('lets the owner post while the room is still pending', async () => {
+      const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'pending' });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(published[0].convoId).toBe('room-1');
+    });
+
+    it('404s a room this session does not participate in', async () => {
+      const { handler } = makeRoomFixture({ sessionRoomId: '!other', role: 'guest', state: 'joined' });
+      expect((await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' })).status).toBe(404);
+      expect((await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-ghost' })).status).toBe(404);
+    });
+
+    it('409s a guest room that is not joined', async () => {
+      const { handler } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'pending' });
+      const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/pending/);
+    });
+
+    it('409s an owner who left/was refused/expired — same shared gate as agent_chat_send', async () => {
+      for (const state of ['left', 'refused', 'expired']) {
+        const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state });
+        const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
+        expect(res.status).toBe(409);
+        expect(published).toHaveLength(0);
+      }
+    });
+
+    it('400s a non-string chat_room_id', async () => {
+      const { handler } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      expect((await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 42 })).status).toBe(400);
+    });
+
+    it('404s when no rooms registry is wired at all', async () => {
+      const { sessions, publisher } = makeFixture();
+      const handler = createSendAttachmentHandler({ sessions, publisher, journalConvoIdFor: () => 'convo-abc' });
+      const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
+      expect(res.status).toBe(404);
+    });
+  });
+
   describe('symlink escapes', () => {
     it('refuses a symlink that points at a sensitive file outside the workdir', async () => {
       const { handler, workdir, uploads } = makeFixture();

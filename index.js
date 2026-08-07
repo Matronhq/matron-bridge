@@ -65,11 +65,16 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
+import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
+import { createRoomDelivery } from './lib/room-delivery.js';
+import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
+import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -290,6 +295,12 @@ const toolStreamPumps = new Map();
 function toolStreamKey(convoId, messageRef) {
   return `${convoId}\0${messageRef}`;
 }
+// Agent-chat invite manager (lib/agent-invites.js). Declared before the
+// publisher so its options can reference it as thunks; constructed much
+// later (next to the journal input consumer, where its own deps —
+// journalPublisher, agentRooms, the inject glue — all exist). The thunks
+// only ever fire once the socket is live, long after the assignment.
+let agentInvites = null;
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -307,6 +318,10 @@ const journalPublisher = createJournalPublisher({
   // is — the callback only ever fires once the socket is live, long after
   // module evaluation.
   onRpcRequest: (request) => journalRpcHandler(request),
+  // Agent-chat invite lifecycle (kind:'invite' ephemerals and room-op error
+  // frames) — thunked because agentInvites is constructed later (above).
+  onInviteFrame: (frame) => agentInvites?.onInviteFrame(frame),
+  onOpError: (err) => agentInvites?.onOpError(err),
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -1664,7 +1679,17 @@ function finishCodexTurn(session, {
     else if (session.sendCallback) session.sendCallback(message);
   }
 
-  if (!preserveQueue) flushPendingSessionQueue(session);
+  if (!preserveQueue) {
+    // Coalesced room updates go out AFTER Dan's queued input (turn-end seam;
+    // preserveQueue teardowns keep the inbox for the replacement session —
+    // same roomId key) — but NEVER on top of a turn the queue flush just
+    // dispatched (Task 6 review, C1): flushPendingSessionQueue returns true
+    // exactly when a batch went out ('deferred' = codex interrupt in
+    // flight; false = nothing to send / send refused). The new turn hits
+    // this same seam at its own end, so nothing is lost by waiting.
+    const dispatched = flushPendingSessionQueue(session) === true;
+    if (!dispatched) maybeFlushRoomDelivery(session);
+  }
 }
 
 // --- Interactive-mode session (MATRON_INTERACTIVE_MODE=1) ---
@@ -2015,9 +2040,16 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       }
     }
     // Flush any queued messages now that claude is free.
+    let queueDispatched = false;
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-      flushPendingSessionQueue(session);
+      queueDispatched = flushPendingSessionQueue(session) === true;
     }
+    // Coalesced room updates go out AFTER Dan's queued input (turn-end
+    // seam) — never on top of the turn that flush just dispatched (Task 6
+    // review, C1), and never into an open prompt (maybeFlushRoomDelivery's
+    // composite occupied gate covers waitingForAnswer AND
+    // pendingInteractivePrompt, C2).
+    if (!queueDispatched) maybeFlushRoomDelivery(session);
   };
 
   // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
@@ -3371,9 +3403,15 @@ function handleClaudeEvent(session, event) {
       }
 
       // Send any queued messages now that Claude is free
+      let queueDispatched = false;
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-        flushPendingSessionQueue(session);
+        queueDispatched = flushPendingSessionQueue(session) === true;
       }
+      // Coalesced room updates go out AFTER Dan's queued input (turn-end
+      // seam) — never on top of the turn that flush just dispatched (Task 6
+      // review, C1), and never into an open prompt (the composite occupied
+      // gate inside maybeFlushRoomDelivery, C2).
+      if (!queueDispatched) maybeFlushRoomDelivery(session);
 
       break;
     }
@@ -3976,6 +4014,11 @@ function startResumeReadyWatcher(session) {
     // later ordinary clean exit isn't misreported as "👋 Logged out"
     // (Bugbot, PR #162).
     if (parkedSlash !== '/logout') session._accountLogoutPending = false;
+    // Set ONLY where sendText actually typed the parked command: the other
+    // parked branches (held messages won, session died) typed nothing, so
+    // there is no pending Enter for a room flush to garble — suppressing the
+    // flush there would just strand the inbox (whole-branch review, M4).
+    let parkedSlashTyped = false;
     if (parkedSlash) {
       if (outbox.length > 0) {
         debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
@@ -3988,6 +4031,7 @@ function startResumeReadyWatcher(session) {
         if (session.sendCallback) session.sendCallback(note);
       } else if (session.alive && session.iv && typeof session.iv.sendText === 'function'
                  && session.iv.sendText(parkedSlash) !== false) {
+        parkedSlashTyped = true;
         debug(`typed parked ${parkedSlash} into ready TUI`);
       } else {
         // The user was promised the command would run when the TUI was
@@ -4011,6 +4055,18 @@ function startResumeReadyWatcher(session) {
       // send itself failed) — don't leave a typing indicator spinning with
       // no turn behind it.
       session.busy = false;
+      // Room messages that arrived during the hold coalesced into the pending
+      // inbox (isBusy counts _awaitingInputReady). With no held user message
+      // there is no turn — and so no turn-end seam — to flush them, so flush
+      // here; when something WAS sent, that turn's end seam flushes instead.
+      // EXCEPT when a parked slash command was ACTUALLY typed into the ready
+      // TUI just now: a back-to-back sendText would cancel its pending Enter
+      // and submit `/login` and the room block as ONE garbled line (Task 6
+      // review, I3). The couldn't-run branch typed nothing, so it flushes
+      // like any other dead-end (whole-branch review, M4). The composite
+      // gate inside maybeFlushRoomDelivery also skips if a TUI prompt opened
+      // mid-hold.
+      if (!parkedSlashTyped) maybeFlushRoomDelivery(session);
     }
   };
 
@@ -4682,31 +4738,45 @@ async function maybeUpdatePinnedSummary(session) {
       `${m.role}: ${m.text}`
     ).join('\n\n');
 
+    // ROSTER must stay the LAST format line in both variants:
+    // parseTitlePassResponse's multi-line capture stops at the next `KEY:`
+    // line or end-of-text, so a field placed after it would be swallowed.
     const prompt = currentSummary
-      ? `Based on these recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
-      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
+      ? `Based on these recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n3. A 2-3 sentence rolling summary of what this session is working on right now\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\nROSTER: <2-3 sentences describing what this session is working on right now, for other agents deciding whether to contact it>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n3. A 2-3 sentence rolling summary of what this session is working on right now\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\nROSTER: <2-3 sentences describing what this session is working on right now, for other agents deciding whether to contact it>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().trim();
-    const titleMatch = text.match(/TITLE:\s*(.+)/i);
-    const summaryMatch = text.match(/SUMMARY:\s*(.+)/i);
-    const newMatch = text.match(/NEW:\s*(.+)/i);
+    const parsed = parseTitlePassResponse(text);
 
     const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
 
     // Update room name (Element sidebar truncates visually, full name visible on hover)
-    if (titleMatch) {
-      const name = `${SERVER_LABEL}:${sessionShort} ${titleMatch[1].trim().slice(0, 60)}`;
+    if (parsed.title) {
+      const name = `${SERVER_LABEL}:${sessionShort} ${parsed.title.slice(0, 60)}`;
       updateRoomName(session.roomId, name);
+    }
+
+    // Publish the roster summary to the journal so other agents' rosters show
+    // what this session is doing. Don't-clobber analysis: the journal's
+    // COALESCE keeps the existing summary whenever the field is omitted, and
+    // journalUpsertConvo only carries `summary` when this pass actually
+    // produced one. The seed path (lib/journal-title-seed.js), the state-only
+    // path (journalSessionState), and the hint-replay upserts in
+    // journalPublish never carry `summary` — the publisher's omit-don't-null
+    // handling makes that automatic. No fallback summary when Gemini is off:
+    // the roster shows '', which is honest.
+    if (parsed.roster) {
+      journalUpsertConvo(session, { summary: parsed.roster.slice(0, 1000) });
     }
 
     // Build cumulative summary for pinned message
     let updatedSummary = '';
-    if (newMatch && currentSummary) {
-      updatedSummary = `${currentSummary}\n• ${newMatch[1].trim()}`;
-    } else if (summaryMatch && !currentSummary) {
+    if (parsed.added && currentSummary) {
+      updatedSummary = `${currentSummary}\n• ${parsed.added}`;
+    } else if (parsed.summary && !currentSummary) {
       // Only use SUMMARY: for the initial summary, not after compaction
-      updatedSummary = `• ${summaryMatch[1].trim()}`;
+      updatedSummary = `• ${parsed.summary}`;
     } else if (currentSummary) {
       // LLM didn't produce a match — keep the existing summary (e.g. after compaction)
       updatedSummary = currentSummary;
@@ -6816,6 +6886,224 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
   }
 }
 
+// --- Agent-chat rooms (spec: agent chat phase 3) ---
+// Persisted room↔session registry: which journal convos this bridge
+// participates in as agent-chat rooms, and which local session each is bound
+// to. Same atomic-replace persistence rationale as the timer store above.
+const AGENT_ROOMS_FILE = path.join(os.homedir(), '.matron-bridge-agent-rooms.json');
+const agentRooms = createAgentRooms({
+  load: () => (fs.existsSync(AGENT_ROOMS_FILE) ? JSON.parse(fs.readFileSync(AGENT_ROOMS_FILE, 'utf-8')) : null),
+  save: (data) => atomicWriteFileSync(AGENT_ROOMS_FILE, JSON.stringify(data, null, 2)),
+  log: console,
+});
+
+// Inbound join_requests for rooms this bridge OWNS, held OUTSIDE the rooms
+// registry: agentRooms.record() merges, so recording a third party's request
+// would clobber state 'pending' over an already-'joined' owned room and
+// repoint peerDeviceId at the newcomer — refusing the newcomer then flips
+// the SHARED record terminal and kills routing to the real peer forever
+// (whole-branch review, C1). roomId -> { deviceId, at }; read by the
+// agent-chat handlers via the pendingPeerFor seam; in-memory only (an
+// unanswered request is re-issuable and lapses with the invite TTL anyway).
+const pendingJoinRequests = new Map();
+function pendingPeerFor(roomId) {
+  const entry = pendingJoinRequests.get(roomId);
+  if (!entry) return null;
+  if (Date.now() - entry.at > INVITE_TTL_MS) { pendingJoinRequests.delete(roomId); return null; }
+  return entry.deviceId;
+}
+
+// A session that can't act on new input RIGHT NOW. `busy` covers a running
+// turn; `_awaitingInputReady` covers the post-resume input hold, whose
+// sendToSession branch buffers into _resumeOutbox and returns true WITHOUT
+// setting busy — without this second check every room message during a
+// resume hold would take the idle branch and be injected individually,
+// defeating coalescing (Task 5 review, finding 9). `waitingForAnswer` and
+// `pendingInteractivePrompt` cover open prompts: the prompt-surfacing paths
+// deliberately CLEAR busy so the user's answer types into the PTY, and an
+// "idle-branch" room injection there would answer a permission or
+// AskUserQuestion prompt with `[room …] peer: …` (Task 6 review, C2).
+function sessionOccupiedForRoomDelivery(session) {
+  return !!session.busy || !!session._awaitingInputReady
+    || !!session.waitingForAnswer || !!session.pendingInteractivePrompt;
+}
+
+// The one shared room-flush gate used by every turn-end/idle seam (and the
+// journalOnRoomFrame self-heal): flush the coalesced room inbox ONLY when
+// the session is genuinely free, by the SAME composite predicate that routes
+// deliver()'s busy/idle branches — so the two can never disagree.
+function maybeFlushRoomDelivery(session) {
+  if (!sessionOccupiedForRoomDelivery(session)) roomDelivery.flush(session, session.roomId);
+}
+
+// Hybrid idle/busy delivery of room messages into local sessions
+// (lib/room-delivery.js): idle sessions get one injected turn per message,
+// occupied sessions accumulate a pending inbox flushed as one coalesced
+// turn at the turn-end seams (finishCodexTurn, iv onTurnEnd, print-mode
+// `case 'result'`). skipJournalMirror: the message already lives in the
+// room convo — mirroring it into the session convo would duplicate it.
+const roomDelivery = createRoomDelivery({
+  isBusy: sessionOccupiedForRoomDelivery,
+  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  log: console,
+});
+
+// Per-room once-listener registry backing agent_chat_send's optional short
+// reply wait (the awaitRoomMessage dep of lib/agent-chat.js;
+// lib/room-reply-waiters.js). Fed from journalOnRoomFrame below so the
+// handler module stays free of journal frame knowledge. A CONSUMED reply is
+// the tool result itself and is NOT also delivered as a turn (see the
+// resolve() short-circuit in journalOnRoomFrame).
+const roomReplyWaiters = createRoomReplyWaiters();
+function awaitRoomMessage(chatRoomId, ms) {
+  return roomReplyWaiters.await(chatRoomId, ms);
+}
+
+// Router seam: a journal frame in an active room convo lands here instead of
+// the main-convo input path. Formats the peer's message as a `[room …]` line
+// and hands it to roomDelivery against the room's bound session.
+function journalOnRoomFrame(room, frame) {
+  const session = sessions.get(room.sessionRoomId);
+  if (!session || !session.alive) {
+    debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} not live — dropping (agent_chat_read recovers)`);
+    return;
+  }
+  const sender = frame.sender || '';
+  const from = sender.startsWith('agent:') ? `${sender.slice(6)} (agent)` : sender.startsWith('user:') ? sender.slice(5) : sender;
+  const payload = frame.payload || {};
+  let body;
+  if (frame.type === 'text') {
+    body = typeof payload.body === 'string' ? payload.body.trim() : '';
+  } else {
+    const kind = frame.type === 'image' ? 'image' : 'file';
+    // Carry the blob_ref (whole-branch review, M1): the name alone gives the
+    // receiving agent nothing to fetch. Same rendering as agent_chat_read's
+    // attachment lines (lib/agent-chat.js shapeMessages).
+    body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.blob_ref ? ` (blob ${payload.blob_ref})` : ''}${payload.caption ? `: ${payload.caption}` : ''}]`;
+  }
+  if (!body) return;
+  // Self-heal for a stranded pending inbox (Task 6 review, I4): several
+  // paths clear busy WITHOUT passing a turn-end flush seam (esc-cancel,
+  // interrupt-wedge, resume-failed, the prompt paths). If the session is
+  // free now, drain the older messages BEFORE this one so room messages
+  // never overtake each other.
+  maybeFlushRoomDelivery(session);
+  // A reply consumed by an agent_chat_send wait already reached the agent
+  // inline as the tool result — the session is busy for the whole tool call,
+  // so deliver() would queue the SAME message and wake the agent with a
+  // duplicate `[room …]` turn at turn end (Task 8 review, finding 1). The
+  // journal keeps the durable copy; agent_chat_read recovers.
+  if (roomReplyWaiters.resolve(frame.convo_id, { from, body })) return;
+  roomDelivery.deliver(session, session.roomId, {
+    roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
+  });
+}
+
+// Which local session an inbound invite/join request is FOR.
+// - join_request: the session bound to the room this bridge owns.
+// - request: v1 coarseness — the invite frame carries no target convo/session
+//   address (the caller targeted a conversation; the journal resolved it to
+//   this DEVICE), so with more than one live session the receiving bridge
+//   cannot know which was meant. Route to the most recently active live
+//   session; the request text carries the room id so the agent can hand off.
+//   Fixing this properly means carrying target_convo_id through agent_invite
+//   (a small Phase 3.5 journal addition) — flagged in the PR description.
+function resolveInviteTargetSession(frame, room) {
+  if (frame.event === 'join_request') {
+    const session = room ? sessions.get(room.sessionRoomId) : null;
+    return session && session.alive ? session : null;
+  }
+  let best = null;
+  for (const session of sessions.values()) {
+    if (!session.alive) continue;
+    if (!best || (session.lastActivityAt || 0) > (best.lastActivityAt || 0)) best = session;
+  }
+  return best;
+}
+
+// Inbound invite/join request -> record the room as pending, ack with the
+// target session's state, and surface the request to the agent as a turn
+// (via roomDelivery, so a busy session sees it coalesced at turn end).
+function journalInjectInviteRequest(frame) {
+  // request  -> a peer wants THIS bridge's session to join frame.room_id
+  // join_request -> a peer asks to join a room THIS bridge owns
+  const isJoin = frame.event === 'join_request';
+  const room = agentRooms.get(frame.room_id);
+  const session = resolveInviteTargetSession(frame, room);
+  if (!session) {
+    debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask`);
+    // No session ⇒ nobody will ever answer. Refuse immediately instead of
+    // letting the peer burn its full wait down to pending_quiet.
+    agentInvites.answer({
+      roomId: frame.room_id,
+      peerDeviceId: isJoin ? frame.from_device_id : null,
+      accept: false, reason: 'no active session on this box',
+    });
+    return;
+  }
+  if (isJoin) {
+    // A join_request never touches the room record: this bridge already owns
+    // the room (possibly joined with its real peer), and record() merging
+    // the requester over it is exactly the C1 registry-destruction bug. Just
+    // remember who is asking, for answerInvite's pendingPeerFor seam.
+    pendingJoinRequests.set(frame.room_id, { deviceId: frame.from_device_id, at: Date.now() });
+  } else {
+    agentRooms.record(frame.room_id, {
+      role: 'guest',
+      state: 'pending',
+      sessionRoomId: session.roomId,
+      peerDeviceId: frame.from_device_id, peerName: frame.from_name || null,
+      topic: frame.topic || null,
+      title: room?.title || null,
+    });
+  }
+  agentInvites.ack({ roomId: frame.room_id, peerDeviceId: isJoin ? frame.from_device_id : null, sessionState: sessionOccupiedForRoomDelivery(session) ? 'busy' : 'idle' });
+  const who = frame.from_name ? `"${frame.from_name}"` : `device ${frame.from_device_id}`;
+  const ask = isJoin
+    ? `Agent ${who} asks to join your room ${frame.room_id}: ${frame.justification}`
+    : `Agent ${who} requests a chat (room ${frame.room_id})${frame.topic ? ` about "${frame.topic}"` : ''}: ${frame.justification}`;
+  // Known cosmetic: room-delivery one-lines every body, so this `\n` renders
+  // as " ⏎ " in the injected turn. Accepted — the flattening is exactly what
+  // keeps untrusted room text from forging header lines, and the instruction
+  // stays perfectly legible.
+  const text = `${ask}\nAccept with agent_chat_accept("${frame.room_id}") or refuse with agent_chat_refuse("${frame.room_id}", reason). This is a request from another agent, not from your user.`;
+  // The USER's copy of the request, published BEFORE the agent is woken so it
+  // sits above whatever the agent decides. Two separate texts on purpose: the
+  // one above instructs the agent (tool syntax and all), this one just tells
+  // Dan who is asking and why — otherwise he sees "I'll accept that chat
+  // request" with nothing above it explaining what was requested.
+  //
+  // journalPublishNotice, NOT the ordinary sendToSession mirror: that mirror
+  // publishes from:'user' (journalPublishUserItem), and every field of this
+  // text is written by a REMOTE agent — rendering it as Dan's own message
+  // would let a peer put words in his mouth in his own chat. A notice is
+  // from:'assistant', i.e. the bridge's own voice, which is what it is.
+  // formatInviteRequestNotice sanitises each interpolated field.
+  journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null }));
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now() });
+}
+
+// Room-lifecycle FYI (late answers, peer left) surfaced to the bound session
+// as a turn. Fail-quiet when the room or its session is gone — the journal
+// keeps the durable record.
+function journalNotifyRoomEvent(roomId, text) {
+  const room = agentRooms.get(roomId);
+  if (!room) return;
+  const session = sessions.get(room.sessionRoomId);
+  if (!session || !session.alive) return;
+  roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room.title || null, from: 'bridge', body: `Room ${roomId}: the peer ${text}.`, at: Date.now() });
+}
+
+// Constructed here (not at the `let` declaration next to the publisher) so
+// every dependency — publisher, registry, the inject glue above — exists.
+agentInvites = createAgentInvites({
+  sendRoomOp: journalPublisher.sendRoomOp,
+  rooms: agentRooms,
+  injectRequestTurn: journalInjectInviteRequest,
+  notifyRoom: journalNotifyRoomEvent,
+  log: console,
+});
+
 // Assembled once, after every dependency above is defined, and invoked from
 // journalHandleInboundEvent (the `function` declaration wired into
 // createJournalPublisher near the top of this file — hoisted, so that
@@ -6839,6 +7127,11 @@ const journalInputConsumer = createJournalInputConsumer({
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
+    // A user: frame in an INACTIVE room convo (TTL lapse / left) falls
+    // through the room carve-out to here — but this notice would be
+    // published INTO the shared room convo, spamming the peer's chat with
+    // "no longer active". A known-but-inactive room just stops routing.
+    if (agentRooms.get(convoId)) return;
     journalPublishNotice(convoId, type === 'prompt_reply'
       ? "This session is no longer active on this bridge — your answer wasn't delivered."
       : "This session is no longer active on this bridge — your message wasn't delivered.");
@@ -6862,6 +7155,14 @@ const journalInputConsumer = createJournalInputConsumer({
   },
   processStartSeq: journalPublisher.startSeq,
   emitRelease,
+  // Agent-chat room carve-out seams: frames in an ACTIVE room convo become
+  // session input (even agent-sent — that's the point of a room); own echoes
+  // are dropped by device id (frame sender_device_id vs hello_ok identity)
+  // when both are known, by device name otherwise.
+  roomFor: (convoId) => (agentRooms.isActive(convoId) ? agentRooms.get(convoId) : null),
+  routeRoomFrame: journalOnRoomFrame,
+  selfAgentName: () => journalPublisher.identity()?.name || null,
+  selfAgentDeviceId: () => journalPublisher.identity()?.deviceId ?? null,
   log: console,
 });
 
@@ -6884,6 +7185,25 @@ function journalHandleInboundEvent(frame) {
 // Hoisted function declaration — the exit handlers are defined earlier in
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
+  // Terminal teardown leaves this session's joined rooms too: an orphaned
+  // 'joined' entry stays bound to a dead session key forever — isActive
+  // true, every peer frame dropped at debug level, noticeUnknownConvo
+  // suppressed by the known-room guard: a permanent silent black hole
+  // (whole-branch review, I4). Tell the peer (fire-and-forget — there is no
+  // one left to report a failure to; an owner's leave is rejected
+  // server-side, a journal gap noted in the PR) and mark the binding left.
+  for (const r of agentRooms.forSession(session?.roomId)) {
+    if (r.state === 'joined') {
+      agentInvites.leave({ roomId: r.roomId }).catch(() => {});
+      agentRooms.setState(r.roomId, 'left');
+    }
+  }
+  // …and drops any pending room-message inbox with the session: there is no
+  // live session left to coalesce into, and the room content is durable in
+  // the journal (agent_chat_read recovers it). Auto-restart and
+  // recreateSession never come through here AND keep the same session.roomId
+  // key, so a surviving session's pending inbox rides across untouched.
+  roomDelivery.dropSession(session?.roomId);
   const convoId = journalConvoIdFor(session);
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
@@ -7048,7 +7368,40 @@ const handleSendAttachment = createSendAttachmentHandler({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
+  rooms: agentRooms,
 });
+
+// The eight agent-chat room tools (lib/agent-chat.js), mounted below as thin
+// loopback routes in the /send-attachment pattern. awaitRoomMessage is the
+// per-room once-listener seam defined next to journalOnRoomFrame.
+const agentChatHandlers = createAgentChatHandlers({
+  sessions,
+  publisher: journalPublisher,
+  rooms: agentRooms,
+  invites: agentInvites,
+  awaitRoomMessage,
+  // Owner-side join_request seam (C1) — who is asking to join an owned room,
+  // held outside the rooms registry (see pendingJoinRequests above).
+  pendingPeerFor,
+  clearPendingPeer: (roomId) => pendingJoinRequests.delete(roomId),
+  // chatJoin's own-session-convo guard (I2).
+  journalConvoIdFor,
+  serverLabel: SERVER_LABEL,
+  log: console,
+});
+
+// Adapter wrapper for the eight agent-chat loopback routes: a throw inside a
+// handler must surface as that route's own 500 with the real message — not
+// bubble to the request body's outer catch and masquerade as
+// "HTTP 400 Invalid JSON" (Task 8 review, finding 5).
+async function respondAgentChatRoute(res, data, handler, describe) {
+  let status, resBody;
+  try { ({ status, body: resBody } = await handler(data)); }
+  catch (e) { status = 500; resBody = { error: e?.message || 'internal error' }; }
+  try { describe(status, resBody); } catch { /* debug lines must never break the response */ }
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(resBody));
+}
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
@@ -7155,6 +7508,54 @@ const apiServer = createServer(async (req, res) => {
         debug(`send-attachment ${status} ${data?.path} ${resBody.kind || resBody.error || ''}`);
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/agent-roster') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.roster,
+          (status, b) => debug(`agent-roster ${status} ${b.error || `${(b.conversations || []).length} convos`}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-start') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatStart,
+          (status, b) => debug(`agent-chat-start ${status} ${b.room_id || ''} ${b.status || b.error || ''}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-send') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatSend,
+          (status, b) => debug(`agent-chat-send ${status} ${data?.room_id} ${b.error || (b.reply ? 'reply' : 'ok')}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-accept') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatAccept,
+          (status, b) => debug(`agent-chat-accept ${status} ${data?.room_id} ${b.error || 'ok'}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-refuse') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatRefuse,
+          (status, b) => debug(`agent-chat-refuse ${status} ${data?.room_id} ${b.error || 'ok'}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-join') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatJoin,
+          (status, b) => debug(`agent-chat-join ${status} ${data?.room_id} ${b.status || b.error || ''}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-leave') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatLeave,
+          (status, b) => debug(`agent-chat-leave ${status} ${data?.room_id} ${b.error || 'ok'}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-read') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatRead,
+          (status, b) => debug(`agent-chat-read ${status} ${data?.room_id} ${b.error || `${(b.messages || []).length} messages`}`));
         return;
       }
 
