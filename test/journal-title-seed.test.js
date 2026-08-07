@@ -219,6 +219,35 @@ describe('parseTitlePassResponse (Gemini title-pass parsing)', () => {
     expect(parsed.added).toBe('something new');
   });
 
+  it('keeps prose that merely looks like a key (API:, TODO:) inside the ROSTER body', () => {
+    // The stop delimiter is this parser's own format keys, not any capitalised
+    // word: an ordinary roster sentence opening `API:` used to truncate the
+    // summary there and drop every sentence after it.
+    const parsed = parseTitlePassResponse([
+      'TITLE: bridge room work',
+      'ROSTER: Working on the agent-chat delivery path.',
+      'API: the tool surface is still in flux.',
+      'TODO: sender escaping is next.',
+      'Ready for questions about room delivery.',
+    ].join('\n'));
+    expect(parsed.roster).toBe([
+      'Working on the agent-chat delivery path.',
+      'API: the tool surface is still in flux.',
+      'TODO: sender escaping is next.',
+      'Ready for questions about room delivery.',
+    ].join('\n'));
+  });
+
+  it('still stops the ROSTER capture at a real trailing format key', () => {
+    const parsed = parseTitlePassResponse([
+      'ROSTER: Working on the delivery path.',
+      'TODO: not a key, stays in the body.',
+      'TITLE: out of order',
+    ].join('\n'));
+    expect(parsed.roster).toBe('Working on the delivery path.\nTODO: not a key, stays in the body.');
+    expect(parsed.title).toBe('out of order');
+  });
+
   it('returns null for absent fields (pre-ROSTER responses keep working)', () => {
     const parsed = parseTitlePassResponse('TITLE: voice note support\nNEW: Wired the recorder.');
     expect(parsed.title).toBe('voice note support');
