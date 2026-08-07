@@ -97,12 +97,12 @@ describe('createAgentInvites', () => {
       await expect(p).resolves.toEqual({ kind: 'accepted', peerDeviceId: 7 });
     });
 
-    it('no delivered/error within the deliver window resolves {kind:timeout}', async () => {
+    it('no delivered/error within the deliver window resolves pending_quiet (a documented outcome, not a raw timeout)', async () => {
       vi.useFakeTimers();
       const { inv } = makeInvites();
       const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
       await vi.advanceTimersByTimeAsync(5_000);
-      await expect(p).resolves.toEqual({ kind: 'timeout' });
+      await expect(p).resolves.toEqual({ kind: 'pending_quiet' });
     });
 
     it('delivered but silence resolves pending_quiet', async () => {
@@ -110,7 +110,9 @@ describe('createAgentInvites', () => {
       const { inv } = makeInvites();
       const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
       inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
-      await vi.advanceTimersByTimeAsync(10_000);
+      // Stage waiters are armed up front, so the ack/answer window is
+      // DELIVER+ANSWER from the send, not ANSWER from the delivered frame.
+      await vi.advanceTimersByTimeAsync(15_000);
       await expect(p).resolves.toEqual({ kind: 'pending_quiet' });
     });
 
@@ -121,7 +123,8 @@ describe('createAgentInvites', () => {
       inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
       await flush();
       inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r1', session_state: 'idle' });
-      await vi.advanceTimersByTimeAsync(10_000);
+      // Answer waiter budget is DELIVER + 2*ANSWER from the send.
+      await vi.advanceTimersByTimeAsync(25_000);
       await expect(p).resolves.toEqual({ kind: 'pending_idle' });
     });
 
@@ -129,6 +132,60 @@ describe('createAgentInvites', () => {
       const { inv } = makeInvites({ sendRoomOp: vi.fn(() => false) });
       await expect(inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' }))
         .resolves.toEqual({ kind: 'error', code: 'journal_unreachable' });
+    });
+  });
+
+  // ws emits every message from one TCP chunk synchronously in one tick, so
+  // lifecycle frames can land back-to-back with no microtask gap. These tests
+  // deliberately do NOT flush() between frames: every stage waiter must
+  // already be armed when the batch drains.
+  describe('same-tick frame batches', () => {
+    it('invite: delivered+ack(idle)+answer(accept) in one tick returns the accept (no leak to notifyRoom)', async () => {
+      const { inv, rooms, notifyRoom } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
+      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
+      inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r1', session_state: 'idle' });
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
+      await expect(p).resolves.toEqual({ kind: 'accepted', peerDeviceId: 7 });
+      expect(rooms.get('r1').state).toBe('joined');
+      expect(notifyRoom).not.toHaveBeenCalled();
+    });
+
+    it('invite: delivered+answer in one tick (no ack) returns the answer', async () => {
+      const { inv, rooms, notifyRoom } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
+      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: false, reason: 'heads-down', peer_device_id: 7, from_device_id: 7 });
+      await expect(p).resolves.toEqual({ kind: 'refused', reason: 'heads-down', peerDeviceId: 7 });
+      expect(rooms.get('r1').state).toBe('refused');
+      expect(notifyRoom).not.toHaveBeenCalled();
+    });
+
+    it('join: delivered+ack(idle)+answer(accept) in one tick returns the accept', async () => {
+      const { inv, notifyRoom } = makeInvites();
+      const p = inv.join({ roomId: 'r2', justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r2' });
+      inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r2', session_state: 'idle' });
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r2', accept: true, peer_device_id: 3, from_device_id: 3 });
+      await expect(p).resolves.toEqual({ kind: 'accepted', peerDeviceId: 3 });
+      expect(notifyRoom).not.toHaveBeenCalled();
+    });
+
+    it('frames settle only their own room; op errors fan out to every in-flight invite (coarse, pinned)', async () => {
+      const { inv } = makeInvites();
+      const p1 = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      const p2 = inv.invite({ roomId: 'r2', targetDeviceId: 8, justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
+      inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r1', session_state: 'idle' });
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
+      await expect(p1).resolves.toEqual({ kind: 'accepted', peerDeviceId: 7 });
+      // r2 was untouched by r1's frames. The error correlation is ref-level
+      // (no room_id in error frames): it settles EVERY in-flight invite —
+      // acceptable for v1 because room ops serialize per tool call.
+      inv.onOpError({ code: 'offline', ref: 'agent_invite', detail: 'peer offline' });
+      await expect(p2).resolves.toEqual({ kind: 'error', code: 'offline', detail: 'peer offline' });
     });
   });
 
@@ -165,6 +222,34 @@ describe('createAgentInvites', () => {
       const { inv } = makeInvites({ sendRoomOp: vi.fn(() => false) });
       await expect(inv.join({ roomId: 'r2', justification: 'j' }))
         .resolves.toEqual({ kind: 'error', code: 'journal_unreachable' });
+    });
+
+    it('no delivered/error within the deliver window resolves pending_quiet', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p = inv.join({ roomId: 'r2', justification: 'j' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p).resolves.toEqual({ kind: 'pending_quiet' });
+    });
+
+    it('delivered but silence resolves pending_quiet', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p = inv.join({ roomId: 'r2', justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r2' });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(p).resolves.toEqual({ kind: 'pending_quiet' });
+    });
+
+    it('idle ack but no answer resolves pending_idle', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p = inv.join({ roomId: 'r2', justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r2' });
+      await flush();
+      inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r2', session_state: 'idle' });
+      await vi.advanceTimersByTimeAsync(25_000);
+      await expect(p).resolves.toEqual({ kind: 'pending_idle' });
     });
   });
 
@@ -207,6 +292,33 @@ describe('createAgentInvites', () => {
       inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: false, reason: 'nope', peer_device_id: 7, from_device_id: 7 });
       expect(notifyRoom).toHaveBeenCalledWith('r1', 'refused the chat: nope');
       expect(rooms.get('r1').state).toBe('refused');
+    });
+
+    it('a replayed/duplicate answer does not resurrect a terminal room', () => {
+      const { inv, rooms, notifyRoom } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
+      rooms.setState('r1', 'joined');
+      rooms.record('r1', { role: 'owner', state: 'left', sessionRoomId: '!sess' }); // chatLeave stamped it
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
+      expect(rooms.get('r1').state).toBe('left');
+      // Late-answer notify still fires; only the state transition is gated.
+      expect(notifyRoom).toHaveBeenCalledWith('r1', 'accepted the chat');
+    });
+
+    it('a peer refusal whose reason text is literally "expired" is refused, not expired', () => {
+      const { inv, rooms } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: false, reason: 'expired', peer_device_id: 7, from_device_id: 7 });
+      expect(rooms.get('r1').state).toBe('refused');
+    });
+
+    it('left marks a known room state=left so it goes inactive (routing/chatSend stop)', () => {
+      const { inv, rooms, notifyRoom } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'joined', sessionRoomId: '!sess' });
+      inv.onInviteFrame({ kind: 'invite', event: 'left', room_id: 'r1', from_device_id: 7 });
+      expect(rooms.get('r1').state).toBe('left');
+      expect(rooms.isActive('r1')).toBe(false);
+      expect(notifyRoom).toHaveBeenCalledWith('r1', 'left the room');
     });
 
     it('answer for an unknown room settles nothing and never notifies', () => {
@@ -265,14 +377,34 @@ describe('createAgentInvites', () => {
       expect(notifyRoom).not.toHaveBeenCalled();
     });
 
-    it('timed-out waiters are unhooked: a late frame after timeout settles nothing', async () => {
+    it('timed-out and cancelled waiters are unhooked: late frames after a deliver timeout settle nothing', async () => {
       vi.useFakeTimers();
       const { inv, notifyRoom } = makeInvites();
       const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
       await vi.advanceTimersByTimeAsync(5_000);
-      await expect(p).resolves.toEqual({ kind: 'timeout' });
-      expect(() => inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' })).not.toThrow();
-      expect(notifyRoom).not.toHaveBeenCalled();
+      await expect(p).resolves.toEqual({ kind: 'pending_quiet' });
+      // The up-front outcome/answer waiters must be cancelled on this path too.
+      expect(() => {
+        inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
+        inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r1', session_state: 'idle' });
+        inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
+      }).not.toThrow();
+      expect(notifyRoom).not.toHaveBeenCalled(); // room never recorded
+    });
+
+    it('after pending_busy the abandoned answer waiter is cancelled: a late answer surfaces via notifyRoom', async () => {
+      const { inv, rooms, notifyRoom } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
+      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
+      await flush();
+      inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r1', session_state: 'busy' });
+      await expect(p).resolves.toEqual({ kind: 'pending_busy' });
+      // If the armed answer waiter leaked, settleReturns would report true
+      // and this genuinely late answer would be swallowed silently.
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
+      expect(notifyRoom).toHaveBeenCalledWith('r1', 'accepted the chat');
+      expect(rooms.get('r1').state).toBe('joined');
     });
   });
 });
