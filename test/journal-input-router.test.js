@@ -1504,6 +1504,27 @@ describe('agent-chat room carve-out', () => {
     expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
   });
 
+  it('device id 0 is a real id: selfAgentDeviceId 0 + frame sender_device_id 0 drops as own echo', () => {
+    // Pins Number.isInteger over truthiness: with a truthy check, id 0 would
+    // fall back to the name path and this differently-named echo would route.
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 0) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:someone-else', sender_device_id: 0 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('a string-typed sender_device_id warns exactly once and falls back to name matching', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42), log });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1', sender_device_id: '42' })); // own name → dropped via name path
+    consumer(roomFrame({ sender: 'agent:dev-2', sender_device_id: '7' })); // peer name → routes via name path
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    const w = log.warn.mock.calls.filter(([msg]) => /non-integer sender_device_id/.test(msg));
+    expect(w).toHaveLength(1);
+  });
+
   it('sender_device_id present but own identity UNKNOWN fails closed via the name path (warnOnceNoIdentity)', () => {
     const log = { warn: vi.fn(), error: vi.fn() };
     const deps = makeRoomDeps({

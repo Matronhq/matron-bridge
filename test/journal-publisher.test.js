@@ -1603,6 +1603,33 @@ describe('createJournalPublisher — agent-chat room ops', () => {
     await fake.close();
   });
 
+  it('an empty-string or numeric room_id on an error frame normalizes to roomId:null (non-empty-string guard)', async () => {
+    // Pins the guard against a `?? null` simplification: '' must not become
+    // a falsy-but-present key, and a numeric id must never reach the
+    // string-keyed waiter map in agent-invites.
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'agent_invite'
+        ? { kind: 'control', op: 'error', code: 'conflict', ref: 'agent_invite', detail: 'dup',
+            room_id: msg.room_id === 'r-empty' ? '' : 7 }
+        : null),
+    });
+    const opErrors = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onOpError: (e) => opErrors.push(e),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r-empty', target_device_id: 4, justification: 'j' })).toBe(true);
+    await waitFor(() => opErrors.length === 1);
+    expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r-num', target_device_id: 4, justification: 'j' })).toBe(true);
+    await waitFor(() => opErrors.length === 2);
+    expect(opErrors[0]).toEqual({ code: 'conflict', ref: 'agent_invite', detail: 'dup', roomId: null });
+    expect(opErrors[1]).toEqual({ code: 'conflict', ref: 'agent_invite', detail: 'dup', roomId: null });
+    pub.close();
+    await fake.close();
+  });
+
   it('a throwing onOpError is swallowed (handler survives)', async () => {
     const fake = await startFakeServer({
       onFrame: (msg) => (msg.op === 'agent_invite'

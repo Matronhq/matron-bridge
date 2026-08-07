@@ -39,6 +39,7 @@ function makeFixture(overrides = {}) {
     invite: vi.fn(async (args) => { calls.push({ call: 'invite', args }); return overrides.inviteOutcome ?? { kind: 'accepted', peerDeviceId: 7 }; }),
     join: vi.fn(async (args) => { calls.push({ call: 'join', args }); return overrides.joinOutcome ?? { kind: 'accepted', peerDeviceId: 7 }; }),
     answer: vi.fn(() => true),
+    answerAwait: vi.fn(async (args) => { calls.push({ call: 'answerAwait', args }); return overrides.answerAwaitOutcome ?? { kind: 'answered' }; }),
     leave: vi.fn(async () => overrides.leaveOutcome ?? { kind: 'left' }),
     ...overrides.invites,
   };
@@ -388,8 +389,36 @@ describe('createAgentChatHandlers', () => {
         { sender: 'agent:mac', type: 'image', ts: 2, body: '[image "shot.png" (blob b9)]' },
       ] });
       expect(fetchMessages).toHaveBeenCalledWith('room-1', { limit: 20 });
-      expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: null, accept: true, reason: undefined });
+      // Accept rides the AWAITED answer path; the fire-and-forget answer()
+      // is reserved for refusals.
+      expect(invites.answerAwait).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: null, accept: true, reason: undefined });
+      expect(invites.answer).not.toHaveBeenCalled();
       expect(rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('guest accept the journal REJECTS does not join: room expired, error surfaced, no backfill (Major 2)', async () => {
+      const fetchMessages = vi.fn(async () => ({ events: [] }));
+      const { handlers, rooms } = makeFixture({
+        publisher: { fetchMessages },
+        answerAwaitOutcome: { kind: 'error', code: 'conflict', detail: 'invite expired' },
+      });
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/invite expired/);
+      expect(res.body.error).toMatch(/ask for a fresh one/i);
+      // pending -> expired (allowed transition), never 'joined': a joined
+      // room the journal refused would black-hole every later send.
+      expect(rooms.get('room-1').state).toBe('expired');
+      expect(fetchMessages).not.toHaveBeenCalled();
+    });
+
+    it('guest accept rejected with a non-conflict code maps to 502 and still expires the room', async () => {
+      const { handlers, rooms } = makeFixture({ answerAwaitOutcome: { kind: 'error', code: 'not_found' } });
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(502);
+      expect(rooms.get('room-1').state).toBe('expired');
     });
 
     it('guest accept still joins when the backfill read fails — degrades to a note', async () => {
@@ -416,7 +445,7 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ ok: true, room_id: 'room-1', admitted: true });
-      expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: 9, accept: true, reason: undefined });
+      expect(invites.answerAwait).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: 9, accept: true, reason: undefined });
       // Admitting a third party never changes the owner's own membership,
       // and the consumed request is cleared (a second answer has nothing).
       expect(rooms.get('room-1')).toMatchObject({ state: 'joined', peerDeviceId: 7 });
@@ -454,6 +483,7 @@ describe('createAgentChatHandlers', () => {
       expect(res.status).toBe(409);
       expect(res.body.error).toMatch(/start a new room/i);
       expect(invites.answer).not.toHaveBeenCalled();
+      expect(invites.answerAwait).not.toHaveBeenCalled();
       expect(pendingJoin.has('room-1')).toBe(true);
       // Refusing the requester is still fine — it tells them to go away.
       const refuse = await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1' });
@@ -480,14 +510,46 @@ describe('createAgentChatHandlers', () => {
       expect(rooms.get('room-1').state).toBe('pending');
     });
 
-    it('owner answer keeps the pending join request when the answer op cannot be sent', async () => {
-      const { handlers, rooms, pendingJoin } = makeFixture({ invites: { answer: vi.fn(() => false) } });
+    it('owner ADMIT keeps the pending join request when the answer op never left the socket', async () => {
+      const { handlers, rooms, pendingJoin } = makeFixture({ answerAwaitOutcome: { kind: 'error', code: 'journal_unreachable' } });
       rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
       pendingJoin.set('room-1', 9);
       const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/journal unreachable/i);
       expect(pendingJoin.get('room-1')).toBe(9); // retryable
       expect(rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('owner ADMIT the journal rejects returns the error and CONSUMES the request; own membership untouched (Major 2)', async () => {
+      const { handlers, rooms, pendingJoin } = makeFixture({ answerAwaitOutcome: { kind: 'error', code: 'conflict', detail: 'no such request' } });
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      pendingJoin.set('room-1', 9);
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/no such request/);
+      expect(res.body).not.toHaveProperty('admitted');
+      // The request the journal rejected is dead server-side: consumed here,
+      // and the requester can re-ask.
+      expect(pendingJoin.has('room-1')).toBe(false);
+      expect(rooms.get('room-1')).toMatchObject({ state: 'joined', peerDeviceId: 7 });
+    });
+
+    it('owner REFUSE stays fire-and-forget: answer(), never answerAwait()', async () => {
+      const { handlers, invites, rooms, pendingJoin } = makeFixture();
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      pendingJoin.set('room-1', 9);
+      await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1' });
+      expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: 9, accept: false, reason: undefined });
+      expect(invites.answerAwait).not.toHaveBeenCalled();
+    });
+
+    it('guest REFUSE stays fire-and-forget: answer(), never answerAwait()', async () => {
+      const { handlers, invites, rooms } = makeFixture();
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1' });
+      expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: null, accept: false, reason: undefined });
+      expect(invites.answerAwait).not.toHaveBeenCalled();
     });
 
     it('refuse carries the reason and marks the room refused', async () => {
@@ -509,10 +571,18 @@ describe('createAgentChatHandlers', () => {
       expect(invites.answer.mock.calls[0][0].reason).toHaveLength(1000);
     });
 
-    it('502s when the answer op cannot be sent and leaves the room pending', async () => {
-      const { handlers, rooms } = makeFixture({ invites: { answer: vi.fn(() => false) } });
+    it('502s a guest accept whose answer op never left the socket and leaves the room pending (retryable)', async () => {
+      const { handlers, rooms } = makeFixture({ answerAwaitOutcome: { kind: 'error', code: 'journal_unreachable' } });
       rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
       const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(502);
+      expect(rooms.get('room-1').state).toBe('pending');
+    });
+
+    it('502s a guest REFUSE whose answer op cannot be sent and leaves the room pending', async () => {
+      const { handlers, rooms } = makeFixture({ invites: { answer: vi.fn(() => false) } });
+      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+      const res = await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(502);
       expect(rooms.get('room-1').state).toBe('pending');
     });

@@ -223,6 +223,35 @@ describe('createAgentInvites', () => {
       await vi.advanceTimersByTimeAsync(5_000);
       await expect(p1).resolves.toEqual({ kind: 'left' });
     });
+
+    it('after any stamped error, an UNSTAMPED error settles NOTHING (sticky journalStampsRoomIds)', async () => {
+      // A stamping journal stamps every correlatable error, so an unstamped
+      // one is uncorrelatable — the pre-fix scan would have failed r1 here
+      // (arm order), a false terminal outcome for the wrong room.
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p1 = inv.leave({ roomId: 'r1' });
+      const p2 = inv.leave({ roomId: 'r2' });
+      const p3 = inv.leave({ roomId: 'r3' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'r3 failed', roomId: 'r3' });
+      await expect(p3).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'r3 failed' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'mystery' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p1).resolves.toEqual({ kind: 'left' });
+      await expect(p2).resolves.toEqual({ kind: 'left' });
+    });
+
+    it('the sticky flag is journal-level, not ref-level: a stamped invite error mutes a later unstamped leave error', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const pInv = inv.invite({ roomId: 'rA', targetDeviceId: 7, justification: 'j' });
+      inv.onOpError({ code: 'offline', ref: 'agent_invite', detail: 'peer offline', roomId: 'rA' });
+      await expect(pInv).resolves.toEqual({ kind: 'error', code: 'offline', detail: 'peer offline' });
+      const pLeave = inv.leave({ roomId: 'rB' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'mystery' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(pLeave).resolves.toEqual({ kind: 'left' });
+    });
   });
 
   describe('join()', () => {
@@ -335,6 +364,50 @@ describe('createAgentInvites', () => {
       inv.onOpError({ code: 'conflict', ref: 'agent_invite', detail: 'unrelated' });
       await vi.advanceTimersByTimeAsync(5_000);
       await expect(p).resolves.toEqual({ kind: 'left' });
+    });
+
+    it('answerAwait: silence within the error window means the answer took (journal only answers on failure)', async () => {
+      vi.useFakeTimers();
+      const { inv, sendRoomOp } = makeInvites();
+      const p = inv.answerAwait({ roomId: 'r1', peerDeviceId: null, accept: true });
+      expect(sendRoomOp).toHaveBeenCalledWith({ op: 'agent_invite_answer', room_id: 'r1', accept: true });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p).resolves.toEqual({ kind: 'answered' });
+    });
+
+    it('answerAwait: includes peer_device_id and reason only when given', async () => {
+      vi.useFakeTimers();
+      const { inv, sendRoomOp } = makeInvites();
+      const p = inv.answerAwait({ roomId: 'r1', peerDeviceId: 9, accept: true, reason: 'come in' });
+      expect(sendRoomOp).toHaveBeenLastCalledWith({ op: 'agent_invite_answer', room_id: 'r1', peer_device_id: 9, accept: true, reason: 'come in' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p).resolves.toEqual({ kind: 'answered' });
+    });
+
+    it('answerAwait: sendRoomOp false resolves journal_unreachable and cancels the armed waiter', async () => {
+      const { inv } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await expect(inv.answerAwait({ roomId: 'r1', accept: true }))
+        .resolves.toEqual({ kind: 'error', code: 'journal_unreachable' });
+      // The abandoned waiter was cancelled: a late error settles into nothing.
+      expect(() => inv.onOpError({ code: 'conflict', ref: 'agent_invite_answer', detail: 'late', roomId: 'r1' })).not.toThrow();
+    });
+
+    it('answerAwait: a stamped agent_invite_answer error is the outcome and settles ONLY its own room (Major 1 interplay)', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p1 = inv.answerAwait({ roomId: 'r1', accept: true });
+      const p2 = inv.answerAwait({ roomId: 'r2', accept: true });
+      inv.onOpError({ code: 'conflict', ref: 'agent_invite_answer', detail: 'invite expired', roomId: 'r1' });
+      await expect(p1).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'invite expired' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p2).resolves.toEqual({ kind: 'answered' });
+    });
+
+    it('answerAwait: an UNSTAMPED agent_invite_answer error (old journal) still settles via the ref-level scan', async () => {
+      const { inv } = makeInvites();
+      const p = inv.answerAwait({ roomId: 'r1', accept: true });
+      inv.onOpError({ code: 'conflict', ref: 'agent_invite_answer', detail: 'invite expired' });
+      await expect(p).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'invite expired' });
     });
 
     it('leave: one error frame settles exactly ONE of several in-flight leave waiters', async () => {
