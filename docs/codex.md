@@ -23,6 +23,50 @@ The bridge:
 
 The installed Codex CLI remains responsible for model access, authentication, user/project configuration, `AGENTS.md`, skills, rules, MCP servers, and tool execution.
 
+### Enabling the live view
+
+The Codex live view is opt-in. Set `MATRON_CODEX_VIZ=1` in the bridge environment
+to activate it. When it is unset (the default), the bridge provisions no sink
+directory and starts no watcher, so existing sessions behave exactly as before.
+
+Before Codex events are durably published, the bridge redacts assignment values
+whose keys look secret (for example, `DATABASE_PASSWORD=...` or
+`"API_TOKEN": "..."`) and drops recognizable raw environment dumps as an
+additional safeguard. This built-in secret-key baseline always applies. An
+optional value-pattern policy adds format-based rules on top (for example, known
+token shapes); point `MATRON_REDACTOR_CONFIG` at a YAML policy file to enable it.
+Pattern-based redaction cannot decide that an arbitrary value is secret: a secret
+under a non-secret-looking key whose value matches no configured pattern may pass
+and must not be printed into agent output.
+
+### Accepted single-principal residual
+
+The live-view sidecar directory is writable by the Codex wrapper and therefore
+by a shell-capable descendant. Such a descendant can forge a matching metadata
+file and JSONL transcript that the journal presents as a Codex run. Shape and
+PID-liveness validation, together with separate 64-child limits for live and
+historical restart reconciliation, bound malformed data and volume but do not
+establish provenance. Runs beyond either budget are omitted after one durable
+notice on the parent conversation.
+
+This is accepted only for a single-principal deployment, where the operator's own
+trusted sessions share the OS principal: forgery within the operator's own journal
+is not a new cross-principal capability. Out-of-band, bridge-stamped run
+registration through a mediator that descendants cannot forge is a hard
+prerequisite before any multi-principal or shared-toolset deployment. The current
+bridge does not claim that provenance.
+
+### Known outcome-delivery edge
+
+The common disconnected-journal case is repaired by reconnect outcome re-emit
+and terminal-field coalescing. A narrower edge remains if a parent session is
+replaced during the outage after its terminal frame has been evicted from the
+bounded publisher queue: the old tracker is no longer attached to a session,
+so its child outcome cannot be re-emitted and the journal may continue to show
+that child as running. Closing this fully would require a session-independent
+terminal ledger that re-emits outcomes until the publisher receives an
+authoritative acknowledgement.
+
 ## Install and authenticate
 
 Install Codex globally, then authenticate it as the same OS user that launches matron-bridge:
