@@ -300,6 +300,20 @@ describe('createAgentInvites', () => {
       await vi.advanceTimersByTimeAsync(5_000);
       await expect(p).resolves.toEqual({ kind: 'left' });
     });
+
+    it('leave: one error frame settles exactly ONE of several in-flight leave waiters', async () => {
+      // Eviction fires a BATCH of agent_leave ops; a single owner-room
+      // conflict must not fail every leave in the window (scoped re-review,
+      // finding 2). Op errors are 1:1 with ops on an ordered socket.
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p1 = inv.leave({ roomId: 'r1' });
+      const p2 = inv.leave({ roomId: 'r2' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'not a joined participant' });
+      await expect(p1).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'not a joined participant' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p2).resolves.toEqual({ kind: 'left' });
+    });
   });
 
   describe('onInviteFrame (inbound, no waiter)', () => {

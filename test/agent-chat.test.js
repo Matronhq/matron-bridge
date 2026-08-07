@@ -443,6 +443,33 @@ describe('createAgentChatHandlers', () => {
       expect(calls).toContainEqual({ call: 'publishText', convoId: 'room-1', payload: { body: 'still here, B?', from: 'agent' } });
     });
 
+    it('409s an owner ADMIT into a locally-dead room, but still allows the refusal', async () => {
+      // The C1 isolation removed record()'s accidental resurrection of a
+      // terminal room — admitting into one would strand the newcomer in a
+      // room this bridge never routes (scoped re-review, finding 1).
+      const { handlers, rooms, invites, pendingJoin } = makeFixture();
+      rooms.record('room-1', { role: 'owner', state: 'left', sessionRoomId: '!sess', peerDeviceId: 7 });
+      pendingJoin.set('room-1', 9);
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/start a new room/i);
+      expect(invites.answer).not.toHaveBeenCalled();
+      expect(pendingJoin.has('room-1')).toBe(true);
+      // Refusing the requester is still fine — it tells them to go away.
+      const refuse = await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1' });
+      expect(refuse.status).toBe(200);
+      expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: 9, accept: false, reason: undefined });
+    });
+
+    it('chatLeave on an already-left room is a calm 200, not a re-surfaced journal conflict', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      rooms.record('room-1', { role: 'guest', state: 'left', sessionRoomId: '!sess' });
+      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true, room_id: 'room-1', note: 'already left' });
+      expect(invites.leave).not.toHaveBeenCalled();
+    });
+
     it('409s an owner answer when no join request is pending (including its own outbound pending invite)', async () => {
       const { handlers, rooms, invites } = makeFixture();
       rooms.record('room-1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 7 });

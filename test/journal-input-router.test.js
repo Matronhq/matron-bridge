@@ -1594,6 +1594,20 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('\nfunction ', start + 1);
     expect(src.slice(start, end)).toMatch(/roomDelivery\.dropSession\(session\?\.roomId\)/);
+    // Eviction must auto-leave every joined room so the peer's bridge doesn't
+    // keep publishing into a black hole (whole-branch review, I4).
+    expect(src.slice(start, end)).toMatch(/agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]*agentRooms\.setState\(r\.roomId, 'left'\)/);
+  });
+
+  it('an inbound join_request never touches the room record — only the pendingJoinRequests seam (whole-branch review, C1)', () => {
+    const start = src.indexOf('function journalInjectInviteRequest(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toMatch(/if \(isJoin\) \{[^}]*pendingJoinRequests\.set/);
+    // The record() call must live in the non-join else branch only.
+    const isJoinBlock = body.match(/if \(isJoin\) \{[\s\S]*?\n {4}\} else \{/)?.[0] ?? '';
+    expect(isJoinBlock).not.toMatch(/agentRooms\.record/);
   });
 
   it('the publisher receives thunked invite/op-error dispatch into the (later-built) invite manager', () => {
