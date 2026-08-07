@@ -1560,7 +1560,7 @@ describe('createJournalPublisher — agent-chat room ops', () => {
     await fake.close();
   });
 
-  it('dispatches inbound error frames to onOpError with {code, ref, detail}, after the warn-once', async () => {
+  it('dispatches inbound error frames to onOpError with {code, ref, detail, roomId:null when absent}, after the warn-once', async () => {
     const fake = await startFakeServer({
       onFrame: (msg) => (msg.op === 'agent_invite'
         ? { kind: 'control', op: 'error', code: 'offline', ref: 'agent_invite', detail: 'peer bridge offline' }
@@ -1576,9 +1576,29 @@ describe('createJournalPublisher — agent-chat room ops', () => {
     await delay(50);
     expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r1', target_device_id: 4, justification: 'j' })).toBe(true);
     await waitFor(() => opErrors.length === 1);
-    expect(opErrors[0]).toEqual({ code: 'offline', ref: 'agent_invite', detail: 'peer bridge offline' });
+    expect(opErrors[0]).toEqual({ code: 'offline', ref: 'agent_invite', detail: 'peer bridge offline', roomId: null });
     // The pre-existing warn-once still fired for the same frame.
     expect(warnings.some((w) => w.includes('server error frame'))).toBe(true);
+    pub.close();
+    await fake.close();
+  });
+
+  it('an error frame\'s room_id (newer journals) reaches onOpError as roomId', async () => {
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'agent_invite'
+        ? { kind: 'control', op: 'error', code: 'conflict', ref: 'agent_invite', detail: 'dup', room_id: 'r-err' }
+        : null),
+    });
+    const opErrors = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onOpError: (e) => opErrors.push(e),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r-err', target_device_id: 4, justification: 'j' })).toBe(true);
+    await waitFor(() => opErrors.length === 1);
+    expect(opErrors[0]).toEqual({ code: 'conflict', ref: 'agent_invite', detail: 'dup', roomId: 'r-err' });
     pub.close();
     await fake.close();
   });

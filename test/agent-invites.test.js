@@ -173,7 +173,7 @@ describe('createAgentInvites', () => {
       expect(notifyRoom).not.toHaveBeenCalled();
     });
 
-    it('frames settle only their own room; op errors fan out to every in-flight invite (coarse, pinned)', async () => {
+    it('frames settle only their own room; roomId-less op errors fan out to every in-flight invite (coarse, pinned)', async () => {
       const { inv } = makeInvites();
       const p1 = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
       const p2 = inv.invite({ roomId: 'r2', targetDeviceId: 8, justification: 'j' });
@@ -181,11 +181,47 @@ describe('createAgentInvites', () => {
       inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: 'r1', session_state: 'idle' });
       inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
       await expect(p1).resolves.toEqual({ kind: 'accepted', peerDeviceId: 7 });
-      // r2 was untouched by r1's frames. The error correlation is ref-level
-      // (no room_id in error frames): it settles EVERY in-flight invite —
-      // acceptable for v1 because room ops serialize per tool call.
+      // r2 was untouched by r1's frames. Without a roomId (old journal) the
+      // error correlation is ref-level: it settles EVERY in-flight invite —
+      // acceptable because room ops serialize per tool call.
       inv.onOpError({ code: 'offline', ref: 'agent_invite', detail: 'peer offline' });
       await expect(p2).resolves.toEqual({ kind: 'error', code: 'offline', detail: 'peer offline' });
+    });
+  });
+
+  describe('roomId-correlated op errors (newer journals stamp room_id)', () => {
+    it('settles exactly the named room even when another room armed an EARLIER waiter for the same ref', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p1 = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' }); // older waiter, scan order
+      const p2 = inv.invite({ roomId: 'r2', targetDeviceId: 8, justification: 'j' });
+      inv.onOpError({ code: 'offline', ref: 'agent_invite', detail: 'peer offline', roomId: 'r2' });
+      await expect(p2).resolves.toEqual({ kind: 'error', code: 'offline', detail: 'peer offline' });
+      // r1 was NOT settled by r2's error — it runs out its own clock.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p1).resolves.toEqual({ kind: 'pending_quiet' });
+    });
+
+    it('a correlated error with no waiter for its room settles nothing (never leaks into another room\'s scan)', async () => {
+      const { inv } = makeInvites();
+      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_invite', detail: 'stale', roomId: 'r-gone' });
+      // r1's in-flight invite still resolves by its own frames.
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
+      await flush();
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
+      await expect(p).resolves.toEqual({ kind: 'accepted', peerDeviceId: 7 });
+    });
+
+    it('correlates leave errors by room across an eviction-style batch, regardless of arm order', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p1 = inv.leave({ roomId: 'r1' });
+      const p2 = inv.leave({ roomId: 'r2' });
+      inv.onOpError({ code: 'conflict', ref: 'agent_leave', detail: 'not a joined participant', roomId: 'r2' });
+      await expect(p2).resolves.toEqual({ kind: 'error', code: 'conflict', detail: 'not a joined participant' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(p1).resolves.toEqual({ kind: 'left' });
     });
   });
 
