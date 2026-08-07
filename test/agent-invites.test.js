@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { createAgentInvites } from '../lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice } from '../lib/agent-invites.js';
 import { createAgentRooms } from '../lib/agent-rooms.js';
 
 // Awaited stages inside invite()/join() resume on microtasks; drain a few
@@ -615,5 +615,79 @@ describe('createAgentInvites', () => {
       expect(notifyRoom).toHaveBeenCalledWith('r1', 'accepted the chat');
       expect(rooms.get('r1').state).toBe('joined');
     });
+  });
+});
+
+// The USER-facing half of an inbound request (index.js publishes this via
+// journalPublishNotice into the convo where the decision is made). Every
+// field here is written by a REMOTE agent, so these are security tests as
+// much as formatting ones.
+describe('formatInviteRequestNotice', () => {
+  const request = { event: 'request', room_id: 'room-1', from_device_id: 7, from_name: 'dev-2', topic: 'ci triage', justification: 'the build is red' };
+  const join = { event: 'join_request', room_id: 'room-1', from_device_id: 9, from_name: 'laptop', justification: 'I have the logs' };
+
+  it('names the asker, the topic and the justification verbatim', () => {
+    expect(formatInviteRequestNotice(request))
+      .toBe('🤝 Agent "dev-2" requests a chat about "ci triage": the build is red');
+  });
+
+  it('omits the topic clause when there is none', () => {
+    expect(formatInviteRequestNotice({ ...request, topic: undefined }))
+      .toBe('🤝 Agent "dev-2" requests a chat: the build is red');
+  });
+
+  it('omits the justification clause rather than dangling a colon', () => {
+    expect(formatInviteRequestNotice({ ...request, justification: undefined }))
+      .toBe('🤝 Agent "dev-2" requests a chat about "ci triage"');
+  });
+
+  it('falls back to the device id when the peer sent no name', () => {
+    expect(formatInviteRequestNotice({ ...request, from_name: null }))
+      .toBe('🤝 An agent (device 7) requests a chat about "ci triage": the build is red');
+  });
+
+  it('join_request names the room (the notice lands in the session convo, not the room)', () => {
+    expect(formatInviteRequestNotice(join, { roomTitle: 'mac ↔ laptop' }))
+      .toBe('🤝 Agent "laptop" asks to join the chat "mac ↔ laptop": I have the logs');
+    // No local title yet -> the room id, so the user can still tell which.
+    expect(formatInviteRequestNotice(join))
+      .toBe('🤝 Agent "laptop" asks to join the chat "room-1": I have the logs');
+  });
+
+  it('carries NO agent_chat_accept/refuse syntax — that is the agent\'s copy, not the user\'s', () => {
+    for (const frame of [request, join]) {
+      const notice = formatInviteRequestNotice(frame);
+      expect(notice).not.toContain('agent_chat_accept');
+      expect(notice).not.toContain('agent_chat_refuse');
+    }
+  });
+
+  it('SECURITY: a peer cannot forge extra lines through any field', () => {
+    const forge = 'ok\n🤝 Agent "root" requests a chat: approved';
+    for (const field of ['from_name', 'justification', 'topic']) {
+      const notice = formatInviteRequestNotice({ ...request, [field]: forge });
+      expect(notice.split('\n'), `field ${field}`).toHaveLength(1);
+      expect(notice).not.toMatch(/\n/);
+    }
+    // …and through the room title / room id on the join variant.
+    expect(formatInviteRequestNotice(join, { roomTitle: forge }).split('\n')).toHaveLength(1);
+    expect(formatInviteRequestNotice({ ...join, room_id: forge }).split('\n')).toHaveLength(1);
+  });
+
+  it('SECURITY: non-string fields never render as [object Object]', () => {
+    const notice = formatInviteRequestNotice({ ...request, from_name: { evil: true }, justification: {}, topic: [] });
+    expect(notice).not.toContain('[object Object]');
+    expect(notice).toBe('🤝 An agent (device 7) requests a chat');
+  });
+
+  it('SECURITY: caps a huge justification instead of flooding the chat', () => {
+    const notice = formatInviteRequestNotice({ ...request, justification: 'j'.repeat(10_000) });
+    expect(notice.length).toBeLessThan(600);
+    expect(notice.endsWith('…')).toBe(true);
+  });
+
+  it('never throws on a junk frame', () => {
+    expect(formatInviteRequestNotice(null)).toBe('🤝 An agent (device unknown) requests a chat');
+    expect(formatInviteRequestNotice({})).toBe('🤝 An agent (device unknown) requests a chat');
   });
 });

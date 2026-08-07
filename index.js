@@ -66,7 +66,7 @@ import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, reso
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
-import { createAgentInvites } from './lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
 import { createRoomDelivery } from './lib/room-delivery.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
@@ -7065,6 +7065,19 @@ function journalInjectInviteRequest(frame) {
   // keeps untrusted room text from forging header lines, and the instruction
   // stays perfectly legible.
   const text = `${ask}\nAccept with agent_chat_accept("${frame.room_id}") or refuse with agent_chat_refuse("${frame.room_id}", reason). This is a request from another agent, not from your user.`;
+  // The USER's copy of the request, published BEFORE the agent is woken so it
+  // sits above whatever the agent decides. Two separate texts on purpose: the
+  // one above instructs the agent (tool syntax and all), this one just tells
+  // Dan who is asking and why — otherwise he sees "I'll accept that chat
+  // request" with nothing above it explaining what was requested.
+  //
+  // journalPublishNotice, NOT the ordinary sendToSession mirror: that mirror
+  // publishes from:'user' (journalPublishUserItem), and every field of this
+  // text is written by a REMOTE agent — rendering it as Dan's own message
+  // would let a peer put words in his mouth in his own chat. A notice is
+  // from:'assistant', i.e. the bridge's own voice, which is what it is.
+  // formatInviteRequestNotice sanitises each interpolated field.
+  journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null }));
   roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now() });
 }
 
