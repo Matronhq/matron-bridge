@@ -673,6 +673,7 @@ function journalUpsertConvo(session, opts) {
 function journalSeedTitle(session, { incomingHint, reattaching = false } = {}) {
   return seedJournalTitle(session, {
     workdir: session.workdir,
+    serverLabel: SERVER_LABEL,
     incomingHint,
     reattaching,
     upsertConvo: journalUpsertConvo,
@@ -4645,13 +4646,14 @@ async function updateRoomName(roomId, name) {
 }
 
 async function maybeUpdatePinnedSummary(session) {
-  if (!genAI) {
-    // No Gemini key: no pinned summary, but still name the convo Claude's
-    // own way — its first user message, the same summary `claude --resume`
-    // and /sessions display — instead of leaving the workdir-basename seed.
-    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
-    return;
-  }
+  // Name the convo from the first user message — the same summary
+  // `claude --resume` and /sessions display — instead of leaving the
+  // workdir seed. One-shot, and guarded to only ever replace the seed.
+  // With Gemini configured this covers the gap before the LLM rename's
+  // 5-message threshold (short chats never get there); without Gemini
+  // it is the only naming that runs.
+  applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
+  if (!genAI) return;
 
   if (!session.chatHistory) session.chatHistory = [];
   debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
