@@ -7221,6 +7221,7 @@ const handleSendAttachment = createSendAttachmentHandler({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
+  rooms: agentRooms,
 });
 
 const apiServer = createServer(async (req, res) => {

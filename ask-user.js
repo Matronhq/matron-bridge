@@ -130,19 +130,20 @@ server.tool(
   {
     path: z.string().describe('Path to the file — absolute, or relative to the session working directory'),
     caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body'),
+    chat_room_id: z.string().optional().describe('Optional agent chat room id — post the attachment into that room instead of this conversation (you must be a participant of the room)'),
   },
-  async ({ path, caption }) => {
+  async ({ path, caption, chat_room_id }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/send-attachment`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, path, caption }),
+        body: JSON.stringify({ roomId: ROOM_ID, path, caption, ...(chat_room_id ? { chat_room_id } : {}) }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `send_attachment failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      return { content: [{ type: 'text', text: `Sent ${data.kind} "${data.name}" (${data.size} bytes) into the chat.` }] };
+      return { content: [{ type: 'text', text: `Sent ${data.kind} "${data.name}" (${data.size} bytes) into ${chat_room_id ? `room ${chat_room_id}` : 'the chat'}.` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
