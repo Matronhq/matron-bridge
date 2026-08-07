@@ -53,6 +53,8 @@ import {
 } from './lib/codex-watcher-setup.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { createSubagentRunningStore } from './lib/subagent-running-store.js';
+import { selectStrandedChildren } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -373,6 +375,18 @@ let agentInvites = null;
 // safe — onEvent is only ever CALLED once the socket is live, long after the
 // whole module, including `sessions` and the routing functions below, has
 // finished evaluating).
+// Fires on every hello_ok — the FIRST connect (bridge startup, live sessions
+// map still empty → all persisted running children reconcile) and every later
+// reconnect (only children whose parent is no longer live). Named (not inlined
+// into the createJournalPublisher options) so the reconcile + reemit block does
+// not read as part of the publisher's option object. `journalPublisher` is
+// referenced lazily — the handler only ever fires once the socket is live, long
+// after the const below is assigned.
+function handleJournalReconnect() {
+  reconcileStrandedSubagents('reconnect');
+  journalReemitCodexOutcomes({ sessions, publisher: journalPublisher });
+}
+
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
   token: _journalToken,
@@ -382,10 +396,7 @@ const journalPublisher = createJournalPublisher({
   onStreamResync: (convoId, messageRef, have) => {
     toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
   },
-  onReconnect: () => journalReemitCodexOutcomes({
-    sessions,
-    publisher: journalPublisher,
-  }),
+  onReconnect: handleJournalReconnect,
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -637,6 +648,12 @@ function findPersistedAgentSession(agent, sessionId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
+
+// Persistent record of subagent child convos currently `running`.
+// Written by each session's subagent tracker (add on mint, remove on finish);
+// read at startup/reconnect by reconcileStrandedSubagents to mark ghosts done.
+// A single shared store is safe — childConvoIds are globally unique.
+const subagentRunningStore = createSubagentRunningStore({ log: console });
 
 // RPC-start (lib/journal-rpc.js `start`): the !start command body minus the
 // origin-room replies — an RPC start has no origin chat room. Returns the
@@ -3017,6 +3034,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
+    runningStore: subagentRunningStore,
     log: console,
   });
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
@@ -3041,6 +3059,72 @@ function teardownSubagentTracking(session) {
   if (session.subagentWatcher) {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
+  }
+}
+
+// Reconcile stranded `running` subagent child convos. A child is a
+// ghost when it is persisted `running` (subagentRunningStore) but no LIVE
+// session currently owns its parent convo — i.e. the parent is TERMINAL: the
+// bridge restarted and the parent's claude process died with the old bridge, or
+// the parent stream was lost. At startup the live `sessions` map is empty, so
+// every persisted running child reconciles; on a transient WS reconnect only
+// genuinely orphaned children do (a still-live coordinator parent keeps its
+// children running — see selectStrandedChildren).
+//
+// Reconciles purely from PERSISTED state, never from watcher re-discovery:
+// subagent-watcher.snapshot() marks the already-complete agent-*.jsonl "seen",
+// so completed children are never re-found and finish() never re-fires. The
+// published frame (convo_upsert, session_state: done) is byte-identical to the
+// live finish() transition, so web clients update the card the same way; here it
+// rides upsertConvoBestEffort, the established reconnect-repair fan-out path.
+function reconcileStrandedSubagents(reason = 'startup') {
+  if (!JOURNAL_ENABLED) return;
+  let entries;
+  try {
+    entries = subagentRunningStore.list();
+  } catch (e) {
+    console.warn(`[subagent-reconcile] list failed: ${e.message}`);
+    return;
+  }
+  if (!entries.length) return;
+
+  // Parent convo ids currently owned by a live session — do NOT retire their
+  // children (a coordinator parent legitimately stays running).
+  const liveParents = new Set();
+  for (const session of sessions.values()) {
+    if (!session?.alive) continue;
+    const convoId = journalConvoIdFor(session);
+    if (convoId) liveParents.add(convoId);
+  }
+
+  const { stranded, malformed } = selectStrandedChildren(entries, liveParents);
+  let published = 0;
+  for (const childConvoId of stranded) {
+    try {
+      // Publish `done` and drop the store record ONLY on confirmed delivery
+      // a capacity-rejected best-effort send or a
+      // crash before the socket flushes must leave the record in place so the
+      // next startup/reconnect reconcile retries — never erase the write-ahead
+      // record on an unconfirmed send. Re-publishing `done` is idempotent
+      // server-side.
+      journalPublisher.upsertConvoBestEffort(
+        childConvoId,
+        { sessionState: 'done' },
+        { onDelivered: () => subagentRunningStore.remove(childConvoId) },
+      );
+      published += 1;
+    } catch (e) {
+      console.warn(`[subagent-reconcile] failed for ${childConvoId}: ${e.message}`);
+    }
+  }
+  if (published) {
+    console.log(`[subagent-reconcile] ${reason}: publishing done for ${published} stranded subagent child convo(s)`);
+  }
+  if (malformed.length) {
+    // Fail-closed: records with no validated parent provenance are
+    // left running rather than terminally mutated. Surface them — they only
+    // arise from corruption / schema drift and warrant inspection.
+    console.warn(`[subagent-reconcile] ${reason}: ${malformed.length} malformed running record(s) with no parent convo — left untouched: ${malformed.join(', ')}`);
   }
 }
 
