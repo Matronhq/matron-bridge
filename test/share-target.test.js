@@ -12,6 +12,7 @@ describe('resolveShareTarget', () => {
     _journalTitleHint: 'DANS:3a InDesign template cleanup',
     claudeSessionId: '3a258fa0-ee0a-43e2-9f01-a30db5695e39',
     workdir: '/Users/danbarker/Dev/yearbook-infra',
+    sendHtml: () => {},
     ...over,
   });
 
@@ -53,5 +54,40 @@ describe('resolveShareTarget', () => {
     const out = resolveShareTarget(sessions, 'room-1');
     expect(out.ok).toBe(true);
     expect(out.description).toContain('yearbook-infra');
+  });
+
+  // Sessions are constructed with sendCallback/sendHtml null and get them
+  // attached afterwards, so "alive" alone did not mean "can be told". The
+  // caller reported `notified: <that room>` regardless, and the MCP tool
+  // passed that on to the agent — which then believed the user had the link.
+  it('rejects a live session that has no send channel attached yet', () => {
+    const sessions = new Map([['room-1', session({ sendHtml: null, sendCallback: null })]]);
+    const out = resolveShareTarget(sessions, 'room-1');
+    expect(out.ok).toBe(false);
+    expect(out.error).toMatch(/no send channel/i);
+  });
+
+  it('accepts a session reachable only through the plain-text callback', () => {
+    const sessions = new Map([['room-1', session({ sendHtml: null, sendCallback: () => {} })]]);
+    expect(resolveShareTarget(sessions, 'room-1').ok).toBe(true);
+  });
+
+  it('omits unreachable sessions from the list of alternatives it suggests', () => {
+    const sessions = new Map([
+      ['aaaa1111-0000-0000-0000-000000000000', session()],
+      ['bbbb2222-0000-0000-0000-000000000000', session({ _journalTitleHint: 'not wired up', sendHtml: null, sendCallback: null })],
+    ]);
+    const out = resolveShareTarget(sessions, 'cccc3333-0000-0000-0000-000000000000');
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain('aaaa1111');
+    expect(out.error).not.toContain('not wired up');
+  });
+
+  // The caller sends through this object rather than re-reading the map, so
+  // what was vetted and what gets messaged cannot drift apart.
+  it('returns the vetted session itself so the caller need not look it up again', () => {
+    const live = session();
+    const sessions = new Map([['room-1', live]]);
+    expect(resolveShareTarget(sessions, 'room-1').session).toBe(live);
   });
 });

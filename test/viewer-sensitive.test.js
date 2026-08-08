@@ -124,6 +124,27 @@ describe('GET /sensitive (shell page)', () => {
     const res = await getPage('/sensitive', { label: 'x' });
     expect(res.status).toBe(400);
   });
+
+  // The shell used to hardcode the one-time warning, so a share created with
+  // one_time:false was announced in chat as reusable and then described on
+  // its own page as spent-on-first-view. The token now carries the flag (ot,
+  // absent = one-time) and it is signed, so the holder cannot flip it.
+  it('warns that a one-time link is one-time', async () => {
+    const res = await getPage('/sensitive', { sensitiveId: 'abc', label: 'x' });
+    expect(await res.text()).toContain('one-time link');
+  });
+
+  it('does not call a multi-use link one-time', async () => {
+    const res = await getPage('/sensitive', { sensitiveId: 'abc', label: 'x', ot: false });
+    const html = await res.text();
+    expect(html).not.toContain('one-time link');
+    expect(html).toContain('used more than once');
+  });
+
+  it('carries the same distinction onto the download-mode shell', async () => {
+    const res = await getPage('/sensitive-download', { sensitiveId: 'abc', label: 'x', dl: true, ot: false });
+    expect(await res.text()).toContain('used more than once');
+  });
 });
 
 describe('GET /sensitive-download (shell page)', () => {
