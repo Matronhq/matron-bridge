@@ -378,7 +378,7 @@ function generateSecretLink(secretId, label, roomId) {
   return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
 
-function generateSensitiveLink(sensitiveId, label, ttl, { download = false } = {}) {
+function generateSensitiveLink(sensitiveId, label, ttl, { download = false, oneTime = true } = {}) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   const exp = Math.floor((Date.now() + ttl * 1000) / 1000);
   // dl discriminates the direct-download route (viewer /sensitive-download)
@@ -386,6 +386,12 @@ function generateSensitiveLink(sensitiveId, label, ttl, { download = false } = {
   const payloadObj = download
     ? { sensitiveId, label, dl: true, exp }
     : { sensitiveId, label, exp };
+  // The shell page has to warn the user what kind of link they hold, and it
+  // knows nothing but the token — so the token has to say. Present only for
+  // multi-use shares: absent means one-time, matching both the creation
+  // default and any token already in flight. Signed like everything else in
+  // the payload, so it cannot be flipped by the holder.
+  if (oneTime === false) payloadObj.ot = false;
   const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   const route = download ? 'sensitive-download' : 'sensitive';
@@ -7513,7 +7519,11 @@ const apiServer = createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Sensitive data has expired' }));
       return;
     }
-    if (s.oneTime && s.viewed) {
+    // `!== false` rather than a truthy test, so this read side defaults the
+    // same way the write side does (`oneTime: oneTime !== false`). An entry
+    // that somehow reached the store without the field then fails closed —
+    // consumed once — instead of silently becoming a multi-use share.
+    if (s.oneTime !== false && s.viewed) {
       res.writeHead(403);
       res.end(JSON.stringify({ error: 'Sensitive data has already been viewed (one-time link)' }));
       return;
@@ -7525,7 +7535,7 @@ const apiServer = createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ label: s.label, content: s.content, filename: s.filename }));
 
-    if (s.oneTime) {
+    if (s.oneTime !== false) {
       // Delete after 1 minute to allow time for the page to render, but prevent repeated access
       setTimeout(() => {
         pendingSensitiveData.delete(sensitiveId);
@@ -7699,7 +7709,10 @@ const apiServer = createServer(async (req, res) => {
         const expiresAt = Date.now() + ttlSeconds * 1000;
 
         // Generate secure link before storing data — if viewer is misconfigured, don't leak sensitive content in memory
-        const link = generateSensitiveLink(sensitiveId, label, ttlSeconds, { download: download === true });
+        const link = generateSensitiveLink(sensitiveId, label, ttlSeconds, {
+          download: download === true,
+          oneTime: oneTime !== false,
+        });
         if (!link) {
           res.writeHead(500);
           res.end(JSON.stringify({ error: 'Viewer not configured (missing HMAC_SECRET or VIEWER_BASE_URL)' }));
@@ -7719,8 +7732,11 @@ const apiServer = createServer(async (req, res) => {
           expiresAt,
         });
 
-        // Send notification to user in Matrix chat
-        const activeSession = sessions.get(roomId);
+        // Send notification to user in Matrix chat. Use the session
+        // resolveShareTarget already vetted — it guaranteed one of these two
+        // channels exists, which is what makes the `notified` field below
+        // true rather than merely hopeful.
+        const activeSession = target.session;
 
         const verb = download === true ? 'Download' : 'View';
         const linkKind = oneTime !== false ? 'one-time link' : 'link';
