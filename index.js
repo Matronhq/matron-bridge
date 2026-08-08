@@ -69,6 +69,7 @@ import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
+import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery } from './lib/room-delivery.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
@@ -7074,26 +7075,15 @@ function journalOnRoomFrame(room, frame) {
   });
 }
 
-// Which local session an inbound invite/join request is FOR.
-// - join_request: the session bound to the room this bridge owns.
-// - request: v1 coarseness — the invite frame carries no target convo/session
-//   address (the caller targeted a conversation; the journal resolved it to
-//   this DEVICE), so with more than one live session the receiving bridge
-//   cannot know which was meant. Route to the most recently active live
-//   session; the request text carries the room id so the agent can hand off.
-//   Fixing this properly means carrying target_convo_id through agent_invite
-//   (a small Phase 3.5 journal addition) — flagged in the PR description.
+// Which local session an inbound invite/join request is FOR — see
+// lib/invite-target.js for the rule and the incident behind it. Bound to
+// this file's `sessions` map and the journal return path's own reverse
+// lookup, so the routing rule stays pure and testable.
 function resolveInviteTargetSession(frame, room) {
-  if (frame.event === 'join_request') {
-    const session = room ? sessions.get(room.sessionRoomId) : null;
-    return session && session.alive ? session : null;
-  }
-  let best = null;
-  for (const session of sessions.values()) {
-    if (!session.alive) continue;
-    if (!best || (session.lastActivityAt || 0) > (best.lastActivityAt || 0)) best = session;
-  }
-  return best;
+  return resolveInviteTarget(frame, room, {
+    sessions,
+    findSessionByConvoId: findSessionByClaudeSessionId,
+  });
 }
 
 // Inbound invite/join request -> record the room as pending, ack with the
@@ -7104,15 +7094,22 @@ function journalInjectInviteRequest(frame) {
   // join_request -> a peer asks to join a room THIS bridge owns
   const isJoin = frame.event === 'join_request';
   const room = agentRooms.get(frame.room_id);
-  const session = resolveInviteTargetSession(frame, room);
+  const { session, addressed } = resolveInviteTargetSession(frame, room);
   if (!session) {
     debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask`);
     // No session ⇒ nobody will ever answer. Refuse immediately instead of
-    // letting the peer burn its full wait down to pending_quiet.
+    // letting the peer burn its full wait down to pending_quiet. An
+    // ADDRESSED request that finds nothing says so specifically: the target
+    // conversation exists on this device but isn't running right now, which
+    // is a different fact from "this box is idle" and the one the caller
+    // needs to hear (it picked that conversation off the roster).
     agentInvites.answer({
       roomId: frame.room_id,
       peerDeviceId: isJoin ? frame.from_device_id : null,
-      accept: false, reason: 'no active session on this box',
+      accept: false,
+      reason: !isJoin && frame.target_convo_id
+        ? 'that conversation has no running session right now'
+        : 'no active session on this box',
     });
     return;
   }
@@ -7154,7 +7151,20 @@ function journalInjectInviteRequest(frame) {
   // would let a peer put words in his mouth in his own chat. A notice is
   // from:'assistant', i.e. the bridge's own voice, which is what it is.
   // formatInviteRequestNotice sanitises each interpolated field.
-  journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null }));
+  //
+  // Only when the request was actually ADDRESSED here. An unaddressed one
+  // (pre-3.5 caller) reached this session by a guess among several live
+  // ones, and publishing a stranger's request into a conversation it was
+  // never meant for is exactly the visible half of the 2026-08-08 incident.
+  // The agent still gets the ask as a turn below — it can accept, and any
+  // room it accepts gets its own conversation — but the user's chat is not
+  // written to on a guess. Logged, because a silently dropped notice would
+  // otherwise look like the feature simply not working.
+  if (addressed) {
+    journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null }));
+  } else {
+    console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
+  }
   roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now() });
 }
 

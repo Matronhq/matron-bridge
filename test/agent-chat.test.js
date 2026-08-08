@@ -163,7 +163,13 @@ describe('createAgentChatHandlers', () => {
         role: 'owner', state: 'pending', sessionRoomId: '!sess',
         peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: 'mac ↔ dev-2 — ci triage',
       });
-      expect(invites.invite).toHaveBeenCalledWith({ roomId: chatRoomId, targetDeviceId: 7, topic: 'ci triage', justification: 'need eyes' });
+      // targetConvoId rides along with the device: the caller picked a
+      // specific conversation, and without it the receiving bridge is left
+      // guessing which of its live sessions the ask was for.
+      expect(invites.invite).toHaveBeenCalledWith({
+        roomId: chatRoomId, targetDeviceId: 7, targetConvoId: 'convo-remote',
+        topic: 'ci triage', justification: 'need eyes',
+      });
       // The invite outcome drives state via onInviteFrame in production; the
       // handler itself leaves the registry pending.
       expect(rooms.get(chatRoomId).state).toBe('pending');
