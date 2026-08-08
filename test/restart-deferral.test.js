@@ -125,6 +125,18 @@ describe('index.js turn-end seams dispatch the deferred restart (source inspecti
     expectDispatchBeforeFlush(seamWindow("case 'result': {", "case 'system':"));
   });
 
+  // The fatal "no conversation found" result path breaks out early, before
+  // the normal seam — a parked restart must fire there too (Bugbot, PR #187)
+  // or it sits dormant after the user was told it was waiting.
+  it("fatal no-conversation-found result path (early break before the seam)", () => {
+    const body = seamWindow('const noSession = event.errors.some', 'if (session.iv)');
+    const busyClear = body.indexOf('session.busy = false');
+    const dispatch = body.indexOf('dispatchDeferredRestart(session)');
+    expect(busyClear).toBeGreaterThan(-1);
+    expect(dispatch).toBeGreaterThan(-1);
+    expect(busyClear).toBeLessThan(dispatch);
+  });
+
   it('finishCodexTurn', () => {
     expectDispatchBeforeFlush(seamWindow('function finishCodexTurn(session', '\n}\n'));
   });

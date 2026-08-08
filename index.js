@@ -3341,6 +3341,11 @@ function handleClaudeEvent(session, event) {
           // without our normal result-handling path running.
           session.busy = false;
           clearPendingInterrupt(session);
+          // This early break skips the normal turn-end seam below, so a
+          // /restart parked mid-turn must fire here too — otherwise it
+          // would sit dormant (or fire surprisingly at the end of some
+          // later turn) after the user was told it was waiting.
+          dispatchDeferredRestart(session);
           break;
         }
       }
