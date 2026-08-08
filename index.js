@@ -3341,11 +3341,17 @@ function handleClaudeEvent(session, event) {
           // without our normal result-handling path running.
           session.busy = false;
           clearPendingInterrupt(session);
-          // This early break skips the normal turn-end seam below, so a
-          // /restart parked mid-turn must fire here too — otherwise it
-          // would sit dormant (or fire surprisingly at the end of some
-          // later turn) after the user was told it was waiting.
-          dispatchDeferredRestart(session);
+          // This early break skips the normal turn-end seam below, so in
+          // print mode a /restart parked mid-turn must fire here —
+          // otherwise it would sit dormant (or fire surprisingly at the
+          // end of some later turn) after the user was told it was
+          // waiting. In iv mode, LEAVE the stash parked: this path can run
+          // from the Stop hook's /turn-end transcript drain, and onTurnEnd
+          // (the authoritative iv seam, which always follows) must find
+          // the stash so it skips the queue flush — dispatching here would
+          // clear it and let onTurnEnd type queued messages into the
+          // session the in-flight restart is about to replace.
+          if (!session.iv) dispatchDeferredRestart(session);
           break;
         }
       }

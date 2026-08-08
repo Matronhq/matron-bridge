@@ -126,12 +126,17 @@ describe('index.js turn-end seams dispatch the deferred restart (source inspecti
   });
 
   // The fatal "no conversation found" result path breaks out early, before
-  // the normal seam — a parked restart must fire there too (Bugbot, PR #187)
-  // or it sits dormant after the user was told it was waiting.
-  it("fatal no-conversation-found result path (early break before the seam)", () => {
-    const body = seamWindow('const noSession = event.errors.some', 'if (session.iv)');
+  // the normal seam — in print mode a parked restart must fire there too
+  // (Bugbot, PR #187) or it sits dormant after the user was told it was
+  // waiting. In iv mode it must NOT fire there: the path can run from the
+  // Stop hook's /turn-end transcript drain, and onTurnEnd (which always
+  // follows) needs the stash intact to skip the queue flush — otherwise
+  // queued messages get typed into the session the restart is replacing
+  // (Bugbot, second pass).
+  it("fatal no-conversation-found result path dispatches, print mode only", () => {
+    const body = seamWindow('const noSession = event.errors.some', "if (session.iv) {");
     const busyClear = body.indexOf('session.busy = false');
-    const dispatch = body.indexOf('dispatchDeferredRestart(session)');
+    const dispatch = body.indexOf('if (!session.iv) dispatchDeferredRestart(session)');
     expect(busyClear).toBeGreaterThan(-1);
     expect(dispatch).toBeGreaterThan(-1);
     expect(busyClear).toBeLessThan(dispatch);
