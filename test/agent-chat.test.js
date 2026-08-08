@@ -157,7 +157,7 @@ describe('createAgentChatHandlers', () => {
       expect(chatRoomId).toMatch(/^[0-9a-f-]{36}$/);
 
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'invite']);
-      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'mac ↔ dev-2 — ci triage', sessionState: 'running' } });
+      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'mac ↔ dev-2 — ci triage', sessionState: 'waiting' } });
       expect(calls[1]).toEqual({ call: 'publishText', convoId: chatRoomId, payload: { body: 'hi, seen the red build?', from: 'agent' } });
       expect(calls[2].fields).toEqual({
         role: 'owner', state: 'pending', sessionRoomId: '!sess',
@@ -212,7 +212,7 @@ describe('createAgentChatHandlers', () => {
       expect(args.justification).toHaveLength(1000);
     });
 
-    it('cleans up the ghost room on a hard invite error: registry expired, convo marked ended', async () => {
+    it('cleans up the ghost room on a hard invite error: registry expired, convo marked done', async () => {
       const { handlers, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'error', code: 'offline' } });
       const res = await handlers.chatStart(good);
       expect(res.status).toBe(200);
@@ -220,7 +220,7 @@ describe('createAgentChatHandlers', () => {
       expect(rooms.get(res.body.room_id).state).toBe('expired');
       const upserts = calls.filter((c) => c.call === 'upsertConvo');
       expect(upserts).toHaveLength(2);
-      expect(upserts[1].opts.sessionState).toBe('ended');
+      expect(upserts[1].opts.sessionState).toBe('done');
     });
 
     it('leaves the room pending on a non-error outcome (no ghost cleanup)', async () => {
@@ -230,14 +230,34 @@ describe('createAgentChatHandlers', () => {
       expect(calls.filter((c) => c.call === 'upsertConvo')).toHaveLength(1);
     });
 
-    it('marks a REFUSED room\'s convo ended in the user\'s chat list without expiring the registry (I3)', async () => {
+    // A room is a conversation between two agents, not a turn this bridge is
+    // executing, and nothing ever flips a room's state back. 'running' was
+    // therefore permanent, and the apps read session_state to decide a turn
+    // is in flight — so every room carried a floating Stop button forever
+    // that posted a literal "!esc" into the room when pressed.
+    it('never marks a room "running" — a live room is waiting, a dead one is done', async () => {
+      for (const inviteOutcome of [{ kind: 'pending_quiet' }, { kind: 'refused' }, { kind: 'error', code: 'offline' }]) {
+        const { handlers, calls } = makeFixture({ inviteOutcome });
+        await handlers.chatStart(good);
+        const states = calls.filter((c) => c.call === 'upsertConvo').map((c) => c.opts.sessionState);
+        expect(states[0]).toBe('waiting');
+        expect(states).not.toContain('running');
+        // And every value has to be one the journal will actually accept:
+        // conversations.session_state CHECKs against exactly this set
+        // (matron-journal src/db.js), which is why the old 'ended' upsert was
+        // rejected outright and left a dead room in whatever state it started.
+        for (const st of states) expect(['running', 'waiting', 'done', 'archived']).toContain(st);
+      }
+    });
+
+    it('marks a REFUSED room\'s convo done in the user\'s chat list without expiring the registry (I3)', async () => {
       const { handlers, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'heads-down' } });
       const res = await handlers.chatStart(good);
       expect(res.status).toBe(200);
       expect(res.body.status).toBe('refused');
       const upserts = calls.filter((c) => c.call === 'upsertConvo');
       expect(upserts).toHaveLength(2);
-      expect(upserts[1].opts.sessionState).toBe('ended');
+      expect(upserts[1].opts.sessionState).toBe('done');
       // Registry state is onInviteFrame's job ('refused' in production);
       // the handler must NOT stamp 'expired' over it on this branch.
       expect(rooms.get(res.body.room_id).state).not.toBe('expired');
@@ -248,14 +268,14 @@ describe('createAgentChatHandlers', () => {
     describe('dead-room explanation line', () => {
       const closingLine = (calls) => calls.filter((c) => c.call === 'publishText').at(-1);
 
-      it('a refusal names the peer and quotes the reason, into the room convo, before the ended flip', async () => {
+      it('a refusal names the peer and quotes the reason, into the room convo, before the done flip', async () => {
         const { handlers, calls } = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'heads-down until Friday' } });
         const res = await handlers.chatStart(good);
         const line = closingLine(calls);
         expect(line.convoId).toBe(res.body.room_id);
         expect(line.payload.body).toBe('Agent "dev-2" refused this chat: heads-down until Friday');
-        // …last word in the room, then the convo goes 'ended'.
-        expect(calls.indexOf(line)).toBeLessThan(calls.findIndex((c) => c.call === 'upsertConvo' && c.opts.sessionState === 'ended'));
+        // …last word in the room, then the convo goes 'done'.
+        expect(calls.indexOf(line)).toBeLessThan(calls.findIndex((c) => c.call === 'upsertConvo' && c.opts.sessionState === 'done'));
       });
 
       it('omits the reason clause when the peer gave none', async () => {
