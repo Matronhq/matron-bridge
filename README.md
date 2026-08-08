@@ -159,7 +159,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!start now` | Start a fresh session (skip resume offer) |
 | `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
 | `!stop` | Stop the current session |
-| `!restart [--browser]` | Stop and immediately resume the session (`--browser` is Claude-only) |
+| `!restart [--force] [--browser]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser` is Claude-only) |
 | `!resume [--claude\|--codex] <n\|id> [--browser]` | Resume a previous session (`--browser` is Claude-only) |
 | `!sessions [--claude\|--codex]` | List past sessions for an agent |
 | `!workdir [--claude\|--codex] <path> [--browser]` | Start an agent session in another working directory (`--browser` is Claude-only) |
