@@ -70,7 +70,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice } from './lib/room-delivery.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -7058,6 +7058,26 @@ function journalOnRoomFrame(room, frame) {
     body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.blob_ref ? ` (blob ${payload.blob_ref})` : ''}${payload.caption ? `: ${payload.caption}` : ''}]`;
   }
   if (!body) return;
+  // The user's copy of the peer's message. The agent-facing injection below
+  // passes skipJournalMirror (the message is durable in the room convo), so
+  // without this the session conversation shows the agent's REPLY to a peer
+  // and never the message it was replying to — "it just looks like random
+  // messages turning up" (Dan, 2026-08-08).
+  //
+  // Published BEFORE the waiter short-circuit and before delivery, so it
+  // sits above whatever the agent does about it, and so a reply consumed
+  // inline by agent_chat_send's wait — which never becomes a turn at all —
+  // is still visible to the user.
+  // Peer AGENTS only. A `user:` frame here is Dan typing into the room convo
+  // himself — he can already see it there, and re-rendering his own words in
+  // another conversation, in the bridge's assistant voice, would read as
+  // something a remote agent said.
+  if (sender.startsWith('agent:')) {
+    journalPublishNotice(
+      journalConvoIdFor(session),
+      formatRoomMessageNotice({ from, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
+    );
+  }
   // Self-heal for a stranded pending inbox (Task 6 review, I4): several
   // paths clear busy WITHOUT passing a turn-end flush seam (esc-cancel,
   // interrupt-wedge, resume-failed, the prompt paths). If the session is
