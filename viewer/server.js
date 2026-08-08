@@ -408,7 +408,10 @@ app.post('/secret', async (req, res) => {
 // Both sensitive GET routes serve only the no-secret shell page — the GET
 // must be safe to repeat (prefetchers, Safe Browsing, URL previewers), so the
 // one-time consumption happens exclusively in POST /sensitive/reveal below.
-app.get('/sensitive', (req, res) => {
+// They still answer "is this token valid?" though, so they share the same
+// budget as the routes that move bytes: a guesser must not get unlimited
+// probes just because this particular reply is only a shell page.
+app.get('/sensitive', downloadLimiter, (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
@@ -423,7 +426,7 @@ app.get('/sensitive', (req, res) => {
 // instead of rendering the content. Requires dl:true in the token (same
 // discriminator pattern as /view vs /download) so the two link flavours stay
 // distinct in chat even though both now land on a click-through page.
-app.get('/sensitive-download', (req, res) => {
+app.get('/sensitive-download', downloadLimiter, (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
