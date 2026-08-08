@@ -22,13 +22,25 @@ afterEach(() => {
 
 describe('createAgentInvites', () => {
   describe('invite()', () => {
+    it('omits target_convo_id entirely when there is none to send', async () => {
+      // Absent, never null: the journal treats a present value as
+      // authorisation and the receiving bridge treats its absence as "this
+      // ask addresses no particular conversation" — a null would read as the
+      // latter being addressed to nothing.
+      const { inv, sendRoomOp, rooms } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
+      inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      const op = sendRoomOp.mock.calls[0][0];
+      expect('target_convo_id' in op).toBe(false);
+    });
+
     it('happy path: delivered -> idle ack -> accept answer, registry joined', async () => {
       const { inv, sendRoomOp, rooms } = makeInvites();
       rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
 
-      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, topic: 'ci triage', justification: 'need eyes' });
+      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, targetConvoId: 'convo-remote', topic: 'ci triage', justification: 'need eyes' });
       expect(sendRoomOp).toHaveBeenCalledWith({
-        op: 'agent_invite', room_id: 'r1', target_device_id: 7, topic: 'ci triage', justification: 'need eyes',
+        op: 'agent_invite', room_id: 'r1', target_device_id: 7, target_convo_id: 'convo-remote', topic: 'ci triage', justification: 'need eyes',
       });
 
       inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
