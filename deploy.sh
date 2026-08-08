@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SERVICE="chat.matron.claude-matrix-bridge"
+SERVICE="chat.matron.matron-bridge"
 TARGET="gui/$(id -u)/$SERVICE"
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
