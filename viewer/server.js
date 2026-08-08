@@ -142,10 +142,16 @@ export function sensitiveFilename(label, filename) {
 // the view ("already been viewed" before the user ever saw it). The secret
 // only moves on POST /sensitive/reveal, which nothing automated sends —
 // mode 'view' shows it in-page, mode 'download' saves it straight to a file.
-function renderSensitiveShell(label, token, mode) {
+function renderSensitiveShell(label, token, mode, oneTime = true) {
   const labelEscaped = escapeHtml(label);
   const tokenJson = scriptJsonString(token);
   const modeJson = scriptJsonString(mode);
+  // Must agree with what the chat notification promised: a share created with
+  // one_time:false stays usable until it expires, and telling the user it is
+  // one-time makes them treat a live secret as spent.
+  const warning = oneTime
+    ? '⚠️ This is a one-time link.'
+    : '⚠️ This link can be used more than once, until it expires.';
 
   return `<!DOCTYPE html>
 <html>
@@ -174,7 +180,7 @@ function renderSensitiveShell(label, token, mode) {
 <body>
   <div class="header">
     <div class="label">🔐 ${labelEscaped}</div>
-    <div class="warning">⚠️ This is a one-time link.</div>
+    <div class="warning">${warning}</div>
     <div class="note">Nothing has been revealed yet — the data is fetched only when you press the button below.</div>
   </div>
   <div class="content" id="box">
@@ -408,9 +414,10 @@ app.post('/secret', async (req, res) => {
 // Both sensitive GET routes serve only the no-secret shell page — the GET
 // must be safe to repeat (prefetchers, Safe Browsing, URL previewers), so the
 // one-time consumption happens exclusively in POST /sensitive/reveal below.
-// They still answer "is this token valid?" though, so they share the same
-// budget as the routes that move bytes: a guesser must not get unlimited
-// probes just because this particular reply is only a shell page.
+// They still answer "is this token valid?" though, so they stay rate-limited
+// alongside the routes that move bytes: a guesser must not get unlimited
+// probes just because this particular reply is only a shell page. What they
+// no longer share is the reveal POST's budget — see revealLimiter below.
 app.get('/sensitive', downloadLimiter, (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
@@ -419,7 +426,7 @@ app.get('/sensitive', downloadLimiter, (req, res) => {
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.sensitiveId || !data.label) return res.status(400).send('Invalid sensitive data token');
 
-  res.type('html').send(renderSensitiveShell(data.label, token, 'view'));
+  res.type('html').send(renderSensitiveShell(data.label, token, 'view', data.ot !== false));
 });
 
 // Direct-download variant: same shell, but the click saves straight to a file
@@ -435,14 +442,29 @@ app.get('/sensitive-download', downloadLimiter, (req, res) => {
     return res.status(403).send('Invalid or expired token');
   }
 
-  res.type('html').send(renderSensitiveShell(data.label, token, 'download'));
+  res.type('html').send(renderSensitiveShell(data.label, token, 'download', data.ot !== false));
+});
+
+// Own budget, deliberately not the GET one. Behind the tunnel every request
+// arrives from the loopback IP, so a shared limiter is one global counter —
+// and the shell GETs are the requests nobody controls: previewers, Safe
+// Browsing, a refresh, a probe. Any of that could spend the window and 429
+// the single POST the user actually pressed a button for. Separate counters
+// keep both properties: guessing stays bounded per route, and cheap
+// repeatable GETs can no longer starve the one action that matters.
+const revealLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.REVEAL_RATE_LIMIT || '30', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
 });
 
 // The only place the secret actually moves. POST-only so nothing automated
 // triggers it (link previewers and browser prefetch send GETs); called by the
 // shell page's button handler. Accepts both token flavours. Responds JSON —
 // the shell renders content/errors client-side via textContent.
-app.post('/sensitive/reveal', downloadLimiter, async (req, res) => {
+app.post('/sensitive/reveal', revealLimiter, async (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: 'Missing token' });
 
