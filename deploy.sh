@@ -18,8 +18,26 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SERVICE="chat.matron.matron-bridge"
-TARGET="gui/$(id -u)/$SERVICE"
+# Label of the installed LaunchAgent, discovered rather than hardcoded. Two
+# names are in the wild: setup/service-macos.sh installs
+# "chat.matron.matron-bridge", while machines set up before the repo rename
+# still run "chat.matron.claude-matrix-bridge" — launchd never renames a
+# service just because its repo moved. Hardcoding either one breaks the other
+# half of the installs: the pull, the npm install and the whole preflight
+# succeed, then launchctl says "Could not find service" and the deploy aborts
+# with the OLD code still serving. A pull that looks like a ship.
+#
+# So ask launchd which of them it actually has. Whichever answers is the one
+# that would be restarted.
+DOMAIN="gui/$(id -u)"
+SERVICE=""
+for candidate in chat.matron.matron-bridge chat.matron.claude-matrix-bridge; do
+  if launchctl print "$DOMAIN/$candidate" >/dev/null 2>&1; then
+    SERVICE="$candidate"
+    break
+  fi
+done
+TARGET="$DOMAIN/${SERVICE:-chat.matron.matron-bridge}"
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
@@ -58,6 +76,10 @@ echo "  - native bindings actually load, import chain resolves?"
 node --input-type=module \
   -e "await import('sharp'); await import('./lib/inline-image.js')" \
   || fail "the new code cannot import its dependencies — refusing to restart a broken build"
+
+echo "  - the service we are about to restart exists?"
+launchctl print "$TARGET" >/dev/null 2>&1 \
+  || fail "no such service: $TARGET — nothing would be restarted, and the old code would keep serving"
 
 echo "  preflight OK — the new code imports and boots"
 
