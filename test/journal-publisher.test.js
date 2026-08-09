@@ -718,6 +718,24 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
+  it('publishSummary enqueues a durable summary publish frame', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.upsertConvo('convo-1', {});
+    pub.publishSummary('convo-1', { toc: 'Did the thing', detail: 'Now doing X.', model: 'gpt-5.6-luna' });
+
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 1);
+    const frame = fake.received.find((f) => f.op === 'publish' && f.type === 'summary');
+
+    expect(frame.convo_id).toBe('convo-1');
+    expect(frame.payload).toEqual({ toc: 'Did the thing', detail: 'Now doing X.', model: 'gpt-5.6-luna' });
+    expect(frame.idem_key).toBeTruthy();
+
+    pub.close();
+    await fake.close();
+  });
+
   it('markRead enqueues a read_marker frame with no idem_key, FIFO right after the preceding publish', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
