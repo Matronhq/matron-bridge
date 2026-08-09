@@ -76,6 +76,82 @@ describe('seedJournalTitle (workdir-sourced)', () => {
     expect(upsertConvo).toHaveBeenCalledWith(session, { title: expect.stringContaining('yearbook-app') });
   });
 
+  // A full bridge restart loses the in-memory hint (nothing carries
+  // incomingHint), so resumed sessions used to re-apply the first-user-message
+  // fallback title over the earned Gemini title. The persisted hint (written
+  // by journalUpsertConvo on every title change) is handed in as
+  // persistedHint and must be adopted the same way: silently, no upsert —
+  // the title already exists server-side.
+  it('adopts the persisted hint when reattaching, so the fallback cannot clobber the earned title', async () => {
+    const session = { _journalTitleHint: undefined, roomId: '!abc', claudeSessionId: 'b53e6542' };
+    const upsertConvo = vi.fn();
+    const ok = await seedJournalTitle(session, {
+      workdir: '/home/dan/yearbook-app',
+      serverLabel: '3',
+      persistedHint: '3:b5 css token migration',
+      reattaching: true,
+      upsertConvo,
+      warn: () => {},
+    });
+    expect(ok).toBe(false);
+    expect(upsertConvo).not.toHaveBeenCalled();
+    expect(session._journalTitleHint).toBe('3:b5 css token migration');
+
+    session.chatHistory = [{ role: 'user', text: 'Hi' }, { role: 'assistant', text: 'hello' }];
+    const updateRoomName = vi.fn();
+    const applied = applyFallbackTitle(session, { serverLabel: '3', updateRoomName, workdir: '/home/dan/yearbook-app' });
+    expect(applied).toBe(false);
+    expect(updateRoomName).not.toHaveBeenCalled();
+  });
+
+  it('ignores the persisted hint for a brand-new convo (not reattaching)', async () => {
+    // A fresh convo reusing a room (new journalConvoId) has no server-side
+    // title yet — a stale hint from the room's PRIOR convo must not suppress
+    // the seed, or the new convo starts untitled.
+    const session = { _journalTitleHint: undefined };
+    const upsertConvo = vi.fn();
+    const ok = await seedJournalTitle(session, {
+      workdir: '/home/dan/yearbook-app',
+      persistedHint: 'stale title from a prior convo',
+      reattaching: false,
+      upsertConvo,
+      warn: () => {},
+    });
+    expect(ok).toBe(true);
+    expect(upsertConvo).toHaveBeenCalledWith(session, { title: expect.stringContaining('yearbook-app') });
+    expect(session._journalTitleHint).not.toBe('stale title from a prior convo');
+  });
+
+  it('a live incoming hint wins over the persisted hint', async () => {
+    const session = { _journalTitleHint: undefined };
+    const upsertConvo = vi.fn();
+    await seedJournalTitle(session, {
+      workdir: '/home/dan/yearbook-app',
+      incomingHint: 'live carried title',
+      persistedHint: 'older persisted title',
+      reattaching: true,
+      upsertConvo,
+      warn: () => {},
+    });
+    expect(session._journalTitleHint).toBe('live carried title');
+    expect(upsertConvo).not.toHaveBeenCalled();
+  });
+
+  it('an empty-string persisted hint is a real title and is still adopted', async () => {
+    const session = { _journalTitleHint: undefined };
+    const upsertConvo = vi.fn();
+    const ok = await seedJournalTitle(session, {
+      workdir: '/home/dan/yearbook-app',
+      persistedHint: '',
+      reattaching: true,
+      upsertConvo,
+      warn: () => {},
+    });
+    expect(ok).toBe(false);
+    expect(upsertConvo).not.toHaveBeenCalled();
+    expect(session._journalTitleHint).toBe('');
+  });
+
   it('an empty-string incoming hint is a real title and is still adopted silently', async () => {
     // undefined means "no prior title"; '' is a title the user/agent chose.
     // Only undefined should fall through to the workdir seed.

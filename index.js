@@ -691,7 +691,15 @@ function emitRelease(convoId, { promptId, action, releasedIds }) {
 }
 
 function journalUpsertConvo(session, opts) {
-  if (opts.title !== undefined) session._journalTitleHint = opts.title;
+  if (opts.title !== undefined && opts.title !== session._journalTitleHint) {
+    session._journalTitleHint = opts.title;
+    // Mirror the hint into the session record: the in-memory carry
+    // (options.journalTitleHint on respawn) dies with the process, and a
+    // session resumed after a full bridge restart with no hint re-applies
+    // the first-user-message fallback title over the earned Gemini title.
+    persistSession(session.roomId, session.claudeSessionId, session.workdir,
+      session.originRoomId, { journalTitleHint: opts.title });
+  }
   journalPublish(session, 'upsertConvo', opts);
 }
 
@@ -700,11 +708,12 @@ function journalUpsertConvo(session, opts) {
 // re-seeding the repo basename over it. opts.reattaching: this convo already
 // exists server-side (a journalConvoId was supplied), so suppress the workdir
 // seed entirely — it could only clobber the earned title.
-function journalSeedTitle(session, { incomingHint, reattaching = false } = {}) {
+function journalSeedTitle(session, { incomingHint, persistedHint, reattaching = false } = {}) {
   return seedJournalTitle(session, {
     workdir: session.workdir,
     serverLabel: SERVER_LABEL,
     incomingHint,
+    persistedHint,
     reattaching,
     upsertConvo: journalUpsertConvo,
     warn: (m) => DEBUG && console.warn(m),
@@ -1083,7 +1092,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
+    journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
     journalSpawnStatus(codexSession);
     return codexSession;
   }
@@ -1094,7 +1103,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   });
   if (interactive) {
     const ivSession = createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(ivSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
+    journalSeedTitle(ivSession, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
     journalSpawnStatus(ivSession);
     return ivSession;
   }
@@ -1410,7 +1419,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
 
   sessions.set(roomId, session);
-  journalSeedTitle(session, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
+  journalSeedTitle(session, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
   journalSpawnStatus(session);
   return session;
 }
@@ -3015,7 +3024,7 @@ function handleClaudeEvent(session, event) {
     const extras = [];
     if (event.permission_denials?.length) extras.push(`denials=${JSON.stringify(event.permission_denials)}`);
     if (event.subtype) extras.push(`subtype=${event.subtype}`);
-    console.log(`[PLAN-DEBUG] Event type=${event.type}${extras.length ? ' | ' + extras.join(' | ') : ''}`);
+    debug(`[PLAN-DEBUG] Event type=${event.type}${extras.length ? ' | ' + extras.join(' | ') : ''}`);
   }
 
   switch (event.type) {
@@ -3130,14 +3139,14 @@ function handleClaudeEvent(session, event) {
           // Print-mode only: stash the tool_use_id so a "build" reply can
           // emit the matching tool_result later. iv-mode handles approval
           // through claude's own TUI confirmation prompt instead.
-          console.log(`[PLAN-DEBUG] Tool call: ExitPlanMode | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
+          debug(`[PLAN-DEBUG] Tool call: ExitPlanMode | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
           session.pendingPlanDenialId = block.id;
           if (session.claudeSessionId) {
             persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: block.id });
           }
         }
         if (toolName === 'EnterPlanMode') {
-          console.log(`[PLAN-DEBUG] Tool call: EnterPlanMode | block.id: ${block.id}`);
+          debug(`[PLAN-DEBUG] Tool call: EnterPlanMode | block.id: ${block.id}`);
         }
 
         if (toolName === 'AskUserQuestion') {
@@ -3445,10 +3454,10 @@ function handleClaudeEvent(session, event) {
 
       // Check for ExitPlanMode permission denial — present Build prompt
       const denials = event.permission_denials || [];
-      console.log(`[PLAN-DEBUG] Room ${session.roomId} | result event | denials: ${JSON.stringify(denials)} | pendingPlan: ${!!session.pendingPlan}`);
+      debug(`[PLAN-DEBUG] Room ${session.roomId} | result event | denials: ${JSON.stringify(denials)} | pendingPlan: ${!!session.pendingPlan}`);
       const planDenial = denials.find(d => d.tool_name === 'ExitPlanMode');
       if (planDenial && session.sendCallback) {
-        console.log(`[PLAN-DEBUG] ExitPlanMode denial found! tool_use_id: ${planDenial.tool_use_id} | plan length: ${(planDenial.tool_input?.plan || '').length}`);
+        debug(`[PLAN-DEBUG] ExitPlanMode denial found! tool_use_id: ${planDenial.tool_use_id} | plan length: ${(planDenial.tool_input?.plan || '').length}`);
         const planText = planDenial.tool_input?.plan || '';
         session.pendingPlan = planText;
         session.pendingPlanDenialId = planDenial.tool_use_id;
@@ -4884,7 +4893,10 @@ async function maybeUpdatePinnedSummary(session) {
       }
     }
   } catch (e) {
-    debug(`Failed to update pinned summary: ${e.message}`);
+    // warn, not debug: these failures were invisible in production (DEBUG is
+    // off), which made a chat that silently never got its title/summary
+    // undiagnosable after the fact.
+    console.warn(`[summary] title/summary pass failed for ${session.roomId}: ${e.message}`);
   }
 }
 
@@ -7365,7 +7377,7 @@ function journalEvictConvoInput(session) {
 // ctx's sendToRoom sink, which also mirrors into the journal.
 async function approvePlanBuild(session, { sendHtml }) {
   const toolUseId = session.pendingPlanDenialId;
-  console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
+  debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
 
   // Check if a tool_result already exists in the session history for this tool_use_id.
   // Claude CLI auto-generates a tool_result for permission denials, so sending another
@@ -7373,7 +7385,7 @@ async function approvePlanBuild(session, { sendHtml }) {
   const alreadyAnswered = toolUseId && session.claudeSessionId
     ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
     : false;
-  console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
+  debug(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
 
   if (session.iv) {
     // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
@@ -7390,10 +7402,10 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     if (pending) {
-      console.log(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
+      debug(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
       pending.resolve({ decision: 'allow', reason: 'approved by user' });
     } else {
-      console.log(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
+      debug(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
       sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
     }
   } else if (!toolUseId || alreadyAnswered) {
@@ -7403,7 +7415,7 @@ async function approvePlanBuild(session, { sendHtml }) {
     if (session.claudeSessionId) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
-    console.log(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
+    debug(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
     sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
   } else {
     // No existing tool_result — send tool_result to properly exit plan mode
@@ -7430,7 +7442,7 @@ async function approvePlanBuild(session, { sendHtml }) {
         ]
       }
     }) + '\n';
-    console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
+    debug(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
     session.proc.stdin.write(jsonMsg);
     if (session.resetTimeout) session.resetTimeout();
   }
