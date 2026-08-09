@@ -146,3 +146,42 @@ describe('index.js turn-end seams dispatch the deferred restart (source inspecti
     expectDispatchBeforeFlush(seamWindow('function finishCodexTurn(session', '\n}\n'));
   });
 });
+
+// The queue those seams deliberately did NOT flush has to be delivered by
+// the REPLACEMENT session, or it strands in memory forever: the fresh
+// session is idle, so no turn-end seam will ever fire on its own. This is
+// the "/compact → /restart (parked) → message → restart → message lost"
+// incident: the message queued behind the compacting turn, rode into the
+// replacement via recreateSession, and nothing ever flushed it — the iv
+// resume-ready watcher only flushed the hold-window outbox, and
+// recreateSession's immediate flush was Codex-only.
+describe('index.js carried queue flushes on the replacement session (source inspection)', () => {
+  it('iv resume-ready flush covers carried queuedMessages, merged ahead of the hold outbox', () => {
+    const start = src.indexOf('function startResumeReadyWatcher(session)');
+    expect(start).toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf('function dispatchMergedFlush', start));
+    // The carried queue is flushed through the one true queue path (summary
+    // tile + notification retire + compact priority)…
+    expect(body).toMatch(/flushPendingSessionQueue\(session\)/);
+    // …and hold-window messages merge onto its TAIL first, so both go out as
+    // ONE send (queue entries were sent earlier, so they keep first place;
+    // back-to-back sendText calls would cancel each other's pending Enter).
+    expect(body).toMatch(/queuedMessages\.push\(\.\.\.outbox\)/);
+  });
+
+  it('a parked slash command yields to a carried queue, not just to held messages', () => {
+    const start = src.indexOf('function startResumeReadyWatcher(session)');
+    const body = src.slice(start, src.indexOf('function dispatchMergedFlush', start));
+    expect(body).toMatch(/outbox\.length > 0 \|\| carriedQueue/);
+  });
+
+  it('recreateSession flushes immediately for every session that skips the resume hold', () => {
+    const start = src.indexOf('function recreateSession(');
+    expect(start).toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf('function printModeInterrupt', start));
+    // Print-mode Claude has no resume hold and no turn running — the old
+    // Codex-only gate stranded its carried queue exactly the same way.
+    expect(body).toMatch(/!next\._awaitingInputReady && next\.queuedMessages\?\.length/);
+    expect(body).not.toMatch(/next\.agent === AGENT_CODEX && next\.queuedMessages/);
+  });
+});
