@@ -327,6 +327,32 @@ describe('publish-side Codex redaction', () => {
   });
 
   it.each([
+    ['space-separated', 'curl --password hunter2 https://x', 'hunter2'],
+    ['equals-separated', 'curl --password=hunter2 https://x', 'hunter2'],
+    ['single-dash long flag', 'tool -token opaque-secret-value', 'opaque-secret-value'],
+    ['hyphenated key suffix', 'svc --api-key abc123def --verbose', 'abc123def'],
+    ['auth flag mid-command', 'mytool --auth Bearer-xyz next-arg', 'Bearer-xyz'],
+    ['quoted value with spaces', 'cmd --secret "s3 cr3t val" tail', 's3 cr3t val'],
+  ])('redacts a secret-named CLI flag value (%s)', (_label, input, secret) => {
+    const redact = createPublishRedactor({
+      configPath: '/test/redactor.yaml',
+      readFileSyncFn: () => POLICY,
+    });
+    const output = redact(input);
+    expect(output).not.toContain(secret);
+    expect(output).toContain('[REDACTED:secret-key:');
+  });
+
+  it('leaves non-secret CLI flags and their values untouched', () => {
+    const redact = createPublishRedactor({
+      configPath: '/test/redactor.yaml',
+      readFileSyncFn: () => POLICY,
+    });
+    const input = 'curl --output result.json --retry 3 https://example.com';
+    expect(redact(input)).toBe(input);
+  });
+
+  it.each([
     [
       'a multiline dotenv quoted value',
       'API_TOKEN="dotenv-first\ndotenv-second"\nSAFE=value',
