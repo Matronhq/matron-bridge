@@ -37,7 +37,7 @@ const server = new McpServer({
 });
 
 server.registerTool('show_file', {
-  description: 'Display a file to the operator inline: an image (PNG/JPG/SVG/GIF/WebP) renders as a picture, any other file (PDF, report) as a downloadable attachment. The file must exist and be under the session workdir.',
+  description: 'Display a file to the operator inline: an image (PNG/JPG/GIF/WebP) renders as a picture, any other file (PDF, SVG, report) as a downloadable attachment. The file must exist and be under the session workdir.',
   inputSchema: {
     path: z.string().refine(filePath => path.isAbsolute(filePath), 'path must be absolute'),
     caption: z.string().max(4096).optional(),

@@ -7798,12 +7798,15 @@ const apiServer = createServer(async (req, res) => {
       showFileBodyTooLarge = true;
       body = '';
       auditShowFile({ result: 'request-too-large' });
-      res.writeHead(413, { 'Content-Type': 'application/json' });
+      // Connection: close tears the socket down after the 413 flushes, so the
+      // client sees the status. Do NOT req.destroy() here: destroying the socket
+      // can discard the just-written 413 before it's flushed, and the adapter
+      // then reports a generic "internal error" instead of "too large". Pause the
+      // request so we stop buffering the oversized body; the 'data'/'end'
+      // handlers are already guarded by showFileBodyTooLarge.
+      res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
       res.end(JSON.stringify({ error: 'request body too large' }));
-      // Stop the client streaming into an already-answered socket; without
-      // this the 'data' handler keeps firing (guarded, but the bytes still
-      // arrive) after we've committed the 413.
-      req.destroy();
+      req.pause();
       return;
     }
     body += chunk;

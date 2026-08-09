@@ -80,7 +80,7 @@ describe('processShowFile', () => {
       deps,
     });
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'token must be a non-empty string' });
+    expect(res.body).toEqual({ error: 'token must be a non-empty string', reason: 'missing-token' });
     expect(deps.auditShowFile).toHaveBeenCalledWith(expect.objectContaining({ result: 'missing-token' }));
     expect(deps.shareAgentMedia).not.toHaveBeenCalled();
   });
@@ -95,7 +95,7 @@ describe('processShowFile', () => {
       deps,
     });
     expect(res.status).toBe(403);
-    expect(res.body).toEqual({ error: 'invalid token' });
+    expect(res.body).toEqual({ error: 'invalid token', reason: 'invalid-token' });
     expect(deps.auditShowFile).toHaveBeenCalledWith(expect.objectContaining({ result: 'invalid-token' }));
     expect(deps.shareAgentMedia).not.toHaveBeenCalled();
     expect(budget).toEqual({ inFlight: 0, reservedBytes: 0 });
