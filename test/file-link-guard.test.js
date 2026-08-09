@@ -162,6 +162,39 @@ describe('validateAndOpen', () => {
     });
   });
 
+  // Helper: same-length in-place overwrite mid-read. Size is unchanged, so the
+  // size-only guard would miss it; mtime/ctime move, which strict mode catches.
+  const withContentChangingRead = async (filePath, replacement, fn) => {
+    const actualOpen = fsp.open.bind(fsp);
+    let readSpy;
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      const actualRead = fd.read.bind(fd);
+      readSpy = vi.spyOn(fd, 'read').mockImplementation(async (...readArgs) => {
+        const result = await actualRead(...readArgs);
+        writeFileSync(filePath, replacement);
+        const future = new Date(Date.now() + 10_000);
+        await fsp.utimes(filePath, future, future);
+        return result;
+      });
+      return fd;
+    });
+    try {
+      return await fn();
+    } finally {
+      readSpy?.mockRestore();
+      openSpy.mockRestore();
+    }
+  };
+
+  it('strict mode rejects a same-size in-place overwrite during read', async () => {
+    const filePath = path.join(dir, 'mutated-content-strict.txt');
+    writeFileSync(filePath, 'abcdef');
+    await withContentChangingRead(filePath, 'ABCDEF', async () => {
+      expect(await denied(filePath, { workdir: dir, strictSnapshot: true })).toBe('unreadable');
+    });
+  });
+
   it('default (non-strict) mode returns the bounded snapshot for a size-changing file', async () => {
     const filePath = path.join(dir, 'mutated-serve.txt');
     writeFileSync(filePath, 'abcdef');
