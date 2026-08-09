@@ -4048,7 +4048,21 @@ function startResumeReadyWatcher(session) {
     if (iv.detector) iv.detector.reset();
     const outbox = session._resumeOutbox || [];
     session._resumeOutbox = null;
-    debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
+    // A queue carried across a restart (recreateSession and the crash-restart
+    // paths copy queuedMessages; a parked /restart's turn-end seam skipped
+    // its flush deliberately) has no later seam on this fresh session — it's
+    // idle, so no turn-end will ever fire to flush it. This release IS its
+    // seam. Merge the hold-window messages onto the queue's TAIL (queue
+    // entries were sent earlier so they keep first place, and the
+    // queueNotifications alignment is prefix-based, so appending preserves
+    // it) and send everything as ONE flush below — back-to-back sends would
+    // cancel each other's pending Enter (see lib/interactive-session.js).
+    const carriedQueue = (session.queuedMessages?.length ?? 0) > 0;
+    if (carriedQueue && outbox.length > 0) {
+      session.queuedMessages.push(...outbox);
+      outbox.length = 0;
+    }
+    debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)${carriedQueue ? ` + ${session.queuedMessages.length} carried queued` : ''}`);
     // A /login- or /logout-initiated mode switch parked its command here:
     // type it the moment the TUI is ready, via iv.sendText — no busy,
     // because no claude turn runs (see the '!login' case in handleCommand).
@@ -4071,8 +4085,8 @@ function startResumeReadyWatcher(session) {
     // flush there would just strand the inbox (whole-branch review, M4).
     let parkedSlashTyped = false;
     if (parkedSlash) {
-      if (outbox.length > 0) {
-        debug(`dropping parked ${parkedSlash}: ${outbox.length} held message(s) take priority`);
+      if (outbox.length > 0 || carriedQueue) {
+        debug(`dropping parked ${parkedSlash}: held/queued message(s) take priority`);
         // The account flow is abandoned along with the parked command —
         // don't leave the flags armed to hijack a later unrelated login or
         // to mislabel an ordinary exit as a logout.
@@ -4100,7 +4114,13 @@ function startResumeReadyWatcher(session) {
     // dispatchMergedFlush / lib/queue-flush.js planQueueFlush): splitting a
     // mixed-origin hold into separate sendToSession calls is what garbled
     // iv-mode input in the first place (Bugbot finding #1).
-    const sent = session.alive && outbox.length > 0 && dispatchMergedFlush(session, outbox);
+    // Carried queue present: flush through the one true queue path
+    // (summary tile, notification retire, compact priority — a queued
+    // /compact still goes out alone, and its boundary routes back to
+    // onTurnEnd which flushes the rest). Otherwise the plain hold flush.
+    const sent = carriedQueue
+      ? session.alive && flushPendingSessionQueue(session) === true
+      : session.alive && outbox.length > 0 && dispatchMergedFlush(session, outbox);
     if (!sent) {
       // Nothing actually went out (session died, hold was empty, or the
       // send itself failed) — don't leave a typing indicator spinning with
@@ -8297,10 +8317,14 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // still-loading TUI and dropped. No-op for print sessions (enterResumeHold
   // returns early when there's no PTY).
   enterResumeHold(next);
-  // A forced Codex restart may have interrupted a turn with user messages
-  // already queued behind it. They belong to the logical conversation, not
-  // the killed child, so dispatch them through the idle replacement now.
-  if (next.agent === AGENT_CODEX && next.queuedMessages?.length) {
+  // A restart may have interrupted a turn with user messages already queued
+  // behind it (or a parked /restart's turn-end seam skipped its flush on
+  // purpose). They belong to the logical conversation, not the killed child,
+  // so dispatch them through the idle replacement now — for every session
+  // that skips the resume hold (Codex, print-mode Claude). An iv session is
+  // holding (_awaitingInputReady): its readiness watcher flushes the carried
+  // queue once the TUI can actually take input.
+  if (!next._awaitingInputReady && next.queuedMessages?.length) {
     flushPendingSessionQueue(next);
   }
   return next;
