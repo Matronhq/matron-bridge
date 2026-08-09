@@ -46,3 +46,10 @@ describe('buildSummaryPrompt', () => {
     expect(p).not.toContain('previous rolling summary');
   });
 });
+
+describe('gate constants', () => {
+  it('exports the gate constants the index.js wiring consumes', () => {
+    expect(SUMMARY_MIN_NEW).toBe(5);
+    expect(SUMMARY_WINDOW_CAP).toBe(200);
+  });
+});
