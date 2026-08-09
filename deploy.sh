@@ -18,7 +18,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SERVICE="chat.matron.matron-bridge"
+# Label of the installed LaunchAgent, read from the plist rather than
+# hardcoded. It was hardcoded to "chat.matron.matron-bridge" — a name that
+# followed the repo rename but that no installed service ever had. Every step
+# up to the restart succeeded, then launchctl reported "Could not find service"
+# and the deploy aborted with the OLD code still serving: a pull that looked
+# like a ship.
+SERVICE_PLIST="$HOME/Library/LaunchAgents/chat.matron.claude-matrix-bridge.plist"
+SERVICE="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$SERVICE_PLIST" 2>/dev/null \
+  || echo 'chat.matron.claude-matrix-bridge')"
 TARGET="gui/$(id -u)/$SERVICE"
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
@@ -58,6 +66,10 @@ echo "  - native bindings actually load, import chain resolves?"
 node --input-type=module \
   -e "await import('sharp'); await import('./lib/inline-image.js')" \
   || fail "the new code cannot import its dependencies — refusing to restart a broken build"
+
+echo "  - the service we are about to restart exists?"
+launchctl print "$TARGET" >/dev/null 2>&1 \
+  || fail "no such service: $TARGET — nothing would be restarted, and the old code would keep serving"
 
 echo "  preflight OK — the new code imports and boots"
 
