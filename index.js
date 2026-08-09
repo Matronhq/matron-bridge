@@ -75,7 +75,7 @@ import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
-import { isCompactCommand, compactBatchSize } from './lib/compact-priority.js';
+import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
@@ -6543,6 +6543,14 @@ async function journalRouteTextToSession(session, body) {
     // splitting on the same slice. `//compact` escapes this and queues as
     // ordinary text, same as everywhere else.
     const compactJump = isCompactCommand(trimmed);
+    // Only ONE /compact may wait: flushes send the front compact ALONE, so a
+    // second queued compact wouldn't merge — it would run a second compaction
+    // right after the first. Refuse the repeat before the entry, the "📨
+    // Queued" tile, and the release registration exist for it.
+    if (compactJump && hasQueuedCompact(session.queuedMessages)) {
+      await ctx.sendReply('🗜️ /compact is already queued — it will run as soon as this turn finishes.');
+      return;
+    }
     const entry = markJournalOrigin([{ type: 'text', text: trimmed }]);
     if (compactJump) session.queuedMessages.unshift(entry);
     else session.queuedMessages.push(entry);

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isCompactCommand, isCompactEntry, compactBatchSize } from '../lib/compact-priority.js';
+import { isCompactCommand, isCompactEntry, compactBatchSize, hasQueuedCompact } from '../lib/compact-priority.js';
 
 const text = (t) => [{ type: 'text', text: t }];
 const media = (name) => [{ type: 'image', source: name }];
@@ -98,5 +98,30 @@ describe('compactBatchSize', () => {
   // reordering a queue someone else built.
   it('ignores a compact that is not at the front', () => {
     expect(compactBatchSize([text('a'), text('/compact')])).toBe(2);
+  });
+});
+
+describe('hasQueuedCompact', () => {
+  it('is false for an empty/absent queue', () => {
+    expect(hasQueuedCompact(null)).toBe(false);
+    expect(hasQueuedCompact(undefined)).toBe(false);
+    expect(hasQueuedCompact([])).toBe(false);
+  });
+
+  it('finds the compact enqueue unshifted to the front', () => {
+    expect(hasQueuedCompact([text('/compact'), text('a')])).toBe(true);
+    expect(hasQueuedCompact([text('/compact keep the refactor'), text('a')])).toBe(true);
+  });
+
+  // Defensive whole-queue scan: the enqueue invariant puts a compact at
+  // index 0, but if one ever rides mid-queue the dedupe should still see it
+  // rather than let a second compaction run stack up behind it.
+  it('finds a compact anywhere in the queue', () => {
+    expect(hasQueuedCompact([text('a'), text('/compact')])).toBe(true);
+  });
+
+  it('is false for ordinary text and the // escape form', () => {
+    expect(hasQueuedCompact([text('a'), text('//compact')])).toBe(false);
+    expect(hasQueuedCompact([media('x.png'), text('compact')])).toBe(false);
   });
 });

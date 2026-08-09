@@ -1275,10 +1275,27 @@ describe('index.js journal busy caller — queued-tile notification wiring (sour
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
     const start = src.indexOf('const compactJump = isCompactCommand(trimmed);');
     expect(start).toBeGreaterThan(-1);
-    const window = src.slice(start, start + 1200);
+    const window = src.slice(start, start + 2000);
     expect(window).toMatch(/if \(compactJump\) session\.queuedMessages\.unshift\(entry\);/);
     expect(window).toMatch(/else session\.queuedMessages\.push\(entry\);/);
     expect(window).toMatch(/compactJump,/);
+  });
+
+  // Only ONE /compact may wait in the queue. Each flush sends the front
+  // compact ALONE (compactBatchSize), so a second queued compact wouldn't
+  // merge with the first — it would run a SECOND compaction right after the
+  // first finishes. A repeat /compact while one waits is refused with a
+  // plain reply, before the entry, the tile, and the release registration.
+  it('a repeat /compact is refused while one is already queued', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('const compactJump = isCompactCommand(trimmed);');
+    expect(start).toBeGreaterThan(-1);
+    const window = src.slice(start, start + 2000);
+    const dedupe = window.indexOf('hasQueuedCompact(session.queuedMessages)');
+    const enqueue = window.indexOf('session.queuedMessages.unshift(entry)');
+    expect(dedupe).toBeGreaterThan(-1);
+    expect(window).toContain('already queued');
+    expect(dedupe).toBeLessThan(enqueue);
   });
 });
 
