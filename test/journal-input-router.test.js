@@ -1644,7 +1644,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     expect(gated.length).toBeGreaterThanOrEqual(5);
     const bareFlushes = src.match(/roomDelivery\.flush\(session, session\.roomId\)/g) || [];
     expect(bareFlushes).toHaveLength(1); // inside maybeFlushRoomDelivery only
-    expect(src).toMatch(/function maybeFlushRoomDelivery\(session\) \{\s*\n\s*if \(!sessionOccupiedForRoomDelivery\(session\)\) roomDelivery\.flush\(session, session\.roomId\);/);
+    expect(src).toMatch(/function maybeFlushRoomDelivery\(session\) \{\s*\n\s*if \(sessionOccupiedForRoomDelivery\(session\)\) return;/);
     // …and a queue flush that dispatched a turn suppresses the room flush
     // (the new turn's own end seam picks it up) — one gate per seam family:
     // codex, iv onTurnEnd, print result, and the resume-hold release (which
@@ -1656,6 +1656,66 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // nothing and must still flush (whole-branch review, M4).
     expect(src).toMatch(/if \(!parkedSlashTyped\) maybeFlushRoomDelivery\(session\);/);
     expect(src).toMatch(/parkedSlashTyped = true;\s*\n\s*debug\(`typed parked /);
+  });
+
+  // Dan, 2026-08-09: "perhaps it could even show eg when the receiving chat
+  // has queued the message but not had it delivered yet". A ⏳ that never
+  // resolves is worse than none, so these pin both halves and the one case
+  // where "busy" does NOT mean queued.
+  describe('the queued-but-not-delivered state', () => {
+    const frame = (() => {
+      const start = src.indexOf('function journalOnRoomFrame(');
+      return src.slice(start, src.indexOf('\nfunction ', start + 1));
+    })();
+
+    it('reads queued-ness off the inbox, not deliver()\'s boolean', () => {
+      // deliver() returns true for BOTH branches — "accepted", not
+      // "delivered". Empty-before/non-empty-after is the only honest test of
+      // "this message opened a pending batch".
+      expect(frame).toMatch(/const queuedBefore = roomDelivery\.pendingCount\(session\.roomId\)/);
+      expect(frame).toMatch(/queuedBefore === 0 && roomDelivery\.pendingCount\(session\.roomId\) > 0/);
+    });
+
+    it('publishes ⏳ only AFTER the reply-waiter short-circuit', () => {
+      // During an agent_chat_send wait the session is busy but the reply is
+      // consumed inline as the tool result and never queued at all. A notice
+      // published before the short-circuit would claim "queued" in exactly
+      // the case the peer agent answered fastest.
+      const resolve = frame.indexOf('roomReplyWaiters.resolve(');
+      const queued = frame.indexOf('ROOM_MESSAGE_QUEUED_NOTICE');
+      expect(resolve).toBeGreaterThan(-1);
+      expect(queued).toBeGreaterThan(resolve);
+    });
+
+    it('gates ⏳ to peer agents, like the 💬 notice it follows', () => {
+      // A `user:` frame is Dan typing into the room convo himself; he gets no
+      // 💬 line for it, so a bare ⏳ would have nothing to attach to.
+      expect(frame).toMatch(/const isPeerAgent = sender\.startsWith\('agent:'\)/);
+      expect(frame).toMatch(/if \(isPeerAgent\) \{/);
+      expect(frame).toMatch(/if \(isPeerAgent && queuedBefore === 0/);
+    });
+
+    it('drains an older batch BEFORE publishing this message\'s notice', () => {
+      // Otherwise the journal reads out of order: the 💬 for a message that
+      // arrived second appears above the 📨 closing the batch before it.
+      const flush = frame.indexOf('maybeFlushRoomDelivery(session)');
+      const notice = frame.indexOf('formatRoomMessageNotice(');
+      expect(flush).toBeGreaterThan(-1);
+      expect(notice).toBeGreaterThan(flush);
+    });
+
+    it('closes the ⏳ at the flush seam, counting BEFORE flush clears the inbox', () => {
+      const start = src.indexOf('function maybeFlushRoomDelivery(');
+      const body = src.slice(start, src.indexOf('\n}', start));
+      const count = body.indexOf('roomDelivery.pendingCount(');
+      const flush = body.indexOf('roomDelivery.flush(');
+      expect(count).toBeGreaterThan(-1);
+      expect(flush).toBeGreaterThan(count);
+      // Nothing queued => nothing to close, and no notice at all.
+      expect(body).toMatch(/if \(!queued\) return;/);
+      // A refused inject must say so rather than leave the ⏳ hanging.
+      expect(body).toMatch(/flushed \? formatRoomDeliveredNotice\(queued\) : formatRoomDeliveryFailedNotice\(queued\)/);
+    });
   });
 
   it('terminal teardown drops the pending room inbox with the session', () => {
