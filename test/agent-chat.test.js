@@ -168,6 +168,9 @@ describe('createAgentChatHandlers', () => {
       // guessing which of its live sessions the ask was for.
       expect(invites.invite).toHaveBeenCalledWith({
         roomId: chatRoomId, targetDeviceId: 7, targetConvoId: 'convo-remote',
+        // …and fromConvoId names OUR side, so the user's consent card can
+        // say which session is asking rather than just which box.
+        fromConvoId: 'convo-sess',
         topic: 'ci triage', justification: 'need eyes',
       });
       // The invite outcome drives state via onInviteFrame in production; the
