@@ -248,8 +248,19 @@ const SHOW_FILE_ARTIFACT_ROOTS = (process.env.SHOW_FILE_ARTIFACT_ROOTS || '')
   .split(':')
   .filter(Boolean);
 for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
-  if (!path.isAbsolute(artifactRoot) || !fs.existsSync(artifactRoot)) {
-    throw new Error(`Invalid SHOW_FILE_ARTIFACT_ROOTS entry: ${JSON.stringify(artifactRoot)}`);
+  // Must be an absolute path to an existing DIRECTORY. A regular file passes
+  // isAbsolute+exists but is later rejected by session pinning, which would leave
+  // show_file advertised with no token supplied (fail-loud config convention).
+  let artifactRootStat = null;
+  try {
+    artifactRootStat = fs.statSync(artifactRoot);
+  } catch {
+    artifactRootStat = null;
+  }
+  if (!path.isAbsolute(artifactRoot) || !artifactRootStat || !artifactRootStat.isDirectory()) {
+    throw new Error(
+      `Invalid SHOW_FILE_ARTIFACT_ROOTS entry (must be an absolute path to an existing directory): ${JSON.stringify(artifactRoot)}`,
+    );
   }
 }
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
