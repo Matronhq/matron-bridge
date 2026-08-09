@@ -251,7 +251,7 @@ for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
   // Must be an absolute path to an existing DIRECTORY. A regular file passes
   // isAbsolute+exists but is later rejected by session pinning, which would leave
   // show_file advertised with no token supplied (fail-loud config convention).
-  let artifactRootStat = null;
+  let artifactRootStat;
   try {
     artifactRootStat = fs.statSync(artifactRoot);
   } catch {
