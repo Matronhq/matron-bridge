@@ -1723,6 +1723,12 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('\nfunction ', start + 1);
     expect(src.slice(start, end)).toMatch(/roomDelivery\.dropSession\(session\?\.roomId\)/);
+    // …and closes the ⏳ those dropped messages left open (Bugbot, #197): a
+    // silent drop is the never-resolving indicator this feature exists to
+    // avoid. Counted BEFORE the drop clears the inbox.
+    const teardown = src.slice(start, end);
+    expect(teardown.indexOf('roomDelivery.pendingCount(')).toBeLessThan(teardown.indexOf('roomDelivery.dropSession('));
+    expect(teardown).toMatch(/if \(strandedRoomMessages && convoId\) \{\s*\n\s*journalPublishNotice\(convoId, formatRoomDeliveryFailedNotice\(strandedRoomMessages\)\)/);
     // Eviction must auto-leave every joined room so the peer's bridge doesn't
     // keep publishing into a black hole (whole-branch review, I4).
     expect(src.slice(start, end)).toMatch(/agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]*agentRooms\.setState\(r\.roomId, 'left'\)/);

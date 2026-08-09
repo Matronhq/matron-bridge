@@ -7384,8 +7384,20 @@ function journalEvictConvoInput(session) {
   // the journal (agent_chat_read recovers it). Auto-restart and
   // recreateSession never come through here AND keep the same session.roomId
   // key, so a surviving session's pending inbox rides across untouched.
+  //
+  // A dropped batch still owes Dan an outcome: those messages had a ⏳ line
+  // published against them, and clearing the inbox silently would leave it
+  // hanging forever with no delivered/failed line to close it — the exact
+  // never-resolving indicator this feature exists to avoid (Bugbot, #197).
+  // Counted before the drop, and reported through the same failed notice the
+  // refused-inject path uses, because it is the same outcome: not delivered,
+  // still durable in the room, recoverable with agent_chat_read.
+  const strandedRoomMessages = roomDelivery.pendingCount(session?.roomId);
   roomDelivery.dropSession(session?.roomId);
   const convoId = journalConvoIdFor(session);
+  if (strandedRoomMessages && convoId) {
+    journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));
+  }
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
