@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -212,6 +213,46 @@ describe('publish-side Codex redaction', () => {
       readFileSyncFn: () => ['patterns:', '  - name: translated', `    regex: '${regex}'`].join('\n'),
     });
     expect(redact(sample)).toMatch(/^\[REDACTED:translated:[0-9a-f]{8}\]$/);
+  });
+
+  it('keys the redaction marker so it correlates within a run but is not a plaintext fingerprint', () => {
+    const redact = createPublishRedactor({});
+    const first = redact('password=hunter2');
+    const second = redact('password=hunter2');
+    const marker = /\[REDACTED:secret-key:([0-9a-f]{8})\]/.exec(first)?.[1];
+
+    expect(marker).toMatch(/^[0-9a-f]{8}$/);
+    // Identical secret -> identical marker within the process: the useful property.
+    expect(second).toBe(first);
+    // ...but the marker is an HMAC under a per-process key, not a bare sha256
+    // prefix of the plaintext, so it can't be brute-forced offline from the journal.
+    const plaintextFingerprint = createHash('sha256').update('hunter2', 'utf8').digest('hex').slice(0, 8);
+    expect(marker).not.toBe(plaintextFingerprint);
+  });
+
+  it('skips operator patterns above the size threshold and warns once, keeping baseline redaction', () => {
+    const log = { warn: vi.fn() };
+    const redact = createPublishRedactor({
+      configPath: '/test/redactor.yaml',
+      readFileSyncFn: () => ['patterns:', '  - name: cc', '    regex: SECRETVAL'].join('\n'),
+      log,
+      maxOperatorPatternBytes: 32,
+    });
+
+    const oversize = `${'x'.repeat(64)}\npassword=hunter2\nSECRETVAL`;
+    const out = redact(oversize);
+    // Operator pattern skipped over the threshold: SECRETVAL survives...
+    expect(out).toContain('SECRETVAL');
+    // ...but the vetted baseline still redacts the key=value secret.
+    expect(out).toContain('[REDACTED:secret-key:');
+    expect(log.warn).toHaveBeenCalledOnce();
+
+    // A second oversize input does not warn again.
+    redact(`${oversize}\nmore`);
+    expect(log.warn).toHaveBeenCalledOnce();
+
+    // A small input still runs the operator pattern.
+    expect(redact('SECRETVAL')).toMatch(/^\[REDACTED:cc:[0-9a-f]{8}\]$/);
   });
 
   it('redacts every allowlisted string and excludes unknown fields before publishing', () => {
