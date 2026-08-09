@@ -989,7 +989,11 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // must SHORT-CIRCUIT before roomDelivery.deliver, or the same message is
     // queued and re-delivered as a duplicate injected turn at turn end
     // (Task 8 review, finding 1).
-    expect(indexSrc).toMatch(/if \(roomReplyWaiters\.resolve\(frame\.convo_id, \{ from, body \}\)\) return;[\s\S]{0,700}roomDelivery\.deliver\(/);
+    // The window stays bounded so this can only match inside the one
+    // function, but it has to clear the queued-notice rationale that now sits
+    // between the two (the ⏳ is published after the short-circuit for the
+    // same reason the short-circuit exists).
+    expect(indexSrc).toMatch(/if \(roomReplyWaiters\.resolve\(frame\.convo_id, \{ from, body \}\)\) return;[\s\S]{0,1400}roomDelivery\.deliver\(/);
   });
 
   it('holds inbound join_requests in pendingJoinRequests, never the rooms registry (C1)', () => {

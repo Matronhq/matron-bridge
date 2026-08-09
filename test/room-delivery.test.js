@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createRoomDelivery, formatRoomMessageNotice } from '../lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from '../lib/room-delivery.js';
 
 function makeDelivery({ injectResult = true } = {}) {
   const injectTurn = vi.fn(() => injectResult);
@@ -358,5 +358,31 @@ describe('formatRoomMessageNotice', () => {
   it('caps a very long body instead of flooding the chat', () => {
     const out = formatRoomMessageNotice({ from: 'd', body: 'x'.repeat(5000), roomId: 'r1' });
     expect(out.length).toBeLessThan(700);
+  });
+});
+
+// The two halves of the queued state. `deliver` parks a message in the
+// pending inbox whenever the session is mid-turn, which from Dan's chair is
+// indistinguishable from the message being lost — these are what tell them
+// apart, and what eventually closes the ⏳ either way.
+describe('the queued-state notices', () => {
+  it('says the message is waiting, and on what', () => {
+    expect(ROOM_MESSAGE_QUEUED_NOTICE).toContain('⏳');
+    expect(ROOM_MESSAGE_QUEUED_NOTICE).toContain('mid-turn');
+  });
+
+  it('closes the ⏳ with the count that was outstanding, singular and plural', () => {
+    expect(formatRoomDeliveredNotice(1)).toBe('📨 Delivered 1 queued message.');
+    expect(formatRoomDeliveredNotice(3)).toBe('📨 Delivered 3 queued messages.');
+  });
+
+  it('a refused flush says so and names the recovery, rather than claiming delivery', () => {
+    const out = formatRoomDeliveryFailedNotice(2);
+    expect(out).toContain("Couldn't deliver 2 queued messages");
+    // Nothing is actually lost — the room convo is the durable copy.
+    expect(out).toContain('agent_chat_read');
+    // …and the rest of the sentence agrees in number with the count.
+    expect(formatRoomDeliveryFailedNotice(1)).toContain("1 queued message to this chat — it's still in the room");
+    expect(out).toContain("2 queued messages to this chat — they're still in the room");
   });
 });

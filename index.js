@@ -70,7 +70,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -7055,7 +7055,18 @@ function sessionOccupiedForRoomDelivery(session) {
 // the session is genuinely free, by the SAME composite predicate that routes
 // deliver()'s busy/idle branches — so the two can never disagree.
 function maybeFlushRoomDelivery(session) {
-  if (!sessionOccupiedForRoomDelivery(session)) roomDelivery.flush(session, session.roomId);
+  if (sessionOccupiedForRoomDelivery(session)) return;
+  // Counted BEFORE the flush, which clears the inbox either way — this is the
+  // number the ⏳ line left outstanding, and the number Dan is owed an outcome
+  // for. Zero means there was no queued batch, so there is nothing to close
+  // and no notice to publish (the ordinary idle path never queued anything).
+  const queued = roomDelivery.pendingCount(session.roomId);
+  const flushed = roomDelivery.flush(session, session.roomId);
+  if (!queued) return;
+  journalPublishNotice(
+    journalConvoIdFor(session),
+    flushed ? formatRoomDeliveredNotice(queued) : formatRoomDeliveryFailedNotice(queued),
+  );
 }
 
 // Hybrid idle/busy delivery of room messages into local sessions
@@ -7118,27 +7129,46 @@ function journalOnRoomFrame(room, frame) {
   // himself — he can already see it there, and re-rendering his own words in
   // another conversation, in the bridge's assistant voice, would read as
   // something a remote agent said.
-  if (sender.startsWith('agent:')) {
-    journalPublishNotice(
-      journalConvoIdFor(session),
-      formatRoomMessageNotice({ from, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
-    );
-  }
   // Self-heal for a stranded pending inbox (Task 6 review, I4): several
   // paths clear busy WITHOUT passing a turn-end flush seam (esc-cancel,
   // interrupt-wedge, resume-failed, the prompt paths). If the session is
   // free now, drain the older messages BEFORE this one so room messages
   // never overtake each other.
+  //
+  // Runs BEFORE this message's own notice so the journal reads in the order
+  // things happened: any ⏳ from an earlier batch is closed by its 📨 above
+  // the 💬 line for the message that arrived after it.
   maybeFlushRoomDelivery(session);
+  const isPeerAgent = sender.startsWith('agent:');
+  if (isPeerAgent) {
+    journalPublishNotice(
+      journalConvoIdFor(session),
+      formatRoomMessageNotice({ from, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
+    );
+  }
   // A reply consumed by an agent_chat_send wait already reached the agent
   // inline as the tool result — the session is busy for the whole tool call,
   // so deliver() would queue the SAME message and wake the agent with a
   // duplicate `[room …]` turn at turn end (Task 8 review, finding 1). The
   // journal keeps the durable copy; agent_chat_read recovers.
   if (roomReplyWaiters.resolve(frame.convo_id, { from, body })) return;
+  // Queued-vs-injected is read off the inbox rather than deliver()'s boolean,
+  // which reports "accepted" for both branches. Empty before and non-empty
+  // after is precisely "this message opened a pending batch" — the one
+  // message of the batch that gets a ⏳, closed later by maybeFlushRoomDelivery.
+  //
+  // This has to sit after the waiter short-circuit above, not beside the 💬
+  // notice: during an agent_chat_send wait the session is busy, but the reply
+  // is consumed inline as the tool result and never queued at all, so a
+  // busy-means-queued line published earlier would be a lie in exactly the
+  // case the agent responded fastest.
+  const queuedBefore = roomDelivery.pendingCount(session.roomId);
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
   });
+  if (isPeerAgent && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
+    journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
+  }
 }
 
 // Which local session an inbound invite/join request is FOR — see
@@ -7354,8 +7384,20 @@ function journalEvictConvoInput(session) {
   // the journal (agent_chat_read recovers it). Auto-restart and
   // recreateSession never come through here AND keep the same session.roomId
   // key, so a surviving session's pending inbox rides across untouched.
+  //
+  // A dropped batch still owes Dan an outcome: those messages had a ⏳ line
+  // published against them, and clearing the inbox silently would leave it
+  // hanging forever with no delivered/failed line to close it — the exact
+  // never-resolving indicator this feature exists to avoid (Bugbot, #197).
+  // Counted before the drop, and reported through the same failed notice the
+  // refused-inject path uses, because it is the same outcome: not delivered,
+  // still durable in the room, recoverable with agent_chat_read.
+  const strandedRoomMessages = roomDelivery.pendingCount(session?.roomId);
   roomDelivery.dropSession(session?.roomId);
   const convoId = journalConvoIdFor(session);
+  if (strandedRoomMessages && convoId) {
+    journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));
+  }
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
