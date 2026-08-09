@@ -53,6 +53,25 @@ describe('createAgentInvites', () => {
       expect(rooms.get('r1').state).toBe('joined');
     });
 
+    it('sends from_convo_id so the consent card can name the asking session', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.invite({ roomId: 'r1', targetDeviceId: 7, targetConvoId: 'convo-remote', fromConvoId: 'convo-mine', justification: 'j' });
+      expect(sendRoomOp).toHaveBeenCalledWith({
+        op: 'agent_invite', room_id: 'r1', target_device_id: 7,
+        target_convo_id: 'convo-remote', from_convo_id: 'convo-mine', justification: 'j',
+      });
+    });
+
+    it('omits from_convo_id entirely when the session has no journal convo yet', async () => {
+      // Same absent-never-null discipline as target_convo_id: the journal
+      // validates a PRESENT from_convo_id against this device and fails the
+      // whole invite on a mismatch, so a null would turn a missing label
+      // into a failed chat.
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.invite({ roomId: 'r1', targetDeviceId: 7, fromConvoId: null, justification: 'j' });
+      expect('from_convo_id' in sendRoomOp.mock.calls[0][0]).toBe(false);
+    });
+
     it('omits topic when not given', async () => {
       const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
       await inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
@@ -640,22 +659,22 @@ describe('formatInviteRequestNotice', () => {
 
   it('names the asker, the topic and the justification verbatim', () => {
     expect(formatInviteRequestNotice(request))
-      .toBe('🤝 Agent "dev-2" requests a chat about "ci triage": the build is red');
+      .toBe('🤝 Agent "dev-2" requests a chat with this session about "ci triage": the build is red');
   });
 
   it('omits the topic clause when there is none', () => {
     expect(formatInviteRequestNotice({ ...request, topic: undefined }))
-      .toBe('🤝 Agent "dev-2" requests a chat: the build is red');
+      .toBe('🤝 Agent "dev-2" requests a chat with this session: the build is red');
   });
 
   it('omits the justification clause rather than dangling a colon', () => {
     expect(formatInviteRequestNotice({ ...request, justification: undefined }))
-      .toBe('🤝 Agent "dev-2" requests a chat about "ci triage"');
+      .toBe('🤝 Agent "dev-2" requests a chat with this session about "ci triage"');
   });
 
   it('falls back to the device id when the peer sent no name', () => {
     expect(formatInviteRequestNotice({ ...request, from_name: null }))
-      .toBe('🤝 An agent (device 7) requests a chat about "ci triage": the build is red');
+      .toBe('🤝 An agent (device 7) requests a chat with this session about "ci triage": the build is red');
   });
 
   it('join_request names the room (the notice lands in the session convo, not the room)', () => {
@@ -689,7 +708,7 @@ describe('formatInviteRequestNotice', () => {
   it('SECURITY: non-string fields never render as [object Object]', () => {
     const notice = formatInviteRequestNotice({ ...request, from_name: { evil: true }, justification: {}, topic: [] });
     expect(notice).not.toContain('[object Object]');
-    expect(notice).toBe('🤝 An agent (device 7) requests a chat');
+    expect(notice).toBe('🤝 An agent (device 7) requests a chat with this session');
   });
 
   it('SECURITY: caps a huge justification instead of flooding the chat', () => {
@@ -699,7 +718,7 @@ describe('formatInviteRequestNotice', () => {
   });
 
   it('never throws on a junk frame', () => {
-    expect(formatInviteRequestNotice(null)).toBe('🤝 An agent (device unknown) requests a chat');
-    expect(formatInviteRequestNotice({})).toBe('🤝 An agent (device unknown) requests a chat');
+    expect(formatInviteRequestNotice(null)).toBe('🤝 An agent (device unknown) requests a chat with this session');
+    expect(formatInviteRequestNotice({})).toBe('🤝 An agent (device unknown) requests a chat with this session');
   });
 });
