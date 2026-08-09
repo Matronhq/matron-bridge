@@ -18,16 +18,26 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Label of the installed LaunchAgent, read from the plist rather than
-# hardcoded. It was hardcoded to "chat.matron.matron-bridge" — a name that
-# followed the repo rename but that no installed service ever had. Every step
-# up to the restart succeeded, then launchctl reported "Could not find service"
-# and the deploy aborted with the OLD code still serving: a pull that looked
-# like a ship.
-SERVICE_PLIST="$HOME/Library/LaunchAgents/chat.matron.claude-matrix-bridge.plist"
-SERVICE="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$SERVICE_PLIST" 2>/dev/null \
-  || echo 'chat.matron.claude-matrix-bridge')"
-TARGET="gui/$(id -u)/$SERVICE"
+# Label of the installed LaunchAgent, discovered rather than hardcoded. Two
+# names are in the wild: setup/service-macos.sh installs
+# "chat.matron.matron-bridge", while machines set up before the repo rename
+# still run "chat.matron.claude-matrix-bridge" — launchd never renames a
+# service just because its repo moved. Hardcoding either one breaks the other
+# half of the installs: the pull, the npm install and the whole preflight
+# succeed, then launchctl says "Could not find service" and the deploy aborts
+# with the OLD code still serving. A pull that looks like a ship.
+#
+# So ask launchd which of them it actually has. Whichever answers is the one
+# that would be restarted.
+DOMAIN="gui/$(id -u)"
+SERVICE=""
+for candidate in chat.matron.matron-bridge chat.matron.claude-matrix-bridge; do
+  if launchctl print "$DOMAIN/$candidate" >/dev/null 2>&1; then
+    SERVICE="$candidate"
+    break
+  fi
+done
+TARGET="$DOMAIN/${SERVICE:-chat.matron.matron-bridge}"
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
