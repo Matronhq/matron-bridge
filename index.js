@@ -100,6 +100,8 @@ import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from './lib/journal-title-seed.js';
+import { createSummaryModel } from './lib/summary-model.js';
+import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -276,6 +278,12 @@ const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_
 // Gemini client for room topic summarization
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+
+const summaryModel = createSummaryModel({
+  openaiApiKey: process.env.OPENAI_API_KEY || '',
+  geminiClient: genAI,
+  modelOverride: process.env.SUMMARY_MODEL || '',
+});
 
 function loadBridgeSystemPrompt() {
   try {
@@ -1333,6 +1341,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     chatHistory: [],         // { role, text } - full messages (code/tools stripped)
     pinnedSummaryEventId: null, // event ID of pinned summary message
     pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
+    lastSummaryMsgCount: 0, // chatHistory index the summary pass has consumed through (persisted)
+    lastRosterText: '',     // last ROSTER paragraph — preamble for the next incremental pass (persisted)
   };
 
   // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop
@@ -1453,6 +1463,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.chatHistory = session.chatHistory;
         restarted.pinnedSummaryText = session.pinnedSummaryText;
         restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
+        restarted.lastSummaryMsgCount = session.lastSummaryMsgCount || 0;
+        restarted.lastRosterText = session.lastRosterText || '';
         restarted._agentHistoryCursor = session._agentHistoryCursor;
         restarted._pendingAgentHandoff = session._pendingAgentHandoff;
         restarted._agentSessions = session._agentSessions;
@@ -1571,6 +1583,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     chatHistory: [],
     pinnedSummaryEventId: null,
     pinnedSummaryText: '',
+    lastSummaryMsgCount: 0, // chatHistory index the summary pass has consumed through (persisted)
+    lastRosterText: '',     // last ROSTER paragraph — preamble for the next incremental pass (persisted)
     _codexTurnFinished: true,
     _codexLastError: null,
   };
@@ -1810,6 +1824,7 @@ function finishCodexTurn(session, {
   session.busy = false;
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
+  maybeSummarizeAtTurnEnd(session);
   journalStatus(session);
   if (!discardOutput && error && session.alive) {
     const message = `⚠️ ${error}`;
@@ -1994,6 +2009,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     chatHistory: [],
     pinnedSummaryEventId: null,
     pinnedSummaryText: '',
+    lastSummaryMsgCount: 0, // chatHistory index the summary pass has consumed through (persisted)
+    lastRosterText: '',     // last ROSTER paragraph — preamble for the next incremental pass (persisted)
     pendingInteractivePrompt: null,
   };
 
@@ -2116,6 +2133,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.chatHistory = session.chatHistory;
         restarted.pinnedSummaryText = session.pinnedSummaryText;
         restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
+        restarted.lastSummaryMsgCount = session.lastSummaryMsgCount || 0;
+        restarted.lastRosterText = session.lastRosterText || '';
         restarted._agentHistoryCursor = session._agentHistoryCursor;
         restarted._pendingAgentHandoff = session._pendingAgentHandoff;
         restarted._agentSessions = session._agentSessions;
@@ -2201,6 +2220,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.busy = false;
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
+    maybeSummarizeAtTurnEnd(session);
     // The turn ended, so any best-effort unclassified-prompt notice is stale.
     session.pendingUnclassifiedPrompt = false;
     // A real turn-end supersedes any armed operator-compact fallback: disarm
@@ -3573,6 +3593,7 @@ function handleClaudeEvent(session, event) {
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
+      maybeSummarizeAtTurnEnd(session);
 
       // Check for ExitPlanMode permission denial — present Build prompt
       const denials = event.permission_denials || [];
@@ -3963,8 +3984,9 @@ function flushResponse(session) {
   const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
   if (cleanText) {
     recordConversationMessage(session, 'assistant', cleanText);
-    // Update room name and pinned summary after adding message
-    maybeUpdatePinnedSummary(session);
+    // Fallback titling stays on the flush path (names short convos); the
+    // LLM summary pass moved to turn-end (maybeSummarizeAtTurnEnd).
+    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
   }
 
   // Arm the durable ref for the very next journal mirror (the first chunk's
@@ -4930,44 +4952,39 @@ async function maybeUpdatePinnedSummary(session) {
   // 5-message threshold (short chats never get there); without Gemini
   // it is the only naming that runs.
   applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
-  if (!genAI) return;
+  if (!summaryModel) return;
 
   if (!session.chatHistory) session.chatHistory = [];
   debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
 
-  // Trigger every 5 messages
-  if (session.chatHistory.length < 5 || session.chatHistory.length % 5 !== 0) return;
+  // NOTE: the every-5-messages modulo gate is GONE — the caller
+  // (maybeSummarizeAtTurnEnd) gates on >=SUMMARY_MIN_NEW new messages.
 
   try {
     // Use in-memory summary as source of truth (not Matrix, since getEvent returns original, not edits)
     let currentSummary = session.pinnedSummaryText || '';
     const bulletCount = (currentSummary.match(/^•/gm) || []).length;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
-
     // Check if we need to compact (>15 bullets)
     if (bulletCount > 15 && currentSummary) {
       const compactPrompt = `Condense this session summary into exactly 3 bullet points (using • prefix) capturing the key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
-      const compactResult = await model.generateContent(compactPrompt);
-      currentSummary = compactResult.response.text().trim();
+      currentSummary = (await summaryModel.generate(compactPrompt)).trim();
       // Persist compacted result immediately so it isn't lost if the next LLM call fails to match
       session.pinnedSummaryText = currentSummary;
     }
 
-    // Get last 50 messages for summarization (broad context for better titles)
-    const recentMessages = session.chatHistory.slice(-50).map(m =>
-      `${m.role}: ${m.text}`
-    ).join('\n\n');
+    // Incremental window: only messages since the last SUCCESSFUL pass
+    // (cursor advances below on success only), capped at 200, plus the
+    // prior ROSTER paragraph as a fenced context preamble.
+    const { messages, nextCount } = summaryWindow(session.chatHistory, session.lastSummaryMsgCount);
+    if (!messages.length) return;
+    const prompt = buildSummaryPrompt({
+      messages,
+      priorRoster: session.lastRosterText || null,
+      hasCumulative: Boolean(currentSummary),
+    });
 
-    // ROSTER must stay the LAST format line in both variants:
-    // parseTitlePassResponse's multi-line capture stops at the next `KEY:`
-    // line or end-of-text, so a field placed after it would be swallowed.
-    const prompt = currentSummary
-      ? `Based on these recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n3. A 2-3 sentence rolling summary of what this session is working on right now\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\nROSTER: <2-3 sentences describing what this session is working on right now, for other agents deciding whether to contact it>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
-      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n3. A 2-3 sentence rolling summary of what this session is working on right now\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\nROSTER: <2-3 sentences describing what this session is working on right now, for other agents deciding whether to contact it>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
-
-    const result = await model.generateContent(prompt);
-    const text = result.response.text().trim();
+    const text = await summaryModel.generate(prompt);
     const parsed = parseTitlePassResponse(text);
 
     const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
@@ -4985,10 +5002,27 @@ async function maybeUpdatePinnedSummary(session) {
     // produced one. The seed path (lib/journal-title-seed.js), the state-only
     // path (journalSessionState), and the hint-replay upserts in
     // journalPublish never carry `summary` — the publisher's omit-don't-null
-    // handling makes that automatic. No fallback summary when Gemini is off:
-    // the roster shows '', which is honest.
+    // handling makes that automatic. No fallback summary when the summary
+    // model is off: the roster shows '', which is honest.
     if (parsed.roster) {
       journalUpsertConvo(session, { summary: parsed.roster.slice(0, 1000) });
+    }
+
+    // TOC event: one per successful pass, anchored by its own journal seq.
+    const toc = (parsed.added || parsed.summary || '').trim();
+    if (toc) {
+      journalPublish(session, 'publishSummary', {
+        toc: toc.slice(0, 300),
+        detail: (parsed.roster || '').slice(0, 1000),
+        model: summaryModel.model,
+      });
+    }
+
+    // Cursor + roster memory advance ONLY on a successful, parseable pass —
+    // a failing provider replays the same window next turn (capped at 200).
+    if (toc || parsed.roster) {
+      session.lastSummaryMsgCount = nextCount;
+      if (parsed.roster) session.lastRosterText = parsed.roster;
     }
 
     // Build cumulative summary for pinned message
@@ -5011,8 +5045,22 @@ async function maybeUpdatePinnedSummary(session) {
       // that's all that gets persisted now.
       session.pinnedSummaryText = updatedSummary;
       if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory, pinnedSummaryText: updatedSummary });
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+          chatHistory: session.chatHistory,
+          pinnedSummaryText: updatedSummary,
+          lastSummaryMsgCount: session.lastSummaryMsgCount ?? 0,
+          lastRosterText: session.lastRosterText || '',
+        });
       }
+    } else if (session.claudeSessionId && (toc || parsed.roster)) {
+      // No cumulative summary change (e.g. a roster-only pass), but the
+      // cursor still advanced — persist it so a restart doesn't replay the
+      // same window.
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+        chatHistory: session.chatHistory,
+        lastSummaryMsgCount: session.lastSummaryMsgCount ?? 0,
+        lastRosterText: session.lastRosterText || '',
+      });
     }
   } catch (e) {
     // warn, not debug: these failures were invisible in production (DEBUG is
@@ -5020,6 +5068,33 @@ async function maybeUpdatePinnedSummary(session) {
     // undiagnosable after the fact.
     console.warn(`[summary] title/summary pass failed for ${session.roomId}: ${e.message}`);
   }
+}
+
+// Turn-end gate for the summary pass. Fire-and-forget with an explicit catch
+// (an un-awaited rejection would be fatal under Node 22 defaults) and a
+// re-entrancy latch — turn-ends can arrive while a prior LLM call is pending.
+// A trigger swallowed by the latch is coalesced into one rerun when the
+// in-flight pass settles; otherwise messages recorded during a slow LLM call
+// would wait for the NEXT turn-end, and a conversation that goes quiet right
+// after would keep a stale summary indefinitely. Bounded: at most one rerun
+// per dropped trigger, and the min-new gate re-checks before the rerun fires.
+function maybeSummarizeAtTurnEnd(session) {
+  const count = session.chatHistory?.length || 0;
+  if (count - (session.lastSummaryMsgCount || 0) < SUMMARY_MIN_NEW) return;
+  if (session._summaryInFlight) {
+    session._summaryRerunQueued = true;
+    return;
+  }
+  session._summaryInFlight = true;
+  maybeUpdatePinnedSummary(session)
+    .catch((e) => console.warn(`[summary] turn-end pass failed for ${session.roomId}: ${e.message}`))
+    .finally(() => {
+      session._summaryInFlight = false;
+      if (session._summaryRerunQueued) {
+        session._summaryRerunQueued = false;
+        maybeSummarizeAtTurnEnd(session);
+      }
+    });
 }
 
 // Path of a session's on-disk transcript. Extraction + bounded reading live
@@ -5562,6 +5637,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.chatHistory = resumeHistory;
       session.pinnedSummaryText = resumePersisted?.pinnedSummaryText || '';
       session.pinnedSummaryEventId = resumePersisted?.pinnedSummaryEventId || null;
+      session.lastSummaryMsgCount = resumePersisted?.lastSummaryMsgCount || 0;
+      session.lastRosterText = resumePersisted?.lastRosterText || '';
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
@@ -5587,6 +5664,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         chatHistory: session.chatHistory,
         pinnedSummaryText: session.pinnedSummaryText,
         pinnedSummaryEventId: session.pinnedSummaryEventId,
+        lastSummaryMsgCount: session.lastSummaryMsgCount || 0,
+        lastRosterText: session.lastRosterText || '',
         model: session.currentModel || null,
         interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
         mcpExtras: session.mcpExtras,
@@ -7654,6 +7733,8 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   newSession.chatHistory = history;
   newSession.pinnedSummaryText = prev.pinnedSummaryText || '';
   newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
+  newSession.lastSummaryMsgCount = prev.lastSummaryMsgCount || 0;
+  newSession.lastRosterText = prev.lastRosterText || '';
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
   newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
@@ -8474,6 +8555,8 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.chatHistory = history;
   next.pinnedSummaryText = existing.pinnedSummaryText;
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  next.lastSummaryMsgCount = existing.lastSummaryMsgCount || 0;
+  next.lastRosterText = existing.lastRosterText || '';
   next.journalConvoId = stableConvoId;
   next._journalBuffer = existing._journalBuffer;
   next._journalTitleHint = existing._journalTitleHint;
@@ -8491,6 +8574,8 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
     chatHistory: history,
     pinnedSummaryText: next.pinnedSummaryText || '',
     pinnedSummaryEventId: next.pinnedSummaryEventId || null,
+    lastSummaryMsgCount: next.lastSummaryMsgCount || 0,
+    lastRosterText: next.lastRosterText || '',
     model: next.currentModel || null,
     interactiveMode: target === AGENT_CLAUDE ? !!next.iv : undefined,
     mcpExtras: next.mcpExtras,
@@ -8672,6 +8757,8 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.chatHistory = existing.chatHistory;
   next.pinnedSummaryText = existing.pinnedSummaryText;
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
+  next.lastSummaryMsgCount = existing.lastSummaryMsgCount || 0;
+  next.lastRosterText = existing.lastRosterText || '';
   next._agentHistoryCursor = existing._agentHistoryCursor;
   next._pendingAgentHandoff = existing._pendingAgentHandoff;
   next._agentSessions = existing._agentSessions;

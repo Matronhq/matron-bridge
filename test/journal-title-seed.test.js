@@ -369,12 +369,12 @@ describe('title-pass wiring in index.js (source inspection)', () => {
     expect(indexSrc).toMatch(/const parsed = parseTitlePassResponse\(text\);/);
   });
 
-  it('asks for ROSTER as the last format line of both prompt variants', () => {
-    // Two prompt variants, each ending its Format: block with the ROSTER
-    // line — the parser's multi-line capture would swallow any field
-    // placed after it.
-    const rosterFormatLines = indexSrc.match(/\\nROSTER: <2-3 sentences[^>]*>\\n\\nNo quotes\./g) || [];
-    expect(rosterFormatLines.length).toBe(2);
+  it('builds the prompt via buildSummaryPrompt instead of hand-rolling it', () => {
+    // Task B4: the two inline prompt variants (each ending its Format: block
+    // with the ROSTER line) moved to lib/summary-pass.js's buildSummaryPrompt,
+    // which keeps its own coverage of the ROSTER-must-be-last invariant
+    // (test/summary-pass.test.js) — index.js's job is just to call it.
+    expect(indexSrc).toMatch(/const prompt = buildSummaryPrompt\(\{/);
   });
 
   it('upserts the roster to the journal, sliced to the protocol cap', () => {
