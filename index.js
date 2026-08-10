@@ -88,7 +88,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs } from './lib/permission-prompt.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
@@ -521,6 +521,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const live = sessions.get(roomId);
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  if (typeof live?.bypassMode === 'boolean') derived.bypassMode = live.bypassMode;
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
@@ -1192,6 +1193,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  // bypassMode: explicit --bypass/--auto flag wins; otherwise the persisted
+  // value. Sessions persisted before this feature have no bypassMode and thus
+  // resume in auto mode — the intended migration (spec 2026-08-10).
+  const bypassMode = typeof options.bypass === 'boolean'
+    ? options.bypass
+    : (persistedForRoom?.bypassMode === true);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   let showFileToken;
@@ -1222,12 +1229,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
-    '--dangerously-skip-permissions',
+    ...permissionSpawnArgs(bypassMode),
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify({
+      permissions: {
+        allow: ['mcp__ask-user', 'mcp__show-file'],
+      },
       hooks: {
         PreCompact: [{
           hooks: [{
@@ -1251,6 +1261,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : resolveModel({ option: options.model, persisted: persistedMode?.model });
   if (printModel) {
     args.push('--model', printModel);
+  }
+  // Auto mode needs Opus 4.6+/Sonnet 4.6+/Fable-class models; Haiku-class
+  // sessions fall back to `default` permission mode and prompt for far more.
+  if (!bypassMode && printModel && /haiku/i.test(printModel)) {
+    const hw = notice('warning',
+      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to restore the old behavior.`,
+      `Model <code>${escapeHtml(printModel)}</code> doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use <code>--bypass</code> to restore the old behavior.`);
+    Promise.resolve(sendToRoom(roomId, hw.plain, hw.html)).catch(() => {});
   }
   args.push(...identity.cliArgs);
 
@@ -1302,6 +1320,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     showFilePinnedRoots,
     _showFileInFlight: 0,
     mcpExtras,
+    bypassMode,
+    permAllowedTools: new Set(),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
