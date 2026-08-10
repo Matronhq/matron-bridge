@@ -8043,6 +8043,7 @@ const apiServer = createServer(async (req, res) => {
         sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ requestId: permRequestId }));
+        return;
       }
 
       if (url.pathname === '/send-attachment') {
