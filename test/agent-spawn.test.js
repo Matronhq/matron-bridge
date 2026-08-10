@@ -27,6 +27,8 @@ function mk(overrides = {}) {
     notifyParent,
     targetsTimeoutMs: overrides.targetsTimeoutMs ?? 20,
     pendingTimeoutMs: overrides.pendingTimeoutMs ?? 20,
+    handledTtlMs: overrides.handledTtlMs,
+    sweepIntervalMs: overrides.sweepIntervalMs,
     log: { warn: () => {} },
   });
   return { handlers, sent, notices, rooms, sessions, notifyParent };
@@ -213,6 +215,35 @@ describe('createAgentSpawnHandlers', () => {
       ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-1' });
       expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
     });
+
+    it('a task with an embedded newline and quotes is flattened and escaped in the notice, and carries no raw newline into the room title', async () => {
+      const ctx = mk();
+      const task = 'run "rm -rf /"\nand then reboot';
+      const p = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task });
+      const rid = ctx.sent[0].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: 'row-2' });
+      await p;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-2', outcome: 'started', room_id: 'room-2', child_convo_id: 'child-2' });
+
+      const text = ctx.notices[0].text;
+      // No raw newline anywhere in the published notice.
+      expect(text).not.toMatch(/\n/);
+      // The embedded quotes are escaped (quotedField), not left free to close
+      // the wrapping "…" segment early — the forgery quotedField exists to
+      // stop (lib/peer-text.js:22-39).
+      expect(text).toContain('\\"rm -rf /\\"');
+      // Exactly two UNESCAPED double quotes remain: the prefix's own
+      // delimiters (same invariant formatInviteRequestNotice relies on).
+      const unescapedQuotes = text.replace(/\\"/g, '').match(/"/g) || [];
+      expect(unescapedQuotes).toHaveLength(2);
+
+      // rooms.record's title (sourced from the same ctx.task, sanitized at
+      // capture in sessionStart) must not carry the raw newline through to
+      // a downstream room-title renderer either.
+      const title = ctx.rooms.calls[0].fields.title;
+      expect(title).not.toMatch(/\n/);
+      expect(title).toContain('run "rm -rf /"');
+    });
   });
 
   describe('frame hygiene', () => {
@@ -231,6 +262,49 @@ describe('createAgentSpawnHandlers', () => {
         expect(() => handlers.onSpawnFrame(f)).not.toThrow();
       }
       expect(notifyParent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('pendingSpawns tombstone sweep', () => {
+    it('prunes a resolved (tombstoned) spawn after handledTtlMs, but a still-pending context survives the same sweep untouched', async () => {
+      const ctx = mk({ handledTtlMs: 5, sweepIntervalMs: 5 });
+
+      // Spawn "live": acked but never given an outcome — a genuinely
+      // in-flight context that must survive any amount of sweeping (the
+      // sweep only ever touches tombstoned/HANDLED entries).
+      const pLive = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'long-running task' });
+      const ridLive = ctx.sent[0].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: ridLive, spawn_id: 'row-live' });
+      await pLive;
+
+      // Spawn "tomb": acked and resolved right away — its context tombstones.
+      const pTomb = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'quick task' });
+      const ridTomb = ctx.sent[1].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: ridTomb, spawn_id: 'row-tomb' });
+      await pTomb;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-tomb', outcome: 'declined' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+
+      // Let the unref'd sweep interval fire at least once past the TTL.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      // The tombstone for row-tomb is gone: a second 'declined' frame for
+      // the same spawn id now reads as "never tracked" (same as a
+      // bridge-restart case) and produces ANOTHER notifyParent — proving
+      // the entry was actually pruned rather than deduped forever.
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-tomb', outcome: 'declined' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(2);
+      expect(ctx.notices[1].session).toBeNull();
+
+      // row-live was NEVER tombstoned, so the sweep must never have touched
+      // it — resolving it now must still find its real context (session
+      // non-null, rooms.record called), proving a genuinely pending spawn
+      // is immune to the sweep regardless of elapsed time.
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-live', outcome: 'started', room_id: 'room-live', child_convo_id: 'child-live' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(3);
+      expect(ctx.notices[2].session).not.toBeNull();
+      expect(ctx.notices[2].text).toContain('long-running task');
+      expect(ctx.rooms.calls.some((c) => c.roomId === 'room-live')).toBe(true);
     });
   });
 });
