@@ -57,13 +57,12 @@ describe("index.js !restart busy deferral (source inspection)", () => {
 
   it('a busy, unforced /restart defers instead of restarting', () => {
     expect(body).toMatch(/existing\.busy && !restartForced/);
-    expect(body).toMatch(/_deferredRestartText/);
+    expect(body).toMatch(/_deferredCommandText/);
   });
 
-  it("replies with the exact 'waiting' message", () => {
-    expect(body).toContain(
-      "'Waiting for turn to finish before restarting. Send again with --force to restart immediately.'",
-    );
+  it("replies with the 'waiting' message, --force escape hatch included", () => {
+    expect(body).toContain('Waiting for turn to finish before restarting');
+    expect(body).toContain('Send again with --force to restart immediately.');
   });
 
   it('the stashed replay is forced so it cannot re-defer at the seam', () => {
@@ -71,8 +70,8 @@ describe("index.js !restart busy deferral (source inspection)", () => {
   });
 });
 
-describe('index.js dispatchDeferredRestart (source inspection)', () => {
-  const start = src.indexOf('function dispatchDeferredRestart(session)');
+describe('index.js dispatchDeferredCommand (source inspection)', () => {
+  const start = src.indexOf('function dispatchDeferredCommand(session)');
   const body = src.slice(start, src.indexOf('\n}\n', start));
 
   it('exists', () => {
@@ -80,7 +79,7 @@ describe('index.js dispatchDeferredRestart (source inspection)', () => {
   });
 
   it('clears the stash before the liveness check, so a dead session can never restart later', () => {
-    const clear = body.indexOf('session._deferredRestartText = null');
+    const clear = body.indexOf('session._deferredCommandText = null');
     const aliveCheck = body.indexOf('!session.alive');
     expect(clear).toBeGreaterThan(-1);
     expect(aliveCheck).toBeGreaterThan(-1);
@@ -102,7 +101,7 @@ describe('index.js dispatchDeferredRestart (source inspection)', () => {
 // about to kill. recreateSession carries queuedMessages into the
 // replacement, and the room-delivery inbox is keyed by roomId, so both
 // reach the new session.
-describe('index.js turn-end seams dispatch the deferred restart (source inspection)', () => {
+describe('index.js turn-end seams dispatch the deferred command (source inspection)', () => {
   const seamWindow = (anchor, end) => {
     const start = src.indexOf(anchor);
     expect(start).toBeGreaterThan(-1);
@@ -110,7 +109,7 @@ describe('index.js turn-end seams dispatch the deferred restart (source inspecti
   };
 
   const expectDispatchBeforeFlush = (body) => {
-    const dispatch = body.indexOf('dispatchDeferredRestart(session)');
+    const dispatch = body.indexOf('dispatchDeferredCommand(session)');
     const flush = body.indexOf('flushPendingSessionQueue(session)');
     expect(dispatch).toBeGreaterThan(-1);
     expect(flush).toBeGreaterThan(-1);
@@ -136,7 +135,7 @@ describe('index.js turn-end seams dispatch the deferred restart (source inspecti
   it("fatal no-conversation-found result path dispatches, print mode only", () => {
     const body = seamWindow('const noSession = event.errors.some', "if (session.iv) {");
     const busyClear = body.indexOf('session.busy = false');
-    const dispatch = body.indexOf('if (!session.iv) dispatchDeferredRestart(session)');
+    const dispatch = body.indexOf('if (!session.iv) dispatchDeferredCommand(session)');
     expect(busyClear).toBeGreaterThan(-1);
     expect(dispatch).toBeGreaterThan(-1);
     expect(busyClear).toBeLessThan(dispatch);
@@ -144,6 +143,39 @@ describe('index.js turn-end seams dispatch the deferred restart (source inspecti
 
   it('finishCodexTurn', () => {
     expectDispatchBeforeFlush(seamWindow('function finishCodexTurn(session', '\n}\n'));
+  });
+});
+
+// A busy print-mode /model no longer refuses ("Finish or interrupt the
+// current turn…") — it parks `!model <alias>` on the SAME deferred-command
+// stash /restart uses, replayed at the turn-end seam BEFORE the queue
+// flush. The replay recreates the session with the new model, and the
+// carried queue then flushes on the replacement (compact still first), so
+// the switch applies ahead of every queued message. One stash, one slot:
+// parking /model over a parked /restart (or vice versa) replaces it with a
+// notice, mirroring the /login//logout parked-slash precedent.
+describe('index.js busy /model parks on the deferred-command stash (source inspection)', () => {
+  const start = src.indexOf('function applyModelSwitch(');
+  const body = src.slice(start, src.indexOf('function applyModeSwitch(', start));
+
+  it('parks the normalized replay text when the planner defers', () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(body).toMatch(/decision\.defer/);
+    expect(body).toMatch(/_deferredCommandText = `!model \$\{decision\.normalized\}`/);
+  });
+
+  it('a repeat of the same parked /model just says it is already queued', () => {
+    expect(body).toContain('already queued');
+  });
+
+  it('replacing a different parked command says so instead of silently dropping it', () => {
+    expect(body).toMatch(/replacing the queued/);
+  });
+
+  it('the /restart park site names a replaced /model too', () => {
+    const rs = src.indexOf("case '!restart':");
+    const rbody = src.slice(rs, src.indexOf("case '!resume':", rs));
+    expect(rbody).toMatch(/replacing the queued/);
   });
 });
 
