@@ -73,4 +73,26 @@ describe('formatBox', () => {
     expect(formatBox({ device_id: 1, name: '', online: true, folders: [] }))
       .toBe('unknown (device 1) — online');
   });
+
+  it('degrades a box whose limits.as_of is out of Date range to a single unavailable line, without throwing', () => {
+    const box = {
+      device_id: 6, name: 'bad-box', online: true, folders: [],
+      limits: { as_of: 1e16, lines: [] },
+    };
+    let text;
+    expect(() => { text = formatBox(box); }).not.toThrow();
+    expect(text).toBe('bad-box (device 6) — (unavailable)');
+  });
+
+  it('a box list with one malformed box renders the other boxes normally plus a degraded line for the bad one', () => {
+    const good1 = { device_id: 1, name: 'eric', online: true, folders: [] };
+    const bad = { device_id: 6, name: 'bad-box', online: true, folders: [], limits: { as_of: 1e16, lines: [] } };
+    const good2 = { device_id: 2, name: 'sue', online: false, folders: [] };
+    const text = [good1, bad, good2].map(formatBox).join('\n\n');
+    expect(text).toBe(
+      'eric (device 1) — online\n\n' +
+      'bad-box (device 6) — (unavailable)\n\n' +
+      'sue (device 2) — offline'
+    );
+  });
 });

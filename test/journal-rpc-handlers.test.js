@@ -327,7 +327,7 @@ describe('composeSpawnOpeningTurn', () => {
     expect(text).toContain('room-42');
     expect(text).toContain('yearbook-app');
     expect(text).toMatch(/agent_chat_send/);
-    expect(text).toMatch(/chat_room_id "room-42"/);
+    expect(text).toMatch(/room_id "room-42"/);
     expect(text).toMatch(/report progress/);
     expect(text).toMatch(/The user can read everything you write/);
   });

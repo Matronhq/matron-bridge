@@ -64,6 +64,18 @@ describe('buildActivity', () => {
     const out = buildActivity({ sessions: new Map(), persisted, now: NOW });
     expect(out).toEqual({ live_sessions: 0, last_hour: [] });
   });
+
+  it('omits an over-long path (>1024 chars) from last_hour while keeping other entries — the journal rejects the whole block otherwise', () => {
+    const overlong = '/w/' + 'x'.repeat(1025);
+    const sessions = new Map([
+      ['r1', mkSession('r1', overlong)],
+      ['r2', mkSession('r2', '/w/fine')],
+    ]);
+    const out = buildActivity({ sessions, persisted: {}, now: NOW });
+    // live_sessions still counts both — only last_hour grouping skips the bad path.
+    expect(out.live_sessions).toBe(2);
+    expect(out.last_hour).toEqual([{ path: '/w/fine', sessions: 1 }]);
+  });
 });
 
 describe('buildLimits', () => {
