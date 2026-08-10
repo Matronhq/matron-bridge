@@ -49,7 +49,7 @@ describe('buildSummaryPrompt', () => {
 
 describe('gate constants', () => {
   it('exports the gate constants the index.js wiring consumes', () => {
-    expect(SUMMARY_MIN_NEW).toBe(5);
+    expect(SUMMARY_MIN_NEW).toBe(1);
     expect(SUMMARY_WINDOW_CAP).toBe(200);
   });
 });
