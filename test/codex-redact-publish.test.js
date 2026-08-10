@@ -289,6 +289,31 @@ describe('publish-side Codex redaction', () => {
     expect(out).toContain('SECRETVAL'); // env-selected 'skip' → operator pattern skipped
   });
 
+  it('measures the bound in UTF-8 bytes, not UTF-16 code units', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    // 30 three-byte chars = 30 code units (< 32) but 90 UTF-8 bytes (> 32). A
+    // code-unit check would wrongly treat this as under the bound.
+    const out = redact('中'.repeat(30));
+    expect(out).toContain('[REDACTED-OVERSIZE:'); // detected as oversize despite <32 code units
+  });
+
+  it('drops a secret that straddles the truncation cut — never a partial prefix', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    // The safe head ends at the last newline within the bound (byte 9). SECRETVAL
+    // begins after it, so it lands entirely in the dropped tail.
+    const out = redact(`8 chars.\nSECRETVAL${'x'.repeat(80)}`);
+    expect(out).not.toContain('SECRET'); // not even a prefix of the secret leaks
+    expect(out).toContain('[REDACTED-OVERSIZE:');
+  });
+
+  it('drops the whole payload (empty head) when no newline fits in the bound', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    const out = redact(`${'x'.repeat(64)}\nSECRETVAL`); // no newline in the first 32 bytes
+    expect(out).not.toContain('x'.repeat(64));
+    expect(out).not.toContain('SECRETVAL');
+    expect(out.startsWith('[REDACTED-OVERSIZE:')).toBe(true); // annotation only, no partial line
+  });
+
   it('redacts every allowlisted string and excludes unknown fields before publishing', () => {
     const publisher = makePublisher();
     const state = {};
