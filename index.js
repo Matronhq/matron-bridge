@@ -9105,17 +9105,22 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   if (signal === 'SIGINT') console.log('\nShutting down...');
-  stopCpuSampler();
-  for (const [, session] of sessions) {
-    killSession(session);
-  }
+  // Everything is inside try/finally so a throw from ANY step (sampler, session
+  // kill, or the flush) still reaches process.exit(0). Previously stopCpuSampler
+  // / killSession ran outside the try, so a throw there rejected the promise the
+  // signal handlers ignore, and the process never exited (unhandled rejection).
   try {
+    stopCpuSampler();
+    for (const [, session] of sessions) {
+      killSession(session);
+    }
     await journalPublisher.flush({ timeoutMs: FLUSH_TIMEOUT_MS });
   } catch (e) {
-    try { console.warn(`[shutdown] release flush failed: ${e?.message ?? String(e)}`); } catch { /* ignore */ }
+    try { console.warn(`[shutdown] failed: ${e?.message ?? String(e)}`); } catch { /* ignore */ }
+  } finally {
+    process.exit(0);
   }
-  process.exit(0);
 }
 
-process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
-process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
+process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });

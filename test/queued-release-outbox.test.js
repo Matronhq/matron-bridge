@@ -4,10 +4,6 @@ import path from 'node:path';
 import os from 'node:os';
 import { createQueuedReleaseOutbox, ACK_RETENTION_MS } from '../lib/queued-release-outbox.js';
 
-function tmpFile() {
-  return path.join(os.tmpdir(), `qr-outbox-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
-}
-
 function rec(overrides = {}) {
   return {
     convoId: 'convo-1',
@@ -23,25 +19,21 @@ function rec(overrides = {}) {
 const KEY = 'pr_1\0pr_1::0\0cancel';
 
 describe('queued-release-outbox', () => {
+  let dir;
   let file;
   let store;
 
   beforeEach(() => {
-    file = tmpFile();
+    // A private 0700 temp DIR (not a predictable name in the shared tmpdir) so
+    // the store file + its siblings (.tmp, .corrupt-*) can't collide or be
+    // pre-created by another user, and cleanup is a single recursive remove.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qr-outbox-'));
+    file = path.join(dir, 'outbox.json');
     store = createQueuedReleaseOutbox({ file, log: { warn() {} } });
   });
 
   afterEach(() => {
-    for (const f of [file, `${file}.tmp`]) {
-      try { fs.unlinkSync(f); } catch { /* ignore */ }
-    }
-    try {
-      const dir = path.dirname(file);
-      const base = path.basename(file);
-      for (const name of fs.readdirSync(dir)) {
-        if (name.startsWith(`${base}.corrupt-`)) fs.unlinkSync(path.join(dir, name));
-      }
-    } catch { /* ignore */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
   it('list() is empty before anything is put (missing file)', () => {
@@ -50,7 +42,8 @@ describe('queued-release-outbox', () => {
 
   it('put() persists a record (atomic tmp+rename, no leftover tmp) and returns true', () => {
     expect(store.put(KEY, rec())).toBe(true);
-    expect(fs.existsSync(`${file}.tmp`)).toBe(false);
+    // No leftover tmp of any name (the write uses a random suffix + rename).
+    expect(fs.readdirSync(dir).filter(n => n.endsWith('.tmp'))).toEqual([]);
     const list = store.list();
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({ key: KEY, promptId: 'pr_1', action: 'cancel', status: 'pending' });
