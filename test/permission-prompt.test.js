@@ -4,6 +4,8 @@ import {
   permissionButtons,
   parsePermTap,
   permissionSpawnArgs,
+  createPermissionRegistry,
+  DENY_MESSAGE,
 } from '../lib/permission-prompt.js';
 
 const UUID = '01234567-89ab-cdef-0123-456789abcdef';
@@ -89,5 +91,92 @@ describe('permissionSpawnArgs', () => {
 
   it('bypass: the old skip-permissions flag', () => {
     expect(permissionSpawnArgs(true)).toEqual(['--dangerously-skip-permissions']);
+  });
+});
+
+// Hand-rolled controllable timers, per the room-reply-waiters convention.
+function fakeTimers() {
+  const timers = new Map();
+  let nextHandle = 1;
+  return {
+    setTimeout: (fn, ms) => { const h = nextHandle++; timers.set(h, { fn, ms }); return h; },
+    clearTimeout: (h) => { timers.delete(h); },
+    fire: (h) => { const t = timers.get(h); timers.delete(h); t?.fn(); },
+    handles: () => [...timers.keys()],
+    count: () => timers.size,
+  };
+}
+
+describe('createPermissionRegistry', () => {
+  const mkReg = (over = {}) => {
+    const t = fakeTimers();
+    let n = 0;
+    const reg = createPermissionRegistry({
+      setTimeout: t.setTimeout,
+      clearTimeout: t.clearTimeout,
+      mintId: () => `id-${++n}`,
+      ...over,
+    });
+    return { reg, t };
+  };
+
+  it('create → allow answer → consumed read', () => {
+    const { reg } = mkReg();
+    const { id } = reg.create({ roomId: 'room-1', toolName: 'Bash' });
+    expect(reg.read(id)).toEqual({ answered: false });
+    expect(reg.answer(id, 'allow')).toEqual({
+      roomId: 'room-1', toolName: 'Bash', verdict: 'allow', behavior: 'allow',
+    });
+    expect(reg.read(id)).toEqual({ answered: true, behavior: 'allow', message: null });
+    // consumed on answered read
+    expect(reg.read(id)).toBeNull();
+    expect(reg.size()).toBe(0);
+  });
+
+  it('always verdict reports behavior allow and the toolName', () => {
+    const { reg } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'WebFetch' });
+    expect(reg.answer(id, 'always')).toEqual({
+      roomId: 'r', toolName: 'WebFetch', verdict: 'always', behavior: 'allow',
+    });
+  });
+
+  it('deny carries DENY_MESSAGE through read', () => {
+    const { reg } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'Bash' });
+    reg.answer(id, 'deny');
+    expect(reg.read(id)).toEqual({ answered: true, behavior: 'deny', message: DENY_MESSAGE });
+  });
+
+  it('double answer returns null and keeps the first verdict', () => {
+    const { reg } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'Bash' });
+    expect(reg.answer(id, 'deny')).not.toBeNull();
+    expect(reg.answer(id, 'allow')).toBeNull();
+    expect(reg.read(id).behavior).toBe('deny');
+  });
+
+  it('unknown id: answer and read return null', () => {
+    const { reg } = mkReg();
+    expect(reg.answer('nope', 'allow')).toBeNull();
+    expect(reg.read('nope')).toBeNull();
+  });
+
+  it('TTL expiry deletes the entry (poller then 404s → tool fail-closes)', () => {
+    const { reg, t } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'Bash' });
+    expect(t.count()).toBe(1);
+    t.fire(t.handles()[0]);
+    expect(reg.read(id)).toBeNull();
+    expect(reg.answer(id, 'allow')).toBeNull();
+    expect(reg.size()).toBe(0);
+  });
+
+  it('answered read clears the TTL timer', () => {
+    const { reg, t } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'Bash' });
+    reg.answer(id, 'allow');
+    reg.read(id);
+    expect(t.count()).toBe(0);
   });
 });
