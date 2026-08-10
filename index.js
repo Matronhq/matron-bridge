@@ -4951,14 +4951,28 @@ async function maybeUpdatePinnedSummary(session) {
 // Turn-end gate for the summary pass. Fire-and-forget with an explicit catch
 // (an un-awaited rejection would be fatal under Node 22 defaults) and a
 // re-entrancy latch — turn-ends can arrive while a prior LLM call is pending.
+// A trigger swallowed by the latch is coalesced into one rerun when the
+// in-flight pass settles; otherwise messages recorded during a slow LLM call
+// would wait for the NEXT turn-end, and a conversation that goes quiet right
+// after would keep a stale summary indefinitely. Bounded: at most one rerun
+// per dropped trigger, and the min-new gate re-checks before the rerun fires.
 function maybeSummarizeAtTurnEnd(session) {
   const count = session.chatHistory?.length || 0;
   if (count - (session.lastSummaryMsgCount || 0) < SUMMARY_MIN_NEW) return;
-  if (session._summaryInFlight) return;
+  if (session._summaryInFlight) {
+    session._summaryRerunQueued = true;
+    return;
+  }
   session._summaryInFlight = true;
   maybeUpdatePinnedSummary(session)
     .catch((e) => console.warn(`[summary] turn-end pass failed for ${session.roomId}: ${e.message}`))
-    .finally(() => { session._summaryInFlight = false; });
+    .finally(() => {
+      session._summaryInFlight = false;
+      if (session._summaryRerunQueued) {
+        session._summaryRerunQueued = false;
+        maybeSummarizeAtTurnEnd(session);
+      }
+    });
 }
 
 // Path of a session's on-disk transcript. Extraction + bounded reading live
