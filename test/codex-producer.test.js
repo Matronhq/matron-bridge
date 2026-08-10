@@ -274,7 +274,8 @@ describe('producer shim — signal forwarding + no orphan (T-6.4)', () => {
     const meta = JSON.parse(fs.readFileSync(path.join(sink, metaName), 'utf8'));
     expect(meta.interrupted).toBe(true);
     expect(Object.hasOwn(meta, 'exitCode')).toBe(false);
-  });
+  }, 20000); // 3x waitFor (5s each) + a subprocess spawn exceed the 5s default;
+  // give the real failure room to surface instead of a framework-timeout abort.
 });
 
 // T-1.7: live smoke against a REAL codex (flat-rate CLI). Skipped where no

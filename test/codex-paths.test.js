@@ -32,6 +32,14 @@ describe('codexRunsDirFor', () => {
     expect(codexRunsDirFor(worktreeCwd, sessionId))
       .toBe(codexRunsDirFor(mainCwd, sessionId));
   });
+
+  it('rejects a sessionId that could traverse out of the sinks root', () => {
+    for (const bad of ['..', '../evil', 'a/../../etc', 'a/b', 'a\\b', 'x\0y', '', '.']) {
+      expect(() => codexRunsDirFor('/home/user/project', bad)).toThrow(/unsafe sessionId/);
+    }
+    // A normal UUID session id is fine.
+    expect(() => codexRunsDirFor('/home/user/project', '00000000-1111-2222-3333-444444444444')).not.toThrow();
+  });
 });
 
 describe('configureCodexSinkEnv', () => {

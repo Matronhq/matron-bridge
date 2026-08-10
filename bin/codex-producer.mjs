@@ -98,11 +98,31 @@ export function mintRunId({ pid = process.pid, now = Date.now } = {}) {
   return runId;
 }
 
+// Both resolve probes run the resolved binary synchronously ON the bridge's
+// startup path, so they must be bounded: a hung `codex` would otherwise stall
+// the shim before it spawns anything, and a verbose one could blow the default
+// stdout buffer (ENOBUFS) and get misread as "no JSON flag". Bound both by time
+// and buffer, and surface a spawn-level error (timeout / ENOBUFS) as a distinct
+// loud failure rather than letting it fall through to the not-found paths.
+const PROBE_TIMEOUT_MS = 5000;
+const PROBE_MAX_BUFFER = 1024 * 1024;
+
+function runProbe(runner, realbin, args) {
+  const res = runner(realbin, args, {
+    encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: PROBE_MAX_BUFFER,
+  });
+  if (res.error) {
+    const error = new Error(`[codex-shim] probe '${realbin} ${args.join(' ')}' failed: ${res.error.message}`);
+    error.code = 'PROBE_FAILED';
+    throw error;
+  }
+  return `${res.stdout || ''}${res.stderr || ''}`;
+}
+
 // T-1.2: resolve the JSON event-stream flag against the resolved binary; fail
 // loud rather than launch a run that produces no transcript.
 export function resolveJsonFlag(realbin, { runner = spawnSync } = {}) {
-  const help = runner(realbin, ['exec', '--help'], { encoding: 'utf8' });
-  const text = `${help.stdout || ''}${help.stderr || ''}`;
+  const text = runProbe(runner, realbin, ['exec', '--help']);
   if (/(^|\s)--json(\s|$|=)/.test(text)) return '--json';
   if (/(^|\s)--experimental-json(\s|$|=)/.test(text)) return '--experimental-json';
   const error = new Error('[codex-shim] resolved codex has no JSON event stream');
@@ -112,8 +132,7 @@ export function resolveJsonFlag(realbin, { runner = spawnSync } = {}) {
 
 // T-1.2: schemaVersion string 'codex-cli X.Y.Z' from `<realbin> --version`.
 export function resolveSchemaVersion(realbin, { runner = spawnSync } = {}) {
-  const res = runner(realbin, ['--version'], { encoding: 'utf8' });
-  const text = `${res.stdout || ''}${res.stderr || ''}`;
+  const text = runProbe(runner, realbin, ['--version']);
   const match = /codex-cli\s+(\d+\.\d+\.\d+)/.exec(text);
   if (!match) {
     const error = new Error('[codex-shim] codex --version did not yield "codex-cli X.Y.Z"');
@@ -268,7 +287,11 @@ async function runProducer(realbin, argv, ctx) {
       finish(resolve, 127);
     });
 
-    child.on('exit', (code, signal) => {
+    // 'close' (not 'exit'): 'exit' can fire while child.stdout is still open —
+    // e.g. a descendant inherited the pipe — and later tee'd chunks would then
+    // reach stdout.write() after finish() closed the sink fd, diverging the sink
+    // from the caller's stdout. 'close' fires only once all stdio has ended.
+    child.on('close', (code, signal) => {
       cleanupSignals();
       const terminal = { ...meta };
       if (signal || signalled) {
@@ -325,10 +348,15 @@ const isMain = (() => {
 })();
 
 if (isMain) {
+  // Set exitCode and let the event loop drain rather than process.exit(): with a
+  // piped stdout Node flushes asynchronously, and process.exit() would terminate
+  // before that queue drains, dropping the final teed bytes even though the
+  // synchronous JSONL sink kept them. The shim holds no handles after finish()
+  // closes the sink fd, so the process exits on its own once stdout drains.
   runShim(process.argv.slice(2))
-    .then(code => process.exit(code))
+    .then(code => { process.exitCode = code; })
     .catch(error => {
       try { process.stderr.write(`[codex-shim] fatal: ${error?.message ?? error}\n`); } catch { /* noop */ }
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
