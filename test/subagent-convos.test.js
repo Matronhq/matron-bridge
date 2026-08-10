@@ -385,6 +385,36 @@ describe('createSubagentConvoTracker', () => {
       expect(runningStore.calls.add).toHaveLength(1);
     });
 
+    it('does not publish a running child when the write-ahead record fails, and re-mints on retry', () => {
+      const publisher = makePublisher();
+      let addResult = false; // store can't durably persist yet
+      const store = {
+        calls: { add: [], remove: [] },
+        add(childConvoId, meta) { this.calls.add.push({ childConvoId, meta }); return addResult; },
+        remove(childConvoId) { this.calls.remove.push(childConvoId); },
+        list() { return []; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore: store,
+        log: { warn() {} },
+      });
+
+      // Write-ahead failed → the child must NOT be published (no server-visible
+      // running child with no recovery record).
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(store.calls.add).toHaveLength(1);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // The mint rolled back, so a later watcher poll re-discovers the agent;
+      // once the store can persist, it mints and publishes normally.
+      addResult = true;
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(store.calls.add).toHaveLength(2);
+      expect(publisher.calls.upsertConvo).toHaveLength(1);
+    });
+
     it('finishAll removes every still-running child from the store', () => {
       const runningStore = makeStore();
       const tracker = createSubagentConvoTracker({
