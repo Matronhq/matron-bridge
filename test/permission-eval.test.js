@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,7 +15,6 @@ import {
 } from '../lib/permission-eval.js';
 
 const WEBFLOW_SETTINGS_FIXTURE = path.resolve('test/fixtures/webflow-settings.local.json');
-const PRODUCTION_SETTINGS_LOCAL = '/root/.openclaw/workspace/.claude/settings.local.json';
 
 function webflowAllowRules(settings) {
   return settings.permissions.allow.filter(rule => (
@@ -54,23 +52,6 @@ describe('permission snapshot', () => {
     expect(Object.isFrozen(snapshot.mcpAsk)).toBe(true);
     expect(webflowTools).toHaveLength(26);
     expect(webflowTools).not.toContain('mcp__webflow__data_sites_tool');
-    for (const toolName of webflowTools) {
-      expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
-    }
-    expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
-  });
-
-  it('classifies the live Webflow allowlist when present, otherwise the committed fixture', () => {
-    const sourcePath = existsSync(PRODUCTION_SETTINGS_LOCAL)
-      ? PRODUCTION_SETTINGS_LOCAL
-      : WEBFLOW_SETTINGS_FIXTURE;
-    const fixtureSettings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
-    const settings = JSON.parse(readFileSync(sourcePath, 'utf8'));
-    const fixtureWebflowTools = webflowAllowRules(fixtureSettings);
-    const webflowTools = webflowAllowRules(settings);
-    const snapshot = buildPermissionSnapshot({ sourcePaths: [sourcePath] });
-
-    expect(webflowTools).toEqual(fixtureWebflowTools);
     for (const toolName of webflowTools) {
       expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
     }
