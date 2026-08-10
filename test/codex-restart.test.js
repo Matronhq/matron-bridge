@@ -62,6 +62,8 @@ function makeWatcher(dir, {
   breakerThreshold,
   maxChildren,
   isWrapperAliveFn = () => false,
+  metaParseMaxAttempts,
+  metaParseTtlMs,
 } = {}) {
   const calls = [];
   const notices = [];
@@ -102,6 +104,8 @@ function makeWatcher(dir, {
     isWrapperAliveFn,
     pollIntervalMs: 60_000,
     TailClass: FakeTail,
+    metaParseMaxAttempts,
+    metaParseTtlMs,
   });
   watchers.push(watcher);
   return { calls, notices, tracker, watcher };
@@ -166,6 +170,7 @@ describe('Codex restart reconciliation', () => {
     const registered = registerCodexWatcherForLiveSession(liveSessions, 'late-room', {}, {
       env: { MATRON_CODEX_VIZ: '1' },
       WatcherClass: ExistingWatcher,
+      detectProducer: () => true, // T-1.6: a producer is present in this scenario
     });
     await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
 
@@ -403,7 +408,10 @@ describe('Codex restart reconciliation', () => {
       wrapperStartTicks: 123,
     }));
     writeRun(dir, RUN_INTERRUPTED);
-    const harness = makeWatcher(dir, { breakerThreshold: 2 });
+    // metaParseMaxAttempts:1 → a malformed-JSON meta quarantines on first
+    // observation (this test asserts the quarantine OUTCOME + polling health).
+    // The DEFAULT bounded transient-retry (F5) is covered in codex-watcher.test.js.
+    const harness = makeWatcher(dir, { breakerThreshold: 2, metaParseMaxAttempts: 1 });
 
     await expect(harness.watcher.reconcile({ claudeSessionId: 'session-1' })).resolves.toBe(true);
     await harness.watcher.start();
