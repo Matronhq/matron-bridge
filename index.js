@@ -5361,8 +5361,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // the only client now, and its new conversation appears on its own —
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      const permNote = session.bypassMode === true ? ' · ⚠️ permissions bypassed'
-        : (session.bypassMode === false ? ' · 🛡 auto permissions' : '');
+      const permNote = permissionNote(session);
       await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}${permNote}.`);
       break;
     }
@@ -5445,8 +5444,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
-      const restartPermNote = restarted && restarted.bypassMode === true ? ' · ⚠️ permissions bypassed'
-        : (restarted && restarted.bypassMode === false ? ' · 🛡 auto permissions' : '');
+      const restartPermNote = permissionNote(restarted);
       await sendReply(
         `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}${restartPermNote}`
       );
@@ -5666,7 +5664,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ...(selectedAgent === AGENT_CLAUDE
           ? { interactive: resumeState.interactiveMode }
           : {}),
-        ...(resumeBypass != null ? { bypass: resumeBypass } : {}),
+        bypass: resumeBypass != null ? resumeBypass : resumePersisted?.bypassMode === true,
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
@@ -5709,8 +5707,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         turnCount: session.turnCount,
       });
 
-      const resumePermNote = session.bypassMode === true ? ' · ⚠️ permissions bypassed'
-        : (session.bypassMode === false ? ' · 🛡 auto permissions' : '');
+      const resumePermNote = permissionNote(session);
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
       const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${resumePermNote}\n\nSend any message to continue.`;
       const resumeHtml =
@@ -5780,8 +5777,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      const workdirPermNote = session.bypassMode === true ? ' · ⚠️ permissions bypassed'
-        : (session.bypassMode === false ? ' · 🛡 auto permissions' : '');
+      const workdirPermNote = permissionNote(session);
       await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}`);
       const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
@@ -7265,6 +7261,17 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
   }
 }
 
+// The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
+// every session-confirmation reply (/start, /restart, /resume, /workdir).
+// bypassMode is undefined for provider sessions (codex, interactive) that
+// don't route through the print-mode permission flow, which is the '' case.
+// Optional chaining lets a possibly-null/undefined session (e.g. a failed
+// /restart) fall through to the same '' result as the old inline ternaries.
+function permissionNote(session) {
+  return session?.bypassMode === true ? ' · ⚠️ permissions bypassed'
+    : (session?.bypassMode === false ? ' · 🛡 auto permissions' : '');
+}
+
 // A perm:<id>:<verdict> tap (permission card). The registry is the source of
 // truth — a tap on an expired or already-answered card is an informative
 // no-op, never a crash. "Always" allowlists the tool for the SESSION (in
@@ -7272,6 +7279,17 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
 function answerPermissionFromButton(session, requestId, verdict, sendReply) {
   const result = permissionRegistry.answer(requestId, verdict);
   if (!result) {
+    sendReply('That permission request has expired or was already answered.');
+    return;
+  }
+  // Defense-in-depth: a permission card is only ever rendered into the room
+  // that raised the request. Refuse to honor a tap whose session isn't that
+  // room (e.g. a stale card left behind in a room after /resume moved the
+  // session elsewhere). answer() above already consumed the entry, so this
+  // effectively voids the request rather than reversing it — the poller
+  // sees it answered and the caller sees no confirmed verdict, which fails
+  // closed (an unresolved permission_request denies on its own timeout).
+  if (result.roomId !== session.roomId) {
     sendReply('That permission request has expired or was already answered.');
     return;
   }
