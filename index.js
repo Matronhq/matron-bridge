@@ -7022,11 +7022,14 @@ function journalOnPromptReply(session, answer, { username }) {
   // A picker answers no pending prompt, so (like the queue-action block above)
   // it emits no "answered:" echo.
   if (answer?.picker) {
-    // Timer-cancel taps skip the alive gate: like the !timer command itself
-    // (PR #171), cancelling only needs the convo-scoped store, and the timer
-    // may well outlive the session process it was set from.
-    const isTimerTap = typeof answer.choice === 'string' && answer.choice.startsWith('timer:');
-    if (!session.alive && !isTimerTap) {
+    // Timer-cancel and permission taps skip the alive gate: like the !timer
+    // command itself (PR #171), cancelling only needs the convo-scoped
+    // store, and the timer may well outlive the session process it was set
+    // from; a permission tap needs only the registry, and an expired-card
+    // tap may outlive the session too.
+    const skipsAliveGate = typeof answer.choice === 'string'
+      && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:'));
+    if (!session.alive && !skipsAliveGate) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
     }
@@ -7037,6 +7040,7 @@ function journalOnPromptReply(session, answer, { username }) {
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
       sendTimerNow: sendTimerNowFromButton,
+      answerPermission: answerPermissionFromButton,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
     });
@@ -7213,6 +7217,28 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
   const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;
   if (!fired) {
     sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
+  }
+}
+
+// A perm:<id>:<verdict> tap (permission card). The registry is the source of
+// truth — a tap on an expired or already-answered card is an informative
+// no-op, never a crash. "Always" allowlists the tool for the SESSION (in
+// memory only; not persisted — a restart re-prompts, by design).
+function answerPermissionFromButton(session, requestId, verdict, sendReply) {
+  const result = permissionRegistry.answer(requestId, verdict);
+  if (!result) {
+    sendReply('That permission request has expired or was already answered.');
+    return;
+  }
+  if (verdict === 'always') {
+    const target = sessions.get(result.roomId) || session;
+    if (!target.permAllowedTools) target.permAllowedTools = new Set();
+    target.permAllowedTools.add(result.toolName);
+    sendReply(`✅ Always allowing ${result.toolName} for this session.`);
+  } else if (verdict === 'deny') {
+    sendReply(`⛔ Denied: ${result.toolName}`);
+  } else {
+    sendReply(`✅ Allowed once: ${result.toolName}`);
   }
 }
 

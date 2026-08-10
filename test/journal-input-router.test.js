@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
+import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply, isPickerFrame } from '../lib/journal-input-router.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -758,6 +758,20 @@ describe('promptExpectsReply', () => {
 
   it('a mixed set with any answerable-looking option stays guarded', () => {
     expect(promptExpectsReply({ options: [{ id: 'model-sonnet' }, { id: 'opt_a' }] })).toBe(true);
+  });
+
+  it('classifies a permission card as a non-answerable picker frame', () => {
+    const payload = {
+      question: '🔐 Permission: Claude wants to run Bash',
+      options: [
+        { id: 'perm-allow', label: 'Allow once', value: 'perm:01234567-89ab-cdef-0123-456789abcdef:allow' },
+        { id: 'perm-always', label: 'Always allow Bash (session)', value: 'perm:01234567-89ab-cdef-0123-456789abcdef:always' },
+        { id: 'perm-deny', label: 'Deny', value: 'perm:01234567-89ab-cdef-0123-456789abcdef:deny' },
+      ],
+      mode: 'pick_one',
+    };
+    expect(isPickerFrame(payload)).toBe(true);
+    expect(promptExpectsReply(payload)).toBe(false);
   });
 });
 
