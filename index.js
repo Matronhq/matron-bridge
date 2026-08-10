@@ -19,7 +19,13 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import {
+  buildMcpServers,
+  effectiveExtras,
+  extractMcpExtraFlags,
+  knownMcpExtras,
+  resolveDefaultExtras,
+} from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import {
@@ -59,7 +65,18 @@ import {
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { sendPrintInterrupt } from './lib/print-interrupt.js';
-import { checkFileLink } from './lib/file-link-guard.js';
+import {
+  checkFileLink,
+  validateAndOpen,
+  FileLinkDenied,
+  pinAllowedRootsSync,
+} from './lib/file-link-guard.js';
+import {
+  denialToStatus,
+  parseShowFileUploadTimeoutMs,
+  shareAgentMedia,
+} from './lib/show-file.js';
+import { processShowFile } from './lib/show-file-handler.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
@@ -169,7 +186,11 @@ const TIMERS_FILE = path.join(os.homedir(), '.matron-bridge-timers.json');
 // Per opt-in combination we write a separate generated file (`.mcp-config-
 // generated[.<extras>].json`) and pass its path to claude. Each browser stack
 // is ~400M resident, so defaulting to none keeps lightweight sessions lean.
+// `share` is likewise opt-in: OFF unless SHOW_FILE_DEFAULT_ON=1 is set in the
+// bridge's environment (the operator launch path sets it so operator sessions
+// keep show_file), or a session passes `--share`.
 const RAW_MCP_CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
+const DEFAULT_MCP_EXTRAS = resolveDefaultExtras(process.env.SHOW_FILE_DEFAULT_ON);
 const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
 
 function mcpConfigPathFor(extras = []) {
@@ -212,6 +233,36 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
+const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
+const SHOW_FILE_MAX_IN_FLIGHT = 2;
+const SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION = 1;
+const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYTES;
+// Mutable global concurrency/byte budget, shared with processShowFile (which
+// reserves before an upload and releases in its finally). An object so the
+// extracted handler can mutate it by reference.
+const showFileBudget = { inFlight: 0, reservedBytes: 0 };
+const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
+  process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
+);
+const SHOW_FILE_ARTIFACT_ROOTS = (process.env.SHOW_FILE_ARTIFACT_ROOTS || '')
+  .split(':')
+  .filter(Boolean);
+for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
+  // Must be an absolute path to an existing DIRECTORY. A regular file passes
+  // isAbsolute+exists but is later rejected by session pinning, which would leave
+  // show_file advertised with no token supplied (fail-loud config convention).
+  let artifactRootStat;
+  try {
+    artifactRootStat = fs.statSync(artifactRoot);
+  } catch {
+    artifactRootStat = null;
+  }
+  if (!path.isAbsolute(artifactRoot) || !artifactRootStat || !artifactRootStat.isDirectory()) {
+    throw new Error(
+      `Invalid SHOW_FILE_ARTIFACT_ROOTS entry (must be an absolute path to an existing directory): ${JSON.stringify(artifactRoot)}`,
+    );
+  }
+}
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
@@ -1121,6 +1172,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  const shareEnabled = effectiveMcpExtras.includes('share');
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (shareEnabled) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
   // Pre-assign the session id for fresh spawns (same trick as iv-mode below):
   // claudeSessionId is then known synchronously, so RPC start can answer with
   // a convo_id immediately and journal publishes never buffer for the init
@@ -1143,7 +1206,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify({
       hooks: {
         PreCompact: [{
@@ -1184,19 +1247,23 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ? existingPath
     : `${nodeBinDir}:${existingPath}`;
 
+  const spawnEnv = {
+    ...process.env,
+    PATH: pathWithNode,
+    CLAUDECODE: '',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    BRIDGE_ROOM_ID: roomId,
+    MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Env is fixed at spawn time; toggling the flag later requires
+    // !restart to take effect.
+    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+  };
+  delete spawnEnv.SHOW_FILE_TOKEN;
+  if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+
   const proc = spawn('claude', args, {
     cwd,
-    env: {
-      ...process.env,
-      PATH: pathWithNode,
-      CLAUDECODE: '',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-      BRIDGE_ROOM_ID: roomId,
-      MATRON_BRIDGE_API_PORT: String(API_PORT),
-      // Env is fixed at spawn time; toggling the flag later requires
-      // !restart to take effect.
-      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    },
+    env: spawnEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -1205,6 +1272,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
+    _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -1760,6 +1830,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  const shareEnabled = effectiveMcpExtras.includes('share');
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (shareEnabled) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
   // transcriptExists demotes a resume whose transcript was never written to a
   // fresh --session-id spawn on the same id (see planSessionIdentity). This is
   // what breaks the /logout crash loop's second half: the iv auto-restart and
@@ -1811,7 +1893,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(settings),
   );
   if (model) {
@@ -1822,6 +1904,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const existingPath = process.env.PATH || '';
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
+  const interactiveEnv = {
+    ...process.env,
+    PATH: pathWithNode,
+    CLAUDECODE: '',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    BRIDGE_ROOM_ID: roomId,
+    MATRON_BRIDGE_API_PORT: String(API_PORT),
+    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+  };
+  delete interactiveEnv.SHOW_FILE_TOKEN;
+  if (showFileToken) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
+
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 
   const iv = createInteractiveSession({
@@ -1829,15 +1923,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     workdir: cwd,
     sessionId,
     claudeArgs,
-    env: {
-      ...process.env,
-      PATH: pathWithNode,
-      CLAUDECODE: '',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-      BRIDGE_ROOM_ID: roomId,
-      MATRON_BRIDGE_API_PORT: String(API_PORT),
-      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    },
+    env: interactiveEnv,
   });
 
   // Same shape as the --print session object. `proc` is null in iv mode;
@@ -1849,6 +1935,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
+    _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -7596,6 +7685,41 @@ async function respondAgentChatRoute(res, data, handler, describe) {
   res.end(JSON.stringify(resBody));
 }
 
+function auditShowFile({ result, roomId, filePath, error, ...details }) {
+  const record = {
+    event: 'show_file',
+    ...(roomId ? { roomId } : {}),
+    ...(filePath ? { path: filePath } : {}),
+    result,
+    ...details,
+  };
+  if (error) {
+    record.error = {
+      name: typeof error.name === 'string' ? error.name : 'Error',
+      ...(typeof error.code === 'string' ? { code: error.code } : {}),
+    };
+  }
+  (result === 'ok' ? console.log : console.warn)(JSON.stringify(record));
+}
+
+function validateShowFileBody(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)
+      || (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null)) {
+    return { error: 'request body must be an object', reason: 'invalid-body' };
+  }
+  if (typeof data.path !== 'string' || data.path.trim() === '') {
+    return { error: 'path must be a non-empty string', reason: 'invalid-path' };
+  }
+  if (typeof data.token !== 'string' || data.token.trim() === '') {
+    return { error: 'token must be a non-empty string', reason: 'missing-token' };
+  }
+  if (data.caption !== undefined
+      && (typeof data.caption !== 'string' || data.caption.length > 4096)) {
+    return { error: 'caption must be a string of at most 4096 characters', reason: 'invalid-caption' };
+  }
+  return null;
+}
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -7658,14 +7782,66 @@ const apiServer = createServer(async (req, res) => {
   }
 
   if (req.method !== 'POST') {
+    if (url.pathname === '/show-file') auditShowFile({ result: 'method-not-allowed' });
     res.writeHead(405);
     res.end('Method not allowed');
     return;
   }
 
   let body = '';
-  req.on('data', chunk => body += chunk);
+  let bodyBytes = 0;
+  let showFileBodyTooLarge = false;
+  req.on('data', chunk => {
+    if (showFileBodyTooLarge) return;
+    bodyBytes += chunk.length;
+    if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
+      showFileBodyTooLarge = true;
+      body = '';
+      auditShowFile({ result: 'request-too-large' });
+      // Connection: close tears the socket down after the 413 flushes, so the
+      // client sees the status. Do NOT req.destroy() here: destroying the socket
+      // can discard the just-written 413 before it's flushed, and the adapter
+      // then reports a generic "internal error" instead of "too large". Pause the
+      // request so we stop buffering the oversized body; the 'data'/'end'
+      // handlers are already guarded by showFileBodyTooLarge.
+      res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
+      res.end(JSON.stringify({ error: 'request body too large' }));
+      req.pause();
+      return;
+    }
+    body += chunk;
+  });
   req.on('end', async () => {
+    if (showFileBodyTooLarge) return;
+
+    if (url.pathname === '/show-file') {
+      const { status, headers, body: resBody } = await processShowFile({
+        body,
+        sessions,
+        budget: showFileBudget,
+        limits: {
+          maxInFlightPerSession: SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION,
+          maxInFlight: SHOW_FILE_MAX_IN_FLIGHT,
+          maxBytes: SHOW_FILE_MAX_BYTES,
+          globalByteBudget: SHOW_FILE_GLOBAL_BYTE_BUDGET,
+          uploadTimeoutMs: SHOW_FILE_UPLOAD_TIMEOUT_MS,
+        },
+        deps: {
+          validateShowFileBody,
+          auditShowFile,
+          shareAgentMedia,
+          validateAndOpen,
+          FileLinkDenied,
+          uploadMedia: journalPublisher.uploadMedia,
+          journalPublish,
+          denialToStatus,
+        },
+      });
+      res.writeHead(status, { 'Content-Type': 'application/json', ...(headers || {}) });
+      res.end(JSON.stringify(resBody));
+      return;
+    }
+
     try {
       const data = JSON.parse(body);
 
