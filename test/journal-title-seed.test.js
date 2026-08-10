@@ -380,4 +380,20 @@ describe('title-pass wiring in index.js (source inspection)', () => {
   it('upserts the roster to the journal, sliced to the protocol cap', () => {
     expect(indexSrc).toMatch(/journalUpsertConvo\(session, \{ summary: parsed\.roster\.slice\(0, 1000\) \}\);/);
   });
+
+  it('names the room from the parsed title alone — no SERVER_LABEL prefix', () => {
+    // Which box owns a conversation is data now (agent_device_id, rendered
+    // as a chip by the apps). A label baked in here is frozen text that a
+    // rename can never reach — and it is what made two boxes both read
+    // "DEV" in the chat list.
+    expect(indexSrc).toMatch(/const name = parsed\.title\.slice\(0, 60\);/);
+  });
+
+  it('names a resumed session without a SERVER_LABEL prefix', () => {
+    expect(indexSrc).toMatch(/: `Resumed \$\{shortId\}`;/);
+  });
+
+  it('never rebuilds a `LABEL:` title prefix anywhere', () => {
+    expect(indexSrc).not.toMatch(/\$\{SERVER_LABEL\}:/);
+  });
 });
