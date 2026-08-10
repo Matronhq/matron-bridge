@@ -10,6 +10,7 @@ const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
 const SECRET_TIMEOUT_MS = 300000;    // 5 min max wait for secret submission
+const PERMISSION_TIMEOUT_MS = Number(process.env.PERMISSION_PROMPT_TIMEOUT_MS || 300000); // 5 min max wait for a permission tap
 
 const server = new McpServer({
   name: 'ask-user',
@@ -54,6 +55,52 @@ server.tool(
       return { content: [{ type: 'text', text: 'Secret request timed out — no input received within 5 minutes.' }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'permission_request',
+  'Internal: Claude Code invokes this automatically (via --permission-prompt-tool) to ask the user for tool permission through Matron. Never call it yourself.',
+  {
+    tool_name: z.string().describe('Name of the tool Claude wants to use'),
+    input: z.any().describe('The input Claude wants to pass to the tool'),
+    tool_use_id: z.string().optional().describe('The tool use id this permission request is for'),
+    permission_suggestions: z.any().optional().describe('Permission rule suggestions from Claude Code (accepted and ignored)'),
+  },
+  async ({ tool_name, input }) => {
+    // The return text IS the protocol: Claude Code JSON-parses it. Fail
+    // CLOSED — any relay failure denies rather than silently allowing.
+    const deny = (message) => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'deny', message }) }] });
+    const allow = () => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'allow', updatedInput: input ?? {} }) }] });
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/permission-request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, toolName: tool_name, input: input ?? {} }),
+      });
+      if (!postRes.ok) {
+        return deny(`Matron bridge rejected the permission request (HTTP ${postRes.status}).`);
+      }
+      const data = await postRes.json();
+      if (data.behavior === 'allow') return allow(); // session-allowlisted tool, no card
+
+      const { requestId } = data;
+      const deadline = Date.now() + PERMISSION_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        const pollRes = await fetch(`${BRIDGE_API}/permission-request/${requestId}`);
+        if (!pollRes.ok) continue;
+        const status = await pollRes.json();
+        if (status.answered) {
+          return status.behavior === 'allow'
+            ? allow()
+            : deny(status.message || 'The user denied this tool use from Matron.');
+        }
+      }
+      return deny('The user did not answer the permission prompt within 5 minutes. You may continue other work that does not need this permission.');
+    } catch (err) {
+      return deny(`Permission relay error: ${err.message}`);
     }
   }
 );
