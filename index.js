@@ -88,6 +88,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons } from './lib/permission-prompt.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
@@ -7755,6 +7756,11 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
 const pendingSecrets = new Map();
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
+// Pending print-mode permission prompts (spec 2026-08-10-auto-permission-mode).
+// The ask-user permission_request tool POSTs + polls; taps answer via the
+// journal prompt_reply perm: path.
+const permissionRegistry = createPermissionRegistry();
+
 // Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
 // requests waiting for a user decision in interactive mode. The hook script
 // (hooks/exit-plan-decision.sh) holds an HTTP request open against
@@ -7857,6 +7863,20 @@ const apiServer = createServer(async (req, res) => {
     if (s.answered) {
       pendingSecrets.delete(secretId);
     }
+    return;
+  }
+
+  // GET /permission-request/:id — permission_request MCP tool polls for a tap
+  if (req.method === 'GET' && url.pathname.startsWith('/permission-request/')) {
+    const permId = url.pathname.split('/')[2];
+    const entry = permissionRegistry.read(permId);
+    if (!entry) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Permission request not found' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(entry));
     return;
   }
 
@@ -7997,6 +8017,32 @@ const apiServer = createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId }));
         return;
+      } else if (url.pathname === '/permission-request') {
+        const { roomId, toolName, input } = data;
+        if (!roomId || typeof toolName !== 'string' || toolName === '') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and toolName are required' }));
+          return;
+        }
+        const permSession = sessions.get(roomId);
+        if (!permSession) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No session for roomId' }));
+          return;
+        }
+        // Session-allowlisted (an earlier "Always allow" tap): short-circuit,
+        // no card.
+        if (permSession.permAllowedTools?.has(toolName)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ behavior: 'allow' }));
+          return;
+        }
+        const { id: permRequestId } = permissionRegistry.create({ roomId, toolName });
+        const card = renderPermissionCard({ toolName, input });
+        const { buttons: permBtns, mode: permMode } = permissionButtons(permRequestId, toolName);
+        sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ requestId: permRequestId }));
       }
 
       if (url.pathname === '/send-attachment') {
