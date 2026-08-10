@@ -84,6 +84,8 @@ import {
 import { processShowFile } from './lib/show-file-handler.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { buildActivity, buildLimits } from './lib/spawn-capacity.js';
+import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
@@ -368,6 +370,10 @@ function toolStreamKey(convoId, messageRef) {
 // journalPublisher, agentRooms, the inject glue — all exist). The thunks
 // only ever fire once the socket is live, long after the assignment.
 let agentInvites = null;
+// Agent-spawn handlers (lib/agent-spawn.js) — same forward-declared-thunk
+// pattern as agentInvites above; constructed next to agentChatHandlers, well
+// after journalPublisher and agentRooms exist.
+let agentSpawnHandlers = null;
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -394,7 +400,15 @@ const journalPublisher = createJournalPublisher({
   // Agent-chat invite lifecycle (kind:'invite' ephemerals and room-op error
   // frames) — thunked because agentInvites is constructed later (above).
   onInviteFrame: (frame) => agentInvites?.onInviteFrame(frame),
-  onOpError: (err) => agentInvites?.onOpError(err),
+  // Agent-spawn ephemeral frames (kind:'spawn') — thunked for the same
+  // reason as onInviteFrame: agentSpawnHandlers is constructed later.
+  onSpawnFrame: (frame) => agentSpawnHandlers?.onSpawnFrame(frame),
+  // Spawn correlation tries first (its waiters are request_id-keyed, same
+  // style as agent-invites' own onOpError) — a `true` return means it owned
+  // and consumed the ref, so the invite manager never sees it. Op-error refs
+  // are never shared between the two managers, so this ordering is not a
+  // race, just "ask the spawn side first."
+  onOpError: (e) => { if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -678,6 +692,22 @@ const journalRpcHandler = createRpcRequestHandler({
   listRememberedFolders: () => recentFolders.list(),
   defaultWorkdir: DEFAULT_WORKDIR,
   expandHome,
+  // Capacity thunks (2026-08-10 capacity spec): answered from cache, never
+  // blocking a reply on a subprocess. getLimits kicks a background refresh
+  // (throttled, see refreshUsageLimits) but always returns synchronously
+  // from whatever usageLimitsCache holds right now.
+  getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
+  getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  // Spawn-room wiring (2026-08-09 agent-spawn spec). agentRooms is declared
+  // later in this file (~:7223) — these arrows only dereference it at call
+  // time, long after module evaluation finishes, same late-binding as
+  // onRpcRequest's forward reference to journalRpcHandler above.
+  bindSpawnRoom: (roomId, session) => {
+    agentRooms.record(roomId, { role: 'guest', state: 'joined', sessionRoomId: session.roomId });
+  },
+  unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
+  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  serverLabel: SERVER_LABEL,
   log: console,
 });
 
@@ -7792,6 +7822,35 @@ const agentChatHandlers = createAgentChatHandlers({
   log: console,
 });
 
+// Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
+// agent_boxes / agent_session_start MCP tools and the kind:'spawn' outcome
+// frames. Constructed exactly once, here — the factory starts an unref'd
+// hourly tombstone sweep with no dispose hook, so a second instantiation
+// would leak a duplicate timer.
+agentSpawnHandlers = createAgentSpawnHandlers({
+  sessions,
+  publisher: journalPublisher,
+  rooms: agentRooms,
+  journalConvoIdFor,
+  // Surfaces a spawn outcome two ways: journalPublishNotice writes the
+  // durable, user-facing copy into the parent session's journal
+  // conversation (works even when ctx is null — bridge restarted between
+  // the ack and the outcome); roomDelivery.deliver additionally wakes the
+  // live agent as an injected turn (idle) or a coalesced one (busy), same
+  // mechanism journalNotifyRoomEvent uses for room-lifecycle FYIs. No real
+  // agent-chat room backs every outcome (declined/expired/failed never get
+  // one), so a synthetic 'spawn' bucket stands in — same shape as a room
+  // key, none of it forgeable (the text itself is bridge-composed, not
+  // peer input).
+  notifyParent: ({ session, convoId, text }) => {
+    if (convoId) journalPublishNotice(convoId, text);
+    if (session) {
+      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
+    }
+  },
+  log: console,
+});
+
 // Adapter wrapper for the eight agent-chat loopback routes: a throw inside a
 // handler must surface as that route's own 500 with the real message — not
 // bubble to the request body's outer catch and masquerade as
@@ -8052,6 +8111,18 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-chat-read') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatRead,
           (status, b) => debug(`agent-chat-read ${status} ${data?.room_id} ${b.error || `${(b.messages || []).length} messages`}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-boxes') {
+        await respondAgentChatRoute(res, data, agentSpawnHandlers.boxes,
+          (status, b) => debug(`agent-boxes ${status} ${(b.boxes || []).length ?? ''} ${b.error || ''}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-session-start') {
+        await respondAgentChatRoute(res, data, agentSpawnHandlers.sessionStart,
+          (status, b) => debug(`agent-session-start ${status} ${b.spawn_id || ''} ${b.status || b.error || ''}`));
         return;
       }
 

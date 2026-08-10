@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'fs';
 import { createAgentSpawnHandlers } from '../lib/agent-spawn.js';
 
 // Fake publisher + recording rooms/notifyParent, modeled on agent-chat.test.js's
@@ -306,5 +307,78 @@ describe('createAgentSpawnHandlers', () => {
       expect(ctx.notices[2].text).toContain('long-running task');
       expect(ctx.rooms.calls.some((c) => c.roomId === 'room-live')).toBe(true);
     });
+  });
+});
+
+// Source-inspection pins for the Task 5 wiring, in the style of
+// test/agent-chat.test.js's "index.js routes + ask-user.js tools" block —
+// that block covers the eight agent-chat tools/routes; this one covers the
+// two spawn ones plus the pieces agent-chat.test.js has no reason to touch
+// (the rpc-handler capacity/spawn-room deps, and the single-instantiation
+// guarantee the factory's unref'd sweep timer depends on).
+describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
+
+  it('createAgentSpawnHandlers is instantiated exactly once', () => {
+    const count = (indexSrc.match(/createAgentSpawnHandlers\(\{/g) || []).length;
+    expect(count).toBe(1);
+  });
+
+  it('wires the capacity thunks and spawn-room deps into createRpcRequestHandler', () => {
+    const start = indexSrc.indexOf('const journalRpcHandler = createRpcRequestHandler({');
+    expect(start).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\n});', start);
+    const args = indexSrc.slice(start, end);
+    // Answered from cache only — never awaited, never blocking a reply on a
+    // subprocess boot.
+    expect(args).toMatch(/getActivity: \(\) => buildActivity\(\{ sessions, persisted: loadPersistedSessions\(\) \}\)/);
+    expect(args).toMatch(/getLimits: \(\) => \{ refreshUsageLimits\(DEFAULT_WORKDIR\); return buildLimits\(usageLimitsCache\); \}/);
+    expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
+    expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
+    expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true \}\)/);
+    expect(args).toMatch(/serverLabel: SERVER_LABEL,/);
+    expect(indexSrc).toMatch(/import \{ buildActivity, buildLimits \} from '\.\/lib\/spawn-capacity\.js';/);
+  });
+
+  it('mounts /agent-boxes and /agent-session-start on agentSpawnHandlers via the throw-isolating adapter, before the /secret regex', () => {
+    expect(indexSrc).toMatch(
+      /url\.pathname === '\/agent-boxes'[\s\S]{0,120}respondAgentChatRoute\(res, data, agentSpawnHandlers\.boxes,/);
+    expect(indexSrc).toMatch(
+      /url\.pathname === '\/agent-session-start'[\s\S]{0,120}respondAgentChatRoute\(res, data, agentSpawnHandlers\.sessionStart,/);
+    const boxesAt = indexSrc.indexOf(`url.pathname === '/agent-boxes'`);
+    const secretAt = indexSrc.indexOf('secretSubmitMatch = url.pathname.match(');
+    expect(boxesAt).toBeGreaterThan(-1);
+    expect(secretAt).toBeGreaterThan(boxesAt);
+  });
+
+  it('declares agent_boxes and agent_session_start in ask-user.js', () => {
+    expect(askUserSrc).toMatch(/server\.tool\(\s*\n\s*'agent_boxes',/);
+    expect(askUserSrc).toMatch(/server\.tool\(\s*\n\s*'agent_session_start',/);
+  });
+
+  const TOOL_WIRING = [
+    ['agent_boxes', '/agent-boxes', ['roomId: ROOM_ID']],
+    ['agent_session_start', '/agent-session-start', ['roomId: ROOM_ID', 'device_id', 'workdir', 'task', 'topic']],
+  ];
+  function toolBlock(name) {
+    const start = askUserSrc.indexOf(`'${name}',`);
+    expect(start, `tool ${name} declared`).toBeGreaterThan(-1);
+    const next = askUserSrc.indexOf('server.tool(', start);
+    return askUserSrc.slice(start, next === -1 ? undefined : next);
+  }
+  it('each spawn tool POSTs to its own loopback path with the expected body keys', () => {
+    for (const [name, path, keys] of TOOL_WIRING) {
+      const block = toolBlock(name);
+      expect(block, `${name} fetches ${path}`).toContain('${BRIDGE_API}' + path + '`');
+      for (const key of keys) expect(block, `${name} body carries ${key}`).toContain(key);
+    }
+  });
+
+  it('agent_session_start caps task/topic and types device_id as an integer, matching the journal-enforced limits', () => {
+    const block = toolBlock('agent_session_start');
+    expect(block).toMatch(/device_id: z\.number\(\)\.int\(\)/);
+    expect(block).toMatch(/task: z\.string\(\)\.max\(2000\)/);
+    expect(block).toMatch(/topic: z\.string\(\)\.max\(200\)\.optional\(\)/);
   });
 });

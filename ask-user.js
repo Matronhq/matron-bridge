@@ -170,6 +170,26 @@ function describeRoomOutcome(body) {
   return `Room ${body.room_id}: ${body.status || body.error || 'unknown'}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
 }
 
+// One block of `agent_boxes` output per box (spec: 2026-08-10 agent-spawn
+// bridge + capacity design). `activity`/`limits` are optional — an older
+// bridge on the far side answers with folders only, so both blocks are
+// simply omitted rather than rendered empty.
+function formatBox(box) {
+  const lines = [`${box.name} (device ${box.device_id}) — ${box.online ? 'online' : 'offline'}`];
+  for (const f of (box.folders || []).slice(0, 5)) lines.push(`  ${f.path}`);
+  if (box.activity) {
+    const entries = box.activity.last_hour || [];
+    const shown = entries.slice(0, 5).map((e) => `${e.path} (${e.sessions})`);
+    if (entries.length > 5) shown.push(`+${entries.length - 5} more`);
+    lines.push(`  activity: ${box.activity.live_sessions} live${shown.length ? `; last hour: ${shown.join(', ')}` : ''}`);
+  }
+  if (box.limits) {
+    const parts = (box.limits.lines || []).map((l) => `${l.label} ${l.percent}%`);
+    lines.push(`  limits: ${parts.join(' · ')} (as of ${new Date(box.limits.as_of).toISOString()})`);
+  }
+  return lines.join('\n');
+}
+
 // Same sender rendering as live room delivery (index.js journalOnRoomFrame):
 // `box2 (agent)` / `dan`, never raw `agent:box2`. Shared by agent_chat_read
 // and agent_chat_accept's joined-room backfill.
@@ -239,6 +259,57 @@ server.tool(
         return { content: [{ type: 'text', text: `agent_chat_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       return { content: [{ type: 'text', text: describeRoomOutcome(data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_boxes',
+  "List the user's other agent boxes (machines) as spawn targets, with recent folders, current activity, and account usage limits. Use this when the user asks to run work on another machine or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
+  {},
+  async () => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-boxes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_boxes failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      const boxes = data.boxes || [];
+      if (!boxes.length) return { content: [{ type: 'text', text: 'No other boxes found.' }] };
+      return { content: [{ type: 'text', text: boxes.map(formatBox).join('\n\n') }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_session_start',
+  "Ask the user's consent to start a new agent session on another of their boxes, seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
+  {
+    device_id: z.number().int().describe('Target box device id, from agent_boxes'),
+    workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
+    task: z.string().max(2000).describe('The task prompt. Shown VERBATIM on the user\'s consent card and executed verbatim as the new session\'s first turn — write it for both audiences.'),
+    topic: z.string().max(200).optional().describe('Optional short room/session title'),
+  },
+  async ({ device_id, workdir, task, topic }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_session_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval. Continue your own work; the outcome will arrive as a later turn.` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
