@@ -325,6 +325,21 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     expect(count).toBe(1);
   });
 
+  it('notifyParent falls back to JOURNAL_CONTROL_CONVO_ID when both session and convoId are absent (ctx-null bridge-restart case)', () => {
+    const start = indexSrc.indexOf('notifyParent: ({ session, convoId, text }) => {');
+    expect(start).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\n  },', start);
+    const body = indexSrc.slice(start, end);
+    // The normal cases are untouched…
+    expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text\)/);
+    expect(body).toMatch(/if \(session\) \{/);
+    expect(body).toMatch(/roomDelivery\.deliver\(session, session\.roomId,/);
+    // …and the fallback fires ONLY when session is absent (the `else`) AND
+    // convoId is also absent (`!convoId`) — never a THIRD notice alongside
+    // the convoId branch above.
+    expect(body).toMatch(/\} else if \(!convoId\) \{\s*\n\s*journalPublishNotice\(JOURNAL_CONTROL_CONVO_ID, text\);/);
+  });
+
   it('wires the capacity thunks and spawn-room deps into createRpcRequestHandler', () => {
     const start = indexSrc.indexOf('const journalRpcHandler = createRpcRequestHandler({');
     expect(start).toBeGreaterThan(-1);

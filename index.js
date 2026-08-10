@@ -7834,18 +7834,30 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   journalConvoIdFor,
   // Surfaces a spawn outcome two ways: journalPublishNotice writes the
   // durable, user-facing copy into the parent session's journal
-  // conversation (works even when ctx is null — bridge restarted between
-  // the ack and the outcome); roomDelivery.deliver additionally wakes the
-  // live agent as an injected turn (idle) or a coalesced one (busy), same
-  // mechanism journalNotifyRoomEvent uses for room-lifecycle FYIs. No real
-  // agent-chat room backs every outcome (declined/expired/failed never get
-  // one), so a synthetic 'spawn' bucket stands in — same shape as a room
-  // key, none of it forgeable (the text itself is bridge-composed, not
-  // peer input).
+  // conversation; roomDelivery.deliver additionally wakes the live agent as
+  // an injected turn (idle) or a coalesced one (busy), same mechanism
+  // journalNotifyRoomEvent uses for room-lifecycle FYIs. No real agent-chat
+  // room backs every outcome (declined/expired/failed never get one), so a
+  // synthetic 'spawn' bucket stands in — same shape as a room key, none of
+  // it forgeable (the text itself is bridge-composed, not peer input).
+  //
+  // ctx-null case (bridge restarted between the ack and the outcome frame):
+  // agent-spawn.js calls this with BOTH session and convoId null — with no
+  // fallback, neither branch below would fire and the outcome (started/
+  // declined/expired/failed) would vanish with zero notices, contradicting
+  // the "exactly-once surfacing" guarantee handleOutcome's tombstone exists
+  // to provide (at-most-once, not zero). JOURNAL_CONTROL_CONVO_ID is the
+  // same synthetic control conversation the bridge already replies into for
+  // session-less commands (journalHandleControlCommand's `reply`); it
+  // always exists (upserted at boot when JOURNAL_ENABLED), so the notice
+  // lands somewhere the user can actually read it instead of being dropped
+  // on the floor.
   notifyParent: ({ session, convoId, text }) => {
     if (convoId) journalPublishNotice(convoId, text);
     if (session) {
       roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
+    } else if (!convoId) {
+      journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
     }
   },
   log: console,

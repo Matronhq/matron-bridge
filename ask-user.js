@@ -5,6 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { formatBox } from './lib/agent-boxes-format.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -170,25 +171,11 @@ function describeRoomOutcome(body) {
   return `Room ${body.room_id}: ${body.status || body.error || 'unknown'}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
 }
 
-// One block of `agent_boxes` output per box (spec: 2026-08-10 agent-spawn
-// bridge + capacity design). `activity`/`limits` are optional — an older
-// bridge on the far side answers with folders only, so both blocks are
-// simply omitted rather than rendered empty.
-function formatBox(box) {
-  const lines = [`${box.name} (device ${box.device_id}) — ${box.online ? 'online' : 'offline'}`];
-  for (const f of (box.folders || []).slice(0, 5)) lines.push(`  ${f.path}`);
-  if (box.activity) {
-    const entries = box.activity.last_hour || [];
-    const shown = entries.slice(0, 5).map((e) => `${e.path} (${e.sessions})`);
-    if (entries.length > 5) shown.push(`+${entries.length - 5} more`);
-    lines.push(`  activity: ${box.activity.live_sessions} live${shown.length ? `; last hour: ${shown.join(', ')}` : ''}`);
-  }
-  if (box.limits) {
-    const parts = (box.limits.lines || []).map((l) => `${l.label} ${l.percent}%`);
-    lines.push(`  limits: ${parts.join(' · ')} (as of ${new Date(box.limits.as_of).toISOString()})`);
-  }
-  return lines.join('\n');
-}
+// formatBox (agent_boxes rendering) lives in lib/agent-boxes-format.js —
+// pulled out so it's independently unit-testable and so its peer-text
+// sanitization (name/paths/labels are another bridge's own strings, not
+// bridge-composed) shares the one peerField implementation everything else
+// in this codebase uses.
 
 // Same sender rendering as live room delivery (index.js journalOnRoomFrame):
 // `box2 (agent)` / `dan`, never raw `agent:box2`. Shared by agent_chat_read
