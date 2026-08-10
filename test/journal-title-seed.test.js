@@ -3,12 +3,12 @@ import { describe, it, expect, vi } from 'vitest';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
-  it('titles the convo from the server label + workdir basename when no hint is set', async () => {
+  it('titles the convo from the workdir basename, with no server-label prefix', async () => {
     const session = { _journalTitleHint: undefined };
     const upsertConvo = vi.fn();
     const ok = await seedJournalTitle(session, { workdir: '/home/dan/yearbook-app', serverLabel: '2', upsertConvo, warn: () => {} });
     expect(ok).toBe(true);
-    expect(upsertConvo).toHaveBeenCalledWith(session, { title: '2: yearbook-app' });
+    expect(upsertConvo).toHaveBeenCalledWith(session, { title: 'yearbook-app' });
   });
 
   it('seeds the bare basename when no server label is given', async () => {
@@ -183,7 +183,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 fix the folder picker');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'fix the folder picker');
   });
 
   it('does nothing until a user message exists, then still applies later', () => {
@@ -193,7 +193,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(d.updateRoomName).not.toHaveBeenCalled();
     session.chatHistory.push({ role: 'user', text: 'now do the thing' });
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 now do the thing');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'now do the thing');
   });
 
   it('applies only once per session', () => {
@@ -210,18 +210,18 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     const title = d.updateRoomName.mock.calls[0][1];
-    expect(title.startsWith('2:f0 refactor the whole session store')).toBe(true);
+    expect(title.startsWith('refactor the whole session store')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
-    expect(title.length).toBe('2:f0 '.length + 61);
+    expect(title.length).toBe(61);
   });
 
-  it('falls back to the room id for the short prefix and survives a missing history', () => {
+  it('survives a missing history and applies once one arrives', () => {
     const session = { roomId: '!room', chatHistory: undefined };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(false);
     session.chatHistory = [{ role: 'user', text: 'hi' }];
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!room', '2:ro hi');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!room', 'hi');
   });
 
   it('never lets angle brackets or reassembled script fragments into the title', () => {
@@ -256,7 +256,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'carry on');
   });
 
   it('still replaces the legacy bare-basename seed from sessions persisted before labeling', () => {
@@ -268,7 +268,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'carry on');
   });
 
   it('skips a tag-only first user message and titles from the next real one', () => {
@@ -282,7 +282,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 the real prompt');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'the real prompt');
   });
 });
 
