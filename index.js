@@ -1667,26 +1667,30 @@ function flushPendingSessionQueue(session) {
   return sent;
 }
 
-// A /restart issued mid-turn without --force parks its command text on the
-// session (see the '!restart' case); the turn-end seams call this to
-// consume and replay it. Returns true when a restart was dispatched — the
-// caller must then SKIP its queue flush: flushing would type queued
-// messages into the process the restart is about to kill, whereas
-// recreateSession carries queuedMessages into the replacement session (and
-// the room-delivery inbox is keyed by roomId, so it follows too). The stash
-// clears before the liveness checks so a session that died mid-turn can
-// never fire a restart later, and the sessions-map identity check keeps a
-// superseded session's late turn-end from restarting its replacement. The
-// replay is fire-and-forget: this runs inside synchronous turn-end
-// bookkeeping, and the '!restart' case reports its own outcome.
-function dispatchDeferredRestart(session) {
-  const text = session._deferredRestartText;
+// A command issued mid-turn that can't run until the turn ends — an
+// unforced /restart, or a print-mode /model switch — parks its replay text
+// on the session (see the '!restart' case and applyModelSwitch); the
+// turn-end seams call this to consume and replay it. One slot: a later
+// parked command replaces the earlier one, with a notice at the park site.
+// Returns true when a command was dispatched — the caller must then SKIP
+// its queue flush: flushing would type queued messages into the process
+// the command is about to kill, whereas recreateSession (both parked
+// commands end in one) carries queuedMessages into the replacement session
+// and flushes them there (and the room-delivery inbox is keyed by roomId,
+// so it follows too). The stash clears before the liveness checks so a
+// session that died mid-turn can never fire a command later, and the
+// sessions-map identity check keeps a superseded session's late turn-end
+// from acting on its replacement. The replay is fire-and-forget: this runs
+// inside synchronous turn-end bookkeeping, and each command's case reports
+// its own outcome.
+function dispatchDeferredCommand(session) {
+  const text = session._deferredCommandText;
   if (!text) return false;
-  session._deferredRestartText = null;
+  session._deferredCommandText = null;
   if (!session.alive || sessions.get(session.roomId) !== session) return false;
   const ctx = journalSessionCommandCtx(session);
   handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).catch((err) => {
-    try { ctx.sendReply(`Deferred restart failed: ${err?.message || err}`); } catch { /* reply sink gone */ }
+    try { ctx.sendReply(`Deferred ${text.split(' ')[0].replace(/^!/, '/')} failed: ${err?.message || err}`); } catch { /* reply sink gone */ }
   });
   return true;
 }
@@ -1730,10 +1734,10 @@ function finishCodexTurn(session, {
   if (!preserveQueue) {
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
     // the queue (and the roomId-keyed room-delivery inbox) carries into the
-    // replacement session; see dispatchDeferredRestart. (killSession's
+    // replacement session; see dispatchDeferredCommand. (killSession's
     // teardown call lands in the preserveQueue branch with alive already
     // false, so a stale stash can never fire from a dying session.)
-    if (dispatchDeferredRestart(session)) return;
+    if (dispatchDeferredCommand(session)) return;
     // Coalesced room updates go out AFTER Dan's queued input (turn-end seam;
     // preserveQueue teardowns keep the inbox for the replacement session —
     // same roomId key) — but NEVER on top of a turn the queue flush just
@@ -2100,9 +2104,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
     // the queue (and the roomId-keyed room-delivery inbox) carries into the
-    // replacement session; see dispatchDeferredRestart. This seam also
+    // replacement session; see dispatchDeferredCommand. This seam also
     // covers a manual /compact: its compact_boundary handler routes here.
-    if (dispatchDeferredRestart(session)) return;
+    if (dispatchDeferredCommand(session)) return;
     // Flush any queued messages now that claude is free.
     let queueDispatched = false;
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
@@ -3379,7 +3383,7 @@ function handleClaudeEvent(session, event) {
           // the stash so it skips the queue flush — dispatching here would
           // clear it and let onTurnEnd type queued messages into the
           // session the in-flight restart is about to replace.
-          if (!session.iv) dispatchDeferredRestart(session);
+          if (!session.iv) dispatchDeferredCommand(session);
           break;
         }
       }
@@ -3479,8 +3483,8 @@ function handleClaudeEvent(session, event) {
 
       // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
       // the queue (and the roomId-keyed room-delivery inbox) carries into
-      // the replacement session; see dispatchDeferredRestart.
-      if (dispatchDeferredRestart(session)) break;
+      // the replacement session; see dispatchDeferredCommand.
+      if (dispatchDeferredCommand(session)) break;
       // Send any queued messages now that Claude is free
       let queueDispatched = false;
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
@@ -5188,17 +5192,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // compaction). The stash replays the ORIGINAL args — forced, so it
       // can't re-defer — through handleCommand at whichever turn-end seam
       // fires first (iv onTurnEnd, print-mode 'result', finishCodexTurn);
-      // see dispatchDeferredRestart. Validation above already ran, so a bad
+      // see dispatchDeferredCommand. Validation above already ran, so a bad
       // flag combination is refused now, not at turn end. A repeat /restart
       // while one is parked just refreshes the stash with the newer args.
       if (existing.busy && !restartForced) {
-        existing._deferredRestartText = ['!restart', '--force', ...restartArgs].join(' ');
-        await sendReply('Waiting for turn to finish before restarting. Send again with --force to restart immediately.');
+        // One deferred slot, shared with /model: replacing a different
+        // parked command says so, mirroring the /login parked-slash notices.
+        const previousParked = existing._deferredCommandText;
+        existing._deferredCommandText = ['!restart', '--force', ...restartArgs].join(' ');
+        const replacedNote = previousParked && !previousParked.startsWith('!restart')
+          ? ` (replacing the queued /${previousParked.slice(1).split(' ')[0]})`
+          : '';
+        await sendReply(`Waiting for turn to finish before restarting${replacedNote}. Send again with --force to restart immediately.`);
         return;
       }
       // A forced restart discards any parked one along with `existing` —
       // recreateSession copies fields onto the replacement explicitly, and
-      // _deferredRestartText is deliberately not among them.
+      // _deferredCommandText is deliberately not among them.
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
@@ -8325,6 +8335,25 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     return;
   }
   const decision = planPrintModelSwitch(session, arg);
+  if (decision.defer) {
+    // Mid-turn: park the switch on the shared deferred-command stash (see
+    // dispatchDeferredCommand). The turn-end seam replays `!model <alias>`
+    // BEFORE the queue flush; the replay lands back here with busy clear,
+    // recreates the session with the new model, and the carried queue then
+    // flushes on the replacement — compact still first — so the switch
+    // applies ahead of every queued message. One slot: a parked /restart is
+    // replaced with a notice, same as the /login parked-slash convention.
+    const previousParked = session._deferredCommandText;
+    session._deferredCommandText = `!model ${decision.normalized}`;
+    if (previousParked === session._deferredCommandText) {
+      sendReply(`🧠 /model ${decision.normalized} is already queued — it will apply as soon as this turn finishes.`);
+    } else if (previousParked) {
+      sendReply(`${decision.message.replace(/\.$/, '')} (replacing the queued /${previousParked.slice(1).split(' ')[0]}).`);
+    } else {
+      sendReply(decision.message);
+    }
+    return;
+  }
   if (!decision.ok) {
     sendReply(decision.message);
     return;
