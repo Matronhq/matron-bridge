@@ -415,6 +415,36 @@ describe('createSubagentConvoTracker', () => {
       expect(publisher.calls.upsertConvo).toHaveLength(1);
     });
 
+    it('restores the consumed FIFO Task ref on write-ahead failure so the retry re-pairs it', () => {
+      const publisher = makePublisher();
+      let addResult = false;
+      const store = {
+        calls: { add: [], remove: [] },
+        add(childConvoId, meta) { this.calls.add.push({ childConvoId, meta }); return addResult; },
+        remove(childConvoId) { this.calls.remove.push(childConvoId); },
+        list() { return []; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore: store,
+        log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1'); // queues a sync-Task FIFO ref
+      // First discover fails to persist → rolls back AND returns the FIFO ref.
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // Retry persists → the restored FIFO ref must re-pair, so the child's later
+      // Task result can find it and drive finish() (store removal on delivery).
+      addResult = true;
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(publisher.calls.upsertConvo).toHaveLength(1);
+      tracker.noteTaskResult('toolu_1');
+      expect(store.calls.remove).toEqual(['parent-uuid:sub:agent-1']);
+    });
+
     it('finishAll removes every still-running child from the store', () => {
       const runningStore = makeStore();
       const tracker = createSubagentConvoTracker({
