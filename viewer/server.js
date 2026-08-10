@@ -7,7 +7,21 @@ import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
-const PORT = process.env.MATRON_VIEWER_PORT || 9803;
+// Port resolution with a legacy-name fallback: the Matrix→Matron rename left
+// old .envs setting MATRIX_VIEWER_PORT, and the silent default fallback bound
+// the viewer on 9803 while the Cloudflare tunnel forwarded to the configured
+// port — a 502 with both services "active" (2026-08-10). Honour the stale
+// name so an un-migrated .env keeps working, but warn loudly so it gets fixed.
+export function resolveViewerPort(env = process.env, warn = console.warn) {
+  if (env.MATRON_VIEWER_PORT) return env.MATRON_VIEWER_PORT;
+  if (env.MATRIX_VIEWER_PORT) {
+    warn('[viewer] MATRIX_VIEWER_PORT is the stale pre-rename name — rename it to MATRON_VIEWER_PORT in .env. Using its value for now.');
+    return env.MATRIX_VIEWER_PORT;
+  }
+  return 9803;
+}
+
+const PORT = resolveViewerPort();
 const SECRET = process.env.HMAC_SECRET;
 
 const app = express();
