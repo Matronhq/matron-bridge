@@ -22,6 +22,7 @@ import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, c
 import {
   buildMcpServers,
   effectiveExtras,
+  extractBypassFlag,
   extractMcpExtraFlags,
   knownMcpExtras,
   resolveDefaultExtras,
@@ -5302,7 +5303,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass);
       const agentFlags = extractAgentFlag(afterMcp);
       if (agentFlags.error) {
         await sendReply(agentFlags.error);
@@ -5340,7 +5342,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
-      const session = createSession(sessionRoomId, workdir, undefined, { agent: selectedAgent, mcpExtras });
+      const session = createSession(sessionRoomId, workdir, undefined, {
+        agent: selectedAgent, mcpExtras,
+        ...(startBypass != null ? { bypass: startBypass } : {}),
+      });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -5356,7 +5361,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // the only client now, and its new conversation appears on its own —
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}.`);
+      const permNote = session.bypassMode === true ? ' · ⚠️ permissions bypassed'
+        : (session.bypassMode === false ? ' · 🛡 auto permissions' : '');
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}${permNote}.`);
       break;
     }
 
@@ -5387,7 +5394,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
       const { force: restartForced, rest: restartArgs } = extractForceFlag(parts.slice(1));
-      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartArgs);
+      const { bypass: restartBypass, rest: restartAfterBypass } = extractBypassFlag(restartArgs);
+      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartAfterBypass);
       const restartAgentFlags = extractAgentFlag(restartAfterMcp);
       if (restartAgentFlags.error) {
         await sendReply(restartAgentFlags.error);
@@ -5430,12 +5438,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
-      recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
+      const restarted = recreateSession(roomId, {
+        mcpExtras: effectiveRestartExtras,
+        bypass: restartBypass != null ? restartBypass : existing.bypassMode === true,
+      }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
+      const restartPermNote = restarted && restarted.bypassMode === true ? ' · ⚠️ permissions bypassed'
+        : (restarted && restarted.bypassMode === false ? ' · 🛡 auto permissions' : '');
       await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
+        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}${restartPermNote}`
       );
       break;
     }
@@ -5446,7 +5459,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: resumeBypass, rest: resumeAfterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(resumeAfterBypass);
       const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
       if (resumeAgentFlags.error) {
         await sendReply(resumeAgentFlags.error);
@@ -5652,6 +5666,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ...(selectedAgent === AGENT_CLAUDE
           ? { interactive: resumeState.interactiveMode }
           : {}),
+        ...(resumeBypass != null ? { bypass: resumeBypass } : {}),
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
@@ -5694,11 +5709,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         turnCount: session.turnCount,
       });
 
-      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
-      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}\n\nSend any message to continue.`;
+      const resumePermNote = session.bypassMode === true ? ' · ⚠️ permissions bypassed'
+        : (session.bypassMode === false ? ' · 🛡 auto permissions' : '');
+      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${resumePermNote}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(session.workdir)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(session.workdir)}</code>${escapeHtml(resumePermNote)}<br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
@@ -5710,7 +5727,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: workdirBypass, rest: workdirAfterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(workdirAfterBypass);
       const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
       if (workdirAgentFlags.error) {
         await sendReply(workdirAgentFlags.error);
@@ -5750,7 +5768,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
-      const session = createSession(sessionRoomId, resolved, undefined, { agent: selectedAgent, mcpExtras: workdirExtras });
+      const session = createSession(sessionRoomId, resolved, undefined, {
+        agent: selectedAgent, mcpExtras: workdirExtras,
+        ...(workdirBypass != null ? { bypass: workdirBypass } : {}),
+      });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -5759,11 +5780,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation.\nWorkdir: ${resolved}`);
-      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
+      const workdirPermNote = session.bypassMode === true ? ' · ⚠️ permissions bypassed'
+        : (session.bypassMode === false ? ' · 🛡 auto permissions' : '');
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}`);
+      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
         `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(resolved)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(resolved)}</code>${escapeHtml(workdirPermNote)}<br/><br/>` +
         `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
       await sessionSendHtml(wdPlain, wdHtml);
       break;
@@ -8764,6 +8787,12 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     // and sending both lines double-messaged the user (Bugbot, PR #162).
     sendReply(refusalAnnouncement || decision.message);
     return null;
+  }
+  // iv-mode has no auto-permission support yet (spec 2026-08-10 out-of-scope):
+  // switching an auto session to interactive silently widens permissions, so
+  // say it out loud rather than refusing the switch.
+  if (wantInteractive && session.bypassMode === false) {
+    sendReply('Heads-up: interactive mode currently runs with permissions bypassed (auto permission mode support is coming).');
   }
   // `announcement` replaces the generic "Switching to … mode" line on SUCCESS
   // only. Used by flows where the switch is an implementation detail the user
