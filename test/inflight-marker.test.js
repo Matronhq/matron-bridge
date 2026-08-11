@@ -124,6 +124,60 @@ describe('takeStale', () => {
   });
 });
 
+// A clear that never reaches disk leaves the markers there for the next boot to
+// find. Reporting them anyway would card the same interruption on every
+// subsequent boot, and a persistent disk fault never resolves itself — so the
+// repeat is unbounded. takeStale fails closed instead.
+describe('takeStale when the clear cannot be written', () => {
+  const priorBoot = () => ({
+    'convo-1': { roomId: 'room-1', bootId: 'boot-1', startedAt: 999_000, touchedAt: 999_000 },
+  });
+
+  it('reports nothing rather than cards it cannot clear', () => {
+    const { marker, state, save } = harness({ initial: priorBoot() });
+    save.mockImplementationOnce(() => { throw new Error('disk full'); });
+
+    expect(marker.takeStale(60_000)).toEqual([]);
+    expect(state.data).toEqual(priorBoot());  // disk untouched by the failed write
+  });
+
+  it('restores the pre-clear state, so a later successful write does not erase the interruption', () => {
+    const { marker, state, save } = harness({ initial: priorBoot() });
+    save.mockImplementationOnce(() => { throw new Error('disk full'); });
+    marker.takeStale(60_000);
+
+    // Any turn boundary persists. Without the restore this would write the
+    // cleared set, dropping an interruption no card was ever published for.
+    marker.noteTurnStart('convo-2', 'room-2');
+
+    expect(state.data['convo-1']).toEqual(priorBoot()['convo-1']);
+    expect(state.data['convo-2'].bootId).toBe('boot-2');
+  });
+
+  it('offers the deferred interruption on the next boot', () => {
+    const first = harness({ initial: priorBoot() });
+    first.save.mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(first.marker.takeStale(60_000)).toEqual([]);  // withheld, not published
+
+    const second = harness({ initial: first.state.data, bootId: 'boot-3' });
+    expect(second.marker.takeStale(60_000)).toEqual([
+      { convoId: 'convo-1', roomId: 'room-1', startedAt: 999_000, touchedAt: 999_000, ageMs: 1_000 },
+    ]);
+    expect(second.state.data).toEqual({});  // this boot's clear did land
+  });
+
+  it('logs why the cards were withheld', () => {
+    const log = vi.fn();
+    const marker = createInflightMarker({
+      load: () => priorBoot(),
+      save: () => { throw new Error('disk full'); },
+      now: () => 1_000_000, bootId: 'boot-2', log,
+    });
+    expect(marker.takeStale(60_000)).toEqual([]);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/deferring carry-on cards/);
+  });
+});
+
 describe('load tolerance', () => {
   it('treats a throwing load as empty and logs', () => {
     const log = vi.fn();
