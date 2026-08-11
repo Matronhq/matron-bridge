@@ -159,4 +159,73 @@ describe('queued-release-outbox', () => {
       fs.rmSync(file, { recursive: true, force: true });
     }
   });
+
+  // Nicety (a): O(1) pending gate for the hot retry driver.
+  it('pendingCount() tracks retry-eligible pending records only', () => {
+    expect(store.pendingCount()).toBe(0);
+    store.put(KEY, rec());
+    expect(store.pendingCount()).toBe(1);
+    store.put('pr_2\0pr_2::0\0send', rec({ promptId: 'pr_2', itemId: 'pr_2::0', action: 'send' }));
+    expect(store.pendingCount()).toBe(2);
+    store.markAcked('pr_1', 'cancel'); // acked no longer counts
+    expect(store.pendingCount()).toBe(1);
+    store.remove('pr_2\0pr_2::0\0send');
+    expect(store.pendingCount()).toBe(0);
+  });
+
+  it('inherited (relabelled) records do not count toward pendingCount()', () => {
+    store.put(KEY, rec());
+    const reopened = createQueuedReleaseOutbox({ file, log: { warn() {} } });
+    expect(reopened.list()[0].status).toBe('pending_inherited');
+    expect(reopened.pendingCount()).toBe(0);
+  });
+
+  // Nicety (a): sweepAcked is no longer boot-only — markAcked GCs aged acked.
+  it('markAcked sweeps retention-expired acked records (GC no longer boot-only)', () => {
+    const oldAckedAt = Date.now() - (ACK_RETENTION_MS + 60_000);
+    fs.writeFileSync(file, JSON.stringify({
+      'old\0old::0\0send': { promptId: 'old', itemId: 'old::0', action: 'send', releasedIds: ['old::0'], status: 'acked', ackedAt: oldAckedAt, at: 1 },
+      [KEY]: rec(), // pending -> pending_inherited on reopen
+    }));
+    const s = createQueuedReleaseOutbox({ file, log: { warn() {} } });
+    expect(s.list().find(r => r.key === 'old\0old::0\0send')).toBeTruthy();
+    s.markAcked('pr_1', 'cancel'); // flips inherited->acked AND sweeps the aged one
+    expect(s.list().find(r => r.key === 'old\0old::0\0send')).toBeUndefined();
+  });
+
+  // Nicety (b): env override for the state-file path (dev/live isolation).
+  it('honors MATRON_QUEUED_RELEASE_OUTBOX_FILE as the default state-file path', async () => {
+    const envFile = path.join(dir, 'env-default-outbox.json');
+    const prev = process.env.MATRON_QUEUED_RELEASE_OUTBOX_FILE;
+    process.env.MATRON_QUEUED_RELEASE_OUTBOX_FILE = envFile;
+    try {
+      // Fresh module eval (distinct specifier) so the module-level DEFAULT_FILE
+      // const re-reads process.env.
+      const mod = await import('../lib/queued-release-outbox.js?envfiletest');
+      const s = mod.createQueuedReleaseOutbox({ log: { warn() {} } }); // no file arg
+      expect(s.put(KEY, rec())).toBe(true);
+      expect(fs.existsSync(envFile)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.MATRON_QUEUED_RELEASE_OUTBOX_FILE;
+      else process.env.MATRON_QUEUED_RELEASE_OUTBOX_FILE = prev;
+    }
+  });
+
+  // Minor: sweep stale tmp/quarantine litter at boot.
+  it('sweeps stale .tmp litter at boot but preserves a recent .corrupt-* quarantine', () => {
+    const staleTmp = `${file}.deadbeef.tmp`;
+    fs.writeFileSync(staleTmp, 'junk');
+    const oldCorrupt = `${file}.corrupt-1`;
+    fs.writeFileSync(oldCorrupt, 'junk');
+    const aged = new Date(Date.now() - 25 * 60 * 60 * 1000); // > 24h
+    fs.utimesSync(oldCorrupt, aged, aged);
+    const recentCorrupt = `${file}.corrupt-${Date.now()}`;
+    fs.writeFileSync(recentCorrupt, 'junk');
+
+    createQueuedReleaseOutbox({ file, log: { warn() {} } });
+
+    expect(fs.existsSync(staleTmp)).toBe(false);     // stale tmp swept
+    expect(fs.existsSync(oldCorrupt)).toBe(false);    // aged quarantine swept
+    expect(fs.existsSync(recentCorrupt)).toBe(true);  // recent quarantine preserved
+  });
 });

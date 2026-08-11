@@ -645,9 +645,9 @@ const sessions = new Map(); // roomId -> session
 // publisher fires any hook. emitRelease writes-ahead into it; the router's
 // echo-ack flips records `acked`; the retry driver + boot reconcile read it.
 const releaseOutbox = createQueuedReleaseOutbox({ log: console });
-// One-shot guard so boot reconciliation (reconcileReleaseOutbox) runs on the
-// first hello_ok only, not on every later reconnect.
-let _releaseReconciled = false;
+// The one-shot boot-reconcile guard + its quiet-period deferral timer live in
+// the emitRelease..journalUpsertConvo seam below (scheduleReleaseReconcile),
+// next to reconcileReleaseOutbox itself.
 
 // RPC-start (lib/journal-rpc.js `start`): the !start command body minus the
 // origin-room replies — an RPC start has no origin chat room. Returns the
@@ -779,13 +779,17 @@ function journalOnReconnect() {
   // driver skips (state gate, not timing).
   republishPendingReleases();
   // Boot reconciliation (spec §5): expire every `pending_inherited` orphan.
-  // Runs once, on the first hello_ok after boot (the publisher is live, so the
-  // terminal `expired` release can actually be sent). Inherited records are a
-  // boot-only concern; later reconnects have none to reconcile.
-  if (!_releaseReconciled) {
-    _releaseReconciled = true;
-    reconcileReleaseOutbox();
-  }
+  // DEFERRED behind a quiet-period timer, re-armed by each replayed journal
+  // frame (journalHandleInboundEvent), so it fires only AFTER the reconnect
+  // replay stream goes quiet. F1 timing fix: the replay carries the echo of a
+  // release that a prior process committed (journal append ran) but died before
+  // acking; that echo's markAcked flips pending_inherited -> acked BEFORE this
+  // reconcile runs, so a durably-committed release is never wrongly stamped
+  // `expired`. Running synchronously here (the old behavior) raced the replay
+  // and produced two contradictory terminal releases for one prompt. One-shot:
+  // only the first hello_ok's replay is reconciled; later reconnects re-arm
+  // nothing (the timer is null after the single reconcile fires).
+  scheduleReleaseReconcile();
 }
 
 function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}) {
@@ -815,7 +819,7 @@ function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}
     action,
     released: releasedIds,
     at,
-  }, { idemKey: `qr\0${promptId}\0${action}` });
+  }, { idemKey: `qr\0${promptId}\0${itemId}\0${action}` });
   return true;
 }
 
@@ -829,11 +833,15 @@ function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}
 let _republishingReleases = false;
 function republishPendingReleases() {
   if (_republishingReleases) return;
+  // O(1) fast path: this fires per confirmed frame on the hot output path
+  // (onSendCapacity). With no retry-eligible records the pendingCount gate
+  // avoids an O(all-releases-since-boot) list() allocation per streamed delta.
+  if (releaseOutbox.pendingCount() === 0) return;
   _republishingReleases = true;
   try {
     for (const rec of releaseOutbox.list()) {
       if (rec.status !== 'pending') continue; // skip pending_inherited + acked
-      const idemKey = `qr\0${rec.promptId}\0${rec.action}`;
+      const idemKey = `qr\0${rec.promptId}\0${rec.itemId}\0${rec.action}`;
       if (journalPublisher.hasQueuedIdem(idemKey)) continue; // frame still queued
       journalPublisher.publishPromptReply(rec.convoId, {
         kind: 'queued_release',
@@ -877,6 +885,34 @@ function reconcileReleaseOutbox() {
     if (emitted && rec.key !== expiredKey) releaseOutbox.remove(rec.key);
   }
   releaseOutbox.sweepAcked();
+}
+
+// --- Boot-reconcile deferral (F1 timing fix) ---
+// reconcileReleaseOutbox must NOT run before the reconnect replay that carries
+// the echo of a committed-but-unacked release (that echo flips the record
+// pending_inherited -> acked, so reconcile then correctly skips it). We defer
+// reconcile behind a quiet-period timer, re-armed by every replayed journal
+// frame, so it fires only once the replay stream has been quiet for the window.
+// One-shot: inherited records are a boot-only concern, so we reconcile exactly
+// once (the first hello_ok's replay); after that the timer is null forever.
+// Quiet window overridable via env (short by default — a boot replay burst is
+// bounded and steady-state single-convo traffic isn't sub-window-continuous).
+const RELEASE_RECONCILE_QUIET_MS = Number(process.env.MATRON_QUEUED_RELEASE_RECONCILE_QUIET_MS) || 750;
+let _releaseReconciled = false;
+let _releaseReconcileTimer = null;
+function runReleaseReconcile() {
+  _releaseReconcileTimer = null;
+  if (_releaseReconciled) return;
+  _releaseReconciled = true;
+  reconcileReleaseOutbox();
+}
+function scheduleReleaseReconcile() {
+  if (_releaseReconciled) return;
+  if (_releaseReconcileTimer) clearTimeout(_releaseReconcileTimer);
+  _releaseReconcileTimer = setTimeout(runReleaseReconcile, RELEASE_RECONCILE_QUIET_MS);
+  if (_releaseReconcileTimer && typeof _releaseReconcileTimer.unref === 'function') {
+    _releaseReconcileTimer.unref();
+  }
 }
 
 function journalUpsertConvo(session, opts) {
@@ -4567,13 +4603,19 @@ function finalizeSentQueue(convoId, flushedSnapshot) {
   for (const { itemId } of flushedSnapshot || []) {
     const liveEntry = liveByItemId.get(itemId);
     if (!liveEntry) continue;
-    emitRelease(convoId, {
+    // Fail-closed (F2): retire the live entry ONLY when the durable write-ahead
+    // committed. If emitRelease fail-closed (write-ahead disk fault, e.g.
+    // ENOSPC), keep the live registry entry so a later release attempt / boot
+    // reconcile can still recover the card — dropping it unconditionally here
+    // would leave a permanently dead card with no durable record, silently.
+    if (emitRelease(convoId, {
       promptId: liveEntry.promptId,
       action: 'send',
       releasedIds: [itemId],
-    });
-    journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-    liveByItemId.delete(itemId);
+    })) {
+      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+      liveByItemId.delete(itemId);
+    }
   }
 }
 
@@ -7689,6 +7731,12 @@ const journalInputConsumer = createJournalInputConsumer({
 // been assigned).
 function journalHandleInboundEvent(frame) {
   journalInputConsumer(frame);
+  // Re-arm the deferred boot reconcile (F1) while one is pending: each replayed
+  // frame pushes the quiet-timer out, so reconcile runs only once the reconnect
+  // replay stream (which carries release echoes) has gone quiet. No-op after the
+  // one-shot reconcile has fired (_releaseReconcileTimer is null), so
+  // steady-state traffic pays only a null check.
+  if (_releaseReconcileTimer) scheduleReleaseReconcile();
 }
 
 // Evict the reply-staleness guard record for a torn-down session's convo

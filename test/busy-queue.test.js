@@ -1121,7 +1121,7 @@ describe('queued-release publisher wiring', () => {
         action: 'cancel',
         released: ['pr_123::0'],
         at: 1_722_000_000_000,
-      }, { idemKey: 'qr pr_123 cancel' });
+      }, { idemKey: 'qr pr_123 pr_123::0 cancel' });
     } finally {
       now.mockRestore();
     }
@@ -1173,7 +1173,7 @@ describe('index.js queued-send finalizer', () => {
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
 
-    const emitRelease = vi.fn();
+    const emitRelease = vi.fn(() => true); // durable emit — finalizeSentQueue's fail-closed gate drops only on success
     const dropItem = vi.fn();
     const journalPublishNotice = vi.fn();
     const listLive = vi.fn(() => [
