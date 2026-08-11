@@ -86,6 +86,7 @@ import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
+import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
@@ -159,6 +160,16 @@ const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE 
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 
+// Restart carry-on window. A turn interrupted by a bridge restart is offered
+// a "Carry on" card at the next boot, but only if the conversation was active
+// within this window — measured from the marker's last touch, so a long turn
+// that was still working right before the crash still qualifies. Deliberately
+// NOT reusing SESSION_IDLE_TIMEOUT_MS: that answers a different question (how
+// long to hold memory for an idle session), and 1h would mean restarting the
+// bridge before a long meeting silently loses the card.
+// eslint-disable-next-line no-unused-vars -- read by the boot reconciliation pass (inflightMarker.takeStale) landing in the next commit; declared here with the rest of the carry-on config.
+const RESTART_CARRY_ON_MAX_AGE_MS = parseInt(process.env.MATRON_RESTART_CARRY_ON_MAX_AGE_MS || '21600000', 10);
+
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
 // far longer than the 500ms paste→Enter window in sendText. Typing the first
@@ -180,6 +191,9 @@ const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json
 // a pending timer outlives the idle reaper, session restarts, and full
 // bridge restarts (re-armed in main() via timerStore.init()).
 const TIMERS_FILE = path.join(os.homedir(), '.matron-bridge-timers.json');
+// In-flight turn markers for restart carry-on — written at turn start, removed
+// at turn end, reconciled at the next boot (see lib/inflight-marker.js).
+const INFLIGHT_FILE = path.join(path.dirname(SESSIONS_FILE), 'inflight.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -1659,6 +1673,9 @@ function codexToolIndicator(item) {
 }
 
 function handleCodexEvent(session, event) {
+  // Progress touch for restart carry-on — the Codex-side counterpart of the
+  // touch in handleClaudeEvent. Debounced and no-op without a marker.
+  inflightMarker.touch(journalConvoIdFor(session));
   switch (event?.type) {
     case 'thread.started': {
       if (!event.thread_id) break;
@@ -1822,6 +1839,8 @@ function finishCodexTurn(session, {
   session.toolCalls = [];
   journalStreamClear(session);
   session.busy = false;
+  // Authoritative Codex turn-end (idempotent via _codexTurnFinished above).
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   maybeSummarizeAtTurnEnd(session);
@@ -2049,6 +2068,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.busy) {
       console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
       session.busy = false;
+      // Deliberately NO inflightMarker.noteTurnEnd here: busy is cleared to
+      // route the user's reply into the PTY, but the turn resumes once they
+      // answer and onTurnEnd remains its authoritative end. A restart while
+      // the prompt is open leaves a genuinely dangling turn — exactly what the
+      // carry-on card is for.
     }
     handleInteractivePrompt(session, prompt);
   });
@@ -2218,6 +2242,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.toolCalls = [];
     session.turnCount++;
     session.busy = false;
+    // Authoritative iv-mode turn-end seam.
+    inflightMarker.noteTurnEnd(journalConvoIdFor(session));
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
     maybeSummarizeAtTurnEnd(session);
@@ -2663,6 +2689,7 @@ function handleInteractiveScreenUpdate(session, update) {
   if (session.busy) {
     console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
     session.busy = false;
+    // No noteTurnEnd — prompt surfacing, not turn end. See iv.on('prompt').
   }
   // Auto-press Enter for pure acknowledgment cues ("Press Enter to
   // continue…" after /login success, "Press Enter to dismiss" notices,
@@ -2762,6 +2789,7 @@ function handleUnclassifiedPrompt(session, { screen }) {
   // busy so the reply is typed into the PTY instead of dropping into the queue.
   if (session.busy) {
     session.busy = false;
+    // No noteTurnEnd — prompt surfacing, not turn end. See iv.on('prompt').
   }
 }
 
@@ -2944,6 +2972,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       return;
     }
     session.busy = true;
+    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
     const jsonMsg = JSON.stringify({
@@ -3112,6 +3141,14 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
 }
 
 function handleClaudeEvent(session, event) {
+  // Progress touch for restart carry-on. This is the single per-event entry
+  // point for BOTH print mode (stdout stream-json) and iv mode (iv.on('event')
+  // → here), so it is where "the turn is still making progress" is known.
+  // Before the sidechain guard on purpose: a subagent's events are still this
+  // turn working. The store debounces to once a minute and no-ops when no
+  // marker exists, so this is cheap on every event.
+  inflightMarker.touch(journalConvoIdFor(session));
+
   // A subagent's event riding the parent's stdout (parent_tool_use_id /
   // isSidechain) is NOT the parent's: its text/tool_use/tool_result belong to
   // the child conversation, and the subagent watcher already routes them
@@ -3510,6 +3547,11 @@ function handleClaudeEvent(session, event) {
           // Reset busy/typing so the session isn't stuck if claude exits 0
           // without our normal result-handling path running.
           session.busy = false;
+          // A failed resume produces no further agent output for this turn, and
+          // the early break below skips the normal turn-end seam — so in print
+          // mode nothing else would ever clear the marker. Leaving it would
+          // card a conversation that is over, not interrupted.
+          inflightMarker.noteTurnEnd(journalConvoIdFor(session));
           clearPendingInterrupt(session);
           // This early break skips the normal turn-end seam below, so in
           // print mode a /restart parked mid-turn must fire here —
@@ -3588,6 +3630,8 @@ function handleClaudeEvent(session, event) {
       // (the durable publish already cleared the ref).
       journalStreamClear(session);
       session.busy = false;
+      // Authoritative print-mode turn-end seam.
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       clearPendingInterrupt(session);
       // Print-mode's turn-end (this `case 'result':` block is its equivalent
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
@@ -3760,6 +3804,10 @@ function handleClaudeEvent(session, event) {
             // unrelated event cleared it. No-op when nothing was streaming.
             journalStreamClear(session);
             session.busy = false;
+            // This branch IS the turn-end for a print-mode session at a manual
+            // compact boundary (the iv branch above delegates to onTurnEnd,
+            // which clears the marker there).
+            inflightMarker.noteTurnEnd(journalConvoIdFor(session));
             clearPendingInterrupt(session);
           }
         } else if (trigger === 'manual') {
@@ -3950,6 +3998,11 @@ function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
 
 function reportSessionSendFailure(session, message, { restoreJournalState = false } = {}) {
   session.busy = false;
+  // Some callers (the Codex/iv/stdin dispatch failures in sendToSession) run
+  // AFTER session.busy = true, so a marker for this turn already exists. The
+  // dispatch failed, so no agent output is coming — clear it or the next boot
+  // offers to carry on a turn that never started.
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   if (restoreJournalState) {
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
@@ -4072,6 +4125,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   session.responseBuffer = '';
   session.toolCalls = [];
   session.busy = true;
+  inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
   // Mirror Claude input here. Codex input is mirrored below only after its
@@ -4298,6 +4352,9 @@ function startResumeReadyWatcher(session) {
       // send itself failed) — don't leave a typing indicator spinning with
       // no turn behind it.
       session.busy = false;
+      // Same reasoning applies to the marker: this branch asserts there is no
+      // turn behind the busy flag, so any marker left over is stale.
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       // Room messages that arrived during the hold coalesced into the pending
       // inbox (isBusy counts _awaitingInputReady). With no held user message
       // there is no turn — and so no turn-end seam — to flush them, so flush
@@ -6698,6 +6755,10 @@ async function journalRouteTextToSession(session, body) {
         session.pendingUnclassifiedPrompt = false;
         if (session.busy) {
           session.busy = false;
+          // Esc cancels the turn: the user deliberately ended it, so there is
+          // nothing to carry on. (If the Stop hook still fires, onTurnEnd's
+          // noteTurnEnd is a harmless no-op.)
+          inflightMarker.noteTurnEnd(journalConvoIdFor(session));
         }
         ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
@@ -7169,6 +7230,21 @@ async function fireTimer(record) {
   journalPublishNotice(journalConvoIdFor(session), `⏰ Timer #${record.id}: sending "${record.text}"`);
   await journalRouteTextToSession(session, record.text);
 }
+
+// One boot identity per bridge process — the whole of restart-carry-on
+// detection is "this marker carries a bootId that isn't mine, so the run that
+// wrote it is gone" (see lib/inflight-marker.js).
+const BRIDGE_BOOT_ID = randomUUID();
+
+const inflightMarker = createInflightMarker({
+  load: () => (fs.existsSync(INFLIGHT_FILE) ? JSON.parse(fs.readFileSync(INFLIGHT_FILE, 'utf-8')) : null),
+  // Atomic replace, same rationale as savePersistedSessions: a truncating
+  // in-place write that dies mid-rewrite would silently drop every marker.
+  save: (data) => atomicWriteFileSync(INFLIGHT_FILE, JSON.stringify(data, null, 2)),
+  now: Date.now,
+  bootId: BRIDGE_BOOT_ID,
+  log: (msg) => { try { console.warn(`[inflight] ${msg}`); } catch { /* logging must never throw */ } },
+});
 
 const timerStore = createTimerStore({
   load: () => (fs.existsSync(TIMERS_FILE) ? JSON.parse(fs.readFileSync(TIMERS_FILE, 'utf-8')) : null),
@@ -7674,6 +7750,7 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     session.busy = true;
+    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -8833,6 +8910,11 @@ async function printModeInterrupt(session, sendReply) {
       session.pendingInterrupt = null;
       if (!session.busy) return;
       session.busy = false;
+      // Deliberately NO noteTurnEnd: this is a defensive unstick after an
+      // interrupt got no acknowledgement, and the reply below says so — "the
+      // turn may still be running". Further agent output is still possible,
+      // and the `result` seam will clear the marker if it arrives. Clearing
+      // here would drop a card for a turn that really was interrupted.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
       Promise.resolve(sendReply('⚠️ No response to the interrupt after 10s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.')).catch(() => {});
