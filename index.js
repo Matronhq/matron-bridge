@@ -1839,8 +1839,18 @@ function finishCodexTurn(session, {
   session.toolCalls = [];
   journalStreamClear(session);
   session.busy = false;
-  // Authoritative Codex turn-end (idempotent via _codexTurnFinished above).
-  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+  // Authoritative Codex turn-end (idempotent via _codexTurnFinished above) —
+  // but ONLY for a turn that actually ended on its own terms. discardOutput is
+  // passed exclusively by the two teardown callers (killSession, and the
+  // turn-exit fallback for an already-dead session), where the turn was
+  // INTERRUPTED rather than completed. Clearing the marker there is what made
+  // a SIGTERM restart erase its own evidence: restart.sh kills with SIGTERM,
+  // the handler calls killSession for every live session, and a mid-turn Codex
+  // session would delete the very record the next boot needs to offer a
+  // carry-on card. Teardown leaves the marker standing; a genuine end clears
+  // it. A deliberate !stop clears it explicitly at its own call site, before
+  // killSession runs, so that case does not rely on this branch.
+  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   maybeSummarizeAtTurnEnd(session);
