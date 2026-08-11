@@ -31,10 +31,17 @@ find capacity instead of the user having to know it.
 
 Per the parent spec. `start` params add:
 
-- `prompt` (string, required when `room_id` present): the task, executed
+- `prompt` (string, required when `room_id` present, ≤ 2000 chars — the
+  wire contract's task cap, enforced target-side too): the task, executed
   verbatim as the seed of the opening turn.
 - `room_id` (string): the journal room the parent created. The target bridge
   joins the spawned session to this room.
+- `from_name` (string, optional): the requesting box's device name as the
+  journal knows it, journal-sanitised, omitted (never empty) when the parent
+  device row is gone by approval time. Used only to name the requester in
+  the opening turn; the target treats it as peer text regardless —
+  flattened, capped to `PEER_NAME_MAX`, and quote-escaped before it is
+  interpolated inside the turn's structural quotes.
 
 Sequence: spawn session → attach room → inject the opening turn → answer
 `{convo_id}`. Any failure after spawn tears the session down and answers

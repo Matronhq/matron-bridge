@@ -74,6 +74,14 @@ describe('formatBox', () => {
       .toBe('unknown (device 1) — online');
   });
 
+  it('degrades a null or non-object box element to a safe line instead of throwing out of the guard', () => {
+    let text;
+    expect(() => { text = formatBox(null); }).not.toThrow();
+    expect(text).toBe('unknown (device ?) — (unavailable)');
+    expect(() => { text = formatBox(undefined); }).not.toThrow();
+    expect(text).toBe('unknown (device ?) — (unavailable)');
+  });
+
   it('degrades a box whose limits.as_of is out of Date range to a single unavailable line, without throwing', () => {
     const box = {
       device_id: 6, name: 'bad-box', online: true, folders: [],

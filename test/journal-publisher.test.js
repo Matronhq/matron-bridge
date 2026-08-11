@@ -1652,6 +1652,10 @@ describe('createJournalPublisher — agent-chat room ops', () => {
     const push = (f) => fake.connections[0].ws.send(JSON.stringify(f));
     push({ kind: 'spawn', request_id: 'r' });              // no event
     push({ kind: 'spawn', event: 42, request_id: 'r' });   // non-string event
+    push({ kind: 'spawn', event: 'outcome' });             // no request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: 7 });   // non-string request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: '' });  // empty request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: 'x'.repeat(129) }); // over the 128 wire cap
     push({ kind: 'spawn', event: 'pending', request_id: 'r-ok' });
     await waitFor(() => seen.length === 1);
     expect(seen[0].request_id).toBe('r-ok');
