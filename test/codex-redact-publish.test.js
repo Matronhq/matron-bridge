@@ -230,29 +230,88 @@ describe('publish-side Codex redaction', () => {
     expect(marker).not.toBe(plaintextFingerprint);
   });
 
-  it('skips operator patterns above the size threshold and warns once, keeping baseline redaction', () => {
-    const log = { warn: vi.fn() };
-    const redact = createPublishRedactor({
-      configPath: '/test/redactor.yaml',
-      readFileSyncFn: () => ['patterns:', '  - name: cc', '    regex: SECRETVAL'].join('\n'),
-      log,
-      maxOperatorPatternBytes: 32,
-    });
+  const makeOversizeRedactor = (overrides = {}) => createPublishRedactor({
+    configPath: '/test/redactor.yaml',
+    readFileSyncFn: () => ['patterns:', '  - name: cc', '    regex: SECRETVAL'].join('\n'),
+    maxOperatorPatternBytes: 32,
+    ...overrides,
+  });
 
+  it('defaults to fail-closed truncate over the size threshold: drops the un-vetted tail', () => {
+    const log = { warn: vi.fn() };
+    const redact = makeOversizeRedactor({ log });
+
+    // A secret past the bound (after 64 chars) must NOT publish once the payload is
+    // over the operator-pattern limit — the old fail-open let it through.
     const oversize = `${'x'.repeat(64)}\npassword=hunter2\nSECRETVAL`;
     const out = redact(oversize);
-    // Operator pattern skipped over the threshold: SECRETVAL survives...
-    expect(out).toContain('SECRETVAL');
-    // ...but the vetted baseline still redacts the key=value secret.
-    expect(out).toContain('[REDACTED:secret-key:');
+    expect(out).not.toContain('SECRETVAL');
+    expect(out).toContain('[REDACTED-OVERSIZE:');
     expect(log.warn).toHaveBeenCalledOnce();
 
     // A second oversize input does not warn again.
     redact(`${oversize}\nmore`);
     expect(log.warn).toHaveBeenCalledOnce();
 
-    // A small input still runs the operator pattern.
+    // A small input still runs the operator pattern in full.
     expect(redact('SECRETVAL')).toMatch(/^\[REDACTED:cc:[0-9a-f]{8}\]$/);
+  });
+
+  it('truncate still fully redacts operator secrets that fall within the bounded head', () => {
+    const redact = makeOversizeRedactor();
+    // SECRETVAL sits in the first 32 chars → inside the head → redacted; tail dropped.
+    const out = redact(`SECRETVAL\n${'x'.repeat(200)}`);
+    expect(out).not.toContain('SECRETVAL');
+    expect(out).toMatch(/\[REDACTED:cc:[0-9a-f]{8}\]/);
+    expect(out).toContain('[REDACTED-OVERSIZE:');
+  });
+
+  it("oversizePolicy 'drop' withholds the whole payload", () => {
+    const redact = makeOversizeRedactor({ oversizePolicy: 'drop' });
+    const out = redact(`${'x'.repeat(64)}\nSECRETVAL`);
+    expect(out).not.toContain('SECRETVAL');
+    expect(out).not.toContain('x'.repeat(64));
+    expect(out).toMatch(/^\[REDACTED-OVERSIZE: \d+B payload withheld/);
+  });
+
+  it("oversizePolicy 'skip' preserves the legacy fail-open behavior (opt-in)", () => {
+    const redact = makeOversizeRedactor({ oversizePolicy: 'skip' });
+    const oversize = `${'x'.repeat(64)}\npassword=hunter2\nSECRETVAL`;
+    const out = redact(oversize);
+    // Legacy: operator pattern skipped so SECRETVAL survives, baseline still redacts.
+    expect(out).toContain('SECRETVAL');
+    expect(out).toContain('[REDACTED:secret-key:');
+  });
+
+  it('reads the oversize policy from MATRON_REDACT_OVERSIZE_POLICY when no explicit option is set', () => {
+    const redact = makeOversizeRedactor({ env: { MATRON_REDACT_OVERSIZE_POLICY: 'skip' } });
+    const out = redact(`${'x'.repeat(64)}\nSECRETVAL`);
+    expect(out).toContain('SECRETVAL'); // env-selected 'skip' → operator pattern skipped
+  });
+
+  it('measures the bound in UTF-8 bytes, not UTF-16 code units', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    // 30 three-byte chars = 30 code units (< 32) but 90 UTF-8 bytes (> 32). A
+    // code-unit check would wrongly treat this as under the bound.
+    const out = redact('中'.repeat(30));
+    expect(out).toContain('[REDACTED-OVERSIZE:'); // detected as oversize despite <32 code units
+  });
+
+  it('drops a secret that straddles the truncation cut — never a partial prefix', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    // The safe head ends at the last newline within the bound (byte 9). SECRETVAL
+    // begins after it, so it lands entirely in the dropped tail.
+    const out = redact(`8 chars.\nSECRETVAL${'x'.repeat(80)}`);
+    expect(out).not.toContain('SECRET'); // not even a prefix of the secret leaks
+    expect(out).toContain('[REDACTED-OVERSIZE:');
+  });
+
+  it('drops the whole payload (empty head) when no newline fits in the bound', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    const out = redact(`${'x'.repeat(64)}\nSECRETVAL`); // no newline in the first 32 bytes
+    expect(out).not.toContain('x'.repeat(64));
+    expect(out).not.toContain('SECRETVAL');
+    expect(out.startsWith('[REDACTED-OVERSIZE:')).toBe(true); // annotation only, no partial line
   });
 
   it('redacts every allowlisted string and excludes unknown fields before publishing', () => {
