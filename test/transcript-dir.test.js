@@ -9,6 +9,7 @@ import {
   projectDirFor,
   transcriptPathFor,
   subagentsDirFor,
+  findTranscriptBySessionId,
 } from '../lib/transcript-dir.js';
 
 // This encoder must match Claude Code's cwd → transcript-dir encoding byte for
@@ -93,5 +94,73 @@ describe('path builders (site-level)', () => {
   it('subagentsDirFor appends <sessionId>/subagents', () => {
     expect(subagentsDirFor('/home/danbarker/my_app', 'sid-9'))
       .toBe(path.join(base, '-home-danbarker-my-app', 'sid-9', 'subagents'));
+  });
+});
+
+// A session that changes cwd mid-flight (EnterWorktree) has its transcript
+// relocated to the new cwd's project dir; the resume paths fall back to this
+// by-id search so the stale persisted workdir doesn't demote the resume to a
+// fresh spawn (silent conversation loss — the fresh-clone-bootstrap amnesia).
+describe('findTranscriptBySessionId', () => {
+  let root;
+  const entry = (cwd) => JSON.stringify({ type: 'user', cwd, message: { role: 'user' } }) + '\n';
+  const writeTranscript = (dirName, sessionId, lines) => {
+    const dir = path.join(root, dirName);
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, `${sessionId}.jsonl`);
+    fs.writeFileSync(p, lines.join(''));
+    return p;
+  };
+
+  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'td-find-')); });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  it('returns null when no project dir holds a transcript for the id', () => {
+    writeTranscript('-home-dan-app', 'other-session', [entry('/home/dan/app')]);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root })).toBeNull();
+  });
+
+  it('returns null for a missing projects root', () => {
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: path.join(root, 'nope') })).toBeNull();
+  });
+
+  it('finds the transcript and recovers the workdir from its last cwd entry', () => {
+    const p = writeTranscript('-home-dan-app--claude-worktrees-wt', 'sid-1', [
+      entry('/home/dan/app'),
+      entry('/home/dan/app/.claude/worktrees/wt'),
+    ]);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root }))
+      .toEqual({ transcriptPath: p, workdir: '/home/dan/app/.claude/worktrees/wt' });
+  });
+
+  it('prefers the most recently modified transcript when several dirs match', () => {
+    const stale = writeTranscript('-home-dan-app', 'sid-1', [entry('/home/dan/app')]);
+    const live = writeTranscript('-home-dan-wt', 'sid-1', [entry('/home/dan/wt')]);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(stale, old, old);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root }))
+      .toEqual({ transcriptPath: live, workdir: '/home/dan/wt' });
+  });
+
+  it('skips malformed tail lines and lines without a cwd while scanning backwards', () => {
+    const p = writeTranscript('-home-dan-app', 'sid-1', [
+      entry('/home/dan/app'),
+      JSON.stringify({ type: 'summary' }) + '\n',
+      '{"truncated": "not json\n',
+    ]);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root }))
+      .toEqual({ transcriptPath: p, workdir: '/home/dan/app' });
+  });
+
+  it('reports a null workdir when no entry carries a cwd', () => {
+    const p = writeTranscript('-home-dan-app', 'sid-1', [JSON.stringify({ type: 'summary' }) + '\n']);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root }))
+      .toEqual({ transcriptPath: p, workdir: null });
+  });
+
+  it('rejects a session id that is not a plain token (filename-component safety)', () => {
+    writeTranscript('-home-dan-app', 'sid-1', [entry('/home/dan/app')]);
+    expect(findTranscriptBySessionId('../-home-dan-app/sid-1', { projectsRoot: root })).toBeNull();
+    expect(findTranscriptBySessionId('', { projectsRoot: root })).toBeNull();
   });
 });

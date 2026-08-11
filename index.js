@@ -17,7 +17,7 @@ import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/
 import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { projectDirFor, transcriptPathFor } from './lib/transcript-dir.js';
+import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
 import {
   buildMcpServers,
@@ -1203,6 +1203,26 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  // A Claude session that changes cwd mid-flight (EnterWorktree is the common
+  // case) has its transcript relocated to the NEW cwd's project dir, while the
+  // bridge's persisted workdir stays where the session was spawned. Resuming
+  // with that stale workdir misses the transcript, and planSessionIdentity
+  // demotes the resume to a fresh --session-id spawn on the same id — the room
+  // keeps its identity but silently loses its whole conversation. Follow the
+  // transcript instead: find it by session id and adopt the cwd recorded
+  // inside it, before any branch spawns (both claude branches and their
+  // transcriptExists checks read this workdir).
+  if (agent === AGENT_CLAUDE && resumeSessionId
+      && !fs.existsSync(transcriptPathFor(workdir, resumeSessionId))) {
+    const found = findTranscriptBySessionId(resumeSessionId);
+    if (found?.workdir && found.workdir !== workdir && fs.existsSync(found.workdir)) {
+      console.warn(`[transcript-relocate] ${roomId}: session ${resumeSessionId.slice(0, 8)}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
+      const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
+        `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
+      Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
+      workdir = found.workdir;
+    }
+  }
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
     journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
