@@ -5,6 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { formatBox } from './lib/agent-boxes-format.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -170,6 +171,12 @@ function describeRoomOutcome(body) {
   return `Room ${body.room_id}: ${body.status || body.error || 'unknown'}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
 }
 
+// formatBox (agent_boxes rendering) lives in lib/agent-boxes-format.js —
+// pulled out so it's independently unit-testable and so its peer-text
+// sanitization (name/paths/labels are another bridge's own strings, not
+// bridge-composed) shares the one peerField implementation everything else
+// in this codebase uses.
+
 // Same sender rendering as live room delivery (index.js journalOnRoomFrame):
 // `box2 (agent)` / `dan`, never raw `agent:box2`. Shared by agent_chat_read
 // and agent_chat_accept's joined-room backfill.
@@ -239,6 +246,57 @@ server.tool(
         return { content: [{ type: 'text', text: `agent_chat_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       return { content: [{ type: 'text', text: describeRoomOutcome(data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_boxes',
+  "List the user's other agent boxes (machines) as spawn targets, with recent folders, current activity, and account usage limits. Use this when the user asks to run work on another machine or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
+  {},
+  async () => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-boxes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_boxes failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      const boxes = data.boxes || [];
+      if (!boxes.length) return { content: [{ type: 'text', text: 'No other boxes found.' }] };
+      return { content: [{ type: 'text', text: boxes.map(formatBox).join('\n\n') }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_session_start',
+  "Ask the user's consent to start a new agent session on another of their boxes, seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
+  {
+    device_id: z.number().int().describe('Target box device id, from agent_boxes'),
+    workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
+    task: z.string().max(2000).describe('The task prompt. Shown VERBATIM on the user\'s consent card and executed verbatim as the new session\'s first turn — write it for both audiences.'),
+    topic: z.string().max(200).optional().describe('Optional short room/session title'),
+  },
+  async ({ device_id, workdir, task, topic }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_session_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval. Continue your own work; the outcome will arrive as a later turn.` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
