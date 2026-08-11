@@ -1751,6 +1751,10 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     const end = src.indexOf('});', start);
     const args = src.slice(start, end);
     expect(args).toMatch(/onInviteFrame: \(frame\) => agentInvites\?\.onInviteFrame\(frame\)/);
-    expect(args).toMatch(/onOpError: \(err\) => agentInvites\?\.onOpError\(err\)/);
+    // Agent-spawn frames are thunked the same way, into the (later-built)
+    // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
+    // return means it consumed the ref) before falling through to invites.
+    expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
+    expect(args).toMatch(/onOpError: \(e\) => \{ if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
   });
 });
