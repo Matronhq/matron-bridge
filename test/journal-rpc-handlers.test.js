@@ -149,6 +149,20 @@ describe('recent_folders', () => {
     expect('limits' in result).toBe(false);
     expect(result.folders.map((f) => f.path)).toEqual(['/w/a', '/home/dan']);
   });
+
+  it('attaches the account block when an email is known', () => {
+    const { handler, responses } = harness({ getAccountEmail: () => 'pat@yearbook.com' });
+    handler(REQ('recent_folders', {}));
+    expect(responses[0].result.account).toEqual({ email: 'pat@yearbook.com' });
+  });
+
+  it('omits the account key entirely when the email is null, empty, or the dep throws', () => {
+    for (const getAccountEmail of [() => null, () => '', () => { throw new Error('boom'); }]) {
+      const { handler, responses } = harness({ getAccountEmail });
+      handler(REQ('recent_folders', {}));
+      expect('account' in responses[0].result).toBe(false);
+    }
+  });
 });
 
 describe('start', () => {
