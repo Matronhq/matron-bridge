@@ -271,6 +271,18 @@ describe('start', () => {
       expect(calls).toHaveLength(0);
     });
 
+    it('room_id carrying structural characters (newline, quote, backslash, control) -> bad_request, no startSession call', () => {
+      for (const roomId of ['room\n42', 'room"42', 'room\\42', 'room42']) {
+        const calls = [];
+        const { handler, responses } = spawnHarness({
+          startSession: (args) => { calls.push(args); return { journalConvoId: 'x' }; },
+        });
+        handler(REQ('start', { room_id: roomId, prompt: 'do the thing' }));
+        expect(responses[0].error).toEqual({ code: 'bad_request', detail: 'bad room_id' });
+        expect(calls).toHaveLength(0);
+      }
+    });
+
     it('prompt over the 2000-char wire cap -> bad_request, no startSession call', () => {
       const calls = [];
       const { handler, responses } = spawnHarness({

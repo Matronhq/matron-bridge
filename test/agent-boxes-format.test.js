@@ -80,6 +80,12 @@ describe('formatBox', () => {
     expect(text).toBe('unknown (device ?) — (unavailable)');
     expect(() => { text = formatBox(undefined); }).not.toThrow();
     expect(text).toBe('unknown (device ?) — (unavailable)');
+    // Primitives and arrays don't throw on property access — the shape gate,
+    // not the try/catch, must catch these (else they'd render a plausible
+    // 'unknown (device undefined) — offline' header for garbage).
+    expect(formatBox(42)).toBe('unknown (device ?) — (unavailable)');
+    expect(formatBox('not-a-box')).toBe('unknown (device ?) — (unavailable)');
+    expect(formatBox([])).toBe('unknown (device ?) — (unavailable)');
   });
 
   it('degrades a box whose limits.as_of is out of Date range to a single unavailable line, without throwing', () => {
