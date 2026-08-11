@@ -155,6 +155,29 @@ On tap:
 Delivery safety is already handled: `sendToSession` holds input in
 `_resumeOutbox` until the resumed TUI is ready, and print mode's stdin buffers.
 
+**Router carve-out (added during planning).** The above does not work unaided.
+`lib/journal-input-router.js:456` deliberately refuses to auto-resume on a
+`prompt_reply` — *"its pending prompt died with the process, so there's nothing
+valid to answer"* — and a carry-on card is published into a convo whose session
+is dead by construction, so a tap would dead-end at the unknown-convo notice.
+
+The rule is correct for ordinary prompts and stays in force. The implementation
+adds one narrow exception: auto-resume on a `prompt_reply` when `target_seq`
+names a picker frame whose chosen value is a `resume:` value that frame itself
+offered. Provenance is what makes it safe — value shape alone is never trusted,
+so an AskUserQuestion option labelled `resume:whatever` cannot wake a session.
+
+Two supporting changes fall out of this: `PICKER_OPTION_ID`
+(`journal-input-router.js:52`) gains a `resume-` prefix, without which the frame
+is not classified as a picker at all, and `PICKER_VALUE`
+(`picker-dispatch.js:38`) gains the `resume` namespace. Frame registration
+itself needs no new code — `pickerFrames.set` is driven by observing outbound
+frames.
+
+Also stricter than described below: the router consumes a picker frame before
+dispatch (`pickerFrames.delete`, `journal-input-router.js:596`), so a second tap
+on the same card is refused as stale rather than re-injecting `carry on`.
+
 **Injected text: accepted trade-off.** The injected message is the literal string
 `carry on`, chosen deliberately by the user over a longer interruption-aware
 prompt.
@@ -177,7 +200,7 @@ oversight. Revisiting it is a wording change in one place.
 | Corrupt `inflight.json` | Treated as `{}`, matching `loadPersistedSessions`' existing stance |
 | Marker for a convo with no persisted session record | Dropped |
 | `journalResumeConvo` returns null (workdir gone, unresumable) | Existing "can't be found or resumed" notice |
-| Double tap | Benign — session is alive, receives `carry on` again |
+| Double tap | Refused as stale — the router consumes the picker frame before dispatch |
 | Marker write fails | Logged, not propagated; a lost marker means a missed card, never a broken turn |
 
 ### 5. Testing
