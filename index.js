@@ -88,7 +88,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
-import { handlePickerValue } from './lib/picker-dispatch.js';
+import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
@@ -1690,7 +1690,32 @@ function handleCodexEvent(session, event) {
         if (nativeIdChanged) {
           console.log(`Updated Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
         }
-        if (journalIdMissing) journalFlushForSession(session);
+        if (journalIdMissing) {
+          // Restart carry-on, first-turn repair. A FRESH Codex conversation has
+          // NO convo id until this very line: createCodexSessionForRoom leaves
+          // both claudeSessionId and journalConvoId null when there is nothing
+          // to resume (index.js:1582-1583), so sendToSession's noteTurnStart —
+          // the `session.busy = true` seam — ran with null and returned early.
+          // The first turn is often the longest one, and it would silently get
+          // no card. touch() cannot repair this: it no-ops when no record
+          // exists. The conversation IS genuinely resumable by then, because
+          // persistSession fired just above.
+          //
+          // Gated on journalIdMissing, NOT on the enclosing block: a later
+          // thread-id change (nativeIdChanged alone) leaves journalConvoId
+          // untouched, so that turn is already marked under this same id and
+          // re-marking would reset startedAt/touchedAt on an in-flight turn.
+          // This branch can therefore fire at most once per conversation.
+          //
+          // journalConvoIdFor(session) is now session.journalConvoId ===
+          // event.thread_id — the identical id persistSession just wrote as
+          // both sessionId and journalConvoId, that publishRestartCarryOnCards
+          // keys the card on, and that journalResumeConvo matches. Claude
+          // print/iv are unaffected: they mint the id at construction
+          // (index.js:1337, 2024), so journalIdMissing is never true for them.
+          if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
+          journalFlushForSession(session);
+        }
       }
       break;
     }
@@ -7692,8 +7717,24 @@ const journalInputConsumer = createJournalInputConsumer({
     // published INTO the shared room convo, spamming the peer's chat with
     // "no longer active". A known-but-inactive room just stops routing.
     if (agentRooms.get(convoId)) return;
+    // The prompt_reply wording differs deliberately. A `text`/media frame only
+    // reaches this notice AFTER the router already tried resumeSessionForConvo
+    // and it returned null (lib/journal-input-router.js:470-499) — so for those,
+    // "send a message" would be a lie. A prompt_reply does NOT get that attempt
+    // in general (its pending prompt died with the process), so the convo may
+    // well still be resumable by plain text.
+    //
+    // This is the honest-failure half of the restart carry-on dead-button case:
+    // pickerFrames is in-memory (lib/journal-input-router.js:261) and takeStale
+    // already consumed the marker, so if the bridge restarts AGAIN before the
+    // user taps a published "Carry on" card, the tap lands here. Verified that
+    // it does not self-heal: journal-publisher.js:583-591 drops any frame with
+    // seq <= lastSeq before onEvent, and lastSeq is persisted across restarts
+    // (journal-publisher.js:332, :496-497), so the card is never re-delivered
+    // and never re-registers. Telling the user the very thing that WOULD work
+    // is the cheap fix; rehydrating pickerFrames from the journal is not.
     journalPublishNotice(convoId, type === 'prompt_reply'
-      ? "This session is no longer active on this bridge — your answer wasn't delivered."
+      ? "This session is no longer active on this bridge — your answer wasn't delivered. Send a message in this chat and I'll pick the conversation back up."
       : "This session is no longer active on this bridge — your message wasn't delivered.");
   },
   noticeStalePromptReply: (convoId) => {
@@ -9115,6 +9156,13 @@ function publishRestartCarryOnCards() {
   if (!JOURNAL_ENABLED) return;
   let stale;
   try {
+    // takeStale clears and PERSISTS before this returns, i.e. before a single
+    // card below has been published. A crash — or a dropped publisher frame —
+    // between here and the loop loses those interruptions permanently: the
+    // marker is gone and the user never saw a card. Accepted, and inherent to
+    // the fire-once guarantee (see lib/inflight-marker.js takeStale). Do not
+    // "fix" it by deferring the clear until after publishing; that reintroduces
+    // duplicate cards, which is the louder failure.
     stale = inflightMarker.takeStale(RESTART_CARRY_ON_MAX_AGE_MS);
   } catch (e) {
     console.warn(`[inflight] boot reconciliation failed: ${e.message}`);
@@ -9129,7 +9177,21 @@ function publishRestartCarryOnCards() {
     // No persisted session record means there is nothing for a tap to resume,
     // so a card would be a dead button. Drop it.
     if (!resumable.has(rec.convoId)) {
-      console.log(`[inflight] skipping carry-on card for convo=${rec.convoId} — no persisted session`);
+      // Wrapped like every other log in this loop: a throw here would abort
+      // every REMAINING card, so one bad record would cost other conversations
+      // their card. Codebase convention — "logging must never throw".
+      try { console.log(`[inflight] skipping carry-on card for convo=${rec.convoId} — no persisted session`); } catch { /* logging must never throw */ }
+      continue;
+    }
+    // A convo id outside picker-dispatch's `resume:` shape produces the worst
+    // failure available: the tap consumes the single-use picker frame, then
+    // handlePickerValue returns false and its caller no-ops SILENTLY — no
+    // resume, no error, nothing. Unreachable today (every convo id is a
+    // randomUUID or a codex thread id), so this is belt-and-braces; the point
+    // is that if it ever becomes reachable it fails loudly in the log instead
+    // of silently in the user's chat.
+    if (!isResumeConvoId(rec.convoId)) {
+      try { console.warn(`[inflight] skipping carry-on card for convo=${rec.convoId} — id does not match the resume: picker value shape, so a tap would silently no-op`); } catch { /* logging must never throw */ }
       continue;
     }
     const question = `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
@@ -9137,7 +9199,7 @@ function publishRestartCarryOnCards() {
       question,
       options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
     });
-    console.log(`[inflight] published carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s)`);
+    try { console.log(`[inflight] published carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s)`); } catch { /* logging must never throw */ }
   }
 }
 

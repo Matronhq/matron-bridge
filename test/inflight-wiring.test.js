@@ -129,7 +129,57 @@ describe('restart carry-on turn-boundary wiring', () => {
     expect(
       notes,
       'every `session.busy = true;` site must be followed by inflightMarker.noteTurnStart(...), '
-      + 'otherwise a turn interrupted by a restart leaves no marker and the user gets no card.',
-    ).toBe(starts);
+      + 'otherwise a turn interrupted by a restart leaves no marker and the user gets no card. '
+      + 'The count is starts + 1, and the +1 is EXACTLY ONE deliberate exception: the first-turn '
+      + "repair in handleCodexEvent's thread.started (pinned by the next test). It exists because a "
+      + 'fresh Codex conversation has no convo id at the `session.busy = true` seam at all, so that '
+      + 'site\'s call is a no-op and the marker has to be written later, once the id exists. If you '
+      + 'are changing this number, you are either adding a turn-start site (pair it, and bump '
+      + '`starts`) or adding a second such repair (justify it here first).',
+    ).toBe(starts + 1);
+  });
+
+  it('repairs the first-turn marker for a fresh Codex convo, once, gated on the missing id', () => {
+    // The +1 above. A fresh Codex session is created with claudeSessionId AND
+    // journalConvoId both null (createCodexSessionForRoom), so sendToSession's
+    // noteTurnStart runs with null and returns early — and touch() cannot fix
+    // it later, because touch() no-ops when no record exists. The id is first
+    // known at thread.started, which is also where persistSession makes the
+    // convo genuinely resumable. Without this repair the FIRST Codex turn —
+    // frequently the longest — silently gets no carry-on card.
+    const body = bodyOf('function handleCodexEvent(', '\nfunction ');
+
+    expect(
+      body,
+      'handleCodexEvent must record the turn start once the Codex thread id arrives, and must gate '
+      + 'it on session.busy so a thread.started outside a turn cannot invent a marker. '
+      + 'CONSEQUENCE OF REMOVING: no carry-on card for the first turn of every new Codex chat.',
+    ).toContain('if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);');
+
+    expect(
+      body.split('inflightMarker.noteTurnStart(').length - 1,
+      'handleCodexEvent must contain EXACTLY ONE noteTurnStart — the first-turn repair. A second '
+      + 'one would re-mark a conversation whose turn is already marked.',
+    ).toBe(1);
+
+    const missingGate = body.indexOf('if (journalIdMissing) {');
+    const repair = body.indexOf('if (session.busy) inflightMarker.noteTurnStart(');
+
+    expect(
+      missingGate,
+      'expected the thread.started handler to still branch on `if (journalIdMissing) {` — this test '
+      + 'needs updating',
+    ).toBeGreaterThan(-1);
+
+    expect(
+      missingGate < repair,
+      'the repair must sit inside the `journalIdMissing` branch, NOT the enclosing '
+      + '`nativeIdChanged || journalIdMissing` block. journalConvoId is assigned once and never '
+      + 'reassigned, so journalIdMissing is true at most once per conversation; nativeIdChanged can '
+      + 'fire again later on a thread-id change, while journalConvoId — and therefore the marker '
+      + 'key — stays put. CONSEQUENCE OF WIDENING THE GATE: a mid-flight turn already marked under '
+      + "that id gets noteTurnStart called on it again, resetting startedAt/touchedAt and wrongly "
+      + 'refreshing the age window that decides whether the interruption is recent enough to card.',
+    ).toBe(true);
   });
 });
