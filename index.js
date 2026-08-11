@@ -167,7 +167,6 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 // NOT reusing SESSION_IDLE_TIMEOUT_MS: that answers a different question (how
 // long to hold memory for an idle session), and 1h would mean restarting the
 // bridge before a long meeting silently loses the card.
-// eslint-disable-next-line no-unused-vars -- read by the boot reconciliation pass (inflightMarker.takeStale) landing in the next commit; declared here with the rest of the carry-on config.
 const RESTART_CARRY_ON_MAX_AGE_MS = parseInt(process.env.MATRON_RESTART_CARRY_ON_MAX_AGE_MS || '21600000', 10);
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
@@ -6602,6 +6601,35 @@ function journalPublishNotice(convoId, body) {
   }
 }
 
+// Publish a picker card into a convo that has NO live session — the restart
+// carry-on case, where the session is dead by construction. journalPublish /
+// sendButtonMessage both key off a live session object, so this goes straight
+// to the publisher; the upsert first is the protocol requirement described at
+// journalPublish (the server hard-rejects publishes to convos it doesn't know).
+// The frame registers itself as a picker on the way back in via the router's
+// onJournalEvent observer, so nothing here has to touch pickerFrames.
+function journalPublishCardForConvo(convoId, { question, options, mode = 'pick_one' }) {
+  if (!JOURNAL_ENABLED || !convoId) return;
+  try {
+    journalPublisher.upsertConvo(convoId, {});
+    journalPublisher.publishPrompt(convoId, { question, options, mode });
+  } catch (e) {
+    try { console.warn(`[inflight] card publish failed for convo=${convoId}: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
+// "about 4 minutes ago" — deliberately coarse. The card is telling the user
+// roughly how stale the interrupted work is so they can judge whether carrying
+// on still makes sense, not timing it.
+function formatInterruptedAgo(ageMs) {
+  const mins = Math.round(ageMs / 60_000);
+  if (mins < 1) return 'less than a minute ago';
+  if (mins === 1) return 'about a minute ago';
+  if (mins < 60) return `about ${mins} minutes ago`;
+  const hours = Math.round(ageMs / 3_600_000);
+  return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
+}
+
 // Echo something into a session's Matrix room WITHOUT re-mirroring it into
 // the journal (sendToRoom's default behavior publishes a from:'assistant'
 // text event for everything it sends — see its own comment — which for an
@@ -7112,7 +7140,20 @@ function journalOnPromptReply(session, answer, { username }) {
     // (PR #171), cancelling only needs the convo-scoped store, and the timer
     // may well outlive the session process it was set from.
     const isTimerTap = typeof answer.choice === 'string' && answer.choice.startsWith('timer:');
-    if (!session.alive && !isTimerTap) {
+    // Restart carry-on taps skip the alive gate for the same reason timer taps
+    // do, only more so: the card is published at boot into a convo whose
+    // session is dead BY CONSTRUCTION, and reviving it is the entire point of
+    // the button. The router normally auto-resumes before dispatch so `session`
+    // is already live here, but it only does that when no session object was
+    // found at all — a dead-but-present one (mid-teardown, or a Codex logical
+    // session between turns) would otherwise be refused here with a message
+    // about model/effort/mode switching and burn the single-use card.
+    // carryOnConvo does its own lookup/resume for exactly that case. Matching
+    // on value shape is safe inside this branch: `answer.picker` already proves
+    // the router verified the choice against the offered values of a picker
+    // frame this bridge published.
+    const isCarryOnTap = typeof answer.choice === 'string' && answer.choice.startsWith('resume:');
+    if (!session.alive && !isTimerTap && !isCarryOnTap) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
     }
@@ -7123,6 +7164,7 @@ function journalOnPromptReply(session, answer, { username }) {
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
       sendTimerNow: sendTimerNowFromButton,
+      carryOnConvo,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
     });
@@ -7228,6 +7270,34 @@ function journalResumeConvo(convoId) {
     return resumePersistedSession(roomId, prev, { skipJournalMirror: true });
   }
   return null;
+}
+
+// A "Carry on" tap. The router has already auto-resumed the session for a
+// verified resume tap (lib/journal-input-router.js), so `session` is live by
+// the time this runs; the lookup is a fallback for the ordering-independent
+// case. The injected text is the literal string `carry on` — a deliberate
+// choice recorded in the design spec, along with its trade-off: a turn killed
+// mid-tool-call can leave the agent unable to tell whether a side-effecting
+// action completed, so a re-run is possible.
+//
+// Never rejects: handlePickerValue dispatches every seam fire-and-forget (it
+// is a sync function and does not await this one), so an escaping rejection
+// would surface as an unhandled rejection rather than as a message to the
+// user. Same stance as journalRouteTextToSession's other non-awaiting caller,
+// the router's routeTextToSession adapter.
+async function carryOnConvo(convoId, session, sendReply) {
+  try {
+    let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
+    if (!target || !target.alive) target = journalResumeConvo(convoId);
+    if (!target) {
+      if (sendReply) await sendReply('That conversation can no longer be found or resumed.');
+      return;
+    }
+    await journalRouteTextToSession(target, 'carry on');
+  } catch (e) {
+    console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
+    journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
+  }
 }
 
 // --- /timer scheduled messages ---
@@ -9035,6 +9105,42 @@ function startIdleReaper() {
 
 // --- Startup ---
 
+// Boot reconciliation for restart carry-on. Every marker still on disk from a
+// previous bridge process is, by construction, a turn that never reached a
+// turn-end seam — the restart killed it (index.js SIGTERM handler kills every
+// live session). Markers inside the window get a card; the rest are dropped
+// silently. takeStale clears ALL previous-boot markers either way, so a given
+// interruption is offered exactly once and can never resurface on a later boot.
+function publishRestartCarryOnCards() {
+  if (!JOURNAL_ENABLED) return;
+  let stale;
+  try {
+    stale = inflightMarker.takeStale(RESTART_CARRY_ON_MAX_AGE_MS);
+  } catch (e) {
+    console.warn(`[inflight] boot reconciliation failed: ${e.message}`);
+    return;
+  }
+  if (!stale.length) return;
+  const persisted = loadPersistedSessions();
+  const resumable = new Set(Object.values(persisted)
+    .flatMap(rec => [rec?.journalConvoId, rec?.sessionId])
+    .filter(Boolean));
+  for (const rec of stale) {
+    // No persisted session record means there is nothing for a tap to resume,
+    // so a card would be a dead button. Drop it.
+    if (!resumable.has(rec.convoId)) {
+      console.log(`[inflight] skipping carry-on card for convo=${rec.convoId} — no persisted session`);
+      continue;
+    }
+    const question = `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
+    journalPublishCardForConvo(rec.convoId, {
+      question,
+      options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
+    });
+    console.log(`[inflight] published carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s)`);
+  }
+}
+
 async function main() {
   // Ensure secrets directory exists with restricted permissions
   try {
@@ -9067,6 +9173,13 @@ async function main() {
   // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
   // journal frames, so there's nothing to sample for when journal mode is off.
   if (JOURNAL_ENABLED) startCpuSampler();
+  // Last: turn any marker left behind by the previous process into a "Carry on"
+  // card. After timerStore.init() so a re-armed timer's own resume can't race
+  // the reconciliation for the same convo, and safe with respect to the journal
+  // socket — the publisher is constructed (and connect()ed) at module load and
+  // queues frames FIFO until hello_ok, exactly as the eager control-convo
+  // upsert above relies on, so nothing is dropped by publishing here.
+  publishRestartCarryOnCards();
 }
 
 main().catch(err => {
