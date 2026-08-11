@@ -6,6 +6,8 @@ import {
   codexRunsDirFor,
   configureCodexSinkEnv,
   launchWithCodexSinkEnv,
+  pruneStaleCodexSinks,
+  SHIPPED_SHIM_DIR,
 } from '../lib/codex-paths.js';
 
 describe('codexRunsDirFor', () => {
@@ -43,19 +45,54 @@ describe('codexRunsDirFor', () => {
 });
 
 describe('configureCodexSinkEnv', () => {
-  it('injects an existing session-scoped sibling directory', () => {
-    const spawnEnv = {};
+  it('injects an existing session-scoped sibling directory (0700) and deploys the shim on PATH', () => {
+    const spawnEnv = { PATH: '/usr/bin:/bin' };
     const mkdirSync = vi.fn();
+    const chmodSync = vi.fn();
     const dir = configureCodexSinkEnv({
       spawnEnv,
       workdir: '/home/user/.config/agent-workspace',
       sessionId: 'abc-123',
       env: { MATRON_CODEX_VIZ: '1' },
       mkdirSync,
+      chmodSync,
     });
 
-    expect(mkdirSync).toHaveBeenCalledWith(dir, { recursive: true });
+    // The sink holds unredacted JSONL: created 0700 and pinned via chmod.
+    expect(mkdirSync).toHaveBeenCalledWith(dir, { recursive: true, mode: 0o700 });
+    expect(chmodSync).toHaveBeenCalledWith(dir, 0o700);
     expect(spawnEnv.MATRON_CODEX_SINK_DIR).toBe(dir);
+    // Deployment half of the activation guard: the shim dir is prepended so the
+    // spawned session's bare `codex` resolves to the producer.
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).toBe(SHIPPED_SHIM_DIR);
+    expect(spawnEnv.PATH).toContain('/usr/bin:/bin');
+  });
+
+  it('does not double-prepend the shim dir when it is already first on PATH', () => {
+    const first = `${SHIPPED_SHIM_DIR}${path.delimiter}/usr/bin`;
+    const spawnEnv = { PATH: first };
+    configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '1' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.PATH).toBe(first);
+  });
+
+  it('does not touch PATH when visualization is disabled', () => {
+    const spawnEnv = { PATH: '/usr/bin', MATRON_CODEX_SINK_DIR: '/inherited' };
+    configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '0' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.PATH).toBe('/usr/bin');
   });
 
   it('deletes an inherited sink when visualization is disabled', () => {
@@ -74,6 +111,40 @@ describe('configureCodexSinkEnv', () => {
     expect(mkdirSync).not.toHaveBeenCalled();
   });
 
+});
+
+describe('pruneStaleCodexSinks', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  function fakeFs(dirs) {
+    const removed = [];
+    return {
+      removed,
+      impl: {
+        readdirSync: () => Object.keys(dirs).map(name => ({ name, isDirectory: () => true })),
+        statSync: dir => {
+          const name = path.basename(dir);
+          return { mtimeMs: dirs[name] };
+        },
+        rmSync: dir => { removed.push(path.basename(dir)); },
+      },
+    };
+  }
+
+  it('removes only session dirs older than the retention window', () => {
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'fresh-sid': 99 * DAY, // 1 day old — keep
+      'stale-sid': 80 * DAY, // 20 days old — prune
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: 7 * DAY, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(1);
+    expect(removed).toEqual(['stale-sid']);
+  });
+
+  it('returns 0 and never throws when the sink root does not exist', () => {
+    const impl = { readdirSync: () => { throw new Error('ENOENT'); } };
+    expect(pruneStaleCodexSinks({ now: () => 0, root: '/nope', fsImpl: impl })).toBe(0);
+  });
 });
 
 describe('Claude spawn-path sink wiring', () => {

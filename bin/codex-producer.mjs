@@ -208,11 +208,37 @@ function resolveMaxRunMs(env) {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_RUN_MS;
 }
 
+// Non-producer path (non-`exec` subcommand, or no sink configured). It must own
+// the child's process group and forward catchable signals exactly like
+// runProducer: with the shim on PATH, the bridge's own Codex backend runs
+// through here, and an interrupt mid-turn (`session.codex.interrupt('SIGINT')`)
+// otherwise kills the shim only — the real `codex` keeps the inherited stdio and
+// the turn wedges until the orphan exits. Resolve on 'close' (all stdio ended),
+// not 'exit'.
 function passthrough(realbin, args, { spawnFn, env }) {
   return new Promise(resolve => {
-    const child = spawnFn(realbin, args, { stdio: 'inherit', env });
-    child.on('error', () => resolve(127));
-    child.on('exit', (code, signal) => resolve(signal ? 128 + osSignalNumber(signal) : (code ?? 0)));
+    const child = spawnFn(realbin, args, {
+      stdio: 'inherit',
+      detached: true, // lead its own process group so we can signal the subtree
+      env,
+    });
+
+    let signalled = null;
+    const onSignal = sig => {
+      signalled = sig;
+      try { process.kill(-child.pid, sig); }
+      catch { try { child.kill(sig); } catch { /* child already gone */ } }
+    };
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+    for (const sig of signals) process.on(sig, onSignal);
+    const cleanupSignals = () => { for (const sig of signals) process.removeListener(sig, onSignal); };
+
+    child.on('error', () => { cleanupSignals(); resolve(127); });
+    child.on('close', (code, signal) => {
+      cleanupSignals();
+      const term = signal || signalled;
+      resolve(term ? 128 + osSignalNumber(term) : (code ?? 0));
+    });
   });
 }
 
@@ -247,8 +273,13 @@ async function runProducer(realbin, argv, ctx) {
   const jsonlPath = path.join(sinkDir, `codex-${runId}.jsonl`);
   const jsonlFd = fs.openSync(jsonlPath, fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND, 0o600);
 
-  // exec <jsonFlag> <original exec args...> (argv[0] === 'exec')
-  const childArgs = ['exec', jsonFlag, ...argv.slice(1)];
+  // exec <jsonFlag> <original exec args...> (argv[0] === 'exec').
+  // Insert the JSON flag only when the caller didn't already pass one: on
+  // argv shapes like `exec resume --json <id>` an unconditional prepend both
+  // duplicates the flag and misplaces it ahead of the `resume` subcommand.
+  const rest = argv.slice(1);
+  const hasJsonFlag = rest.some(a => a === jsonFlag || a === '--json' || a === '--experimental-json');
+  const childArgs = hasJsonFlag ? ['exec', ...rest] : ['exec', jsonFlag, ...rest];
   const child = spawnFn(realbin, childArgs, {
     stdio: ['inherit', 'pipe', 'inherit'],
     detached: true, // lead its own process group so we can signal the subtree
@@ -264,10 +295,14 @@ async function runProducer(realbin, argv, ctx) {
   };
 
   return new Promise(resolve => {
+    // An EPIPE on the child's stdout (caller closed the read end mid-turn) would
+    // otherwise surface as an uncaught 'error' and kill the shim before the
+    // terminal meta is written. Swallow it; 'close' still settles the run.
+    child.stdout.on('error', () => {});
     child.stdout.on('data', chunk => {
       // Verbatim tee: JSONL sink (append) + caller stdout, byte-identical.
       try { fs.writeSync(jsonlFd, chunk); } catch { /* sink loss must not break the run */ }
-      stdout.write(chunk);
+      try { stdout.write(chunk); } catch { /* caller stdout gone; sink already has it */ }
     });
 
     let signalled = null;

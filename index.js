@@ -51,7 +51,7 @@ import { SubagentWatcher } from './lib/subagent-watcher.js';
 import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
-import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
+import { launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
@@ -1297,6 +1297,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
+    // The spawned session's effective env (shim prepended to PATH when
+    // MATRON_CODEX_VIZ=1). The codex-viz activation guard must evaluate the
+    // session's PATH, not the bridge's, to see the producer we just deployed.
+    codexSpawnEnv: spawnEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
     _showFileInFlight: 0,
@@ -1976,6 +1980,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
+    codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
     _showFileInFlight: 0,
@@ -3013,6 +3018,9 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   setupCodexWatcherForSession(session, workdir, sessionId, {
     publisher: journalPublisher,
     liveSessions: sessions,
+    // Evaluate the activation guard against the session's env (shim on PATH),
+    // not the bridge's — the deployed producer lives on the session PATH.
+    watcherDependencies: { env: session.codexSpawnEnv || process.env },
   });
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
@@ -8959,6 +8967,13 @@ async function main() {
   // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
   // journal frames, so there's nothing to sample for when journal mode is off.
   if (JOURNAL_ENABLED) startCpuSampler();
+  // Retention: the relocated codex-viz sink tree lives outside Claude Code's
+  // pruned project dirs, so its unredacted JSONL would accumulate forever.
+  // Best-effort age-based sweep at boot (never throws).
+  if (process.env.MATRON_CODEX_VIZ === '1') {
+    const pruned = pruneStaleCodexSinks();
+    if (pruned > 0) console.log(`Pruned ${pruned} stale codex-viz sink dir(s)`);
+  }
 }
 
 main().catch(err => {

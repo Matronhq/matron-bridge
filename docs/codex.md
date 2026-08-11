@@ -29,6 +29,22 @@ The Codex live view is opt-in. Set `MATRON_CODEX_VIZ=1` in the bridge environmen
 to activate it. When it is unset (the default), the bridge provisions no sink
 directory and starts no watcher, so existing sessions behave exactly as before.
 
+The live view needs an event **producer** on the session's PATH. With
+`MATRON_CODEX_VIZ=1` the bridge deploys one automatically: it prepends its
+shipped `bin/shim` directory to each launched session's `PATH`, so the session's
+`codex` resolves to the redaction-aware producer shim (which forwards to the real
+`codex` found later on PATH). No manual PATH step is required. A son-of-anton–style
+integration that sets `MATRON_CODEX_REAL_BIN` to a redaction-aware wrapper is also
+recognized as a producer; the activation guard evaluates the session's environment
+(not the bridge's), and if neither a shim on PATH nor a resolvable
+`MATRON_CODEX_REAL_BIN` is present it logs one warning and leaves the live view
+disabled rather than rendering a silent empty view.
+
+Sink directories accumulate under `~/.claude/matron/codex-sinks/<sessionId>/`
+(outside Claude Code's own pruned project tree). The bridge sweeps stale session
+sink dirs at boot; override the retention window with
+`MATRON_CODEX_SINK_RETENTION_MS` (default 7 days).
+
 Before Codex events are durably published, the bridge redacts assignment values
 whose keys look secret (for example, `DATABASE_PASSWORD=...` or
 `"API_TOKEN": "..."`) and drops recognizable raw environment dumps as an
