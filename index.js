@@ -193,7 +193,7 @@ const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json
 const TIMERS_FILE = path.join(os.homedir(), '.matron-bridge-timers.json');
 // In-flight turn markers for restart carry-on — written at turn start, removed
 // at turn end, reconciled at the next boot (see lib/inflight-marker.js).
-const INFLIGHT_FILE = path.join(path.dirname(SESSIONS_FILE), 'inflight.json');
+const INFLIGHT_FILE = path.join(os.homedir(), '.matron-bridge-inflight.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -3524,6 +3524,17 @@ function handleClaudeEvent(session, event) {
         const noSession = event.errors.some(e => /no conversation found/i.test(e));
         if (noSession) {
           console.log(`Resume failed for room ${session.roomId}: session not found, clearing stale ID`);
+          // Clear the marker BEFORE nulling claudeSessionId: journalConvoIdFor
+          // falls back to claudeSessionId when journalConvoId is unset, so
+          // doing this after the null below would resolve a different (or no)
+          // convo id and strand the marker. Every resume path populates
+          // journalConvoId today, so the ordering is currently belt-and-braces
+          // — but it costs nothing to remove the dependency.
+          // A failed resume produces no further agent output for this turn, and
+          // the early break below skips the normal turn-end seam, so in print
+          // mode nothing else would ever clear this. Leaving it would card a
+          // conversation that is over, not interrupted.
+          inflightMarker.noteTurnEnd(journalConvoIdFor(session));
           session.claudeSessionId = null;
           session._resumeFailed = true;
           // Clear only this provider's stale native ID. A switched
@@ -3545,13 +3556,10 @@ function handleClaudeEvent(session, event) {
             session.sendCallback('Previous native session not found (expired or deleted). The next message will start this agent fresh; /switch can still return to the other agent.');
           }
           // Reset busy/typing so the session isn't stuck if claude exits 0
-          // without our normal result-handling path running.
+          // without our normal result-handling path running. (The inflight
+          // marker was already cleared above, before claudeSessionId was
+          // nulled.)
           session.busy = false;
-          // A failed resume produces no further agent output for this turn, and
-          // the early break below skips the normal turn-end seam — so in print
-          // mode nothing else would ever clear the marker. Leaving it would
-          // card a conversation that is over, not interrupted.
-          inflightMarker.noteTurnEnd(journalConvoIdFor(session));
           clearPendingInterrupt(session);
           // This early break skips the normal turn-end seam below, so in
           // print mode a /restart parked mid-turn must fire here —
@@ -5402,6 +5410,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         return;
       }
+      // A deliberate !stop is a turn END, not an interruption — there is
+      // nothing to carry on, so drop the marker. This is NOT done inside
+      // killSession: /restart and /switch reuse it and their turns genuinely
+      // WERE interrupted, so those must keep the marker and get a card.
+      // Note this class of turn-end never clears session.busy at all (the kill
+      // path has no busy = false for print/iv), so it is invisible to a
+      // `session.busy = false` grep.
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       killSession(session);
       sessions.delete(roomId);
       journalSessionState(session, 'done');
