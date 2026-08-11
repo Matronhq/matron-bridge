@@ -163,4 +163,34 @@ describe('findTranscriptBySessionId', () => {
     expect(findTranscriptBySessionId('../-home-dan-app/sid-1', { projectsRoot: root })).toBeNull();
     expect(findTranscriptBySessionId('', { projectsRoot: root })).toBeNull();
   });
+
+  it('finds a cwd recorded before a >256KB cwd-less tail (Bugbot: scan must not stop at one tail chunk)', () => {
+    // A giant final tool-result line with no cwd fills more than one scan
+    // chunk; the backward scan must keep walking into older chunks.
+    const huge = JSON.stringify({ type: 'user', message: { role: 'user', content: 'x'.repeat(600 * 1024) } }) + '\n';
+    const p = writeTranscript('-home-dan-app', 'sid-1', [entry('/home/dan/app'), huge]);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root }))
+      .toEqual({ transcriptPath: p, workdir: '/home/dan/app' });
+  });
+
+  it('parses a cwd-bearing line that spans a chunk boundary', () => {
+    // Pad the entry so the line holding the cwd straddles the 256KB chunk
+    // edge — the carry logic must reassemble it before parsing.
+    const padded = JSON.stringify({ type: 'user', cwd: '/home/dan/span', pad: 'y'.repeat(200 * 1024) }) + '\n';
+    const trailer = JSON.stringify({ type: 'user', message: { role: 'user', content: 'z'.repeat(180 * 1024) } }) + '\n';
+    const p = writeTranscript('-home-dan-app', 'sid-1', [padded, trailer]);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root }))
+      .toEqual({ transcriptPath: p, workdir: '/home/dan/span' });
+  });
+
+  it('still prefers the LATEST cwd when older chunks hold earlier ones', () => {
+    const filler = JSON.stringify({ type: 'summary', pad: 'f'.repeat(300 * 1024) }) + '\n';
+    const p = writeTranscript('-home-dan-app', 'sid-1', [
+      entry('/home/dan/old'),
+      filler,
+      entry('/home/dan/new'),
+    ]);
+    expect(findTranscriptBySessionId('sid-1', { projectsRoot: root }))
+      .toEqual({ transcriptPath: p, workdir: '/home/dan/new' });
+  });
 });

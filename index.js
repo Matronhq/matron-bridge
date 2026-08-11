@@ -1214,13 +1214,37 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // transcriptExists checks read this workdir).
   if (agent === AGENT_CLAUDE && resumeSessionId
       && !fs.existsSync(transcriptPathFor(workdir, resumeSessionId))) {
+    const shortId = resumeSessionId.slice(0, 8);
     const found = findTranscriptBySessionId(resumeSessionId);
-    if (found?.workdir && found.workdir !== workdir && fs.existsSync(found.workdir)) {
-      console.warn(`[transcript-relocate] ${roomId}: session ${resumeSessionId.slice(0, 8)}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
-      const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
-        `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
-      Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
-      workdir = found.workdir;
+    if (found?.workdir) {
+      // Claude can only find the transcript when spawned from a cwd that
+      // encodes to the project dir holding it. If the recorded workdir has
+      // been deleted since (a pruned worktree), recreate it: an empty
+      // directory and an intact conversation beats a fresh spawn with total
+      // amnesia — the user can !workdir somewhere real afterwards. (Bugbot,
+      // PR #216: without this, a found transcript was still demoted.)
+      let usable = fs.existsSync(found.workdir);
+      if (!usable) {
+        try {
+          fs.mkdirSync(found.workdir, { recursive: true });
+          usable = true;
+          console.warn(`[transcript-relocate] ${roomId}: recreated deleted workdir ${found.workdir} so session ${shortId}… can resume its transcript`);
+        } catch (error) {
+          console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but its workdir ${found.workdir} is gone and could not be recreated (${error.message}); the resume will start fresh on the same id`);
+        }
+      }
+      if (usable && found.workdir !== workdir) {
+        console.warn(`[transcript-relocate] ${roomId}: session ${shortId}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
+        const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
+          `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
+        Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
+        workdir = found.workdir;
+      }
+    } else if (found) {
+      // Transcript located but no entry records a cwd — with no directory to
+      // spawn from that encodes to its project dir, a --resume would exit 1
+      // and crash-loop, so the planSessionIdentity demotion below stands.
+      console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but it records no cwd; the resume will start fresh on the same id`);
     }
   }
   if (agent === AGENT_CODEX) {
