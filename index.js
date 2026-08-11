@@ -54,7 +54,7 @@ import {
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
-import { selectStrandedChildren } from './lib/subagent-reconcile.js';
+import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -3098,8 +3098,19 @@ function reconcileStrandedSubagents(reason = 'startup') {
   }
 
   const { stranded, malformed } = selectStrandedChildren(entries, liveParents);
+  // Join each stranded id back to its persisted entry so the repair frame can
+  // carry the child's parentConvoId. Reconcile runs precisely when the original
+  // `running` upsert may never have been delivered (SIGKILL before flush, socket
+  // down at mint, queue-overflow eviction) — so the journal row may not exist
+  // yet. `convo_upsert` on an unknown id INSERTs, and parent_convo_id is written
+  // ONLY in the INSERT branch (immutable thereafter): omitting it here would mint
+  // a permanent untitled ROOT orphan that loses the child push exemption and is
+  // un-relinkable. selectStrandedChildren already validated provenance, so every
+  // stranded id has a joinable entry with a parentConvoId. Safe in the normal
+  // (row-exists) case too: the journal's UPDATE path never rewrites parentage.
+  const repairFrames = strandedRepairFrames(entries, stranded);
   let published = 0;
-  for (const childConvoId of stranded) {
+  for (const { childConvoId, parentConvoId } of repairFrames) {
     try {
       // Publish `done` and drop the store record ONLY on confirmed delivery
       // a capacity-rejected best-effort send or a
@@ -3109,7 +3120,7 @@ function reconcileStrandedSubagents(reason = 'startup') {
       // server-side.
       journalPublisher.upsertConvoBestEffort(
         childConvoId,
-        { sessionState: 'done' },
+        { sessionState: 'done', parentConvoId },
         { onDelivered: () => subagentRunningStore.remove(childConvoId) },
       );
       published += 1;
