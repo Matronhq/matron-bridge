@@ -6633,13 +6633,26 @@ function journalPublishNotice(convoId, body) {
 // journalPublish (the server hard-rejects publishes to convos it doesn't know).
 // The frame registers itself as a picker on the way back in via the router's
 // onJournalEvent observer, so nothing here has to touch pickerFrames.
+//
+// Returns whether the prompt actually got enqueued for send — the caller
+// (publishRestartCarryOnCards) uses this to log honestly instead of assuming
+// success. Both upsertConvo and safePublish (which backs publishPrompt) only
+// report enqueue-time acceptance, not that the journal server received or
+// accepted the frame — that's the best signal available synchronously, and
+// is what "succeeded" means here. An exception (caught below) or a queue
+// eviction is reported as failure; the caller's marker is already cleared by
+// then (see takeStale above), so a false here means that card's interruption
+// is now permanently lost — accepted, documented fire-once behavior, not
+// something this function tries to fix.
 function journalPublishCardForConvo(convoId, { question, options, mode = 'pick_one' }) {
-  if (!JOURNAL_ENABLED || !convoId) return;
+  if (!JOURNAL_ENABLED || !convoId) return false;
   try {
-    journalPublisher.upsertConvo(convoId, {});
-    journalPublisher.publishPrompt(convoId, { question, options, mode });
+    const upserted = journalPublisher.upsertConvo(convoId, {});
+    const published = journalPublisher.publishPrompt(convoId, { question, options, mode });
+    return upserted !== false && published !== false;
   } catch (e) {
     try { console.warn(`[inflight] card publish failed for convo=${convoId}: ${e.message}`); } catch { /* logging must never throw */ }
+    return false;
   }
 }
 
@@ -7310,12 +7323,21 @@ function journalResumeConvo(convoId) {
 // would surface as an unhandled rejection rather than as a message to the
 // user. Same stance as journalRouteTextToSession's other non-awaiting caller,
 // the router's routeTextToSession adapter.
-async function carryOnConvo(convoId, session, sendReply) {
+async function carryOnConvo(convoId, session, _sendReply) {
   try {
     let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
     if (!target || !target.alive) target = journalResumeConvo(convoId);
     if (!target) {
-      if (sendReply) await sendReply('That conversation can no longer be found or resumed.');
+      // A carry-on tap always originates in a Matron journal chat (the card
+      // is only ever published there — see publishRestartCarryOnCards), so
+      // the failure has to land in that SAME journal convo, exactly like the
+      // catch block three lines below. `_sendReply` (journalSessionCommandCtx's
+      // sendReply, which routes to the session's MATRIX room) is the wrong
+      // surface here and is left unused rather than called — kept in the
+      // signature only because handlePickerValue (lib/picker-dispatch.js)
+      // positionally calls carryOnConvo(convoId, session, sendReply) and
+      // test/picker-dispatch.test.js pins that three-argument contract.
+      journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
       return;
     }
     await journalRouteTextToSession(target, 'carry on');
@@ -9195,11 +9217,19 @@ function publishRestartCarryOnCards() {
       continue;
     }
     const question = `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
-    journalPublishCardForConvo(rec.convoId, {
+    const published = journalPublishCardForConvo(rec.convoId, {
       question,
       options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
     });
-    try { console.log(`[inflight] published carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s)`); } catch { /* logging must never throw */ }
+    // The marker for this convo was already cleared by takeStale above, so a
+    // false here isn't just "log it wrong" — it means this interruption's
+    // card is gone for good; there is no marker left to retry from on a
+    // later boot (see the fire-once comment above this loop).
+    if (published) {
+      try { console.log(`[inflight] published carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s)`); } catch { /* logging must never throw */ }
+    } else {
+      try { console.warn(`[inflight] carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s) was NOT published — its marker is already cleared, so this interruption's card is lost`); } catch { /* logging must never throw */ }
+    }
   }
 }
 
