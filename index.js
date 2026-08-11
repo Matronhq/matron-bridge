@@ -17,7 +17,7 @@ import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/
 import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { projectDirFor, transcriptPathFor } from './lib/transcript-dir.js';
+import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
 import {
   buildMcpServers,
@@ -1203,6 +1203,50 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  // A Claude session that changes cwd mid-flight (EnterWorktree is the common
+  // case) has its transcript relocated to the NEW cwd's project dir, while the
+  // bridge's persisted workdir stays where the session was spawned. Resuming
+  // with that stale workdir misses the transcript, and planSessionIdentity
+  // demotes the resume to a fresh --session-id spawn on the same id — the room
+  // keeps its identity but silently loses its whole conversation. Follow the
+  // transcript instead: find it by session id and adopt the cwd recorded
+  // inside it, before any branch spawns (both claude branches and their
+  // transcriptExists checks read this workdir).
+  if (agent === AGENT_CLAUDE && resumeSessionId
+      && !fs.existsSync(transcriptPathFor(workdir, resumeSessionId))) {
+    const shortId = resumeSessionId.slice(0, 8);
+    const found = findTranscriptBySessionId(resumeSessionId);
+    if (found?.workdir) {
+      // Claude can only find the transcript when spawned from a cwd that
+      // encodes to the project dir holding it. If the recorded workdir has
+      // been deleted since (a pruned worktree), recreate it: an empty
+      // directory and an intact conversation beats a fresh spawn with total
+      // amnesia — the user can !workdir somewhere real afterwards. (Bugbot,
+      // PR #216: without this, a found transcript was still demoted.)
+      let usable = fs.existsSync(found.workdir);
+      if (!usable) {
+        try {
+          fs.mkdirSync(found.workdir, { recursive: true });
+          usable = true;
+          console.warn(`[transcript-relocate] ${roomId}: recreated deleted workdir ${found.workdir} so session ${shortId}… can resume its transcript`);
+        } catch (error) {
+          console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but its workdir ${found.workdir} is gone and could not be recreated (${error.message}); the resume will start fresh on the same id`);
+        }
+      }
+      if (usable && found.workdir !== workdir) {
+        console.warn(`[transcript-relocate] ${roomId}: session ${shortId}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
+        const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
+          `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
+        Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
+        workdir = found.workdir;
+      }
+    } else if (found) {
+      // Transcript located but no entry records a cwd — with no directory to
+      // spawn from that encodes to its project dir, a --resume would exit 1
+      // and crash-loop, so the planSessionIdentity demotion below stands.
+      console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but it records no cwd; the resume will start fresh on the same id`);
+    }
+  }
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
     journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
