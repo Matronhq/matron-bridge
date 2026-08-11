@@ -5,6 +5,7 @@ import {
   parsePermTap,
   permissionSpawnArgs,
   createPermissionRegistry,
+  resolvePermissionTimeoutMs,
   DENY_MESSAGE,
 } from '../lib/permission-prompt.js';
 
@@ -19,6 +20,11 @@ describe('permissionButtons', () => {
       { id: 'perm-always', label: 'Always allow Bash (session)', value: `perm:${UUID}:always` },
       { id: 'perm-deny', label: 'Deny', value: `perm:${UUID}:deny` },
     ]);
+  });
+
+  it('strips bidirectional control characters from the always-allow label', () => {
+    const { buttons } = permissionButtons(UUID, 'Bash‮hsab');
+    expect(buttons[1].label).toBe('Always allow Bashhsab (session)');
   });
 });
 
@@ -78,6 +84,17 @@ describe('renderPermissionCard', () => {
     expect(() => renderPermissionCard({ toolName: 'Weird' })).not.toThrow();
     const cyc = {}; cyc.self = cyc;
     expect(() => renderPermissionCard({ toolName: 'Weird', input: cyc })).not.toThrow();
+  });
+
+  it('strips bidirectional control characters from tool name and preview', () => {
+    const { plain, html } = renderPermissionCard({
+      toolName: 'Bash‮',
+      input: { command: 'echo ‮gnp.tseb‬ safe', description: 'desc⁦iso⁩' },
+    });
+    for (const out of [plain, html]) {
+      expect(out).not.toMatch(/[؜‎‏‪-‮⁦-⁩]/);
+    }
+    expect(plain).toContain('gnp.tseb safe');
   });
 });
 
@@ -178,5 +195,63 @@ describe('createPermissionRegistry', () => {
     reg.answer(id, 'allow');
     reg.read(id);
     expect(t.count()).toBe(0);
+  });
+
+  it('wrong-room answer is refused without consuming the entry', () => {
+    const { reg } = mkReg();
+    const { id } = reg.create({ roomId: 'room-1', toolName: 'Bash' });
+    expect(reg.answer(id, 'allow', 'room-2')).toBeNull();
+    // still unanswered — a poller must NOT see an allow
+    expect(reg.read(id)).toEqual({ answered: false });
+    // the right room can still answer
+    expect(reg.answer(id, 'deny', 'room-1')).not.toBeNull();
+    expect(reg.read(id).behavior).toBe('deny');
+  });
+
+  it('rejects verdicts outside the closed set without changing state', () => {
+    const { reg } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'Bash' });
+    expect(reg.answer(id, 'maybe', 'r')).toBeNull();
+    expect(reg.read(id)).toEqual({ answered: false });
+  });
+
+  it('answering re-arms a grace timer so a late poller can still read the verdict', () => {
+    const { reg, t } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'Bash' });
+    reg.answer(id, 'allow', 'r');
+    // old TTL timer replaced by exactly one grace timer
+    expect(t.count()).toBe(1);
+    // firing the grace timer reaps the answered-but-never-read entry
+    t.fire(t.handles()[0]);
+    expect(reg.read(id)).toBeNull();
+    expect(reg.size()).toBe(0);
+  });
+
+  it('cancel removes a pending entry and its timer', () => {
+    const { reg, t } = mkReg();
+    const { id } = reg.create({ roomId: 'r', toolName: 'Bash' });
+    expect(reg.cancel(id)).toBe(true);
+    expect(t.count()).toBe(0);
+    expect(reg.read(id)).toBeNull();
+    expect(reg.answer(id, 'allow', 'r')).toBeNull();
+    expect(reg.cancel(id)).toBe(false);
+  });
+});
+
+describe('resolvePermissionTimeoutMs', () => {
+  it('defaults to 5 minutes when unset', () => {
+    expect(resolvePermissionTimeoutMs(undefined)).toBe(300000);
+    expect(resolvePermissionTimeoutMs('')).toBe(300000);
+  });
+
+  it('accepts a finite positive override within the 1-hour cap', () => {
+    expect(resolvePermissionTimeoutMs('120000')).toBe(120000);
+    expect(resolvePermissionTimeoutMs('3600000')).toBe(3600000);
+  });
+
+  it('falls back to the default for NaN, non-positive, infinite, or over-cap values', () => {
+    for (const raw of ['abc', '0', '-5', 'Infinity', 'NaN', '3600001']) {
+      expect(resolvePermissionTimeoutMs(raw)).toBe(300000);
+    }
   });
 });

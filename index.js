@@ -89,7 +89,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
@@ -1459,6 +1459,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
             agent: session.agent,
             model: session.currentModel || undefined,
             mcpExtras: session.mcpExtras,
+            // Same not-yet-persisted rationale as mcpExtras above: carry the
+            // live --bypass/--auto choice explicitly so a crash restart can't
+            // silently flip the permission mode. (Absent on codex/iv sessions,
+            // which never set bypassMode.)
+            ...(typeof session.bypassMode === 'boolean' ? { bypass: session.bypassMode } : {}),
             journalConvoId: session.journalConvoId,
             // Carry the prior title so the re-seed adopts the good Gemini title
             // instead of publishing the repo basename over it (title-revert bug).
@@ -2122,6 +2127,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           agent: session.agent,
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
+          // Carry the live --bypass/--auto choice for the same reason as
+          // mcpExtras: a session that dies before its first persist would
+          // otherwise silently flip back to the default permission mode.
+          ...(typeof session.bypassMode === 'boolean' ? { bypass: session.bypassMode } : {}),
           journalConvoId: session.journalConvoId,
           // Carry the prior title so the re-seed adopts the good Gemini title
           // instead of publishing the repo basename over it (title-revert bug).
@@ -7277,26 +7286,19 @@ function permissionNote(session) {
 // no-op, never a crash. "Always" allowlists the tool for the SESSION (in
 // memory only; not persisted — a restart re-prompts, by design).
 function answerPermissionFromButton(session, requestId, verdict, sendReply) {
-  const result = permissionRegistry.answer(requestId, verdict);
+  // Room affinity is enforced INSIDE answer(), before any state changes: a
+  // permission card is only ever rendered into the room that raised the
+  // request, so a tap arriving via another room's session (e.g. a copied
+  // button value) is refused outright — the entry stays pending and only the
+  // originating room can still answer it.
+  const result = permissionRegistry.answer(requestId, verdict, session.roomId);
   if (!result) {
     sendReply('That permission request has expired or was already answered.');
     return;
   }
-  // Defense-in-depth: a permission card is only ever rendered into the room
-  // that raised the request. Refuse to honor a tap whose session isn't that
-  // room (e.g. a stale card left behind in a room after /resume moved the
-  // session elsewhere). answer() above already consumed the entry, so this
-  // effectively voids the request rather than reversing it — the poller
-  // sees it answered and the caller sees no confirmed verdict, which fails
-  // closed (an unresolved permission_request denies on its own timeout).
-  if (result.roomId !== session.roomId) {
-    sendReply('That permission request has expired or was already answered.');
-    return;
-  }
   if (verdict === 'always') {
-    const target = sessions.get(result.roomId) || session;
-    if (!target.permAllowedTools) target.permAllowedTools = new Set();
-    target.permAllowedTools.add(result.toolName);
+    if (!session.permAllowedTools) session.permAllowedTools = new Set();
+    session.permAllowedTools.add(result.toolName);
     sendReply(`✅ Always allowing ${result.toolName} for this session.`);
   } else if (verdict === 'deny') {
     sendReply(`⛔ Denied: ${result.toolName}`);
@@ -7847,8 +7849,12 @@ const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, vi
 
 // Pending print-mode permission prompts (spec 2026-08-10-auto-permission-mode).
 // The ask-user permission_request tool POSTs + polls; taps answer via the
-// journal prompt_reply perm: path.
-const permissionRegistry = createPermissionRegistry();
+// journal prompt_reply perm: path. The TTL resolves from the same env var the
+// tool's poll deadline uses, so an unanswered card expires exactly when the
+// tool fail-closes to deny — a stale tap can't record a verdict afterwards.
+const permissionRegistry = createPermissionRegistry({
+  ttlMs: resolvePermissionTimeoutMs(process.env.PERMISSION_PROMPT_TIMEOUT_MS),
+});
 
 // Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
 // requests waiting for a user decision in interactive mode. The hook script
@@ -8129,7 +8135,18 @@ const apiServer = createServer(async (req, res) => {
         const { id: permRequestId } = permissionRegistry.create({ roomId, toolName });
         const card = renderPermissionCard({ toolName, input });
         const { buttons: permBtns, mode: permMode } = permissionButtons(permRequestId, toolName);
-        sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
+        try {
+          await sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
+        } catch (err) {
+          // Card never reached the user — withdraw the request and answer
+          // non-OK so the tool denies immediately instead of polling for five
+          // minutes on a card nobody can see.
+          permissionRegistry.cancel(permRequestId);
+          debug(`permission-request card delivery failed for ${roomId}: ${err.message}`);
+          res.writeHead(502);
+          res.end(JSON.stringify({ error: 'Could not deliver the permission card to the room' }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ requestId: permRequestId }));
         return;
@@ -8863,6 +8880,10 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const next = createSession(roomId, workdir, preInitPrint ? null : sessionId, {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
+    // Carry the live --bypass/--auto choice across the swap (same rationale
+    // as mcpExtras: it may not be persisted yet). An explicit override from
+    // the caller still wins via the ...overrides spread below.
+    ...(typeof existing.bypassMode === 'boolean' ? { bypass: existing.bypassMode } : {}),
     journalConvoId: existing.journalConvoId,
     // Carry the good title across the swap so the re-seed adopts it instead of
     // clobbering it with the repo basename (title-revert bug).
