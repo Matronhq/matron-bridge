@@ -9,6 +9,7 @@ describe('handlePickerValue', () => {
       applyModeSwitch: vi.fn(),
       cancelTimer: vi.fn(),
       sendTimerNow: vi.fn(),
+      carryOnConvo: vi.fn(),
       sendReply: vi.fn(),
       sendHtml: vi.fn(),
     };
@@ -95,5 +96,31 @@ describe('handlePickerValue', () => {
     expect(s.applyModeSwitch).not.toHaveBeenCalled();
     expect(s.applyModelSwitch).not.toHaveBeenCalled();
     expect(s.switchEffortInSession).not.toHaveBeenCalled();
+  });
+
+  describe('resume: values', () => {
+    it('dispatches resume:<convoId> to carryOnConvo(convoId, session, sendReply)', () => {
+      const s = seams();
+      const session = { id: 'sess' };
+      expect(handlePickerValue('resume:abc123def456', 'room-1', session, s)).toBe(true);
+      expect(s.carryOnConvo).toHaveBeenCalledWith('abc123def456', session, s.sendReply);
+      expect(s.applyModelSwitch).not.toHaveBeenCalled();
+      expect(s.cancelTimer).not.toHaveBeenCalled();
+    });
+
+    it('accepts uuid-shaped convo ids', () => {
+      const s = seams();
+      const id = '3f2504e0-4f89-11d3-9a0c-0305e82c3301';
+      expect(handlePickerValue(`resume:${id}`, 'room-1', {}, s)).toBe(true);
+      expect(s.carryOnConvo).toHaveBeenCalledWith(id, {}, s.sendReply);
+    });
+
+    it('rejects malformed convo ids without touching any seam', () => {
+      for (const bad of ['resume:', 'resume:short', 'resume:has space', 'resume:has/slash', `resume:${'x'.repeat(129)}`]) {
+        const s = seams();
+        expect(handlePickerValue(bad, 'room-1', {}, s)).toBe(false);
+        expect(s.carryOnConvo).not.toHaveBeenCalled();
+      }
+    });
   });
 });
