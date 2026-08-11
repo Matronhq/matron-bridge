@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
+import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply, isResumePickerTap, isPickerFrame } from '../lib/journal-input-router.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -1752,5 +1752,35 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     const args = src.slice(start, end);
     expect(args).toMatch(/onInviteFrame: \(frame\) => agentInvites\?\.onInviteFrame\(frame\)/);
     expect(args).toMatch(/onOpError: \(err\) => agentInvites\?\.onOpError\(err\)/);
+  });
+});
+
+describe('isResumePickerTap', () => {
+  it('accepts a resume choice the frame actually offered', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 'resume:abc123def456')).toBe(true);
+  });
+
+  it('rejects a resume choice the frame did not offer', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 'resume:other9999999')).toBe(false);
+  });
+
+  it('rejects non-resume picker values', () => {
+    expect(isResumePickerTap(new Set(['model:sonnet']), 'model:sonnet')).toBe(false);
+  });
+
+  it('rejects when there is no frame', () => {
+    expect(isResumePickerTap(null, 'resume:abc123def456')).toBe(false);
+    expect(isResumePickerTap(undefined, 'resume:abc123def456')).toBe(false);
+  });
+
+  it('rejects a non-string choice', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), null)).toBe(false);
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 7)).toBe(false);
+  });
+});
+
+describe('isPickerFrame with resume options', () => {
+  it('classifies a resume- option frame as a picker', () => {
+    expect(isPickerFrame({ options: [{ id: 'resume-abc123def456', value: 'resume:abc123def456' }] })).toBe(true);
   });
 });
