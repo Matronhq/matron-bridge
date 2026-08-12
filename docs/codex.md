@@ -42,8 +42,10 @@ disabled rather than rendering a silent empty view.
 
 Sink directories accumulate under `~/.claude/matron/codex-sinks/<sessionId>/`
 (outside Claude Code's own pruned project tree). The bridge sweeps stale session
-sink dirs at boot; override the retention window with
-`MATRON_CODEX_SINK_RETENTION_MS` (default 7 days).
+sink dirs at boot — staleness is measured from a session's newest run activity
+(its `codex-runs/` writes), not from when the session dir was created, so a
+long-lived but still-active session is not pruned. Override the retention window
+with `MATRON_CODEX_SINK_RETENTION_MS` (default 7 days).
 
 Before Codex events are durably published, the bridge redacts assignment values
 whose keys look secret (for example, `DATABASE_PASSWORD=...` or

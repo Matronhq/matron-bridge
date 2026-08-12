@@ -220,6 +220,16 @@ function passthrough(realbin, args, { spawnFn, env }) {
     const child = spawnFn(realbin, args, {
       stdio: 'inherit',
       detached: true, // lead its own process group so we can signal the subtree
+      // TRADEOFF: detached (POSIX setsid) puts the child in its own session with
+      // NO controlling terminal. For the piped `codex exec` producer path this is
+      // irrelevant (non-interactive, no TUI). But a genuinely interactive `codex`
+      // TUI reaching this passthrough won't receive kernel-delivered SIGWINCH on
+      // terminal resize (SIGWINCH is delivered to the controlling terminal's
+      // foreground process group, which the detached child has left), so its
+      // layout won't reflow until the next redraw. Accepted: owning the process
+      // group is required to forward SIGINT/SIGTERM/SIGHUP to the whole subtree
+      // (an un-forwarded interrupt wedges the turn), and the interactive-TUI-
+      // through-the-shim case is not a path the bridge drives.
       env,
     });
 

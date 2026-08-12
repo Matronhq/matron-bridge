@@ -115,26 +115,84 @@ describe('configureCodexSinkEnv', () => {
 
 describe('pruneStaleCodexSinks', () => {
   const DAY = 24 * 60 * 60 * 1000;
-  function fakeFs(dirs) {
+  // Model the real sink layout: <root>/<sessionId>/codex-runs/<file>. Retention
+  // must key off the NEWEST activity (the codex-runs subdir / its files), not the
+  // <sessionId> dir mtime, which only tracks creation. Each session in `tree`:
+  //   { dir: <ms>, runs: <ms>|undefined, files: { name: <ms> }|undefined }
+  function fakeFs(tree) {
     const removed = [];
-    return {
-      removed,
-      impl: {
-        readdirSync: () => Object.keys(dirs).map(name => ({ name, isDirectory: () => true })),
-        statSync: dir => {
-          const name = path.basename(dir);
-          return { mtimeMs: dirs[name] };
-        },
-        rmSync: dir => { removed.push(path.basename(dir)); },
+    const impl = {
+      readdirSync: (dir, opts) => {
+        if (path.basename(dir) === 'codex-runs') {
+          const sid = path.basename(path.dirname(dir));
+          const files = tree[sid]?.files;
+          if (files === undefined) throw new Error('ENOENT'); // no codex-runs yet
+          return Object.keys(files);
+        }
+        // root listing (the withFileTypes call in the sweep loop)
+        expect(opts).toEqual({ withFileTypes: true });
+        return Object.keys(tree).map(name => ({ name, isDirectory: () => true }));
       },
+      statSync: p => {
+        const base = path.basename(p);
+        if (base === 'codex-runs') {
+          const sid = path.basename(path.dirname(p));
+          const m = tree[sid]?.runs;
+          if (m === undefined) throw new Error('ENOENT');
+          return { mtimeMs: m };
+        }
+        const parent = path.basename(path.dirname(p));
+        if (parent === 'codex-runs') {
+          const sid = path.basename(path.dirname(path.dirname(p)));
+          const m = tree[sid]?.files?.[base];
+          if (m === undefined) throw new Error('ENOENT');
+          return { mtimeMs: m };
+        }
+        // session dir
+        const m = tree[base]?.dir;
+        if (m === undefined) throw new Error('ENOENT');
+        return { mtimeMs: m };
+      },
+      rmSync: dir => { removed.push(path.basename(dir)); },
     };
+    return { removed, impl };
   }
 
-  it('removes only session dirs older than the retention window', () => {
+  it('removes only session dirs whose newest activity is older than the retention window', () => {
     const now = () => 100 * DAY;
     const { impl, removed } = fakeFs({
-      'fresh-sid': 99 * DAY, // 1 day old — keep
-      'stale-sid': 80 * DAY, // 20 days old — prune
+      'fresh-sid': { dir: 99 * DAY }, // 1 day old — keep
+      'stale-sid': { dir: 80 * DAY }, // 20 days old — prune
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: 7 * DAY, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(1);
+    expect(removed).toEqual(['stale-sid']);
+  });
+
+  it('keeps a session whose dir mtime is old but whose codex-runs child is fresh', () => {
+    // The exact case the parent-dir-mtime bug got wrong: a long-lived session
+    // started >retention ago but still actively writing runs must NOT be pruned.
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'active-old-start': {
+        dir: 80 * DAY, // session dir created 20 days ago — stale by dir mtime alone
+        runs: 99 * DAY, // ...but codex-runs touched 1 day ago
+        files: { 'codex-x.jsonl': 99.5 * DAY }, // newest write 12h ago — fresh
+      },
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: 7 * DAY, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(0);
+    expect(removed).toEqual([]);
+  });
+
+  it('prunes a session that is stale across the dir AND its codex-runs child', () => {
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'stale-sid': {
+        dir: 80 * DAY,
+        runs: 85 * DAY,
+        files: { 'codex-x.jsonl': 85 * DAY }, // newest activity still 15 days old
+      },
     });
     const count = pruneStaleCodexSinks({ now, maxAgeMs: 7 * DAY, root: '/sinks', fsImpl: impl });
     expect(count).toBe(1);
