@@ -853,7 +853,7 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
       emitRelease: vi.fn(),
       notify,
-      formatQueueSummary: (queued) => ({ plain: 'x', html: '' }),
+      formatQueueSummary: () => ({ plain: 'x', html: '' }),
     });
     expect(notify).not.toHaveBeenCalled();
   });
