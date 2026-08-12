@@ -297,6 +297,17 @@ describe('index.js journal busy caller — notification seams wiring (source ins
     expect(args).toMatch(/\beditMessage\b/);
     expect(args).toMatch(/\bstripQueueNotificationLinks\b/);
   });
+
+  it('passes notify AND formatQueueSummary to resolveQueueReleaseTap (tap sends must echo the batch)', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('resolveQueueReleaseTap(answer.choice, session, {');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('});', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/\bnotify\b/);
+    expect(args).toMatch(/\bformatQueueSummary\b/);
+  });
 });
 
 describe('handleBusyQueueMagicWord — cancel (Matrix pin, full seams)', () => {
@@ -809,6 +820,60 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       { id: 'pr_1::0', eventId: '$e1', plain: '📨 Queued (1): a' },
       { id: 'pr_1::1', eventId: '$e2', plain: '📨 Queued (2): b' },
     ]);
+  });
+
+  it('send: echoes the batch content at the point of sending (card retires with the preview)', () => {
+    const notify = vi.fn();
+    const session = entrySession();
+    resolveQueueReleaseTap('send', session, {
+      flushQueue: vi.fn(() => true),
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify,
+      formatQueueSummary: (queued) => ({
+        plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
+        html: '',
+      }),
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toBe('⚡ Sending 2 queued messages now:\n  1. a\n  2. b');
+  });
+
+  it('send: a rejected flush echoes nothing — the messages did not go out', () => {
+    const notify = vi.fn();
+    const session = entrySession();
+    resolveQueueReleaseTap('send', session, {
+      flushQueue: vi.fn(() => false),
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify,
+      formatQueueSummary: (queued) => ({ plain: 'x', html: '' }),
+    });
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('send: a caller without the summary seam (legacy shape) still flushes, just without the echo', () => {
+    const notify = vi.fn();
+    const session = entrySession();
+    const flushQueue = vi.fn(() => true);
+    const handled = resolveQueueReleaseTap('send', session, {
+      flushQueue,
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify,
+    });
+    expect(handled).toBe(true);
+    expect(flushQueue).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it('cancel: drops ONLY the tapped item by stable id and emits its cancel release', () => {

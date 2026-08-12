@@ -7233,10 +7233,14 @@ function journalOnPromptReply(session, answer, { username }) {
       queueRelease: queueReleaseForBatch(session, pendingFlushBatch(session)),
       emitRelease,
       // A tap has no reply text of its own — the durable queued_release
-      // prompt_reply is the record. The one thing it can't express is "I sent
-      // only the /compact and held the rest", so a compact split says that
-      // out loud rather than leaving the other cards silently un-actioned.
+      // prompt_reply is the record. But the release retires the card (and
+      // with it the only preview of what was queued), so the tap path also
+      // echoes the batch content at the point of sending — same contract as
+      // the turn-end "📬 Sending …" flush — and a compact split says the
+      // other cards are still waiting rather than leaving them silently
+      // un-actioned.
       notify: (message) => journalPublishNotice(convoId, message),
+      formatQueueSummary,
     });
     return;
   }
