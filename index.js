@@ -103,6 +103,7 @@ import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
+import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from './lib/journal-title-seed.js';
@@ -2047,22 +2048,22 @@ function flushPendingSessionQueue(session) {
   // exactly what the batch is.
   const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
   session.queuedMessages = deferred.length ? deferred : null;
-  const summary = formatQueueSummary(queued);
   // Nothing deferred: the familiar "sending N queued messages" list. Deferred:
   // say WHY the rest didn't go, or the held messages read as swallowed. They
   // need no nudge to be delivered — the compaction run is its own print-mode
   // turn, and its `result` event lands right back here (see the result handler
-  // and onTurnEnd, both of which call this function once busy clears).
-  const plainMsg = deferred.length
-    ? `📬 Sending /compact first — the other ${deferred.length} queued message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
-    : `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`;
-  const htmlMsg = deferred.length
-    ? `<b>📬 Sending /compact first</b> — the other ${deferred.length} queued message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
-    : `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`;
+  // and onTurnEnd, both of which call this function once busy clears). Both
+  // shapes are worded in lib/queue-flush-notice.js, shared with the three
+  // explicit-flush paths so the four cannot drift apart.
+  const notice = queueFlushNotice('turnEnd', {
+    queued: queued.length,
+    deferred: deferred.length,
+    summary: formatQueueSummary(queued),
+  });
   if (session.sendHtml) {
-    session.sendHtml(plainMsg, htmlMsg);
+    session.sendHtml(notice.plain, notice.html);
   } else if (session.sendCallback) {
-    session.sendCallback(plainMsg);
+    session.sendCallback(notice.plain);
   }
   const sent = flushQueue(session, queued, releaseSnapshot);
   // Only the flushed batch's notifications retire; the deferred entries keep
@@ -8888,17 +8889,15 @@ const apiServer = createServer(async (req, res) => {
         session.queuedMessages = deferred.length ? deferred : null;
         let sent = true;
         if (queued.length > 0) {
-          const summary = formatQueueSummary(queued);
-          const plainMsg = deferred.length
-            ? `⚡ Sending /compact now — the other ${deferred.length} message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
-            : `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
+          const notice = queueFlushNotice('sendNow', {
+            queued: queued.length,
+            deferred: deferred.length,
+            summary: formatQueueSummary(queued),
+          });
           if (session.sendHtml) {
-            const htmlMsg = deferred.length
-              ? `<b>⚡ Sending /compact now</b> — the other ${deferred.length} message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
-              : `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
-            session.sendHtml(plainMsg, htmlMsg);
+            session.sendHtml(notice.plain, notice.html);
           } else if (session.sendCallback) {
-            session.sendCallback(plainMsg);
+            session.sendCallback(notice.plain);
           }
           sent = flushQueue(session, queued, releaseSnapshot);
           if (sent === true) session.queueNotifications = notifications.slice(batchSize);
