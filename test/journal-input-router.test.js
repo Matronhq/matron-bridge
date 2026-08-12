@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
+import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply, isResumePickerTap, isPickerFrame } from '../lib/journal-input-router.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -633,6 +633,66 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
     expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'text', username: 'dan' });
   });
+
+  // Restart carry-on (Task 3 review, Finding 1): the isResumePickerTap unit
+  // tests above only cover the pure predicate — they say nothing about
+  // whether the GATE actually wires it in. These drive the gate through the
+  // real onJournalEvent entry point (registering a picker frame, then
+  // replying to it), the same way the picker-dispatch tests below do, so a
+  // stubbed gate that trusts value shape alone (`choice.startsWith('resume:')`)
+  // or that drops convo/frame scoping would fail them.
+  describe('restart carry-on: verified resume taps', () => {
+    const resumeCard = (seq, value, convoId = 'convo-1') => baseFrame({
+      seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+      payload: { question: 'Carry on?', options: [{ id: 'resume-x', value }] },
+    });
+
+    const resumeReply = (targetSeq, choice, convoId = 'convo-1') => baseFrame({
+      seq: 200, convo_id: convoId, type: 'prompt_reply',
+      payload: { target_seq: targetSeq, choice, text: null },
+    });
+
+    it('a resume: choice whose target_seq names the frame that offered it DOES resume', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeCard(12, 'resume:convo-1'));       // bridge-published carry-on card
+      consumer(resumeReply(12, 'resume:convo-1'));       // matching verified tap
+      expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'dan' });
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
+        target_seq: 12, choice: 'resume:convo-1', text: null, picker: true,
+      });
+    });
+
+    it('a resume: choice with NO registered frame does NOT resume — unknown-convo notice instead', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeReply(12, 'resume:convo-1')); // no card was ever published at seq 12
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+
+    it('a resume: choice whose target_seq names a frame that offered a DIFFERENT value does NOT resume', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeCard(12, 'resume:other-convo'));
+      consumer(resumeReply(12, 'resume:convo-1')); // not the value that frame offered
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+
+    it('a resume: choice does not resume via a picker frame recorded for a DIFFERENT convo (convo scoping)', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeCard(12, 'resume:convo-a', 'convo-a'));
+      consumer(resumeReply(12, 'resume:convo-a', 'convo-b')); // same seq/value, different convo
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-b', { type: 'prompt_reply', username: 'dan' });
+    });
+  });
 });
 
 // The wiring half of the auto-resume seam: index.js can't be imported
@@ -1087,8 +1147,8 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
   });
 
   // A published picker frame (option ids model-* / effort-* / mode-*).
-  const pickerFrame = (seq, opts) => baseFrame({
-    seq, sender: 'agent:dev-2', type: 'prompt',
+  const pickerFrame = (seq, opts, sender = 'agent:dev-2') => baseFrame({
+    seq, sender, type: 'prompt',
     payload: { question: 'pick', mode: 'pick_one', options: opts },
   });
 
@@ -1172,6 +1232,23 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     consumer(pickerFrame(12, [{ id: 'mode-print', value: 'mode:print' }]));
     consumer(answerableFrame(10));
     consumer(pickerReply(12, 'mode:bogus')); // not a real picker value → not bypassed
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  // Task 3 review, Finding 2: option ids/values are just strings on the wire
+  // — nothing stops a client device from publishing a `type:'prompt'` frame
+  // shaped exactly like a picker (id 'resume-x', value 'resume:x'). Frame
+  // registration must be gated on sender, the same provenance stance the
+  // sibling queued_release branch already takes, or a non-bridge sender
+  // could get its lookalike frame recorded and later verified as if the
+  // bridge had published it.
+  it('a picker-shaped frame from a non-agent sender does NOT register — a later matching reply is refused as stale, not dispatched', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(pickerFrame(12, [{ id: 'model-sonnet', value: 'model:sonnet' }], 'user:dan')); // spoofed sender
+    consumer(answerableFrame(10));
+    consumer(pickerReply(12, 'model:sonnet'));
     expect(deps.routePromptReply).not.toHaveBeenCalled();
     expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
   });
@@ -1752,6 +1829,40 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     const end = src.indexOf('});', start);
     const args = src.slice(start, end);
     expect(args).toMatch(/onInviteFrame: \(frame\) => agentInvites\?\.onInviteFrame\(frame\)/);
-    expect(args).toMatch(/onOpError: \(err\) => agentInvites\?\.onOpError\(err\)/);
+    // Agent-spawn frames are thunked the same way, into the (later-built)
+    // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
+    // return means it consumed the ref) before falling through to invites.
+    expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
+    expect(args).toMatch(/onOpError: \(e\) => \{ if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+  });
+});
+
+describe('isResumePickerTap', () => {
+  it('accepts a resume choice the frame actually offered', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 'resume:abc123def456')).toBe(true);
+  });
+
+  it('rejects a resume choice the frame did not offer', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 'resume:other9999999')).toBe(false);
+  });
+
+  it('rejects non-resume picker values', () => {
+    expect(isResumePickerTap(new Set(['model:sonnet']), 'model:sonnet')).toBe(false);
+  });
+
+  it('rejects when there is no frame', () => {
+    expect(isResumePickerTap(null, 'resume:abc123def456')).toBe(false);
+    expect(isResumePickerTap(undefined, 'resume:abc123def456')).toBe(false);
+  });
+
+  it('rejects a non-string choice', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), null)).toBe(false);
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 7)).toBe(false);
+  });
+});
+
+describe('isPickerFrame with resume options', () => {
+  it('classifies a resume- option frame as a picker', () => {
+    expect(isPickerFrame({ options: [{ id: 'resume-abc123def456', value: 'resume:abc123def456' }] })).toBe(true);
   });
 });

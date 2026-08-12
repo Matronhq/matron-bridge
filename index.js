@@ -17,7 +17,7 @@ import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/
 import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { projectDirFor, transcriptPathFor } from './lib/transcript-dir.js';
+import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
 import {
   buildMcpServers,
@@ -54,6 +54,8 @@ import {
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
+import { createSubagentRunningStore } from './lib/subagent-running-store.js';
+import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -85,10 +87,13 @@ import {
 import { processShowFile } from './lib/show-file-handler.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { buildActivity, buildLimits } from './lib/spawn-capacity.js';
+import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
+import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
-import { handlePickerValue } from './lib/picker-dispatch.js';
+import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
@@ -160,6 +165,15 @@ const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE 
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 
+// Restart carry-on window. A turn interrupted by a bridge restart is offered
+// a "Carry on" card at the next boot, but only if the conversation was active
+// within this window — measured from the marker's last touch, so a long turn
+// that was still working right before the crash still qualifies. Deliberately
+// NOT reusing SESSION_IDLE_TIMEOUT_MS: that answers a different question (how
+// long to hold memory for an idle session), and 1h would mean restarting the
+// bridge before a long meeting silently loses the card.
+const RESTART_CARRY_ON_MAX_AGE_MS = parseInt(process.env.MATRON_RESTART_CARRY_ON_MAX_AGE_MS || '21600000', 10);
+
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
 // far longer than the 500ms paste→Enter window in sendText. Typing the first
@@ -181,6 +195,9 @@ const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json
 // a pending timer outlives the idle reaper, session restarts, and full
 // bridge restarts (re-armed in main() via timerStore.init()).
 const TIMERS_FILE = path.join(os.homedir(), '.matron-bridge-timers.json');
+// In-flight turn markers for restart carry-on — written at turn start, removed
+// at turn end, reconciled at the next boot (see lib/inflight-marker.js).
+const INFLIGHT_FILE = path.join(os.homedir(), '.matron-bridge-inflight.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -369,11 +386,31 @@ function toolStreamKey(convoId, messageRef) {
 // journalPublisher, agentRooms, the inject glue — all exist). The thunks
 // only ever fire once the socket is live, long after the assignment.
 let agentInvites = null;
+// Agent-spawn handlers (lib/agent-spawn.js) — same forward-declared-thunk
+// pattern as agentInvites above; constructed next to agentChatHandlers, well
+// after journalPublisher and agentRooms exist.
+let agentSpawnHandlers = null;
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
 // whole module, including `sessions` and the routing functions below, has
 // finished evaluating).
+// Fires on every hello_ok — the FIRST connect (bridge startup, live sessions
+// map still empty → all persisted running children reconcile) and every later
+// reconnect (only children whose parent is no longer live). Named (not inlined
+// into the createJournalPublisher options) so the reconcile + reemit block does
+// not read as part of the publisher's option object. `journalPublisher` is
+// referenced lazily — the handler only ever fires once the socket is live, long
+// after the const below is assigned.
+function handleJournalReconnect() {
+  // Union of the two reconnect wirings (#207 + #536). Stranded-subagent reconcile
+  // first, then journalOnReconnect — which reemits codex outcomes, republishes
+  // overflow-evicted releases, and arms the deferred boot reconcile. The codex
+  // reemit lives in journalOnReconnect, so it is NOT duplicated here.
+  reconcileStrandedSubagents('reconnect');
+  journalOnReconnect();
+}
+
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
   token: _journalToken,
@@ -383,7 +420,10 @@ const journalPublisher = createJournalPublisher({
   onStreamResync: (convoId, messageRef, have) => {
     toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
   },
-  onReconnect: journalOnReconnect,
+  // Union of both reconnect wirings: handleJournalReconnect runs #207's stranded-
+  // subagent reconcile AND (via journalOnReconnect) #536's release retry + deferred
+  // boot reconcile. See handleJournalReconnect below.
+  onReconnect: handleJournalReconnect,
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
   onSendCapacity: () => republishPendingReleases(),
@@ -395,7 +435,15 @@ const journalPublisher = createJournalPublisher({
   // Agent-chat invite lifecycle (kind:'invite' ephemerals and room-op error
   // frames) — thunked because agentInvites is constructed later (above).
   onInviteFrame: (frame) => agentInvites?.onInviteFrame(frame),
-  onOpError: (err) => agentInvites?.onOpError(err),
+  // Agent-spawn ephemeral frames (kind:'spawn') — thunked for the same
+  // reason as onInviteFrame: agentSpawnHandlers is constructed later.
+  onSpawnFrame: (frame) => agentSpawnHandlers?.onSpawnFrame(frame),
+  // Spawn correlation tries first (its waiters are request_id-keyed, same
+  // style as agent-invites' own onOpError) — a `true` return means it owned
+  // and consumed the ref, so the invite manager never sees it. Op-error refs
+  // are never shared between the two managers, so this ordering is not a
+  // race, just "ask the spawn side first."
+  onOpError: (e) => { if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -649,13 +697,19 @@ const releaseOutbox = createQueuedReleaseOutbox({ log: console });
 // the emitRelease..journalUpsertConvo seam below (scheduleReleaseReconcile),
 // next to reconcileReleaseOutbox itself.
 
+// Persistent record of subagent child convos currently `running`.
+// Written by each session's subagent tracker (add on mint, remove on finish);
+// read at startup/reconnect by reconcileStrandedSubagents to mark ghosts done.
+// A single shared store is safe — childConvoIds are globally unique.
+const subagentRunningStore = createSubagentRunningStore({ log: console });
+
 // RPC-start (lib/journal-rpc.js `start`): the !start command body minus the
 // origin-room replies — an RPC start has no origin chat room. Returns the
 // session; the RPC handler answers with its claudeSessionId (the journal
 // convo id — NOT the room key, which is bridge-internal).
 function journalStartSessionForRpc({ workdir, mcpExtras }) {
   const sessionRoomId = newSessionConvoId();
-  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
   const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
   const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
     sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -689,6 +743,25 @@ const journalRpcHandler = createRpcRequestHandler({
   listRememberedFolders: () => recentFolders.list(),
   defaultWorkdir: DEFAULT_WORKDIR,
   expandHome,
+  // Capacity thunks (2026-08-10 capacity spec): answered from cache, never
+  // blocking a reply on a subprocess. getLimits kicks a background refresh
+  // (throttled, see refreshUsageLimits) but always returns synchronously
+  // from whatever usageLimitsCache holds right now.
+  getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
+  getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  // Which account a new session here would burn quota against, so the chooser
+  // can tell boxes on different logins apart. Same cache as the status frames.
+  getAccountEmail: () => getAccountEmail(),
+  // Spawn-room wiring (2026-08-09 agent-spawn spec). agentRooms is declared
+  // later in this file (~:7223) — these arrows only dereference it at call
+  // time, long after module evaluation finishes, same late-binding as
+  // onRpcRequest's forward reference to journalRpcHandler above.
+  bindSpawnRoom: (roomId, session) => {
+    agentRooms.record(roomId, { role: 'guest', state: 'joined', sessionRoomId: session.roomId });
+  },
+  unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
+  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  serverLabel: SERVER_LABEL,
   log: console,
 });
 
@@ -779,9 +852,11 @@ function journalOnReconnect() {
   // driver skips (state gate, not timing).
   republishPendingReleases();
   // Boot reconciliation (spec §5): expire every `pending_inherited` orphan.
-  // DEFERRED behind a quiet-period timer, re-armed by each replayed journal
+  // DEFERRED behind a quiet-period timer, re-armed by every inbound journal
   // frame (journalHandleInboundEvent), so it fires only AFTER the reconnect
-  // replay stream goes quiet. F1 timing fix: the replay carries the echo of a
+  // replay stream goes quiet. (The re-arm is not replay-specific — any inbound
+  // frame pushes the timer out; during the post-reconnect burst those frames
+  // are the replay.) F1 timing fix: the replay carries the echo of a
   // release that a prior process committed (journal append ran) but died before
   // acking; that echo's markAcked flips pending_inherited -> acked BEFORE this
   // reconcile runs, so a durably-committed release is never wrongly stamped
@@ -1315,6 +1390,50 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  // A Claude session that changes cwd mid-flight (EnterWorktree is the common
+  // case) has its transcript relocated to the NEW cwd's project dir, while the
+  // bridge's persisted workdir stays where the session was spawned. Resuming
+  // with that stale workdir misses the transcript, and planSessionIdentity
+  // demotes the resume to a fresh --session-id spawn on the same id — the room
+  // keeps its identity but silently loses its whole conversation. Follow the
+  // transcript instead: find it by session id and adopt the cwd recorded
+  // inside it, before any branch spawns (both claude branches and their
+  // transcriptExists checks read this workdir).
+  if (agent === AGENT_CLAUDE && resumeSessionId
+      && !fs.existsSync(transcriptPathFor(workdir, resumeSessionId))) {
+    const shortId = resumeSessionId.slice(0, 8);
+    const found = findTranscriptBySessionId(resumeSessionId);
+    if (found?.workdir) {
+      // Claude can only find the transcript when spawned from a cwd that
+      // encodes to the project dir holding it. If the recorded workdir has
+      // been deleted since (a pruned worktree), recreate it: an empty
+      // directory and an intact conversation beats a fresh spawn with total
+      // amnesia — the user can !workdir somewhere real afterwards. (Bugbot,
+      // PR #216: without this, a found transcript was still demoted.)
+      let usable = fs.existsSync(found.workdir);
+      if (!usable) {
+        try {
+          fs.mkdirSync(found.workdir, { recursive: true });
+          usable = true;
+          console.warn(`[transcript-relocate] ${roomId}: recreated deleted workdir ${found.workdir} so session ${shortId}… can resume its transcript`);
+        } catch (error) {
+          console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but its workdir ${found.workdir} is gone and could not be recreated (${error.message}); the resume will start fresh on the same id`);
+        }
+      }
+      if (usable && found.workdir !== workdir) {
+        console.warn(`[transcript-relocate] ${roomId}: session ${shortId}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
+        const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
+          `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
+        Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
+        workdir = found.workdir;
+      }
+    } else if (found) {
+      // Transcript located but no entry records a cwd — with no directory to
+      // spawn from that encodes to its project dir, a --resume would exit 1
+      // and crash-loop, so the planSessionIdentity demotion below stands.
+      console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but it records no cwd; the resume will start fresh on the same id`);
+    }
+  }
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
     journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
@@ -1814,6 +1933,9 @@ function codexToolIndicator(item) {
 }
 
 function handleCodexEvent(session, event) {
+  // Progress touch for restart carry-on — the Codex-side counterpart of the
+  // touch in handleClaudeEvent. Debounced and no-op without a marker.
+  inflightMarker.touch(journalConvoIdFor(session));
   switch (event?.type) {
     case 'thread.started': {
       if (!event.thread_id) break;
@@ -1829,7 +1951,32 @@ function handleCodexEvent(session, event) {
         if (nativeIdChanged) {
           console.log(`Updated Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
         }
-        if (journalIdMissing) journalFlushForSession(session);
+        if (journalIdMissing) {
+          // Restart carry-on, first-turn repair. A FRESH Codex conversation has
+          // NO convo id until this very line: createCodexSessionForRoom leaves
+          // both claudeSessionId and journalConvoId null when there is nothing
+          // to resume (index.js:1582-1583), so sendToSession's noteTurnStart —
+          // the `session.busy = true` seam — ran with null and returned early.
+          // The first turn is often the longest one, and it would silently get
+          // no card. touch() cannot repair this: it no-ops when no record
+          // exists. The conversation IS genuinely resumable by then, because
+          // persistSession fired just above.
+          //
+          // Gated on journalIdMissing, NOT on the enclosing block: a later
+          // thread-id change (nativeIdChanged alone) leaves journalConvoId
+          // untouched, so that turn is already marked under this same id and
+          // re-marking would reset startedAt/touchedAt on an in-flight turn.
+          // This branch can therefore fire at most once per conversation.
+          //
+          // journalConvoIdFor(session) is now session.journalConvoId ===
+          // event.thread_id — the identical id persistSession just wrote as
+          // both sessionId and journalConvoId, that publishRestartCarryOnCards
+          // keys the card on, and that journalResumeConvo matches. Claude
+          // print/iv are unaffected: they mint the id at construction
+          // (index.js:1337, 2024), so journalIdMissing is never true for them.
+          if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
+          journalFlushForSession(session);
+        }
       }
       break;
     }
@@ -1977,6 +2124,18 @@ function finishCodexTurn(session, {
   session.toolCalls = [];
   journalStreamClear(session);
   session.busy = false;
+  // Authoritative Codex turn-end (idempotent via _codexTurnFinished above) —
+  // but ONLY for a turn that actually ended on its own terms. discardOutput is
+  // passed exclusively by the two teardown callers (killSession, and the
+  // turn-exit fallback for an already-dead session), where the turn was
+  // INTERRUPTED rather than completed. Clearing the marker there is what made
+  // a SIGTERM restart erase its own evidence: restart.sh kills with SIGTERM,
+  // the handler calls killSession for every live session, and a mid-turn Codex
+  // session would delete the very record the next boot needs to offer a
+  // carry-on card. Teardown leaves the marker standing; a genuine end clears
+  // it. A deliberate !stop clears it explicitly at its own call site, before
+  // killSession runs, so that case does not rely on this branch.
+  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   maybeSummarizeAtTurnEnd(session);
@@ -2204,6 +2363,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.busy) {
       console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
       session.busy = false;
+      // Deliberately NO inflightMarker.noteTurnEnd here: busy is cleared to
+      // route the user's reply into the PTY, but the turn resumes once they
+      // answer and onTurnEnd remains its authoritative end. A restart while
+      // the prompt is open leaves a genuinely dangling turn — exactly what the
+      // carry-on card is for.
     }
     handleInteractivePrompt(session, prompt);
   });
@@ -2373,6 +2537,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.toolCalls = [];
     session.turnCount++;
     session.busy = false;
+    // Authoritative iv-mode turn-end seam.
+    inflightMarker.noteTurnEnd(journalConvoIdFor(session));
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
     maybeSummarizeAtTurnEnd(session);
@@ -2818,6 +2984,7 @@ function handleInteractiveScreenUpdate(session, update) {
   if (session.busy) {
     console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
     session.busy = false;
+    // No noteTurnEnd — prompt surfacing, not turn end. See iv.on('prompt').
   }
   // Auto-press Enter for pure acknowledgment cues ("Press Enter to
   // continue…" after /login success, "Press Enter to dismiss" notices,
@@ -2917,6 +3084,7 @@ function handleUnclassifiedPrompt(session, { screen }) {
   // busy so the reply is typed into the PTY instead of dropping into the queue.
   if (session.busy) {
     session.busy = false;
+    // No noteTurnEnd — prompt surfacing, not turn end. See iv.on('prompt').
   }
 }
 
@@ -3099,6 +3267,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       return;
     }
     session.busy = true;
+    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
     const jsonMsg = JSON.stringify({
@@ -3172,6 +3341,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
+    runningStore: subagentRunningStore,
     log: console,
   });
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
@@ -3196,6 +3366,83 @@ function teardownSubagentTracking(session) {
   if (session.subagentWatcher) {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
+  }
+}
+
+// Reconcile stranded `running` subagent child convos. A child is a
+// ghost when it is persisted `running` (subagentRunningStore) but no LIVE
+// session currently owns its parent convo — i.e. the parent is TERMINAL: the
+// bridge restarted and the parent's claude process died with the old bridge, or
+// the parent stream was lost. At startup the live `sessions` map is empty, so
+// every persisted running child reconciles; on a transient WS reconnect only
+// genuinely orphaned children do (a still-live coordinator parent keeps its
+// children running — see selectStrandedChildren).
+//
+// Reconciles purely from PERSISTED state, never from watcher re-discovery:
+// subagent-watcher.snapshot() marks the already-complete agent-*.jsonl "seen",
+// so completed children are never re-found and finish() never re-fires. The
+// published frame (convo_upsert, session_state: done) is byte-identical to the
+// live finish() transition, so web clients update the card the same way; here it
+// rides upsertConvoBestEffort, the established reconnect-repair fan-out path.
+function reconcileStrandedSubagents(reason = 'startup') {
+  if (!JOURNAL_ENABLED) return;
+  let entries;
+  try {
+    entries = subagentRunningStore.list();
+  } catch (e) {
+    console.warn(`[subagent-reconcile] list failed: ${e.message}`);
+    return;
+  }
+  if (!entries.length) return;
+
+  // Parent convo ids currently owned by a live session — do NOT retire their
+  // children (a coordinator parent legitimately stays running).
+  const liveParents = new Set();
+  for (const session of sessions.values()) {
+    if (!session?.alive) continue;
+    const convoId = journalConvoIdFor(session);
+    if (convoId) liveParents.add(convoId);
+  }
+
+  const { stranded, malformed } = selectStrandedChildren(entries, liveParents);
+  // Join each stranded id back to its persisted entry so the repair frame can
+  // carry the child's parentConvoId. Reconcile runs precisely when the original
+  // `running` upsert may never have been delivered (SIGKILL before flush, socket
+  // down at mint, queue-overflow eviction) — so the journal row may not exist
+  // yet. `convo_upsert` on an unknown id INSERTs, and parent_convo_id is written
+  // ONLY in the INSERT branch (immutable thereafter): omitting it here would mint
+  // a permanent untitled ROOT orphan that loses the child push exemption and is
+  // un-relinkable. selectStrandedChildren already validated provenance, so every
+  // stranded id has a joinable entry with a parentConvoId. Safe in the normal
+  // (row-exists) case too: the journal's UPDATE path never rewrites parentage.
+  const repairFrames = strandedRepairFrames(entries, stranded);
+  let published = 0;
+  for (const { childConvoId, parentConvoId } of repairFrames) {
+    try {
+      // Publish `done` and drop the store record ONLY on confirmed delivery
+      // a capacity-rejected best-effort send or a
+      // crash before the socket flushes must leave the record in place so the
+      // next startup/reconnect reconcile retries — never erase the write-ahead
+      // record on an unconfirmed send. Re-publishing `done` is idempotent
+      // server-side.
+      journalPublisher.upsertConvoBestEffort(
+        childConvoId,
+        { sessionState: 'done', parentConvoId },
+        { onDelivered: () => subagentRunningStore.remove(childConvoId) },
+      );
+      published += 1;
+    } catch (e) {
+      console.warn(`[subagent-reconcile] failed for ${childConvoId}: ${e.message}`);
+    }
+  }
+  if (published) {
+    console.log(`[subagent-reconcile] ${reason}: publishing done for ${published} stranded subagent child convo(s)`);
+  }
+  if (malformed.length) {
+    // Fail-closed: records with no validated parent provenance are
+    // left running rather than terminally mutated. Surface them — they only
+    // arise from corruption / schema drift and warrant inspection.
+    console.warn(`[subagent-reconcile] ${reason}: ${malformed.length} malformed running record(s) with no parent convo — left untouched: ${malformed.join(', ')}`);
   }
 }
 
@@ -3267,6 +3514,14 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
 }
 
 function handleClaudeEvent(session, event) {
+  // Progress touch for restart carry-on. This is the single per-event entry
+  // point for BOTH print mode (stdout stream-json) and iv mode (iv.on('event')
+  // → here), so it is where "the turn is still making progress" is known.
+  // Before the sidechain guard on purpose: a subagent's events are still this
+  // turn working. The store debounces to once a minute and no-ops when no
+  // marker exists, so this is cheap on every event.
+  inflightMarker.touch(journalConvoIdFor(session));
+
   // A subagent's event riding the parent's stdout (parent_tool_use_id /
   // isSidechain) is NOT the parent's: its text/tool_use/tool_result belong to
   // the child conversation, and the subagent watcher already routes them
@@ -3642,6 +3897,17 @@ function handleClaudeEvent(session, event) {
         const noSession = event.errors.some(e => /no conversation found/i.test(e));
         if (noSession) {
           console.log(`Resume failed for room ${session.roomId}: session not found, clearing stale ID`);
+          // Clear the marker BEFORE nulling claudeSessionId: journalConvoIdFor
+          // falls back to claudeSessionId when journalConvoId is unset, so
+          // doing this after the null below would resolve a different (or no)
+          // convo id and strand the marker. Every resume path populates
+          // journalConvoId today, so the ordering is currently belt-and-braces
+          // — but it costs nothing to remove the dependency.
+          // A failed resume produces no further agent output for this turn, and
+          // the early break below skips the normal turn-end seam, so in print
+          // mode nothing else would ever clear this. Leaving it would card a
+          // conversation that is over, not interrupted.
+          inflightMarker.noteTurnEnd(journalConvoIdFor(session));
           session.claudeSessionId = null;
           session._resumeFailed = true;
           // Clear only this provider's stale native ID. A switched
@@ -3663,7 +3929,9 @@ function handleClaudeEvent(session, event) {
             session.sendCallback('Previous native session not found (expired or deleted). The next message will start this agent fresh; /switch can still return to the other agent.');
           }
           // Reset busy/typing so the session isn't stuck if claude exits 0
-          // without our normal result-handling path running.
+          // without our normal result-handling path running. (The inflight
+          // marker was already cleared above, before claudeSessionId was
+          // nulled.)
           session.busy = false;
           clearPendingInterrupt(session);
           // This early break skips the normal turn-end seam below, so in
@@ -3743,6 +4011,8 @@ function handleClaudeEvent(session, event) {
       // (the durable publish already cleared the ref).
       journalStreamClear(session);
       session.busy = false;
+      // Authoritative print-mode turn-end seam.
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       clearPendingInterrupt(session);
       // Print-mode's turn-end (this `case 'result':` block is its equivalent
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
@@ -3915,6 +4185,10 @@ function handleClaudeEvent(session, event) {
             // unrelated event cleared it. No-op when nothing was streaming.
             journalStreamClear(session);
             session.busy = false;
+            // This branch IS the turn-end for a print-mode session at a manual
+            // compact boundary (the iv branch above delegates to onTurnEnd,
+            // which clears the marker there).
+            inflightMarker.noteTurnEnd(journalConvoIdFor(session));
             clearPendingInterrupt(session);
           }
         } else if (trigger === 'manual') {
@@ -4105,6 +4379,11 @@ function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
 
 function reportSessionSendFailure(session, message, { restoreJournalState = false } = {}) {
   session.busy = false;
+  // Some callers (the Codex/iv/stdin dispatch failures in sendToSession) run
+  // AFTER session.busy = true, so a marker for this turn already exists. The
+  // dispatch failed, so no agent output is coming — clear it or the next boot
+  // offers to carry on a turn that never started.
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   if (restoreJournalState) {
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
@@ -4227,6 +4506,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   session.responseBuffer = '';
   session.toolCalls = [];
   session.busy = true;
+  inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
   // Mirror Claude input here. Codex input is mirrored below only after its
@@ -4453,6 +4733,9 @@ function startResumeReadyWatcher(session) {
       // send itself failed) — don't leave a typing indicator spinning with
       // no turn behind it.
       session.busy = false;
+      // Same reasoning applies to the marker: this branch asserts there is no
+      // turn behind the busy flag, so any marker left over is stale.
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       // Room messages that arrived during the hold coalesced into the pending
       // inbox (isBusy counts _awaitingInputReady). With no held user message
       // there is no turn — and so no turn-end seam — to flush them, so flush
@@ -4857,13 +5140,13 @@ function padTable(tableText) {
   }).join('\n');
 }
 
-// Improve plain text body for clients that don't render HTML (e.g. Element X)
-// Wraps pipe tables in code fences so they render monospaced with aligned columns
-function plainTextFormat(text) {
-  return text.replace(/((?:^\|.+\|\n?)+)/gm, (match) => {
-    return '```\n' + padTable(match) + '\n```';
-  });
-}
+// Journal bodies are raw markdown: Matron clients render GFM themselves
+// (the Mac timeline lays out pipe tables natively as of matron-apple #134,
+// iOS/Android via their markdown views), so nothing here may rewrite
+// message text for presentation. The old plainTextFormat() Element X
+// fallback — fence + pad pipe tables for monospace — lived here until
+// 2026-08-12; it survived the Matrix exit and silently downgraded every
+// table to a code block on all clients.
 
 // --- File Helpers ---
 
@@ -5475,7 +5758,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -5506,6 +5789,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         return;
       }
+      // A deliberate !stop is a turn END, not an interruption — there is
+      // nothing to carry on, so drop the marker. This is NOT done inside
+      // killSession: /restart and /switch reuse it and their turns genuinely
+      // WERE interrupted, so those must keep the marker and get a card.
+      // Note this class of turn-end never clears session.busy at all (the kill
+      // path has no busy = false for print/iv), so it is invisible to a
+      // `session.busy = false` grep.
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       killSession(session);
       sessions.delete(roomId);
       journalSessionState(session, 'done');
@@ -5758,7 +6049,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -5885,7 +6176,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -6680,6 +6971,48 @@ function journalPublishNotice(convoId, body) {
   }
 }
 
+// Publish a picker card into a convo that has NO live session — the restart
+// carry-on case, where the session is dead by construction. journalPublish /
+// sendButtonMessage both key off a live session object, so this goes straight
+// to the publisher; the upsert first is the protocol requirement described at
+// journalPublish (the server hard-rejects publishes to convos it doesn't know).
+// The frame registers itself as a picker on the way back in via the router's
+// onJournalEvent observer, so nothing here has to touch pickerFrames.
+//
+// Returns whether the prompt actually got enqueued for send — the caller
+// (publishRestartCarryOnCards) uses this to log honestly instead of assuming
+// success. Both upsertConvo and safePublish (which backs publishPrompt) only
+// report enqueue-time acceptance, not that the journal server received or
+// accepted the frame — that's the best signal available synchronously, and
+// is what "succeeded" means here. An exception (caught below) or a queue
+// eviction is reported as failure; the caller's marker is already cleared by
+// then (see takeStale above), so a false here means that card's interruption
+// is now permanently lost — accepted, documented fire-once behavior, not
+// something this function tries to fix.
+function journalPublishCardForConvo(convoId, { question, options, mode = 'pick_one' }) {
+  if (!JOURNAL_ENABLED || !convoId) return false;
+  try {
+    const upserted = journalPublisher.upsertConvo(convoId, {});
+    const published = journalPublisher.publishPrompt(convoId, { question, options, mode });
+    return upserted !== false && published !== false;
+  } catch (e) {
+    try { console.warn(`[inflight] card publish failed for convo=${convoId}: ${e.message}`); } catch { /* logging must never throw */ }
+    return false;
+  }
+}
+
+// "about 4 minutes ago" — deliberately coarse. The card is telling the user
+// roughly how stale the interrupted work is so they can judge whether carrying
+// on still makes sense, not timing it.
+function formatInterruptedAgo(ageMs) {
+  const mins = Math.round(ageMs / 60_000);
+  if (mins < 1) return 'less than a minute ago';
+  if (mins === 1) return 'about a minute ago';
+  if (mins < 60) return `about ${mins} minutes ago`;
+  const hours = Math.round(ageMs / 3_600_000);
+  return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
+}
+
 // Echo something into a session's Matrix room WITHOUT re-mirroring it into
 // the journal (sendToRoom's default behavior publishes a from:'assistant'
 // text event for everything it sends — see its own comment — which for an
@@ -6703,7 +7036,7 @@ function journalEchoToRoom(session, plain, html) {
 // control-convo dispatch makes below.
 function journalSessionCommandCtx(session) {
   return {
-    sendReply: (reply) => sendToRoom(session.roomId, plainTextFormat(reply), markdownToHtml(reply)),
+    sendReply: (reply) => sendToRoom(session.roomId, reply, markdownToHtml(reply)),
     sendHtml: (plainText, html) => sendToRoom(session.roomId, plainText, html),
     sender: ALLOWED_USER_IDS[0],
   };
@@ -6859,6 +7192,10 @@ async function journalRouteTextToSession(session, body) {
         session.pendingUnclassifiedPrompt = false;
         if (session.busy) {
           session.busy = false;
+          // Esc cancels the turn: the user deliberately ended it, so there is
+          // nothing to carry on. (If the Stop hook still fires, onTurnEnd's
+          // noteTurnEnd is a harmless no-op.)
+          inflightMarker.noteTurnEnd(journalConvoIdFor(session));
         }
         ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
@@ -7186,7 +7523,20 @@ function journalOnPromptReply(session, answer, { username }) {
     // (PR #171), cancelling only needs the convo-scoped store, and the timer
     // may well outlive the session process it was set from.
     const isTimerTap = typeof answer.choice === 'string' && answer.choice.startsWith('timer:');
-    if (!session.alive && !isTimerTap) {
+    // Restart carry-on taps skip the alive gate for the same reason timer taps
+    // do, only more so: the card is published at boot into a convo whose
+    // session is dead BY CONSTRUCTION, and reviving it is the entire point of
+    // the button. The router normally auto-resumes before dispatch so `session`
+    // is already live here, but it only does that when no session object was
+    // found at all — a dead-but-present one (mid-teardown, or a Codex logical
+    // session between turns) would otherwise be refused here with a message
+    // about model/effort/mode switching and burn the single-use card.
+    // carryOnConvo does its own lookup/resume for exactly that case. Matching
+    // on value shape is safe inside this branch: `answer.picker` already proves
+    // the router verified the choice against the offered values of a picker
+    // frame this bridge published.
+    const isCarryOnTap = typeof answer.choice === 'string' && answer.choice.startsWith('resume:');
+    if (!session.alive && !isTimerTap && !isCarryOnTap) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
     }
@@ -7197,6 +7547,7 @@ function journalOnPromptReply(session, answer, { username }) {
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
       sendTimerNow: sendTimerNowFromButton,
+      carryOnConvo,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
     });
@@ -7304,6 +7655,43 @@ function journalResumeConvo(convoId) {
   return null;
 }
 
+// A "Carry on" tap. The router has already auto-resumed the session for a
+// verified resume tap (lib/journal-input-router.js), so `session` is live by
+// the time this runs; the lookup is a fallback for the ordering-independent
+// case. The injected text is the literal string `carry on` — a deliberate
+// choice recorded in the design spec, along with its trade-off: a turn killed
+// mid-tool-call can leave the agent unable to tell whether a side-effecting
+// action completed, so a re-run is possible.
+//
+// Never rejects: handlePickerValue dispatches every seam fire-and-forget (it
+// is a sync function and does not await this one), so an escaping rejection
+// would surface as an unhandled rejection rather than as a message to the
+// user. Same stance as journalRouteTextToSession's other non-awaiting caller,
+// the router's routeTextToSession adapter.
+async function carryOnConvo(convoId, session, _sendReply) {
+  try {
+    let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
+    if (!target || !target.alive) target = journalResumeConvo(convoId);
+    if (!target) {
+      // A carry-on tap always originates in a Matron journal chat (the card
+      // is only ever published there — see publishRestartCarryOnCards), so
+      // the failure has to land in that SAME journal convo, exactly like the
+      // catch block three lines below. `_sendReply` (journalSessionCommandCtx's
+      // sendReply, which routes to the session's MATRIX room) is the wrong
+      // surface here and is left unused rather than called — kept in the
+      // signature only because handlePickerValue (lib/picker-dispatch.js)
+      // positionally calls carryOnConvo(convoId, session, sendReply) and
+      // test/picker-dispatch.test.js pins that three-argument contract.
+      journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
+      return;
+    }
+    await journalRouteTextToSession(target, 'carry on');
+  } catch (e) {
+    console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
+    journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
+  }
+}
+
 // --- /timer scheduled messages ---
 //
 // A timer coming due. The record was already removed + persisted by the
@@ -7330,6 +7718,21 @@ async function fireTimer(record) {
   journalPublishNotice(journalConvoIdFor(session), `⏰ Timer #${record.id}: sending "${record.text}"`);
   await journalRouteTextToSession(session, record.text);
 }
+
+// One boot identity per bridge process — the whole of restart-carry-on
+// detection is "this marker carries a bootId that isn't mine, so the run that
+// wrote it is gone" (see lib/inflight-marker.js).
+const BRIDGE_BOOT_ID = randomUUID();
+
+const inflightMarker = createInflightMarker({
+  load: () => (fs.existsSync(INFLIGHT_FILE) ? JSON.parse(fs.readFileSync(INFLIGHT_FILE, 'utf-8')) : null),
+  // Atomic replace, same rationale as savePersistedSessions: a truncating
+  // in-place write that dies mid-rewrite would silently drop every marker.
+  save: (data) => atomicWriteFileSync(INFLIGHT_FILE, JSON.stringify(data, null, 2)),
+  now: Date.now,
+  bootId: BRIDGE_BOOT_ID,
+  log: (msg) => { try { console.warn(`[inflight] ${msg}`); } catch { /* logging must never throw */ } },
+});
 
 const timerStore = createTimerStore({
   load: () => (fs.existsSync(TIMERS_FILE) ? JSON.parse(fs.readFileSync(TIMERS_FILE, 'utf-8')) : null),
@@ -7681,8 +8084,24 @@ const journalInputConsumer = createJournalInputConsumer({
     // published INTO the shared room convo, spamming the peer's chat with
     // "no longer active". A known-but-inactive room just stops routing.
     if (agentRooms.get(convoId)) return;
+    // The prompt_reply wording differs deliberately. A `text`/media frame only
+    // reaches this notice AFTER the router already tried resumeSessionForConvo
+    // and it returned null (lib/journal-input-router.js:470-499) — so for those,
+    // "send a message" would be a lie. A prompt_reply does NOT get that attempt
+    // in general (its pending prompt died with the process), so the convo may
+    // well still be resumable by plain text.
+    //
+    // This is the honest-failure half of the restart carry-on dead-button case:
+    // pickerFrames is in-memory (lib/journal-input-router.js:261) and takeStale
+    // already consumed the marker, so if the bridge restarts AGAIN before the
+    // user taps a published "Carry on" card, the tap lands here. Verified that
+    // it does not self-heal: journal-publisher.js:583-591 drops any frame with
+    // seq <= lastSeq before onEvent, and lastSeq is persisted across restarts
+    // (journal-publisher.js:332, :496-497), so the card is never re-delivered
+    // and never re-registers. Telling the user the very thing that WOULD work
+    // is the cheap fix; rehydrating pickerFrames from the journal is not.
     journalPublishNotice(convoId, type === 'prompt_reply'
-      ? "This session is no longer active on this bridge — your answer wasn't delivered."
+      ? "This session is no longer active on this bridge — your answer wasn't delivered. Send a message in this chat and I'll pick the conversation back up."
       : "This session is no longer active on this bridge — your message wasn't delivered.");
   },
   noticeStalePromptReply: (convoId) => {
@@ -7731,11 +8150,11 @@ const journalInputConsumer = createJournalInputConsumer({
 // been assigned).
 function journalHandleInboundEvent(frame) {
   journalInputConsumer(frame);
-  // Re-arm the deferred boot reconcile (F1) while one is pending: each replayed
-  // frame pushes the quiet-timer out, so reconcile runs only once the reconnect
-  // replay stream (which carries release echoes) has gone quiet. No-op after the
-  // one-shot reconcile has fired (_releaseReconcileTimer is null), so
-  // steady-state traffic pays only a null check.
+  // Re-arm the deferred boot reconcile (F1) while one is pending: every inbound
+  // frame pushes the quiet-timer out (during the post-reconnect burst these are
+  // the replay frames, which carry the release echoes), so reconcile runs only
+  // once that stream has gone quiet. No-op after the one-shot reconcile has fired
+  // (_releaseReconcileTimer is null), so steady-state traffic pays only a null check.
   if (_releaseReconcileTimer) scheduleReleaseReconcile();
 }
 
@@ -7850,6 +8269,7 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     session.busy = true;
+    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -7889,7 +8309,7 @@ async function approvePlanBuild(session, { sendHtml }) {
 // posts its own richer "Session was idle" notice first, and without the
 // skip Matron users would see both.
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
-  const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
   const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
   const activeAgent = resolveAgent({ persisted: prev.agent, fallback: DEFAULT_AGENT });
@@ -7965,6 +8385,47 @@ const agentChatHandlers = createAgentChatHandlers({
   // chatJoin's own-session-convo guard (I2).
   journalConvoIdFor,
   serverLabel: SERVER_LABEL,
+  log: console,
+});
+
+// Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
+// agent_boxes / agent_session_start MCP tools and the kind:'spawn' outcome
+// frames. Constructed exactly once, here — the factory starts an unref'd
+// hourly tombstone sweep with no dispose hook, so a second instantiation
+// would leak a duplicate timer.
+agentSpawnHandlers = createAgentSpawnHandlers({
+  sessions,
+  publisher: journalPublisher,
+  rooms: agentRooms,
+  journalConvoIdFor,
+  // Surfaces a spawn outcome two ways: journalPublishNotice writes the
+  // durable, user-facing copy into the parent session's journal
+  // conversation; roomDelivery.deliver additionally wakes the live agent as
+  // an injected turn (idle) or a coalesced one (busy), same mechanism
+  // journalNotifyRoomEvent uses for room-lifecycle FYIs. No real agent-chat
+  // room backs every outcome (declined/expired/failed never get one), so a
+  // synthetic 'spawn' bucket stands in — same shape as a room key, none of
+  // it forgeable (the text itself is bridge-composed, not peer input).
+  //
+  // ctx-null case (bridge restarted between the ack and the outcome frame):
+  // agent-spawn.js calls this with BOTH session and convoId null — with no
+  // fallback, neither branch below would fire and the outcome (started/
+  // declined/expired/failed) would vanish with zero notices, contradicting
+  // the "exactly-once surfacing" guarantee handleOutcome's tombstone exists
+  // to provide (at-most-once, not zero). JOURNAL_CONTROL_CONVO_ID is the
+  // same synthetic control conversation the bridge already replies into for
+  // session-less commands (journalHandleControlCommand's `reply`); it
+  // always exists (upserted at boot when JOURNAL_ENABLED), so the notice
+  // lands somewhere the user can actually read it instead of being dropped
+  // on the floor.
+  notifyParent: ({ session, convoId, text }) => {
+    if (convoId) journalPublishNotice(convoId, text);
+    if (session) {
+      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
+    } else if (!convoId) {
+      journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
+    }
+  },
   log: console,
 });
 
@@ -8231,6 +8692,18 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === '/agent-boxes') {
+        await respondAgentChatRoute(res, data, agentSpawnHandlers.boxes,
+          (status, b) => debug(`agent-boxes ${status} ${(b.boxes || []).length ?? ''} ${b.error || ''}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-session-start') {
+        await respondAgentChatRoute(res, data, agentSpawnHandlers.sessionStart,
+          (status, b) => debug(`agent-session-start ${status} ${b.spawn_id || ''} ${b.status || b.error || ''}`));
+        return;
+      }
+
       const secretSubmitMatch = url.pathname.match(/^\/secret\/([^/]+)\/submit$/);
       if (secretSubmitMatch) {
         const secretId = secretSubmitMatch[1];
@@ -8493,7 +8966,7 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, plainTextFormat(text), markdownToHtml(text)).then(() => {
+        sendToRoom(roomId, text, markdownToHtml(text)).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
@@ -9009,6 +9482,11 @@ async function printModeInterrupt(session, sendReply) {
       session.pendingInterrupt = null;
       if (!session.busy) return;
       session.busy = false;
+      // Deliberately NO noteTurnEnd: this is a defensive unstick after an
+      // interrupt got no acknowledgement, and the reply below says so — "the
+      // turn may still be running". Further agent output is still possible,
+      // and the `result` seam will clear the marker if it arrives. Clearing
+      // here would drop a card for a turn that really was interrupted.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
       Promise.resolve(sendReply('⚠️ No response to the interrupt after 10s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.')).catch(() => {});
@@ -9103,6 +9581,71 @@ function startIdleReaper() {
 
 // --- Startup ---
 
+// Boot reconciliation for restart carry-on. Every marker still on disk from a
+// previous bridge process is, by construction, a turn that never reached a
+// turn-end seam — the restart killed it (index.js SIGTERM handler kills every
+// live session). Markers inside the window get a card; the rest are dropped
+// silently. takeStale clears ALL previous-boot markers either way, so a given
+// interruption is offered exactly once and can never resurface on a later boot.
+function publishRestartCarryOnCards() {
+  if (!JOURNAL_ENABLED) return;
+  let stale;
+  try {
+    // takeStale clears and PERSISTS before this returns, i.e. before a single
+    // card below has been published. A crash — or a dropped publisher frame —
+    // between here and the loop loses those interruptions permanently: the
+    // marker is gone and the user never saw a card. Accepted, and inherent to
+    // the fire-once guarantee (see lib/inflight-marker.js takeStale). Do not
+    // "fix" it by deferring the clear until after publishing; that reintroduces
+    // duplicate cards, which is the louder failure.
+    stale = inflightMarker.takeStale(RESTART_CARRY_ON_MAX_AGE_MS);
+  } catch (e) {
+    console.warn(`[inflight] boot reconciliation failed: ${e.message}`);
+    return;
+  }
+  if (!stale.length) return;
+  const persisted = loadPersistedSessions();
+  const resumable = new Set(Object.values(persisted)
+    .flatMap(rec => [rec?.journalConvoId, rec?.sessionId])
+    .filter(Boolean));
+  for (const rec of stale) {
+    // No persisted session record means there is nothing for a tap to resume,
+    // so a card would be a dead button. Drop it.
+    if (!resumable.has(rec.convoId)) {
+      // Wrapped like every other log in this loop: a throw here would abort
+      // every REMAINING card, so one bad record would cost other conversations
+      // their card. Codebase convention — "logging must never throw".
+      try { console.log(`[inflight] skipping carry-on card for convo=${rec.convoId} — no persisted session`); } catch { /* logging must never throw */ }
+      continue;
+    }
+    // A convo id outside picker-dispatch's `resume:` shape produces the worst
+    // failure available: the tap consumes the single-use picker frame, then
+    // handlePickerValue returns false and its caller no-ops SILENTLY — no
+    // resume, no error, nothing. Unreachable today (every convo id is a
+    // randomUUID or a codex thread id), so this is belt-and-braces; the point
+    // is that if it ever becomes reachable it fails loudly in the log instead
+    // of silently in the user's chat.
+    if (!isResumeConvoId(rec.convoId)) {
+      try { console.warn(`[inflight] skipping carry-on card for convo=${rec.convoId} — id does not match the resume: picker value shape, so a tap would silently no-op`); } catch { /* logging must never throw */ }
+      continue;
+    }
+    const question = `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
+    const published = journalPublishCardForConvo(rec.convoId, {
+      question,
+      options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
+    });
+    // The marker for this convo was already cleared by takeStale above, so a
+    // false here isn't just "log it wrong" — it means this interruption's
+    // card is gone for good; there is no marker left to retry from on a
+    // later boot (see the fire-once comment above this loop).
+    if (published) {
+      try { console.log(`[inflight] published carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s)`); } catch { /* logging must never throw */ }
+    } else {
+      try { console.warn(`[inflight] carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s) was NOT published — its marker is already cleared, so this interruption's card is lost`); } catch { /* logging must never throw */ }
+    }
+  }
+}
+
 async function main() {
   // Ensure secrets directory exists with restricted permissions
   try {
@@ -9135,6 +9678,13 @@ async function main() {
   // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
   // journal frames, so there's nothing to sample for when journal mode is off.
   if (JOURNAL_ENABLED) startCpuSampler();
+  // Last: turn any marker left behind by the previous process into a "Carry on"
+  // card. After timerStore.init() so a re-armed timer's own resume can't race
+  // the reconciliation for the same convo, and safe with respect to the journal
+  // socket — the publisher is constructed (and connect()ed) at module load and
+  // queues frames FIFO until hello_ok, exactly as the eager control-convo
+  // upsert above relies on, so nothing is dropped by publishing here.
+  publishRestartCarryOnCards();
 }
 
 main().catch(err => {
