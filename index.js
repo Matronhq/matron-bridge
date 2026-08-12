@@ -711,6 +711,9 @@ const journalRpcHandler = createRpcRequestHandler({
   // from whatever usageLimitsCache holds right now.
   getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
   getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  // Which account a new session here would burn quota against, so the chooser
+  // can tell boxes on different logins apart. Same cache as the status frames.
+  getAccountEmail: () => getAccountEmail(),
   // Spawn-room wiring (2026-08-09 agent-spawn spec). agentRooms is declared
   // later in this file (~:7223) — these arrows only dereference it at call
   // time, long after module evaluation finishes, same late-binding as
