@@ -305,10 +305,14 @@ async function runProducer(realbin, argv, ctx) {
   };
 
   return new Promise(resolve => {
-    // An EPIPE on the child's stdout (caller closed the read end mid-turn) would
+    // An EPIPE on either pipe (the caller closed the read end mid-turn) would
     // otherwise surface as an uncaught 'error' and kill the shim before the
-    // terminal meta is written. Swallow it; 'close' still settles the run.
+    // terminal meta is written. Note the write below is guarded by try/catch, but
+    // a stream write error is delivered ASYNCHRONOUSLY via 'error', not thrown
+    // synchronously — so the guard alone is insufficient. Listen on BOTH the
+    // child's stdout and the caller's stdout; 'close' still settles the run.
     child.stdout.on('error', () => {});
+    if (typeof stdout.on === 'function') stdout.on('error', () => {});
     child.stdout.on('data', chunk => {
       // Verbatim tee: JSONL sink (append) + caller stdout, byte-identical.
       try { fs.writeSync(jsonlFd, chunk); } catch { /* sink loss must not break the run */ }

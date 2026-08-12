@@ -203,6 +203,19 @@ describe('pruneStaleCodexSinks', () => {
     const impl = { readdirSync: () => { throw new Error('ENOENT'); } };
     expect(pruneStaleCodexSinks({ now: () => 0, root: '/nope', fsImpl: impl })).toBe(0);
   });
+
+  it('falls back to the default window for a negative/invalid retention (never mass-deletes)', () => {
+    // MATRON_CODEX_SINK_RETENTION_MS=-1 is truthy; a negative window would push
+    // the cutoff into the FUTURE and delete every sink dir. A fresh sink must
+    // survive — with the bug, this prunes it (cutoff = now + 1).
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'fresh-sid': { dir: 99.5 * DAY }, // 12h old
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: -1, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(0);
+    expect(removed).toEqual([]);
+  });
 });
 
 describe('Claude spawn-path sink wiring', () => {
