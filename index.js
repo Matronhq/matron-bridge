@@ -1195,11 +1195,28 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   // bypassMode: explicit --bypass/--auto flag wins; otherwise the persisted
-  // value. Sessions persisted before this feature have no bypassMode and thus
-  // resume in auto mode — the intended migration (spec 2026-08-10).
+  // value; otherwise bypass.
+  //
+  // Defaults to bypass, reverting the 2026-08-10 auto-mode migration. Auto
+  // mode's classifier returns allow/deny itself and only consults
+  // --permission-prompt-tool on `ask`, so a *denied* call never reaches the
+  // Matron card: the user is never asked and cannot overturn it from inside the
+  // session. Measured 2026-08-11 — card delivery works end to end (POST
+  // /permission-request -> 200 + requestId) yet four classifier denials in a row
+  // produced no card, including a read-only grep of this file and the edit to
+  // this very block. That makes auto strictly more obstructive than bypass while
+  // looking like it has a human in the loop. The design doc's fallback
+  // ("repeated classifier blocks -> fallback prompt", spec line 156) assumes a
+  // CLI escape hatch that does not exist; only `permissions.allow` rules are
+  // evaluated ahead of the classifier, and those are a settings edit, not a
+  // prompt.
+  //
+  // `!== false`, not `=== true`: a session that explicitly persisted auto keeps
+  // it. This changes the default for new and legacy sessions without silently
+  // upgrading anyone who deliberately chose auto.
   const bypassMode = typeof options.bypass === 'boolean'
     ? options.bypass
-    : (persistedForRoom?.bypassMode === true);
+    : (persistedForRoom?.bypassMode !== false);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   let showFileToken;
@@ -5940,7 +5957,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
         `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
-        `/start --bypass [workdir] — Skip auto permission mode and run with --dangerously-skip-permissions instead (--auto switches back); also accepted by /restart, /resume, /workdir\n` +
+        `/start --auto [workdir] — Use classifier-based auto permission mode; sessions default to --dangerously-skip-permissions (--bypass forces it); also accepted by /restart, /resume, /workdir\n` +
         `/stop — Stop the current session\n` +
         `/restart — Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)\n` +
         `/resume [--claude|--codex] <n|id> — Resume a session from that agent\n` +
@@ -5981,7 +5998,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
           ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
-          ['/start --bypass [workdir]', 'Skip auto permission mode and run with --dangerously-skip-permissions instead (--auto switches back); also accepted by /restart, /resume, /workdir'],
+          ['/start --auto [workdir]', 'Use classifier-based auto permission mode; sessions default to --dangerously-skip-permissions (--bypass forces it); also accepted by /restart, /resume, /workdir'],
           ['/stop', 'Stop the current session'],
           ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)'],
           ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
