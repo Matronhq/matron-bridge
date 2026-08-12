@@ -1458,9 +1458,39 @@ describe('index.js flushPendingSessionQueue — compact-first split (source insp
     expect(body).toMatch(/if \(sent === true\) session\.queueNotifications = notifications\.slice\(batchSize\)/);
   });
 
-  it('tells the user the rest is waiting on the compaction', () => {
-    expect(body).toMatch(/Sending \/compact first/);
-    expect(body).toMatch(/once compaction finishes/);
+  // The wording moved to lib/queue-flush-notice.js, shared with the three
+  // explicit-flush paths, and is pinned byte-for-byte there by
+  // test/queue-flush-notice.test.js. What THIS site still has to get right is
+  // the delegation, so that is what is pinned here: the turn-end style (using
+  // sendNow would announce "⚡ … now" for a flush the user never asked for),
+  // and passing the deferred count — drop it and a compact split silently
+  // announces the whole batch as sent when only the /compact went out.
+  it('tells the user the rest is waiting on the compaction, via the shared notice', () => {
+    expect(body).toMatch(/queueFlushNotice\('turnEnd', \{/);
+    expect(body).toMatch(/deferred: deferred\.length/);
+    expect(body).toMatch(/summary: formatQueueSummary\(queued\)/);
+  });
+});
+
+// The /interrupt HTTP endpoint is the fourth flush path and the only one that
+// had no announcement coverage at all before the notice was single-sourced.
+describe('index.js /interrupt endpoint — flush announcement (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const start = src.indexOf("} else if (url.pathname === '/interrupt') {");
+  const body = src.slice(start, src.indexOf('\n      } else if (url.pathname ===', start + 10));
+
+  it('announces through the shared notice in the explicit-send style', () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(body).toMatch(/queueFlushNotice\('sendNow', \{/);
+    expect(body).toMatch(/deferred: deferred\.length/);
+  });
+
+  // An endpoint-triggered flush is an explicit send, so it must not fall back
+  // to the turn-end wording, and it must not rebuild the sentence by hand.
+  it('does not hand-build the announcement', () => {
+    expect(body).not.toMatch(/Sending \/compact/);
+    expect(body).not.toMatch(/queued message\$\{/);
+    expect(body).not.toMatch(/turnEnd/);
   });
 });
 
