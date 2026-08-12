@@ -53,6 +53,7 @@ import {
 } from './lib/codex-watcher-setup.js';
 import { launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -84,7 +85,7 @@ import {
   shareAgentMedia,
 } from './lib/show-file.js';
 import { processShowFile } from './lib/show-file-handler.js';
-import { createJournalPublisher } from './lib/journal-publisher.js';
+import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
@@ -402,8 +403,12 @@ let agentSpawnHandlers = null;
 // referenced lazily — the handler only ever fires once the socket is live, long
 // after the const below is assigned.
 function handleJournalReconnect() {
+  // Union of the two reconnect wirings (#207 + #536). Stranded-subagent reconcile
+  // first, then journalOnReconnect — which reemits codex outcomes, republishes
+  // overflow-evicted releases, and arms the deferred boot reconcile. The codex
+  // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
-  journalReemitCodexOutcomes({ sessions, publisher: journalPublisher });
+  journalOnReconnect();
 }
 
 const journalPublisher = createJournalPublisher({
@@ -415,7 +420,13 @@ const journalPublisher = createJournalPublisher({
   onStreamResync: (convoId, messageRef, have) => {
     toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
   },
+  // Union of both reconnect wirings: handleJournalReconnect runs #207's stranded-
+  // subagent reconcile AND (via journalOnReconnect) #536's release retry + deferred
+  // boot reconcile. See handleJournalReconnect below.
   onReconnect: handleJournalReconnect,
+  // Send-completion retry trigger (the mandatory one): re-publishes an
+  // overflow-evicted release frame on a healthy socket that never reconnects.
+  onSendCapacity: () => republishPendingReleases(),
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -676,6 +687,16 @@ function findPersistedAgentSession(agent, sessionId) {
 
 const sessions = new Map(); // roomId -> session
 
+// Persistent, crash-safe write-ahead outbox for queued_release resolutions
+// (loop #536). Constructed here so it loads + relabels any inherited on-disk
+// `pending` records to `pending_inherited` synchronously at boot, before the
+// publisher fires any hook. emitRelease writes-ahead into it; the router's
+// echo-ack flips records `acked`; the retry driver + boot reconcile read it.
+const releaseOutbox = createQueuedReleaseOutbox({ log: console });
+// The one-shot boot-reconcile guard + its quiet-period deferral timer live in
+// the emitRelease..journalUpsertConvo seam below (scheduleReleaseReconcile),
+// next to reconcileReleaseOutbox itself.
+
 // Persistent record of subagent child convos currently `running`.
 // Written by each session's subagent tracker (add on mint, remove on finish);
 // read at startup/reconnect by reconcileStrandedSubagents to mark ghosts done.
@@ -813,14 +834,160 @@ function journalPublish(session, method, payload) {
   }
 }
 
-function emitRelease(convoId, { promptId, action, releasedIds }) {
+// Transactional release seam (loop #536, spec §3). Order: write-ahead a durable
+// `pending` outbox record → (if a mutate thunk is supplied) run the irreversible
+// queue mutation → publish with a deterministic idem_key. FAIL-CLOSED: if the
+// write-ahead can't durably persist, ABORT before the mutation and the publish
+// (return false), leaving the card actionable — a failed durability prerequisite
+// must never let the irreversible mutation proceed with no recoverable record.
+// Returns true on a durable emit, false on a fail-closed abort.
+// Reconnect handler (hoisted so the createJournalPublisher arg block stays free
+// of a nested `});`). Re-emits Codex outcomes (upstream behavior) and drives the
+// queued-release durability retry + one-shot boot reconcile (loop #536).
+function journalOnReconnect() {
+  journalReemitCodexOutcomes({ sessions, publisher: journalPublisher });
+  // Queued-release durability (spec §3 step 6): reconnect is one of the two
+  // retry triggers. Safe on the FIRST hello_ok of a fresh boot — inherited
+  // records are already `pending_inherited` (relabelled at load), which the
+  // driver skips (state gate, not timing).
+  republishPendingReleases();
+  // Boot reconciliation (spec §5): expire every `pending_inherited` orphan.
+  // DEFERRED behind a quiet-period timer, re-armed by every inbound journal
+  // frame (journalHandleInboundEvent), so it fires only AFTER the reconnect
+  // replay stream goes quiet. (The re-arm is not replay-specific — any inbound
+  // frame pushes the timer out; during the post-reconnect burst those frames
+  // are the replay.) F1 timing fix: the replay carries the echo of a
+  // release that a prior process committed (journal append ran) but died before
+  // acking; that echo's markAcked flips pending_inherited -> acked BEFORE this
+  // reconcile runs, so a durably-committed release is never wrongly stamped
+  // `expired`. Running synchronously here (the old behavior) raced the replay
+  // and produced two contradictory terminal releases for one prompt. One-shot:
+  // only the first hello_ok's replay is reconciled; later reconnects re-arm
+  // nothing (the timer is null after the single reconcile fires).
+  scheduleReleaseReconcile();
+}
+
+function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}) {
+  const itemId = (Array.isArray(releasedIds) && releasedIds.length)
+    ? releasedIds[0]
+    : `${promptId}::0`;
+  const at = Date.now();
+  const recordKey = `${promptId}\0${itemId}\0${action}`;
+  const durable = releaseOutbox.put(recordKey, {
+    convoId,
+    promptId,
+    itemId,
+    action,
+    releasedIds: Array.isArray(releasedIds) ? releasedIds : [itemId],
+    status: 'pending',
+    at,
+  });
+  if (!durable) {
+    console.warn(`[queued-release-outbox] write-ahead failed for ${recordKey} — aborting release (card stays actionable)`);
+    return false;
+  }
+  try { mutate?.(); }
+  catch (e) { console.warn(`[emitRelease] mutate thunk threw for ${recordKey}: ${e?.message ?? String(e)}`); }
   journalPublisher.publishPromptReply(convoId, {
     kind: 'queued_release',
     prompt_id: promptId,
     action,
     released: releasedIds,
-    at: Date.now(),
-  });
+    at,
+  }, { idemKey: `qr\0${promptId}\0${itemId}\0${action}` });
+  return true;
+}
+
+// In-process retry driver (spec §3 step 6). Re-publishes every SAME-EPOCH
+// `pending` outbox record whose frame is not already in the outbound queue,
+// with its deterministic idem_key (so a re-publish of an already-journaled
+// release is a server-side dedup no-op). SKIPS `pending_inherited` (the state
+// gate — only boot reconcile touches those) and `acked`. Fired by two triggers
+// (onSendCapacity + onReconnect); the in-progress flag coalesces overlapping
+// fires into one pass.
+let _republishingReleases = false;
+function republishPendingReleases() {
+  if (_republishingReleases) return;
+  // O(1) fast path: this fires per confirmed frame on the hot output path
+  // (onSendCapacity). With no retry-eligible records the pendingCount gate
+  // avoids an O(all-releases-since-boot) list() allocation per streamed delta.
+  if (releaseOutbox.pendingCount() === 0) return;
+  _republishingReleases = true;
+  try {
+    for (const rec of releaseOutbox.list()) {
+      if (rec.status !== 'pending') continue; // skip pending_inherited + acked
+      const idemKey = `qr\0${rec.promptId}\0${rec.itemId}\0${rec.action}`;
+      if (journalPublisher.hasQueuedIdem(idemKey)) continue; // frame still queued
+      journalPublisher.publishPromptReply(rec.convoId, {
+        kind: 'queued_release',
+        prompt_id: rec.promptId,
+        action: rec.action,
+        released: rec.releasedIds,
+        at: rec.at,
+      }, { idemKey });
+    }
+  } finally {
+    _republishingReleases = false;
+  }
+}
+
+// Boot reconciliation (spec §5). The SOLE toucher of `pending_inherited`. For
+// each inherited orphan (a release a prior process wrote but never got acked),
+// emit a terminal `expired` release via the normal write-ahead path — never
+// blind-re-publish the original send/cancel (device_id may differ post-restart,
+// so a re-publish could double-ink; expired is the conservative honest state).
+function reconcileReleaseOutbox() {
+  for (const rec of releaseOutbox.list()) {
+    if (rec.status !== 'pending_inherited') continue;
+    const expiredKey = `${rec.promptId}\0${rec.itemId}\0expired`;
+    // emitRelease write-aheads the expired-recovery record (key === expiredKey,
+    // status `pending`) BEFORE publishing, then publishes the terminal `expired`
+    // release. On a second boot where the inherited record IS the expired record
+    // this relabels it back to `pending` in place under the same key. Returns
+    // false (fail-closed) if the durable write-ahead can't persist.
+    const emitted = emitRelease(rec.convoId, {
+      promptId: rec.promptId,
+      action: 'expired',
+      releasedIds: [rec.itemId],
+    });
+    // F2: only remove the inherited original when the expired release was
+    // durably emitted. If emitRelease fail-closed (disk fault), keep the
+    // inherited record so a later boot retries — never delete with nothing
+    // published, else `_releaseReconciled` would permanently orphan the card.
+    // F1 self-delete guard: also require rec.key !== expiredKey — on an
+    // expired-on-expired second boot the keys match, so we must NOT delete the
+    // record we just re-wrote.
+    if (emitted && rec.key !== expiredKey) releaseOutbox.remove(rec.key);
+  }
+  releaseOutbox.sweepAcked();
+}
+
+// --- Boot-reconcile deferral (F1 timing fix) ---
+// reconcileReleaseOutbox must NOT run before the reconnect replay that carries
+// the echo of a committed-but-unacked release (that echo flips the record
+// pending_inherited -> acked, so reconcile then correctly skips it). We defer
+// reconcile behind a quiet-period timer, re-armed by every replayed journal
+// frame, so it fires only once the replay stream has been quiet for the window.
+// One-shot: inherited records are a boot-only concern, so we reconcile exactly
+// once (the first hello_ok's replay); after that the timer is null forever.
+// Quiet window overridable via env (short by default — a boot replay burst is
+// bounded and steady-state single-convo traffic isn't sub-window-continuous).
+const RELEASE_RECONCILE_QUIET_MS = Number(process.env.MATRON_QUEUED_RELEASE_RECONCILE_QUIET_MS) || 750;
+let _releaseReconciled = false;
+let _releaseReconcileTimer = null;
+function runReleaseReconcile() {
+  _releaseReconcileTimer = null;
+  if (_releaseReconciled) return;
+  _releaseReconciled = true;
+  reconcileReleaseOutbox();
+}
+function scheduleReleaseReconcile() {
+  if (_releaseReconciled) return;
+  if (_releaseReconcileTimer) clearTimeout(_releaseReconcileTimer);
+  _releaseReconcileTimer = setTimeout(runReleaseReconcile, RELEASE_RECONCILE_QUIET_MS);
+  if (_releaseReconcileTimer && typeof _releaseReconcileTimer.unref === 'function') {
+    _releaseReconcileTimer.unref();
+  }
 }
 
 function journalUpsertConvo(session, opts) {
@@ -4727,13 +4894,19 @@ function finalizeSentQueue(convoId, flushedSnapshot) {
   for (const { itemId } of flushedSnapshot || []) {
     const liveEntry = liveByItemId.get(itemId);
     if (!liveEntry) continue;
-    emitRelease(convoId, {
+    // Fail-closed (F2): retire the live entry ONLY when the durable write-ahead
+    // committed. If emitRelease fail-closed (write-ahead disk fault, e.g.
+    // ENOSPC), keep the live registry entry so a later release attempt / boot
+    // reconcile can still recover the card — dropping it unconditionally here
+    // would leave a permanently dead card with no durable record, silently.
+    if (emitRelease(convoId, {
       promptId: liveEntry.promptId,
       action: 'send',
       releasedIds: [itemId],
-    });
-    journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-    liveByItemId.delete(itemId);
+    })) {
+      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+      liveByItemId.delete(itemId);
+    }
   }
 }
 
@@ -7966,6 +8139,15 @@ const journalInputConsumer = createJournalInputConsumer({
   routeRoomFrame: journalOnRoomFrame,
   selfAgentName: () => journalPublisher.identity()?.name || null,
   selfAgentDeviceId: () => journalPublisher.identity()?.deviceId ?? null,
+  // Queued-release universal echo-ack (spec §3 step 5): the echo of our own
+  // release is the true commit signal — flip the outbox record `acked` in
+  // memory unconditionally. Matched by (promptId, action) across
+  // send/cancel/expired.
+  onReleaseEcho: (_convoId, { promptId, action }) => {
+    if (typeof promptId === 'string' && typeof action === 'string') {
+      releaseOutbox.markAcked(promptId, action);
+    }
+  },
   log: console,
 });
 
@@ -7976,6 +8158,12 @@ const journalInputConsumer = createJournalInputConsumer({
 // been assigned).
 function journalHandleInboundEvent(frame) {
   journalInputConsumer(frame);
+  // Re-arm the deferred boot reconcile (F1) while one is pending: every inbound
+  // frame pushes the quiet-timer out (during the post-reconnect burst these are
+  // the replay frames, which carry the release echoes), so reconcile runs only
+  // once that stream has gone quiet. No-op after the one-shot reconcile has fired
+  // (_releaseReconcileTimer is null), so steady-state traffic pays only a null check.
+  if (_releaseReconcileTimer) scheduleReleaseReconcile();
 }
 
 // Evict the reply-staleness guard record for a torn-down session's convo
@@ -9519,19 +9707,33 @@ main().catch(err => {
   process.exit(1);
 });
 
-process.on('SIGINT', () => {
-  console.log('\nShutting down...');
-  stopCpuSampler();
-  for (const [, session] of sessions) {
-    killSession(session);
+// Async shutdown that SETTLES in-flight release frames before exit (loop #536,
+// spec §4). Idempotent: a second signal short-circuits via `shuttingDown`. The
+// outbound queue is drained (or the bounded flush timeout elapses — a dead
+// socket can't hang shutdown), so a clean restart delivers pending releases
+// inline; anything still unsettled is durable in the outbox and reconciled on
+// next boot.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (signal === 'SIGINT') console.log('\nShutting down...');
+  // Everything is inside try/finally so a throw from ANY step (sampler, session
+  // kill, or the flush) still reaches process.exit(0). Previously stopCpuSampler
+  // / killSession ran outside the try, so a throw there rejected the promise the
+  // signal handlers ignore, and the process never exited (unhandled rejection).
+  try {
+    stopCpuSampler();
+    for (const [, session] of sessions) {
+      killSession(session);
+    }
+    await journalPublisher.flush({ timeoutMs: FLUSH_TIMEOUT_MS });
+  } catch (e) {
+    try { console.warn(`[shutdown] failed: ${e?.message ?? String(e)}`); } catch { /* ignore */ }
+  } finally {
+    process.exit(0);
   }
-  process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  stopCpuSampler();
-  for (const [, session] of sessions) {
-    killSession(session);
-  }
-  process.exit(0);
-});
+process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });

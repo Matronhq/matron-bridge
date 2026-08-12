@@ -511,6 +511,7 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
     const emitRelease = vi.fn((convoId, release) => {
       order.push(`release:${release.releasedIds[0]}`);
       expect(convoId).toBe('convo-1');
+      return true; // durable emit — the fail-closed gate only clears on success
     });
     const consumer = createJournalInputConsumer(makeDeps({ emitRelease }));
     consumer.queueRelease.noteQueued('convo-1', {
