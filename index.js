@@ -671,7 +671,7 @@ const sessions = new Map(); // roomId -> session
 // convo id — NOT the room key, which is bridge-internal).
 function journalStartSessionForRpc({ workdir, mcpExtras }) {
   const sessionRoomId = newSessionConvoId();
-  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
   const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
   const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
     sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -4869,13 +4869,13 @@ function padTable(tableText) {
   }).join('\n');
 }
 
-// Improve plain text body for clients that don't render HTML (e.g. Element X)
-// Wraps pipe tables in code fences so they render monospaced with aligned columns
-function plainTextFormat(text) {
-  return text.replace(/((?:^\|.+\|\n?)+)/gm, (match) => {
-    return '```\n' + padTable(match) + '\n```';
-  });
-}
+// Journal bodies are raw markdown: Matron clients render GFM themselves
+// (the Mac timeline lays out pipe tables natively as of matron-apple #134,
+// iOS/Android via their markdown views), so nothing here may rewrite
+// message text for presentation. The old plainTextFormat() Element X
+// fallback — fence + pad pipe tables for monospace — lived here until
+// 2026-08-12; it survived the Matrix exit and silently downgraded every
+// table to a code block on all clients.
 
 // --- File Helpers ---
 
@@ -5487,7 +5487,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -5778,7 +5778,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -5905,7 +5905,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -6765,7 +6765,7 @@ function journalEchoToRoom(session, plain, html) {
 // control-convo dispatch makes below.
 function journalSessionCommandCtx(session) {
   return {
-    sendReply: (reply) => sendToRoom(session.roomId, plainTextFormat(reply), markdownToHtml(reply)),
+    sendReply: (reply) => sendToRoom(session.roomId, reply, markdownToHtml(reply)),
     sendHtml: (plainText, html) => sendToRoom(session.roomId, plainText, html),
     sender: ALLOWED_USER_IDS[0],
   };
@@ -8023,7 +8023,7 @@ async function approvePlanBuild(session, { sendHtml }) {
 // posts its own richer "Session was idle" notice first, and without the
 // skip Matron users would see both.
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
-  const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
   const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
   const activeAgent = resolveAgent({ persisted: prev.agent, fallback: DEFAULT_AGENT });
@@ -8680,7 +8680,7 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, plainTextFormat(text), markdownToHtml(text)).then(() => {
+        sendToRoom(roomId, text, markdownToHtml(text)).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
