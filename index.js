@@ -17,7 +17,7 @@ import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/
 import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { projectDirFor, transcriptPathFor } from './lib/transcript-dir.js';
+import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
 import {
   buildMcpServers,
@@ -53,6 +53,8 @@ import {
 } from './lib/codex-watcher-setup.js';
 import { launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { createSubagentRunningStore } from './lib/subagent-running-store.js';
+import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -392,6 +394,18 @@ let agentSpawnHandlers = null;
 // safe — onEvent is only ever CALLED once the socket is live, long after the
 // whole module, including `sessions` and the routing functions below, has
 // finished evaluating).
+// Fires on every hello_ok — the FIRST connect (bridge startup, live sessions
+// map still empty → all persisted running children reconcile) and every later
+// reconnect (only children whose parent is no longer live). Named (not inlined
+// into the createJournalPublisher options) so the reconcile + reemit block does
+// not read as part of the publisher's option object. `journalPublisher` is
+// referenced lazily — the handler only ever fires once the socket is live, long
+// after the const below is assigned.
+function handleJournalReconnect() {
+  reconcileStrandedSubagents('reconnect');
+  journalReemitCodexOutcomes({ sessions, publisher: journalPublisher });
+}
+
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
   token: _journalToken,
@@ -401,10 +415,7 @@ const journalPublisher = createJournalPublisher({
   onStreamResync: (convoId, messageRef, have) => {
     toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
   },
-  onReconnect: () => journalReemitCodexOutcomes({
-    sessions,
-    publisher: journalPublisher,
-  }),
+  onReconnect: handleJournalReconnect,
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -665,13 +676,19 @@ function findPersistedAgentSession(agent, sessionId) {
 
 const sessions = new Map(); // roomId -> session
 
+// Persistent record of subagent child convos currently `running`.
+// Written by each session's subagent tracker (add on mint, remove on finish);
+// read at startup/reconnect by reconcileStrandedSubagents to mark ghosts done.
+// A single shared store is safe — childConvoIds are globally unique.
+const subagentRunningStore = createSubagentRunningStore({ log: console });
+
 // RPC-start (lib/journal-rpc.js `start`): the !start command body minus the
 // origin-room replies — an RPC start has no origin chat room. Returns the
 // session; the RPC handler answers with its claudeSessionId (the journal
 // convo id — NOT the room key, which is bridge-internal).
 function journalStartSessionForRpc({ workdir, mcpExtras }) {
   const sessionRoomId = newSessionConvoId();
-  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
   const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
   const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
     sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -711,6 +728,9 @@ const journalRpcHandler = createRpcRequestHandler({
   // from whatever usageLimitsCache holds right now.
   getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
   getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  // Which account a new session here would burn quota against, so the chooser
+  // can tell boxes on different logins apart. Same cache as the status frames.
+  getAccountEmail: () => getAccountEmail(),
   // Spawn-room wiring (2026-08-09 agent-spawn spec). agentRooms is declared
   // later in this file (~:7223) — these arrows only dereference it at call
   // time, long after module evaluation finishes, same late-binding as
@@ -1203,6 +1223,50 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  // A Claude session that changes cwd mid-flight (EnterWorktree is the common
+  // case) has its transcript relocated to the NEW cwd's project dir, while the
+  // bridge's persisted workdir stays where the session was spawned. Resuming
+  // with that stale workdir misses the transcript, and planSessionIdentity
+  // demotes the resume to a fresh --session-id spawn on the same id — the room
+  // keeps its identity but silently loses its whole conversation. Follow the
+  // transcript instead: find it by session id and adopt the cwd recorded
+  // inside it, before any branch spawns (both claude branches and their
+  // transcriptExists checks read this workdir).
+  if (agent === AGENT_CLAUDE && resumeSessionId
+      && !fs.existsSync(transcriptPathFor(workdir, resumeSessionId))) {
+    const shortId = resumeSessionId.slice(0, 8);
+    const found = findTranscriptBySessionId(resumeSessionId);
+    if (found?.workdir) {
+      // Claude can only find the transcript when spawned from a cwd that
+      // encodes to the project dir holding it. If the recorded workdir has
+      // been deleted since (a pruned worktree), recreate it: an empty
+      // directory and an intact conversation beats a fresh spawn with total
+      // amnesia — the user can !workdir somewhere real afterwards. (Bugbot,
+      // PR #216: without this, a found transcript was still demoted.)
+      let usable = fs.existsSync(found.workdir);
+      if (!usable) {
+        try {
+          fs.mkdirSync(found.workdir, { recursive: true });
+          usable = true;
+          console.warn(`[transcript-relocate] ${roomId}: recreated deleted workdir ${found.workdir} so session ${shortId}… can resume its transcript`);
+        } catch (error) {
+          console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but its workdir ${found.workdir} is gone and could not be recreated (${error.message}); the resume will start fresh on the same id`);
+        }
+      }
+      if (usable && found.workdir !== workdir) {
+        console.warn(`[transcript-relocate] ${roomId}: session ${shortId}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
+        const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
+          `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
+        Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
+        workdir = found.workdir;
+      }
+    } else if (found) {
+      // Transcript located but no entry records a cwd — with no directory to
+      // spawn from that encodes to its project dir, a --resume would exit 1
+      // and crash-loop, so the planSessionIdentity demotion below stands.
+      console.warn(`[transcript-relocate] ${roomId}: transcript for ${shortId}… found at ${found.transcriptPath} but it records no cwd; the resume will start fresh on the same id`);
+    }
+  }
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
     journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
@@ -3118,6 +3182,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
+    runningStore: subagentRunningStore,
     log: console,
   });
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
@@ -3142,6 +3207,83 @@ function teardownSubagentTracking(session) {
   if (session.subagentWatcher) {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
+  }
+}
+
+// Reconcile stranded `running` subagent child convos. A child is a
+// ghost when it is persisted `running` (subagentRunningStore) but no LIVE
+// session currently owns its parent convo — i.e. the parent is TERMINAL: the
+// bridge restarted and the parent's claude process died with the old bridge, or
+// the parent stream was lost. At startup the live `sessions` map is empty, so
+// every persisted running child reconciles; on a transient WS reconnect only
+// genuinely orphaned children do (a still-live coordinator parent keeps its
+// children running — see selectStrandedChildren).
+//
+// Reconciles purely from PERSISTED state, never from watcher re-discovery:
+// subagent-watcher.snapshot() marks the already-complete agent-*.jsonl "seen",
+// so completed children are never re-found and finish() never re-fires. The
+// published frame (convo_upsert, session_state: done) is byte-identical to the
+// live finish() transition, so web clients update the card the same way; here it
+// rides upsertConvoBestEffort, the established reconnect-repair fan-out path.
+function reconcileStrandedSubagents(reason = 'startup') {
+  if (!JOURNAL_ENABLED) return;
+  let entries;
+  try {
+    entries = subagentRunningStore.list();
+  } catch (e) {
+    console.warn(`[subagent-reconcile] list failed: ${e.message}`);
+    return;
+  }
+  if (!entries.length) return;
+
+  // Parent convo ids currently owned by a live session — do NOT retire their
+  // children (a coordinator parent legitimately stays running).
+  const liveParents = new Set();
+  for (const session of sessions.values()) {
+    if (!session?.alive) continue;
+    const convoId = journalConvoIdFor(session);
+    if (convoId) liveParents.add(convoId);
+  }
+
+  const { stranded, malformed } = selectStrandedChildren(entries, liveParents);
+  // Join each stranded id back to its persisted entry so the repair frame can
+  // carry the child's parentConvoId. Reconcile runs precisely when the original
+  // `running` upsert may never have been delivered (SIGKILL before flush, socket
+  // down at mint, queue-overflow eviction) — so the journal row may not exist
+  // yet. `convo_upsert` on an unknown id INSERTs, and parent_convo_id is written
+  // ONLY in the INSERT branch (immutable thereafter): omitting it here would mint
+  // a permanent untitled ROOT orphan that loses the child push exemption and is
+  // un-relinkable. selectStrandedChildren already validated provenance, so every
+  // stranded id has a joinable entry with a parentConvoId. Safe in the normal
+  // (row-exists) case too: the journal's UPDATE path never rewrites parentage.
+  const repairFrames = strandedRepairFrames(entries, stranded);
+  let published = 0;
+  for (const { childConvoId, parentConvoId } of repairFrames) {
+    try {
+      // Publish `done` and drop the store record ONLY on confirmed delivery
+      // a capacity-rejected best-effort send or a
+      // crash before the socket flushes must leave the record in place so the
+      // next startup/reconnect reconcile retries — never erase the write-ahead
+      // record on an unconfirmed send. Re-publishing `done` is idempotent
+      // server-side.
+      journalPublisher.upsertConvoBestEffort(
+        childConvoId,
+        { sessionState: 'done', parentConvoId },
+        { onDelivered: () => subagentRunningStore.remove(childConvoId) },
+      );
+      published += 1;
+    } catch (e) {
+      console.warn(`[subagent-reconcile] failed for ${childConvoId}: ${e.message}`);
+    }
+  }
+  if (published) {
+    console.log(`[subagent-reconcile] ${reason}: publishing done for ${published} stranded subagent child convo(s)`);
+  }
+  if (malformed.length) {
+    // Fail-closed: records with no validated parent provenance are
+    // left running rather than terminally mutated. Surface them — they only
+    // arise from corruption / schema drift and warrant inspection.
+    console.warn(`[subagent-reconcile] ${reason}: ${malformed.length} malformed running record(s) with no parent convo — left untouched: ${malformed.join(', ')}`);
   }
 }
 
@@ -4833,13 +4975,13 @@ function padTable(tableText) {
   }).join('\n');
 }
 
-// Improve plain text body for clients that don't render HTML (e.g. Element X)
-// Wraps pipe tables in code fences so they render monospaced with aligned columns
-function plainTextFormat(text) {
-  return text.replace(/((?:^\|.+\|\n?)+)/gm, (match) => {
-    return '```\n' + padTable(match) + '\n```';
-  });
-}
+// Journal bodies are raw markdown: Matron clients render GFM themselves
+// (the Mac timeline lays out pipe tables natively as of matron-apple #134,
+// iOS/Android via their markdown views), so nothing here may rewrite
+// message text for presentation. The old plainTextFormat() Element X
+// fallback — fence + pad pipe tables for monospace — lived here until
+// 2026-08-12; it survived the Matrix exit and silently downgraded every
+// table to a code block on all clients.
 
 // --- File Helpers ---
 
@@ -5451,7 +5593,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -5742,7 +5884,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -5869,7 +6011,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
@@ -6729,7 +6871,7 @@ function journalEchoToRoom(session, plain, html) {
 // control-convo dispatch makes below.
 function journalSessionCommandCtx(session) {
   return {
-    sendReply: (reply) => sendToRoom(session.roomId, plainTextFormat(reply), markdownToHtml(reply)),
+    sendReply: (reply) => sendToRoom(session.roomId, reply, markdownToHtml(reply)),
     sendHtml: (plainText, html) => sendToRoom(session.roomId, plainText, html),
     sender: ALLOWED_USER_IDS[0],
   };
@@ -7987,7 +8129,7 @@ async function approvePlanBuild(session, { sendHtml }) {
 // posts its own richer "Session was idle" notice first, and without the
 // skip Matron users would see both.
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
-  const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
+  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
   const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
   const activeAgent = resolveAgent({ persisted: prev.agent, fallback: DEFAULT_AGENT });
@@ -8644,7 +8786,7 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, plainTextFormat(text), markdownToHtml(text)).then(() => {
+        sendToRoom(roomId, text, markdownToHtml(text)).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
