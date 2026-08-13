@@ -112,4 +112,71 @@ describe('resolveInviteTarget', () => {
       expect(addressed).toBe(true);
     });
   });
+
+  // The wake candidate: WHICH sleeping session, if any, the caller should try
+  // to resume before refusing the peer. A reaped session is resumable (that is
+  // the whole premise of the idle reaper), so an addressed request finding no
+  // live session is not the end of the story — but only where the address is
+  // exact. Resolution stays pure: naming the candidate is this function's job,
+  // deciding whether it is actually on disk is index.js's.
+  describe('the wake candidate', () => {
+    it('names the addressed conversation when its session is not running', () => {
+      const deps = fleet();
+      const { session, wake } = resolveInviteTarget(
+        { event: 'request', room_id: 'r1', target_convo_id: 'convo-gone' }, null, deps,
+      );
+      expect(session).toBe(null);
+      expect(wake).toEqual({ kind: 'convo', id: 'convo-gone' });
+    });
+
+    it('names the addressed conversation when its session is dead rather than absent', () => {
+      const deps = fleet();
+      deps.sessions.get('!a').alive = false;
+      const { session, wake } = resolveInviteTarget(
+        { event: 'request', room_id: 'r1', target_convo_id: 'convo-a' }, null, deps,
+      );
+      expect(session).toBe(null);
+      expect(wake).toEqual({ kind: 'convo', id: 'convo-a' });
+    });
+
+    it('names the room-bound session for a join_request whose session is not running', () => {
+      const deps = fleet();
+      deps.sessions.get('!a').alive = false;
+      const { session, wake } = resolveInviteTarget(
+        { event: 'join_request', room_id: 'r1' }, { sessionRoomId: '!a' }, deps,
+      );
+      expect(session).toBe(null);
+      expect(wake).toEqual({ kind: 'room', id: '!a' });
+    });
+
+    it('has nothing to wake for a join_request about an unknown room', () => {
+      const deps = fleet();
+      const { wake } = resolveInviteTarget(
+        { event: 'join_request', room_id: 'r1' }, null, deps,
+      );
+      expect(wake).toBe(null);
+    });
+
+    it('has nothing to wake for an unaddressed request, even with sleepers on the box', () => {
+      const deps = fleet();
+      // The unaddressed path reaches a session by GUESSING among the live
+      // ones. Waking a guessed-at sleeper would spawn a process for a request
+      // that was never aimed at it — strictly worse than refusing.
+      for (const s of deps.sessions.values()) s.alive = false;
+      const { session, wake } = resolveInviteTarget(
+        { event: 'request', room_id: 'r1' }, null, deps,
+      );
+      expect(session).toBe(null);
+      expect(wake).toBe(null);
+    });
+
+    it('is null whenever a live session was found', () => {
+      const deps = fleet();
+      const { session, wake } = resolveInviteTarget(
+        { event: 'request', room_id: 'r1', target_convo_id: 'convo-a' }, null, deps,
+      );
+      expect(session.roomId).toBe('!a');
+      expect(wake).toBe(null);
+    });
+  });
 });

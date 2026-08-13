@@ -96,7 +96,7 @@ import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, reso
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
-import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
@@ -7638,6 +7638,31 @@ async function journalHandleControlCommand(body) {
     (plainText) => reply(plainText), sender);
 }
 
+// The default resume announcement, in the voice of the path that produced
+// every resume until agent chat: the user just sent something into a sleeping
+// convo, so "your message" is exactly what is being waited on. The inbound
+// agent-chat wake overrides it — nobody sent that one a message.
+const JOURNAL_RESUME_NOTICE = '⏳ Session was idle — auto-resuming it now. Your message will be delivered as soon as it\'s ready.';
+
+// Shared body of the two resume-by-address helpers below: they differ only in
+// how they find the persisted record (by convo id, by room id), and must not
+// drift on what they then DO with it.
+//
+// noticeConvoId/noticeText are the journal's own resume announcement. When one
+// is published, resumePersistedSession is told to skip its room-facing
+// "Auto-resuming session…" mirror, or Matron users see both; with no convo to
+// announce into, that mirror is the only announcement and stays on.
+function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
+  const existing = sessions.get(roomId);
+  // A live session in this room under a DIFFERENT claude session id means
+  // this convo is stale history (the room has moved on) — don't hijack it.
+  if (existing && existing.alive) return null;
+  if (existing) sessions.delete(roomId);
+  console.log(`[journal-input] auto-resuming reaped session in ${roomId}`);
+  if (noticeConvoId) journalPublishNotice(noticeConvoId, noticeText);
+  return resumePersistedSession(roomId, prev, { skipJournalMirror: !!noticeConvoId });
+}
+
 // Journal-side auto-resume (the router's resumeSessionForConvo seam): the
 // idle reaper kills sessions on the assumption that "the next user message
 // auto-resumes" them — which the Matrix room path does, but the journal path
@@ -7649,23 +7674,24 @@ async function journalHandleControlCommand(body) {
 // sendToSession holds input in _resumeOutbox until the resumed TUI is ready,
 // and print mode's stdin buffers), or null to fall back to the unknown-convo
 // notice.
-function journalResumeConvo(convoId) {
+function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
     if (!prev || (prev.journalConvoId !== convoId && prev.sessionId !== convoId)) continue;
-    const existing = sessions.get(roomId);
-    // A live session in this room under a DIFFERENT claude session id means
-    // this convo is stale history (the room has moved on) — don't hijack it.
-    if (existing && existing.alive) return null;
-    if (existing) sessions.delete(roomId);
-    console.log(`[journal-input] auto-resuming reaped session ${convoId} in ${roomId}`);
-    journalPublishNotice(convoId, '⏳ Session was idle — auto-resuming it now. Your message will be delivered as soon as it\'s ready.');
-    // This notice IS the journal's resume announcement — tell the shared
-    // helper not to also mirror its room-facing "Auto-resuming session…"
-    // notice into the journal, or Matron users see both.
-    return resumePersistedSession(roomId, prev, { skipJournalMirror: true });
+    return resumeSleepingSession(roomId, prev, convoId, noticeText);
   }
   return null;
+}
+
+// The same wake, addressed by ROOM rather than by convo — what an inbound
+// join_request has to work with, since a room record names its owning session
+// by sessionRoomId and carries no convo id of its own. The announcement goes
+// to whichever convo the persisted record remembers, or falls back to
+// resumePersistedSession's own room notice when it remembers none.
+function journalResumeRoom(roomId, noticeText = JOURNAL_RESUME_NOTICE) {
+  const prev = loadPersistedSessions()[roomId];
+  if (!prev) return null;
+  return resumeSleepingSession(roomId, prev, prev.journalConvoId || prev.sessionId || null, noticeText);
 }
 
 // A "Carry on" tap. The router has already auto-resumed the session for a
@@ -7966,6 +7992,26 @@ function resolveInviteTargetSession(frame, room) {
   });
 }
 
+// Respawn the sleeping session an inbound invite/join request is addressed to,
+// from the wake candidate resolveInviteTarget named. Returns the live session,
+// or null when the id has no persisted record to resume (never spawned here,
+// or its record has since been dropped) — the caller refuses the peer then.
+//
+// Never throws: this runs inside journalInjectInviteRequest, itself called
+// fire-and-forget from the invites manager's frame handler, so an escaping
+// error would lose the refusal too and leave the peer waiting out its full
+// window for an answer that is never coming.
+function wakeSessionForInvite(wake) {
+  try {
+    return (wake.kind === 'room'
+      ? journalResumeRoom(wake.id, INVITE_WAKE_NOTICE)
+      : journalResumeConvo(wake.id, INVITE_WAKE_NOTICE)) || null;
+  } catch (e) {
+    console.warn(`[agent-invites] could not wake ${wake.kind} ${wake.id} for an inbound request: ${e.message}`);
+    return null;
+  }
+}
+
 // Inbound invite/join request -> record the room as pending, ack with the
 // target session's state, and surface the request to the agent as a turn
 // (via roomDelivery, so a busy session sees it coalesced at turn end).
@@ -7974,9 +8020,30 @@ function journalInjectInviteRequest(frame) {
   // join_request -> a peer asks to join a room THIS bridge owns
   const isJoin = frame.event === 'join_request';
   const room = agentRooms.get(frame.room_id);
-  const { session, addressed } = resolveInviteTargetSession(frame, room);
+  const { session: liveSession, addressed, wake } = resolveInviteTargetSession(frame, room);
+  // Asleep is not gone. The idle reaper kills sessions precisely BECAUSE they
+  // are resumable, so an exactly-addressed request whose target was reaped is
+  // woken through the same helper an inbound Matron message or a fired /timer
+  // uses, and then proceeds as if the session had been live all along. Only
+  // when there is nothing on disk to resume — the genuinely-gone case — does
+  // the refusal below still fire.
+  //
+  // Doing this unprompted is safe: an inbound request has already cleared the
+  // user's consent card on the asking side, so it is not an arbitrary stranger
+  // spawning processes here. resolveInviteTarget withholds a wake candidate on
+  // the unaddressed (guessed) path for the same reason it withholds the user's
+  // copy of the request further down.
+  //
+  // The peer does not wait on the wake: resumePersistedSession is synchronous,
+  // so the ack below still lands well inside the peer's window. It reports
+  // 'busy' (a resuming session sets _awaitingInputReady), the peer gets
+  // pending_busy and stops waiting, and the request itself coalesces into the
+  // room-delivery inbox until the resume hold's own flush seam (the
+  // maybeFlushRoomDelivery call in startResumeReadyWatcher's nothing-sent
+  // branch) drains it into the ready TUI.
+  const session = liveSession || (wake && wakeSessionForInvite(wake));
   if (!session) {
-    debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask`);
+    debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask${wake ? ' and nothing resumable to wake' : ''}`);
     // No session ⇒ nobody will ever answer. Refuse immediately instead of
     // letting the peer burn its full wait down to pending_quiet. An
     // ADDRESSED request that finds nothing says so specifically: the target
@@ -7988,7 +8055,7 @@ function journalInjectInviteRequest(frame) {
       peerDeviceId: isJoin ? frame.from_device_id : null,
       accept: false,
       reason: !isJoin && frame.target_convo_id
-        ? 'that conversation has no running session right now'
+        ? 'that conversation is not running and could not be resumed'
         : 'no active session on this box',
     });
     return;
