@@ -1040,8 +1040,9 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(notice).toBeGreaterThan(body.indexOf("reason: 'no active session on this box'"));
     // The AGENT's copy is a different text and keeps the tool syntax…
     expect(body).toMatch(/Accept with agent_chat_accept\(/);
-    // …which the user's copy must not inherit (it lives in lib, pinned there).
-    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice \} from '\.\/lib\/agent-invites\.js';/);
+    // …which the user's copy must not inherit (it lives in lib, pinned there,
+    // alongside the wake notice the reaped-target path publishes).
+    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
   });
 
   it('terminal teardown leaves joined rooms before dropping the inbox (I4)', () => {

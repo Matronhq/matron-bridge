@@ -736,11 +736,24 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     // it must tell the shared helper NOT to also mirror the room-facing
     // "Auto-resuming session…" notice into the journal — Matron users were
     // getting both.
+    //
+    // The suppression itself now lives one level down, in resumeSleepingSession
+    // — the body journalResumeConvo shares with the by-room wake the inbound
+    // agent-chat path uses. So this pins the pair: the shared body suppresses
+    // the mirror exactly when it published a notice of its own, and
+    // journalResumeConvo always hands it a convo id to publish into (so its
+    // own branch is unconditionally the one-message one).
+    const sStart = src.indexOf('function resumeSleepingSession(');
+    expect(sStart).toBeGreaterThan(-1);
+    const shared = src.slice(sStart, src.indexOf('\nfunction ', sStart + 1));
+    expect(shared).toMatch(/if \(noticeConvoId\) journalPublishNotice\(noticeConvoId, noticeText\);/);
+    expect(shared).toMatch(/resumePersistedSession\(roomId, prev, \{ skipJournalMirror: !!noticeConvoId \}\)/);
+
     const start = src.indexOf('function journalResumeConvo(');
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    expect(body).toMatch(/resumePersistedSession\(roomId, prev, \{ skipJournalMirror: true \}\)/);
+    expect(body).toMatch(/resumeSleepingSession\(roomId, prev, convoId, noticeText\)/);
 
     // …and the helper threads that flag into the sendToRoom carrying the
     // notice (the session's own sendCallback/sendHtml stay mirrored). Bound
