@@ -140,7 +140,7 @@ describe('resolveInviteTarget', () => {
     });
 
     it('names the room-bound session for a join_request whose session is not running', () => {
-      const deps = fleet();
+      const deps = { ...fleet(), roomIsActive: () => true };
       deps.sessions.get('!a').alive = false;
       const { session, wake } = resolveInviteTarget(
         { event: 'join_request', room_id: 'r1' }, { sessionRoomId: '!a' }, deps,
@@ -150,9 +150,51 @@ describe('resolveInviteTarget', () => {
     });
 
     it('has nothing to wake for a join_request about an unknown room', () => {
-      const deps = fleet();
+      const deps = { ...fleet(), roomIsActive: () => true };
       const { wake } = resolveInviteTarget(
         { event: 'join_request', room_id: 'r1' }, null, deps,
+      );
+      expect(wake).toBe(null);
+    });
+
+    // Bugbot #220: the idle reaper's own teardown (journalEvictConvoInput)
+    // sets every 'joined' room of the dying session to 'left' and tells the
+    // peer. So the very case a room wake looks like it serves is, after a
+    // reap, one answerInvite refuses outright — "room X is left, start a new
+    // room instead of admitting into a dead one". Waking for it would spawn a
+    // claude process to surface an ask the agent structurally cannot accept.
+    //
+    // The gate is answerInvite's OWN predicate, injected rather than
+    // reimplemented, so the two can't drift into disagreeing about which
+    // rooms are worth waking for.
+    it('has nothing to wake for a join_request about a room that is no longer active', () => {
+      const deps = { ...fleet(), roomIsActive: () => false };
+      deps.sessions.get('!a').alive = false;
+      const { session, wake } = resolveInviteTarget(
+        { event: 'join_request', room_id: 'r1' }, { sessionRoomId: '!a', state: 'left' }, deps,
+      );
+      expect(session).toBe(null);
+      expect(wake).toBe(null);
+    });
+
+    it('asks about the room by its ROOM id, not the session key', () => {
+      // The predicate is answerInvite's, and answerInvite keys it on the chat
+      // room id — passing sessionRoomId would silently always miss.
+      const seen = [];
+      const deps = { ...fleet(), roomIsActive: (id) => { seen.push(id); return true; } };
+      deps.sessions.get('!a').alive = false;
+      resolveInviteTarget({ event: 'join_request', room_id: 'r1' }, { sessionRoomId: '!a' }, deps);
+      expect(seen).toEqual(['r1']);
+    });
+
+    // Fail CLOSED: a caller that cannot say whether the room is live has not
+    // earned a process spawn. The absent-dep default is the whole reason this
+    // bug existed, so it must not be "assume active".
+    it('has nothing to wake for a join_request when no liveness predicate is supplied', () => {
+      const deps = fleet();
+      deps.sessions.get('!a').alive = false;
+      const { wake } = resolveInviteTarget(
+        { event: 'join_request', room_id: 'r1' }, { sessionRoomId: '!a' }, deps,
       );
       expect(wake).toBe(null);
     });

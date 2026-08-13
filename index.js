@@ -7989,6 +7989,10 @@ function resolveInviteTargetSession(frame, room) {
   return resolveInviteTarget(frame, room, {
     sessions,
     findSessionByConvoId: findSessionByClaudeSessionId,
+    // The same predicate answerInvite gates an owner's accept on, so a room
+    // wake is never offered for a room the woken agent would then be refused
+    // permission to admit anyone into (Bugbot, #220).
+    roomIsActive: (roomId) => agentRooms.isActive(roomId),
   });
 }
 
