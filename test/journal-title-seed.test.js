@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs';
 import { describe, it, expect, vi } from 'vitest';
-import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from '../lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
   it('titles the convo from the workdir basename, with no server-label prefix', async () => {
@@ -172,7 +172,7 @@ describe('seedJournalTitle (workdir-sourced)', () => {
 describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
   const deps = () => ({ serverLabel: '2', updateRoomName: vi.fn() });
 
-  it('titles the convo from the first user message, same format as the LLM rename', () => {
+  it('titles the convo from the first user message, prefixed with the session short like the LLM rename', () => {
     const session = {
       roomId: '!abc',
       claudeSessionId: 'f0aa1234',
@@ -183,7 +183,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'fix the folder picker');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] fix the folder picker');
   });
 
   it('does nothing until a user message exists, then still applies later', () => {
@@ -193,7 +193,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(d.updateRoomName).not.toHaveBeenCalled();
     session.chatHistory.push({ role: 'user', text: 'now do the thing' });
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'now do the thing');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] now do the thing');
   });
 
   it('applies only once per session', () => {
@@ -210,18 +210,18 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     const title = d.updateRoomName.mock.calls[0][1];
-    expect(title.startsWith('refactor the whole session store')).toBe(true);
+    expect(title.startsWith('[f0] refactor the whole session store')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
-    expect(title.length).toBe(61);
+    expect(title.length).toBe(66); // '[f0] ' + 60 chars + ellipsis
   });
 
-  it('survives a missing history and applies once one arrives', () => {
-    const session = { roomId: '!room', chatHistory: undefined };
+  it('survives a missing history and applies once one arrives, shorting the room id when the session id is unknown', () => {
+    const session = { roomId: '7c0ffee0-aaaa-bbbb-cccc-000000000000', chatHistory: undefined };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(false);
     session.chatHistory = [{ role: 'user', text: 'hi' }];
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!room', 'hi');
+    expect(d.updateRoomName).toHaveBeenCalledWith('7c0ffee0-aaaa-bbbb-cccc-000000000000', '[7c] hi');
   });
 
   it('never lets angle brackets or reassembled script fragments into the title', () => {
@@ -256,7 +256,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] carry on');
   });
 
   it('still replaces the legacy bare-basename seed from sessions persisted before labeling', () => {
@@ -268,7 +268,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] carry on');
   });
 
   it('skips a tag-only first user message and titles from the next real one', () => {
@@ -282,7 +282,19 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'the real prompt');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] the real prompt');
+  });
+});
+
+describe('withSessionShort (2-char session-id title prefix)', () => {
+  it('prefixes the first two characters of the id in brackets', () => {
+    expect(withSessionShort('b53e6542', 'css token migration')).toBe('[b5] css token migration');
+  });
+
+  it('leaves the title bare when there is no id to short', () => {
+    expect(withSessionShort(undefined, 'untagged')).toBe('untagged');
+    expect(withSessionShort('', 'untagged')).toBe('untagged');
+    expect(withSessionShort('   ', 'untagged')).toBe('untagged');
   });
 });
 
@@ -381,16 +393,18 @@ describe('title-pass wiring in index.js (source inspection)', () => {
     expect(indexSrc).toMatch(/journalUpsertConvo\(session, \{ summary: parsed\.roster\.slice\(0, 1000\) \}\);/);
   });
 
-  it('names the room from the parsed title alone — no SERVER_LABEL prefix', () => {
+  it('names the room from the session short + parsed title — no SERVER_LABEL prefix', () => {
     // Which box owns a conversation is data now (agent_device_id, rendered
     // as a chip by the apps). A label baked in here is frozen text that a
     // rename can never reach — and it is what made two boxes both read
-    // "DEV" in the chat list.
-    expect(indexSrc).toMatch(/const name = parsed\.title\.slice\(0, 60\);/);
+    // "DEV" in the chat list. The 2-char session short is the part that
+    // tells two sessions on the SAME box apart, so it stays.
+    expect(indexSrc).toMatch(/const name = withSessionShort\(session\.claudeSessionId \|\| session\.roomId, parsed\.title\.slice\(0, 60\)\);/);
   });
 
-  it('names a resumed session without a SERVER_LABEL prefix', () => {
-    expect(indexSrc).toMatch(/: `Resumed \$\{shortId\}`;/);
+  it('names a resumed session with the session short but no SERVER_LABEL prefix', () => {
+    expect(indexSrc).toMatch(/withSessionShort\(resumeSessionId, summary/);
+    expect(indexSrc).toMatch(/: `Resumed \$\{shortId\}`\);/);
   });
 
   it('never rebuilds a `LABEL:` title prefix anywhere', () => {

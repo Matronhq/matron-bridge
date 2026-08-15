@@ -106,7 +106,7 @@ import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
@@ -5442,7 +5442,7 @@ async function maybeUpdatePinnedSummary(session) {
 
     // Update room name (Element sidebar truncates visually, full name visible on hover)
     if (parsed.title) {
-      const name = parsed.title.slice(0, 60);
+      const name = withSessionShort(session.claudeSessionId || session.roomId, parsed.title.slice(0, 60));
       updateRoomName(session.roomId, name);
     }
 
@@ -6052,9 +6052,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const summary = selectedAgent === AGENT_CODEX
         ? (resumePersisted?.summary || '')
         : await getSessionSummary(resumeSessionId, actualWorkdir);
-      const roomName = summary
+      // Prefix with the id being resumed — session.claudeSessionId isn't set
+      // until the agent's first event, well after this rename runs.
+      const roomName = withSessionShort(resumeSessionId, summary
         ? `${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
-        : `Resumed ${shortId}`;
+        : `Resumed ${shortId}`);
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
