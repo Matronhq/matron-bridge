@@ -139,6 +139,20 @@ describe('createJournalMediaRouter — multi-attachment batches', () => {
       .toEqual(['saved:a.png', 'saved:b.png', 'saved:c.png']);
   });
 
+  it('a redelivered duplicate does NOT reset the quiet window (replays cannot defer partial delivery)', async () => {
+    vi.useFakeTimers();
+    const { route, deps } = makeRouter({ batchQuietMs: 5_000 });
+
+    await route(session, frame('a.png', { id: 'B6b', index: 1, total: 3 }), ctx);
+    await vi.advanceTimersByTimeAsync(4_000);
+    // The same index again — a cursor replay, not a new frame. The window
+    // measures silence in NEW frames, so this must not push delivery out.
+    await route(session, frame('a.png', { id: 'B6b', index: 1, total: 3 }), ctx);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text)).toEqual(['saved:a.png']);
+  });
+
   it('a redelivered frame (cursor replay) does not double its blocks', async () => {
     const { route, deps } = makeRouter();
 
