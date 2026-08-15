@@ -5440,11 +5440,9 @@ async function maybeUpdatePinnedSummary(session) {
     const text = await summaryModel.generate(prompt);
     const parsed = parseTitlePassResponse(text);
 
-    const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-
     // Update room name (Element sidebar truncates visually, full name visible on hover)
     if (parsed.title) {
-      const name = `${SERVER_LABEL}:${sessionShort} ${parsed.title.slice(0, 60)}`;
+      const name = parsed.title.slice(0, 60);
       updateRoomName(session.roomId, name);
     }
 
@@ -6055,8 +6053,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? (resumePersisted?.summary || '')
         : await getSessionSummary(resumeSessionId, actualWorkdir);
       const roomName = summary
-        ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
-        : `${SERVER_LABEL}: Resumed ${shortId}`;
+        ? `${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
+        : `Resumed ${shortId}`;
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
