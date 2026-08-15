@@ -204,6 +204,70 @@ describe('createJournalMediaRouter — multi-attachment batches', () => {
     expect(deps.publishNotice).toHaveBeenCalledTimes(2);
   });
 
+  it('a straggler after a quiet-window flush injects immediately — no second window', async () => {
+    vi.useFakeTimers();
+    const { route, deps } = makeRouter({ batchQuietMs: 5_000 });
+
+    await route(session, frame('a.png', { id: 'B13', index: 1, total: 3 }), ctx);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1); // partial flush of a.png
+
+    // The upload of b.png finally lands, long after its siblings flushed.
+    // It must not open a fresh gather that can never reach total=3 and sit
+    // out another whole quiet window — it delivers per-frame, now.
+    await route(session, frame('b.png', { id: 'B13', index: 2, total: 3 }), ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(2);
+    expect(deps.injectBlocks.mock.calls[1][1].map((b) => b.text)).toEqual(['saved:b.png']);
+  });
+
+  it('a frame replayed after its batch completed injects per-frame, not into a new gather', async () => {
+    // Cursor replay after completion: the same duplication a replayed
+    // UNTAGGED frame produces today — parity, not a regression — but it
+    // must arrive immediately rather than open a doomed gather.
+    const { route, deps } = makeRouter();
+
+    await route(session, frame('a.png', { id: 'B14', index: 1, total: 2 }), ctx);
+    await route(session, frame('b.png', { id: 'B14', index: 2, total: 2 }), ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+
+    await route(session, frame('a.png', { id: 'B14', index: 1, total: 2 }), ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(2);
+    expect(deps.injectBlocks.mock.calls[1][1].map((b) => b.text)).toEqual(['saved:a.png']);
+  });
+
+  it('a conflicting total for an open batch routes that frame per-frame and leaves the gather intact', async () => {
+    vi.useFakeTimers();
+    const { route, deps } = makeRouter({ batchQuietMs: 5_000 });
+
+    await route(session, frame('a.png', { id: 'B15', index: 1, total: 2 }), ctx);
+    // Malformed client: same id, different total. It must not redefine
+    // completion for the open entry (total 3 would finalize at 2/2 of the
+    // WRONG contract) — the conflicting frame delivers immediately instead.
+    await route(session, frame('x.png', { id: 'B15', index: 2, total: 3 }), ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text)).toEqual(['saved:x.png']);
+
+    // The open entry keeps its own contract: its second frame completes it.
+    await route(session, frame('b.png', { id: 'B15', index: 2, total: 2 }), ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(2);
+    expect(deps.injectBlocks.mock.calls[1][1].map((b) => b.text))
+      .toEqual(['saved:a.png', 'saved:b.png']);
+  });
+
+  it('batch ids containing the old delimiter cannot collide across conversations', async () => {
+    // Structural key regression pin: convo 'a|b' + id 'c' must never share
+    // a gather with convo 'a' + id 'b|c'.
+    const weird = { claudeSessionId: 'a|b', roomId: '!w:s' };
+    const plain = { claudeSessionId: 'a', roomId: '!p:s' };
+    const { route, deps } = makeRouter();
+
+    await route(weird, frame('w1.png', { id: 'c', index: 1, total: 2 }), ctx);
+    await route(plain, frame('p1.png', { id: 'b|c', index: 2, total: 2 }), ctx);
+    // If the keys collided, the second deposit would have completed a mixed
+    // batch. Neither gather is complete, so nothing injects.
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+  });
+
   it('busy-ness is read when the batch completes, not when it started gathering', async () => {
     // Turn ends while the batch is still uploading: the batch must inject
     // immediately at completion, not queue against a busy flag that is no
