@@ -873,7 +873,7 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(media).toEqual({
       type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
-      name: 'report.pdf', size: 1234, dims: null, caption: null,
+      name: 'report.pdf', size: 1234, dims: null, caption: null, batch: null,
     });
     expect(ctx).toEqual({ username: 'dan' });
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
@@ -918,8 +918,40 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     const [, media] = deps.routeMediaToSession.mock.calls[0];
     expect(media).toEqual({
       type: 'image', blobRef: 'img-9', contentType: 'image/png',
-      name: 'shot.png', size: 55, dims: { w: 800, h: 600 }, caption: null,
+      name: 'shot.png', size: 55, dims: { w: 800, h: 600 }, caption: null, batch: null,
     });
+  });
+
+  it('folds the composer batch tag off the payload into media.batch', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'image',
+      payload: {
+        blob_ref: 'img-9', content_type: 'image/png', name: 'shot.png',
+        batch_id: 'B1', batch_index: 2, batch_total: 3,
+      },
+    }));
+    expect(deps.routeMediaToSession.mock.calls[0][1].batch)
+      .toEqual({ id: 'B1', index: 2, total: 3 });
+  });
+
+  it('treats a malformed batch tag as absent (non-integer index, missing id)', () => {
+    // The tag gates gathering only — anything off pattern must degrade to
+    // the per-frame path, never drop the media.
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'image',
+      payload: { blob_ref: 'a', batch_id: 'B1', batch_index: 'two', batch_total: 3 },
+    }));
+    consumer(baseFrame({
+      type: 'image',
+      payload: { blob_ref: 'b', batch_index: 1, batch_total: 3 },
+    }));
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(2);
+    expect(deps.routeMediaToSession.mock.calls[0][1].batch).toBeNull();
+    expect(deps.routeMediaToSession.mock.calls[1][1].batch).toBeNull();
   });
 
   it('falls back to a top-level frame.blob_ref when the payload has none', () => {
