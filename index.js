@@ -106,7 +106,7 @@ import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
@@ -5442,7 +5442,9 @@ async function maybeUpdatePinnedSummary(session) {
 
     // Update room name (Element sidebar truncates visually, full name visible on hover)
     if (parsed.title) {
-      const name = withSessionShort(session.claudeSessionId || session.roomId, parsed.title.slice(0, 60));
+      // A spawned session's rename keeps its 🐣 — the marker is identity,
+      // not part of the disposable title text.
+      const name = withSessionShort(session.claudeSessionId || session.roomId, parsed.title.slice(0, 60), titleMarkerFor(session));
       updateRoomName(session.roomId, name);
     }
 
@@ -6053,10 +6055,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? (resumePersisted?.summary || '')
         : await getSessionSummary(resumeSessionId, actualWorkdir);
       // Prefix with the id being resumed — session.claudeSessionId isn't set
-      // until the agent's first event, well after this rename runs.
+      // until the agent's first event, well after this rename runs. The 🐣
+      // marker is inferred from the persisted record's title: the live
+      // spawnedByAgent flag died with the original process.
       const roomName = withSessionShort(resumeSessionId, summary
         ? `${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
-        : `Resumed ${shortId}`);
+        : `Resumed ${shortId}`,
+      titleMarkerFor({ _journalTitleHint: resumePersisted?.journalTitleHint }));
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
