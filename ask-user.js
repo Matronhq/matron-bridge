@@ -92,7 +92,11 @@ server.tool(
         return deny(`Matron bridge rejected the permission request (HTTP ${postRes.status}).`);
       }
       const data = await postRes.json();
-      if (data.behavior === 'allow') return allow(); // session-allowlisted tool, no card
+      if (data.behavior === 'allow') return allow(); // classifier/allowlist silent-allow, no card
+      // Classifier policy-deny: the bridge decided immediately (no card). Honour
+      // the deny here so Claude gets the standard DENY_MESSAGE rather than
+      // falling through to the invalid-request-id deny below.
+      if (data.behavior === 'deny') return deny(data.message || 'The user denied this tool use from Matron.');
 
       const { requestId } = data;
       if (typeof requestId !== 'string' || requestId === '') {
