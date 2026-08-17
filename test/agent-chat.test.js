@@ -176,7 +176,7 @@ describe('createAgentChatHandlers', () => {
       // then the local inject — a request delivered before the waiters exist
       // can settle into the void.
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'inviteLocal', 'deliverLocalInvite']);
-      expect(calls[0].opts.title).toBe('mac ↔ Local work — ci triage');
+      expect(calls[0].opts.title).toBe(`↔️ [${chatRoomId.slice(0, 2)}] mac ↔ Local work — ci triage`);
       expect(calls[2].fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 1, peerName: 'Local work' });
       expect(invites.invite).not.toHaveBeenCalled();
       expect(deliverLocalInvite).toHaveBeenCalledWith(expect.objectContaining({
@@ -196,11 +196,11 @@ describe('createAgentChatHandlers', () => {
       expect(chatRoomId).toMatch(/^[0-9a-f-]{36}$/);
 
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'invite']);
-      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'mac ↔ dev-2 — ci triage', sessionState: 'waiting' } });
+      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: `↔️ [${chatRoomId.slice(0, 2)}] mac ↔ dev-2 — ci triage`, sessionState: 'waiting' } });
       expect(calls[1]).toEqual({ call: 'publishText', convoId: chatRoomId, payload: { body: 'hi, seen the red build?', from: 'agent' } });
       expect(calls[2].fields).toEqual({
         role: 'owner', state: 'pending', sessionRoomId: '!sess',
-        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: 'mac ↔ dev-2 — ci triage',
+        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: `↔️ [${chatRoomId.slice(0, 2)}] mac ↔ dev-2 — ci triage`,
       });
       // targetConvoId rides along with the device: the caller picked a
       // specific conversation, and without it the receiving bridge is left
@@ -220,7 +220,7 @@ describe('createAgentChatHandlers', () => {
     it('omits the topic suffix from the title when no topic given', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: undefined });
-      expect(calls[0].opts.title).toBe('mac ↔ dev-2');
+      expect(calls[0].opts.title).toBe(`↔️ [${calls[0].convoId.slice(0, 2)}] mac ↔ dev-2`);
     });
 
     it('fails CLOSED on a null identity: no room minted, no side effects', async () => {
@@ -231,10 +231,10 @@ describe('createAgentChatHandlers', () => {
       expect(calls).toEqual([]);
     });
 
-    it('caps the title at 120 chars', async () => {
+    it('caps the title at 120 chars, link prefix included', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: 'x'.repeat(300) });
-      expect(calls[0].opts.title.startsWith('mac ↔ dev-2 — xxx')).toBe(true);
+      expect(calls[0].opts.title.startsWith(`↔️ [${calls[0].convoId.slice(0, 2)}] mac ↔ dev-2 — xxx`)).toBe(true);
       expect(calls[0].opts.title).toHaveLength(120);
     });
 

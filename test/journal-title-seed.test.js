@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs';
 import { describe, it, expect, vi } from 'vitest';
-import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort } from '../lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
   it('titles the convo from the workdir basename, with no server-label prefix', async () => {
@@ -296,6 +296,55 @@ describe('withSessionShort (2-char session-id title prefix)', () => {
     expect(withSessionShort('', 'untagged')).toBe('untagged');
     expect(withSessionShort('   ', 'untagged')).toBe('untagged');
   });
+
+  it('puts a marker ahead of the short, and ahead of a bare title', () => {
+    expect(withSessionShort('b53e6542', 'port the tests', '🐣')).toBe('🐣 [b5] port the tests');
+    expect(withSessionShort(undefined, 'port the tests', '🐣')).toBe('🐣 port the tests');
+  });
+});
+
+describe('spawned-session titles (🐣 marker + task-derived fallback)', () => {
+  const deps = () => ({ serverLabel: '2', updateRoomName: vi.fn() });
+
+  it('names a spawned session from the approved task, not the boilerplate opening turn', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa1234',
+      spawnedByAgent: true,
+      spawnTask: 'port the flaky auth tests to the new harness',
+      chatHistory: [
+        { role: 'user', text: '[spawned session] You were started by the user\'s agent session on "mac".' },
+      ],
+    };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '🐣 [f0] port the flaky auth tests to the new harness');
+  });
+
+  it('cleans and truncates the task exactly like a first-message title', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      spawnedByAgent: true,
+      spawnTask: `<task>  ${'x'.repeat(80)}  </task>`,
+      chatHistory: [],
+    };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    const [, title] = d.updateRoomName.mock.calls[0];
+    expect(title.startsWith('🐣 [f0] xxx')).toBe(true);
+    expect(title.endsWith('…')).toBe(true);
+    expect(title).not.toContain('<');
+  });
+
+  it('titleMarkerFor keeps the marker for a live spawned session and infers it from a persisted title', () => {
+    expect(titleMarkerFor({ spawnedByAgent: true })).toBe('🐣');
+    // After a bridge restart the flag is gone; the current title carries it.
+    expect(titleMarkerFor({ _journalTitleHint: '🐣 [f0] port the tests' })).toBe('🐣');
+    expect(titleMarkerFor({ _journalTitleHint: '[f0] a chat about 🐣 emoji' })).toBe('');
+    expect(titleMarkerFor({})).toBe('');
+    expect(titleMarkerFor(undefined)).toBe('');
+  });
 });
 
 describe('parseTitlePassResponse (Gemini title-pass parsing)', () => {
@@ -399,12 +448,13 @@ describe('title-pass wiring in index.js (source inspection)', () => {
     // rename can never reach — and it is what made two boxes both read
     // "DEV" in the chat list. The 2-char session short is the part that
     // tells two sessions on the SAME box apart, so it stays.
-    expect(indexSrc).toMatch(/const name = withSessionShort\(session\.claudeSessionId \|\| session\.roomId, parsed\.title\.slice\(0, 60\)\);/);
+    expect(indexSrc).toMatch(/const name = withSessionShort\(session\.claudeSessionId \|\| session\.roomId, parsed\.title\.slice\(0, 60\), titleMarkerFor\(session\)\);/);
   });
 
-  it('names a resumed session with the session short but no SERVER_LABEL prefix', () => {
+  it('names a resumed session with the session short but no SERVER_LABEL prefix, inferring the 🐣 marker from the persisted title', () => {
     expect(indexSrc).toMatch(/withSessionShort\(resumeSessionId, summary/);
-    expect(indexSrc).toMatch(/: `Resumed \$\{shortId\}`\);/);
+    expect(indexSrc).toMatch(/: `Resumed \$\{shortId\}`,/);
+    expect(indexSrc).toMatch(/titleMarkerFor\(\{ _journalTitleHint: resumePersisted\?\.journalTitleHint \}\)\);/);
   });
 
   it('never rebuilds a `LABEL:` title prefix anywhere', () => {

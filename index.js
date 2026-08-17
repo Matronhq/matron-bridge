@@ -22,6 +22,7 @@ import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, c
 import {
   buildMcpServers,
   effectiveExtras,
+  extractBypassFlag,
   extractMcpExtraFlags,
   knownMcpExtras,
   resolveDefaultExtras,
@@ -94,6 +95,7 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -106,7 +108,7 @@ import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
@@ -153,6 +155,16 @@ if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAU
   console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
 }
 const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
+// Box-wide default for print-mode Claude sessions: 'bypass' spawns with
+// --dangerously-skip-permissions, 'auto' with Claude Code's auto permission
+// mode + the Matron permission-card prompt tool. Bypass is the default —
+// auto mode blocks too much routine work to impose on every session — so
+// auto is opt-in, per box here or per session via --auto.
+const MATRON_PERMISSION_MODE = process.env.MATRON_PERMISSION_MODE || 'bypass';
+if (!['bypass', 'auto'].includes(MATRON_PERMISSION_MODE)) {
+  console.warn(`[permissions] Unknown MATRON_PERMISSION_MODE=${JSON.stringify(process.env.MATRON_PERMISSION_MODE)}; defaulting to bypass.`);
+}
+const DEFAULT_BYPASS_MODE = MATRON_PERMISSION_MODE !== 'auto';
 // Idle reaping: a session is killed if no activity (incoming user message OR
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
@@ -570,6 +582,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const live = sessions.get(roomId);
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  if (typeof live?.bypassMode === 'boolean') derived.bypassMode = live.bypassMode;
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
@@ -1469,6 +1482,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const bypassMode = resolveBypassMode(options.bypass, persistedForRoom?.bypassMode, DEFAULT_BYPASS_MODE);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   let showFileToken;
@@ -1499,12 +1513,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
-    '--dangerously-skip-permissions',
+    ...permissionSpawnArgs(bypassMode),
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify({
+      permissions: {
+        allow: ['mcp__ask-user', 'mcp__show-file'],
+      },
       hooks: {
         PreCompact: [{
           hooks: [{
@@ -1528,6 +1545,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : resolveModel({ option: options.model, persisted: persistedMode?.model });
   if (printModel) {
     args.push('--model', printModel);
+  }
+  // Auto mode needs Opus 4.6+/Sonnet 4.6+/Fable-class models; Haiku-class
+  // sessions fall back to `default` permission mode and prompt for far more.
+  if (!bypassMode && printModel && /haiku/i.test(printModel)) {
+    const hw = notice('warning',
+      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to run without permission gating instead.`,
+      `Model <code>${escapeHtml(printModel)}</code> doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use <code>--bypass</code> to run without permission gating instead.`);
+    Promise.resolve(sendToRoom(roomId, hw.plain, hw.html)).catch(() => {});
   }
   args.push(...identity.cliArgs);
 
@@ -1583,6 +1608,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     showFilePinnedRoots,
     _showFileInFlight: 0,
     mcpExtras,
+    bypassMode,
+    permAllowedTools: new Set(),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -1719,6 +1746,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
             agent: session.agent,
             model: session.currentModel || undefined,
             mcpExtras: session.mcpExtras,
+            // Same not-yet-persisted rationale as mcpExtras above: carry the
+            // live --bypass/--auto choice explicitly so a crash restart can't
+            // silently flip the permission mode. (Absent on codex/iv sessions,
+            // which never set bypassMode.)
+            ...(typeof session.bypassMode === 'boolean' ? { bypass: session.bypassMode } : {}),
             journalConvoId: session.journalConvoId,
             // Carry the prior title so the re-seed adopts the good Gemini title
             // instead of publishing the repo basename over it (title-revert bug).
@@ -2428,6 +2460,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           agent: session.agent,
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
+          // Carry the live --bypass/--auto choice for the same reason as
+          // mcpExtras: a session that dies before its first persist would
+          // otherwise silently flip back to the default permission mode.
+          ...(typeof session.bypassMode === 'boolean' ? { bypass: session.bypassMode } : {}),
           journalConvoId: session.journalConvoId,
           // Carry the prior title so the re-seed adopts the good Gemini title
           // instead of publishing the repo basename over it (title-revert bug).
@@ -5445,7 +5481,9 @@ async function maybeUpdatePinnedSummary(session) {
 
     // Update room name (Element sidebar truncates visually, full name visible on hover)
     if (parsed.title) {
-      const name = withSessionShort(session.claudeSessionId || session.roomId, parsed.title.slice(0, 60));
+      // A spawned session's rename keeps its 🐣 — the marker is identity,
+      // not part of the disposable title text.
+      const name = withSessionShort(session.claudeSessionId || session.roomId, parsed.title.slice(0, 60), titleMarkerFor(session));
       updateRoomName(session.roomId, name);
     }
 
@@ -5735,7 +5773,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass);
       const agentFlags = extractAgentFlag(afterMcp);
       if (agentFlags.error) {
         await sendReply(agentFlags.error);
@@ -5773,7 +5812,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
-      const session = createSession(sessionRoomId, workdir, undefined, { agent: selectedAgent, mcpExtras });
+      const session = createSession(sessionRoomId, workdir, undefined, {
+        agent: selectedAgent, mcpExtras,
+        ...(startBypass != null ? { bypass: startBypass } : {}),
+      });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -5789,7 +5831,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // the only client now, and its new conversation appears on its own —
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}.`);
+      const permNote = permissionNote(session);
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}${permNote}.`);
       break;
     }
 
@@ -5828,7 +5871,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
       const { force: restartForced, rest: restartArgs } = extractForceFlag(parts.slice(1));
-      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartArgs);
+      const { bypass: restartBypass, rest: restartAfterBypass } = extractBypassFlag(restartArgs);
+      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartAfterBypass);
       const restartAgentFlags = extractAgentFlag(restartAfterMcp);
       if (restartAgentFlags.error) {
         await sendReply(restartAgentFlags.error);
@@ -5871,12 +5915,20 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
-      recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
+      const restarted = recreateSession(roomId, {
+        mcpExtras: effectiveRestartExtras,
+        // Pass undefined (not a coerced false) when nothing was persisted, so
+        // a pre-feature session falls through to the box default instead of
+        // being forced into auto mode by the coercion.
+        bypass: restartBypass != null ? restartBypass
+          : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
+      }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
+      const restartPermNote = permissionNote(restarted);
       await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
+        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}${restartPermNote}`
       );
       break;
     }
@@ -5887,7 +5939,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: resumeBypass, rest: resumeAfterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(resumeAfterBypass);
       const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
       if (resumeAgentFlags.error) {
         await sendReply(resumeAgentFlags.error);
@@ -6056,10 +6109,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? (resumePersisted?.summary || '')
         : await getSessionSummary(resumeSessionId, actualWorkdir);
       // Prefix with the id being resumed — session.claudeSessionId isn't set
-      // until the agent's first event, well after this rename runs.
+      // until the agent's first event, well after this rename runs. The 🐣
+      // marker is inferred from the persisted record's title: the live
+      // spawnedByAgent flag died with the original process.
       const roomName = withSessionShort(resumeSessionId, summary
         ? `${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
-        : `Resumed ${shortId}`);
+        : `Resumed ${shortId}`,
+      titleMarkerFor({ _journalTitleHint: resumePersisted?.journalTitleHint }));
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -6095,6 +6151,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ...(selectedAgent === AGENT_CLAUDE
           ? { interactive: resumeState.interactiveMode }
           : {}),
+        // Same undefined-not-false rule as the /restart site above.
+        bypass: resumeBypass != null ? resumeBypass
+          : (typeof resumePersisted?.bypassMode === 'boolean' ? resumePersisted.bypassMode : undefined),
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
@@ -6137,11 +6196,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         turnCount: session.turnCount,
       });
 
-      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
-      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}\n\nSend any message to continue.`;
+      const resumePermNote = permissionNote(session);
+      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${resumePermNote}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(session.workdir)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(session.workdir)}</code>${escapeHtml(resumePermNote)}<br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
@@ -6153,7 +6213,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: workdirBypass, rest: workdirAfterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(workdirAfterBypass);
       const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
       if (workdirAgentFlags.error) {
         await sendReply(workdirAgentFlags.error);
@@ -6193,7 +6254,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
-      const session = createSession(sessionRoomId, resolved, undefined, { agent: selectedAgent, mcpExtras: workdirExtras });
+      const session = createSession(sessionRoomId, resolved, undefined, {
+        agent: selectedAgent, mcpExtras: workdirExtras,
+        ...(workdirBypass != null ? { bypass: workdirBypass } : {}),
+      });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -6202,11 +6266,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation.\nWorkdir: ${resolved}`);
-      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
+      const workdirPermNote = permissionNote(session);
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}`);
+      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
         `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(resolved)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(resolved)}</code>${escapeHtml(workdirPermNote)}<br/><br/>` +
         `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
       await sessionSendHtml(wdPlain, wdHtml);
       break;
@@ -6355,8 +6420,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
         `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
+        `/start --auto [workdir] — Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir\n` +
         `/stop — Stop the current session\n` +
-        `/restart — Restart the session once the current turn finishes; --force restarts immediately (--browser also accepted)\n` +
+        `/restart — Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)\n` +
         `/resume [--claude|--codex] <n|id> — Resume a session from that agent\n` +
         `/sessions [--claude|--codex] — List past sessions for an agent\n` +
         `/workdir [--claude|--codex] <path> — Start a session in a different directory\n` +
@@ -6395,8 +6461,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
           ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
+          ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
           ['/stop', 'Stop the current session'],
-          ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser also accepted)'],
+          ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)'],
           ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
           ['/sessions [--claude|--codex]', 'List past sessions for an agent'],
           ['/workdir [--claude|--codex] &lt;path&gt;', 'Start a session in a different directory'],
@@ -7535,10 +7602,11 @@ function journalOnPromptReply(session, answer, { username }) {
   // A picker answers no pending prompt, so (like the queue-action block above)
   // it emits no "answered:" echo.
   if (answer?.picker) {
-    // Timer-cancel taps skip the alive gate: like the !timer command itself
-    // (PR #171), cancelling only needs the convo-scoped store, and the timer
-    // may well outlive the session process it was set from.
-    const isTimerTap = typeof answer.choice === 'string' && answer.choice.startsWith('timer:');
+    // Timer-cancel and permission taps skip the alive gate: like the !timer
+    // command itself (PR #171), cancelling only needs the convo-scoped
+    // store, and the timer may well outlive the session process it was set
+    // from; a permission tap needs only the registry, and an expired-card
+    // tap may outlive the session too.
     // Restart carry-on taps skip the alive gate for the same reason timer taps
     // do, only more so: the card is published at boot into a convo whose
     // session is dead BY CONSTRUCTION, and reviving it is the entire point of
@@ -7551,8 +7619,9 @@ function journalOnPromptReply(session, answer, { username }) {
     // on value shape is safe inside this branch: `answer.picker` already proves
     // the router verified the choice against the offered values of a picker
     // frame this bridge published.
-    const isCarryOnTap = typeof answer.choice === 'string' && answer.choice.startsWith('resume:');
-    if (!session.alive && !isTimerTap && !isCarryOnTap) {
+    const skipsAliveGate = typeof answer.choice === 'string'
+      && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:') || answer.choice.startsWith('resume:'));
+    if (!session.alive && !skipsAliveGate) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
     }
@@ -7563,6 +7632,7 @@ function journalOnPromptReply(session, answer, { username }) {
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
       sendTimerNow: sendTimerNowFromButton,
+      answerPermission: answerPermissionFromButton,
       carryOnConvo,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
@@ -7818,6 +7888,48 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
   const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;
   if (!fired) {
     sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
+  }
+}
+
+// The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
+// every session-confirmation reply (/start, /restart, /resume, /workdir).
+// Shown only when the session deviates from the box default
+// (MATRON_PERMISSION_MODE): the norm needs no badge — on a default-bypass
+// box, stamping every session "permissions bypassed" is noise, and on an
+// opted-in auto box the same goes for the auto badge — but running counter
+// to the box's posture is worth a line. bypassMode is undefined for
+// provider sessions (codex, interactive) that don't route through the
+// print-mode permission flow, which is the '' case. Optional chaining lets
+// a possibly-null/undefined session (e.g. a failed /restart) fall through
+// to the same '' result as the old inline ternaries.
+function permissionNote(session) {
+  if (typeof session?.bypassMode !== 'boolean' || session.bypassMode === DEFAULT_BYPASS_MODE) return '';
+  return session.bypassMode ? ' · ⚠️ permissions bypassed' : ' · 🛡 auto permissions';
+}
+
+// A perm:<id>:<verdict> tap (permission card). The registry is the source of
+// truth — a tap on an expired or already-answered card is an informative
+// no-op, never a crash. "Always" allowlists the tool for the SESSION (in
+// memory only; not persisted — a restart re-prompts, by design).
+function answerPermissionFromButton(session, requestId, verdict, sendReply) {
+  // Room affinity is enforced INSIDE answer(), before any state changes: a
+  // permission card is only ever rendered into the room that raised the
+  // request, so a tap arriving via another room's session (e.g. a copied
+  // button value) is refused outright — the entry stays pending and only the
+  // originating room can still answer it.
+  const result = permissionRegistry.answer(requestId, verdict, session.roomId);
+  if (!result) {
+    sendReply('That permission request has expired or was already answered.');
+    return;
+  }
+  if (verdict === 'always') {
+    if (!session.permAllowedTools) session.permAllowedTools = new Set();
+    session.permAllowedTools.add(result.toolName);
+    sendReply(`✅ Always allowing ${result.toolName} for this session.`);
+  } else if (verdict === 'deny') {
+    sendReply(`⛔ Denied: ${result.toolName}`);
+  } else {
+    sendReply(`✅ Allowed once: ${result.toolName}`);
   }
 }
 
@@ -8522,6 +8634,15 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
 const pendingSecrets = new Map();
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
+// Pending print-mode permission prompts (spec 2026-08-10-auto-permission-mode).
+// The ask-user permission_request tool POSTs + polls; taps answer via the
+// journal prompt_reply perm: path. The TTL resolves from the same env var the
+// tool's poll deadline uses, so an unanswered card expires exactly when the
+// tool fail-closes to deny — a stale tap can't record a verdict afterwards.
+const permissionRegistry = createPermissionRegistry({
+  ttlMs: resolvePermissionTimeoutMs(process.env.PERMISSION_PROMPT_TIMEOUT_MS),
+});
+
 // Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
 // requests waiting for a user decision in interactive mode. The hook script
 // (hooks/exit-plan-decision.sh) holds an HTTP request open against
@@ -8681,6 +8802,20 @@ const apiServer = createServer(async (req, res) => {
     return;
   }
 
+  // GET /permission-request/:id — permission_request MCP tool polls for a tap
+  if (req.method === 'GET' && url.pathname.startsWith('/permission-request/')) {
+    const permId = url.pathname.split('/')[2];
+    const entry = permissionRegistry.read(permId);
+    if (!entry) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Permission request not found' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(entry));
+    return;
+  }
+
   // GET /sensitive/:id — Viewer retrieves sensitive data (one-time view)
   if (req.method === 'GET' && url.pathname.startsWith('/sensitive/')) {
     const sensitiveId = url.pathname.split('/')[2];
@@ -8817,6 +8952,44 @@ const apiServer = createServer(async (req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId }));
+        return;
+      } else if (url.pathname === '/permission-request') {
+        const { roomId, toolName, input } = data;
+        if (!roomId || typeof toolName !== 'string' || toolName === '') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and toolName are required' }));
+          return;
+        }
+        const permSession = sessions.get(roomId);
+        if (!permSession) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No session for roomId' }));
+          return;
+        }
+        // Session-allowlisted (an earlier "Always allow" tap): short-circuit,
+        // no card.
+        if (permSession.permAllowedTools?.has(toolName)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ behavior: 'allow' }));
+          return;
+        }
+        const { id: permRequestId } = permissionRegistry.create({ roomId, toolName });
+        const card = renderPermissionCard({ toolName, input });
+        const { buttons: permBtns, mode: permMode } = permissionButtons(permRequestId, toolName);
+        try {
+          await sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
+        } catch (err) {
+          // Card never reached the user — withdraw the request and answer
+          // non-OK so the tool denies immediately instead of polling for five
+          // minutes on a card nobody can see.
+          permissionRegistry.cancel(permRequestId);
+          debug(`permission-request card delivery failed for ${roomId}: ${err.message}`);
+          res.writeHead(502);
+          res.end(JSON.stringify({ error: 'Could not deliver the permission card to the room' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ requestId: permRequestId }));
         return;
       }
 
@@ -9503,6 +9676,12 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     sendReply(refusalAnnouncement || decision.message);
     return null;
   }
+  // iv-mode has no auto-permission support yet (spec 2026-08-10 out-of-scope):
+  // switching an auto session to interactive silently widens permissions, so
+  // say it out loud rather than refusing the switch.
+  if (wantInteractive && session.bypassMode === false) {
+    sendReply('Heads-up: interactive mode currently runs with permissions bypassed (auto permission mode support is coming).');
+  }
   // `announcement` replaces the generic "Switching to … mode" line on SUCCESS
   // only. Used by flows where the switch is an implementation detail the user
   // didn't ask for (/login//logout from print mode) to say what's actually
@@ -9552,6 +9731,10 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const next = createSession(roomId, workdir, preInitPrint ? null : sessionId, {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
+    // Carry the live --bypass/--auto choice across the swap (same rationale
+    // as mcpExtras: it may not be persisted yet). An explicit override from
+    // the caller still wins via the ...overrides spread below.
+    ...(typeof existing.bypassMode === 'boolean' ? { bypass: existing.bypassMode } : {}),
     journalConvoId: existing.journalConvoId,
     // Carry the good title across the swap so the re-seed adopts it instead of
     // clobbering it with the repo basename (title-revert bug).
