@@ -445,6 +445,7 @@ describe('notifyQueuedMessage', () => {
       '📨 Queued (2): second',
       [
         { id: 'cancel', label: '✕ Cancel', value: 'cancel:1' },
+        { id: 'send_one', label: '⚡ Send just this', value: 'sendone:1' },
         { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
       ],
       'pick_one', '📨 Queued (2): second', '📨 Queued (2): second',
@@ -533,6 +534,7 @@ describe('notifyQueuedMessage', () => {
       items: [{ id: itemId, text: 'the full untruncated queued message body' }],
       actions: [
         { id: 'send', intent: 'primary' },
+        { id: 'send_one', intent: 'neutral' },
         { id: 'cancel', intent: 'neutral' },
       ],
     });
@@ -559,7 +561,8 @@ describe('notifyQueuedMessage', () => {
     expect(payload.mode).toBe('pick_one');
     expect(payload.options).toEqual([
       { id: 'send', label: payload.actions[0].label, value: 'send' },
-      { id: 'cancel', label: payload.actions[1].label, value: 'cancel' },
+      { id: 'send_one', label: payload.actions[1].label, value: 'send_one' },
+      { id: 'cancel', label: payload.actions[2].label, value: 'cancel' },
     ]);
   });
 
@@ -588,9 +591,89 @@ describe('notifyQueuedMessage', () => {
       [{ type: 'text', text: 'b' }],
       [{ type: 'text', text: 'c' }],
     ]);
-    expect(several.question).toBe('Send all 3 queued messages now, or cancel this one?');
-    expect(several.actions.map(a => a.label)).toEqual(['⚡ Send all now', '✕ Cancel this']);
-    expect(several.actions.map(a => a.id)).toEqual(['send', 'cancel']);
+    expect(several.question).toBe('Send all 3 queued messages now, send just this one, or cancel it?');
+    expect(several.actions.map(a => a.label)).toEqual(['⚡ Send all now', '⚡ Send just this one', '✕ Cancel this']);
+    expect(several.actions.map(a => a.id)).toEqual(['send', 'send_one', 'cancel']);
+  });
+
+  // Requirement (Dan): a queued card used to be all-or-nothing — `send` flushed
+  // the WHOLE batch and `cancel` was the only per-item action, so "run just this
+  // one and leave the rest queued" was unreachable. The third action exists ONLY
+  // where that asymmetry does: with a single queued message `send` already means
+  // "just this one", and a jumping /compact already flushes ALONE, so a
+  // "send just this one" button on either card would be a second button that
+  // does exactly what the first one does.
+  it('structured path: the send_one action appears ONLY on a multi-queued card', async () => {
+    async function actionIdsFor({ queuedMessages, compactJump = false }) {
+      const sendButtonMessage = vi.fn(async () => '$tile');
+      const session = makeSession({ sendButtonMessage, queueNotifications: [], queuedMessages });
+      await notifyQueuedMessage(session, 'p', {
+        sendReply: vi.fn(),
+        queueRelease: { noteQueued: vi.fn() },
+        convoId: 'convo-1',
+        compactJump,
+      });
+      const buttonArgs = sendButtonMessage.mock.calls[0];
+      const payload = buttonArgs[buttonArgs.length - 1];
+      return { ids: payload.actions.map(a => a.id), optionIds: payload.options.map(o => o.id), payload };
+    }
+
+    // One queued message: `send` already means "just this one".
+    const single = await actionIdsFor({ queuedMessages: [[{ type: 'text', text: 'only' }]] });
+    expect(single.ids).toEqual(['send', 'cancel']);
+    expect(single.optionIds).toEqual(['send', 'cancel']);
+
+    // Several queued: the asymmetry is real, so the third action appears —
+    // between send and cancel, and mirrored into `options` for older clients.
+    const several = await actionIdsFor({
+      queuedMessages: [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]],
+    });
+    expect(several.ids).toEqual(['send', 'send_one', 'cancel']);
+    expect(several.optionIds).toEqual(['send', 'send_one', 'cancel']);
+
+    // A jumping /compact flushes ALONE even with a full queue behind it, so its
+    // `send` is already per-item — no third action.
+    const jumping = await actionIdsFor({
+      queuedMessages: [
+        [{ type: 'text', text: '/compact' }],
+        [{ type: 'text', text: 'a' }],
+        [{ type: 'text', text: 'b' }],
+      ],
+      compactJump: true,
+    });
+    expect(jumping.ids).toEqual(['send', 'cancel']);
+    expect(jumping.optionIds).toEqual(['send', 'cancel']);
+  });
+
+  // The `options` mirror is what keeps a pre-`queued_release` client's card
+  // alive (its reply carries the option VALUE, which the router validates
+  // against QUEUED_RELEASE_ACTIONS). Deriving it from `actions` is what stops
+  // the two drifting when an action is added — as one just was.
+  it('structured path: every action is mirrored as an option whose value is its wire id', async () => {
+    const sendButtonMessage = vi.fn(async () => '$tile');
+    const session = makeSession({ sendButtonMessage, queueNotifications: [] });
+    await notifyQueuedMessage(session, 'p', {
+      sendReply: vi.fn(),
+      queueRelease: { noteQueued: vi.fn() },
+      convoId: 'convo-1',
+    });
+    const buttonArgs = sendButtonMessage.mock.calls[0];
+    const payload = buttonArgs[buttonArgs.length - 1];
+    expect(payload.options).toEqual(
+      payload.actions.map(({ id, label }) => ({ id, label, value: id })),
+    );
+  });
+
+  // Matrix parity: the legacy button tile carries the same third affordance,
+  // positionally addressed (`sendone:<n>`) like its `cancel:<n>` sibling.
+  it('button channel: the Matrix tile gains sendone:<n> only on a multi-queued card', async () => {
+    const solo = vi.fn(async () => '$tile');
+    await notifyQueuedMessage(
+      makeSession({ sendButtonMessage: solo, queueNotifications: [], queuedMessages: [[{ type: 'text', text: 'only' }]] }),
+      'only',
+      { sendReply: vi.fn(), htmlEscape: (s) => s },
+    );
+    expect(solo.mock.calls[0][1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
   });
 });
 
@@ -942,6 +1025,315 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
     });
     expect(handled).toBe(false);
     expect(session.queuedMessages).toHaveLength(2);
+  });
+});
+
+// "Send just this one" (send_one). Until now a queued card was all-or-nothing:
+// `send` flushed the ENTIRE batch as one merged turn and `cancel` was the only
+// action that touched a single item. send_one is cancel's mirror image — it
+// detaches exactly the tapped item and dispatches only that.
+//
+// It deliberately does NOT follow cancel's write-ahead ordering. cancel is
+// destructive (the message is gone whether or not anything else succeeds), so
+// its release must be durable BEFORE the splice. send_one is a dispatch: the
+// release is a `send` release and is only true once the dispatch was accepted,
+// which is exactly what flushQueue's finalizeSentQueue does with the snapshot —
+// so the release rides that path, like every other flush.
+describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
+  function threeSession(overrides = {}) {
+    return {
+      roomId: '!room:server',
+      queuedMessages: [
+        [{ type: 'text', text: 'a' }],
+        [{ type: 'text', text: 'b' }],
+        [{ type: 'text', text: 'c' }],
+      ],
+      queueNotifications: [
+        { id: 'pr_a::0', eventId: '$ea', plain: '📨 Queued (1): a' },
+        { id: 'pr_b::0', eventId: '$eb', plain: '📨 Queued (2): b' },
+        { id: 'pr_c::0', eventId: '$ec', plain: '📨 Queued (3): c' },
+      ],
+      ...overrides,
+    };
+  }
+
+  // Faithful stand-in for index.js flushQueue. The distinction that matters to
+  // this feature is that a `false` return means TWO different things:
+  //   retained  — session alive but the flush was refused / Codex is busy;
+  //               restoreQueuedBatch re-prepends the batch, so the notification
+  //               must come back too or the arrays desynchronise (PR #104).
+  //   dropped   — session dead/auto-stopped; flushQueue DROPS the batch and
+  //               notifies the user it was undeliverable. Restoring the
+  //               notification here would leave a tile with no queue entry
+  //               behind it — the exact dangling-notif bug lockstep exists to
+  //               prevent.
+  function fakeFlushQueue(outcome) {
+    return vi.fn((session, queued) => {
+      if (outcome === true) return true;
+      if (outcome === 'dropped') return false;
+      const pending = session.queuedMessages || [];
+      session.queuedMessages = [...queued, ...pending];
+      return outcome; // false (retained) or 'deferred' (Codex)
+    });
+  }
+
+  function tapSendOne(session, deps = {}) {
+    return resolveQueueReleaseTap('send_one', session, {
+      flushQueue: fakeFlushQueue(true),
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_b', itemIds: ['pr_b::0'] },
+      convoId: 'convo-1',
+      queueRelease: {
+        listLive: vi.fn(() => [
+          { promptId: 'pr_a', itemId: 'pr_a::0' },
+          { promptId: 'pr_b', itemId: 'pr_b::0' },
+          { promptId: 'pr_c', itemId: 'pr_c::0' },
+        ]),
+        dropItem: vi.fn(),
+      },
+      emitRelease: vi.fn(),
+      ...deps,
+    });
+  }
+
+  it('flushes ONLY the tapped message and leaves the rest queued, in lockstep', () => {
+    const flushQueue = fakeFlushQueue(true);
+    const session = threeSession();
+    expect(tapSendOne(session, { flushQueue })).toBe(true);
+
+    // Exactly one message dispatched — the tapped one, not the whole batch.
+    expect(flushQueue).toHaveBeenCalledTimes(1);
+    expect(flushQueue.mock.calls[0][1]).toEqual([[{ type: 'text', text: 'b' }]]);
+
+    // The other two stay queued, and their tiles stay live and actionable.
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: 'a' }],
+      [{ type: 'text', text: 'c' }],
+    ]);
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_a::0', 'pr_c::0']);
+  });
+
+  it('never strips the surviving notifications — the other cards must stay actionable', () => {
+    const stripQueueNotificationLinks = vi.fn();
+    const session = threeSession();
+    tapSendOne(session, { stripQueueNotificationLinks });
+    expect(stripQueueNotificationLinks).not.toHaveBeenCalled();
+  });
+
+  it('passes flushQueue a release snapshot scoped to the TAPPED item alone', () => {
+    const flushQueue = fakeFlushQueue(true);
+    const session = threeSession();
+    tapSendOne(session, { flushQueue });
+
+    // finalizeSentQueue emits one durable `send` release per snapshot entry and
+    // retires that card. Handed the whole live list it would retire all three,
+    // killing two cards whose messages are still sitting in the queue.
+    expect(flushQueue.mock.calls[0][2]).toEqual({
+      convoId: 'convo-1',
+      entries: [{ promptId: 'pr_b', itemId: 'pr_b::0' }],
+    });
+  });
+
+  // deps.queueRelease.listLive is scoped to pendingFlushBatch(session) — a
+  // PREFIX of the queue, computed before the tap. Once a /compact jumps to index
+  // 0 that prefix is just the compact, so deriving the snapshot by filtering
+  // listLive yields nothing for any other card: the message goes out and no
+  // release is ever emitted, leaving its card live forever. The snapshot is
+  // therefore built from the router-supplied `entry`, which is always the
+  // tapped card's own live record.
+  it('still finalizes the tapped card when listLive is scoped to a jumping /compact', () => {
+    const flushQueue = fakeFlushQueue(true);
+    const session = threeSession();
+    tapSendOne(session, {
+      flushQueue,
+      // What queueReleaseForBatch really returns once a /compact sits at index 0.
+      queueRelease: { listLive: () => [{ promptId: 'pr_compact', itemId: 'pr_compact::0' }], dropItem: vi.fn() },
+    });
+    expect(flushQueue.mock.calls[0][2]).toEqual({
+      convoId: 'convo-1',
+      entries: [{ promptId: 'pr_b', itemId: 'pr_b::0' }],
+    });
+  });
+
+  it('emits no release of its own — the send release is finalized by the accepted dispatch', () => {
+    const emitRelease = vi.fn();
+    const dropItem = vi.fn();
+    const session = threeSession();
+    tapSendOne(session, { emitRelease, queueRelease: { listLive: () => [], dropItem } });
+    // Unlike cancel, send_one must NOT write-ahead: a release emitted before
+    // dispatch would retire the card even when the dispatch is then refused.
+    expect(emitRelease).not.toHaveBeenCalled();
+    expect(dropItem).not.toHaveBeenCalled();
+  });
+
+  it('nulls the queue when the tapped message was the only one left', () => {
+    const session = {
+      roomId: '!room:server',
+      queuedMessages: [[{ type: 'text', text: 'solo' }]],
+      queueNotifications: [{ id: 'pr_s::0', eventId: '$es', plain: '📨 Queued (1): solo' }],
+    };
+    const handled = resolveQueueReleaseTap('send_one', session, {
+      flushQueue: fakeFlushQueue(true),
+      entry: { prompt_id: 'pr_s', itemIds: ['pr_s::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: () => [], dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+    });
+    expect(handled).toBe(true);
+    expect(session.queuedMessages).toBeNull();
+    expect(session.queueNotifications).toEqual([]);
+  });
+
+  it('a stale tap (the item already left the queue) is a SILENT no-op, still handled', () => {
+    const flushQueue = fakeFlushQueue(true);
+    const session = threeSession();
+    const handled = resolveQueueReleaseTap('send_one', session, {
+      flushQueue,
+      entry: { prompt_id: 'pr_gone', itemIds: ['pr_gone::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: () => [], dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify: vi.fn(),
+    });
+    expect(handled).toBe(true);
+    expect(flushQueue).not.toHaveBeenCalled();
+    expect(session.queuedMessages).toHaveLength(3); // untouched
+    expect(session.queueNotifications).toHaveLength(3);
+  });
+
+  it('a tap on an empty queue is a SILENT no-op (the batch already flushed)', () => {
+    const flushQueue = fakeFlushQueue(true);
+    const session = threeSession({ queuedMessages: null });
+    expect(resolveQueueReleaseTap('send_one', session, {
+      flushQueue,
+      entry: { prompt_id: 'pr_b', itemIds: ['pr_b::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: () => [], dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+    })).toBe(true);
+    expect(flushQueue).not.toHaveBeenCalled();
+  });
+
+  // A notification that outlives its queue entry makes every later positional
+  // read (an indexed cancel, a batch split) land on the WRONG message.
+  it.each([
+    ['a refused flush (session alive)', false],
+    ['a deferred flush (Codex busy)', 'deferred'],
+  ])('%s puts the message AND its tile back at the front, still aligned', (_label, outcome) => {
+    const flushQueue = fakeFlushQueue(outcome);
+    const session = threeSession();
+    expect(tapSendOne(session, { flushQueue })).toBe(true);
+
+    // flushQueue's own restoreQueuedBatch re-prepends the blocks; the
+    // notification half is this module's job and must match it exactly.
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: 'b' }],
+      [{ type: 'text', text: 'a' }],
+      [{ type: 'text', text: 'c' }],
+    ]);
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_b::0', 'pr_a::0', 'pr_c::0']);
+  });
+
+  it('a DROPPED flush (dead session) does not resurrect the tile — the queue entry is gone', () => {
+    const flushQueue = fakeFlushQueue('dropped');
+    const session = threeSession();
+    expect(tapSendOne(session, { flushQueue })).toBe(true);
+
+    // flushQueue already told the user it could not be delivered. Restoring the
+    // notification here would leave a tile with nothing behind it.
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: 'a' }],
+      [{ type: 'text', text: 'c' }],
+    ]);
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_a::0', 'pr_c::0']);
+  });
+
+  it('echoes what was sent and how many are still waiting (the card retires with its preview)', () => {
+    const notify = vi.fn();
+    const session = threeSession();
+    tapSendOne(session, {
+      notify,
+      formatQueueSummary: (queued) => ({
+        plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
+        html: '',
+      }),
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0])
+      .toBe('⚡ Sending 1 queued message now:\n  1. b\n— the other 2 messages stay queued.');
+  });
+
+  it('a refused flush echoes nothing — the message did not go out', () => {
+    const notify = vi.fn();
+    tapSendOne(threeSession(), {
+      flushQueue: fakeFlushQueue(false),
+      notify,
+      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+    });
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('a caller without the summary seam still sends, just without the echo', () => {
+    const notify = vi.fn();
+    const flushQueue = fakeFlushQueue(true);
+    tapSendOne(threeSession(), { flushQueue, notify });
+    expect(flushQueue).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
+  });
+});
+
+// Matrix-shaped compatibility values. These have had no production caller since
+// the router stopped classifying queue taps by value shape (issue #165), but the
+// branch is still the contract for any pre-deploy tile still on screen, so the
+// third affordance exists here too and obeys the same stale-tap silence.
+describe('resolveQueueReleaseTap — legacy sendone:<n>', () => {
+  it('splices exactly the indexed message + tile, flushes only it, and marks the tile sent', () => {
+    const session = makeSession();
+    const deps = matrixDeps({ flushQueue: vi.fn(() => true) });
+    expect(resolveQueueReleaseTap('sendone:0', session, deps)).toBe(true);
+
+    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
+    expect(deps.flushQueue.mock.calls[0][1]).toEqual([[{ type: 'text', text: 'first' }]]);
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
+    expect(session.queueNotifications).toEqual([{ eventId: '$ev2', plain: '📨 Queued (2): second' }]);
+    expect(deps.editMessage).toHaveBeenCalledWith(
+      '!room:server', '$ev1', '⚡ 📨 Queued (1): first (sent)',
+    );
+    expect(deps.sendReply).not.toHaveBeenCalled();
+  });
+
+  it('nulls the queue when the indexed message was the last one', () => {
+    const session = makeSession({
+      queuedMessages: [[{ type: 'text', text: 'solo' }]],
+      queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
+    });
+    resolveQueueReleaseTap('sendone:0', session, matrixDeps({ flushQueue: vi.fn(() => true) }));
+    expect(session.queuedMessages).toBeNull();
+  });
+
+  it('an out-of-range index is a SILENT no-op (stale tile), still handled', () => {
+    const session = makeSession();
+    const deps = matrixDeps();
+    expect(resolveQueueReleaseTap('sendone:9', session, deps)).toBe(true);
+    expect(deps.flushQueue).not.toHaveBeenCalled();
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(deps.editMessage).not.toHaveBeenCalled();
+  });
+
+  it('a retained flush puts the message and its tile back at the front, and edits nothing', () => {
+    const session = makeSession();
+    const deps = matrixDeps({
+      flushQueue: vi.fn((s, queued) => {
+        s.queuedMessages = [...queued, ...(s.queuedMessages || [])];
+        return false;
+      }),
+    });
+    expect(resolveQueueReleaseTap('sendone:0', session, deps)).toBe(true);
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(session.queueNotifications.map(n => n.plain)).toEqual([
+      '📨 Queued (1): first', '📨 Queued (2): second',
+    ]);
+    expect(deps.editMessage).not.toHaveBeenCalled();
   });
 });
 
