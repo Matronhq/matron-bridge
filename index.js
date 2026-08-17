@@ -1234,18 +1234,18 @@ function journalStatus(session) {
     // keeping the Codex limits array empty (buildSessionStatus omits it).
     limits: isCodex ? [] : (usageLimitsCache.lines || []),
     // Composer argument offers for /model and /effort, session-scoped. Codex
-    // gets neither: its model id is free text passed straight to
-    // `codex --model` (the bridge validates nothing and holds no id list), and
-    // effort switching isn't exposed for Codex at all — see the '!effort'
-    // handler. An absent field beats an invented one.
-    modelOptions: isCodex ? null : modelOptions(),
-    effortLevels: isCodex ? null : effortOptions(),
-    // Optimistically tracked, never read back (lib/effort-tracker.js).
-    // Tri-state, unlike every other field: Codex passes undefined (omitted,
-    // no opinion), Claude passes the tracked level — a string, or null while
-    // unknown, which publishes as an EXPLICIT null so a sticky client clears
-    // a level this session no longer stands behind (e.g. after a restart).
-    effort: isCodex ? undefined : trackedEffort(session),
+    // states EMPTY rather than staying silent: its model id is free text passed
+    // straight to `codex --model` (the bridge validates nothing and holds no id
+    // list) and effort isn't exposed for it at all — see the '!effort' handler.
+    // Silence would merge stickily, so a mid-session /switch claude→codex would
+    // leave Claude's offers standing on a session that refuses them.
+    modelOptions: isCodex ? [] : modelOptions(),
+    effortLevels: isCodex ? [] : effortOptions(),
+    // Optimistically tracked, never read back (lib/effort-tracker.js). Null for
+    // Codex (not applicable) and for a Claude session whose level is unknown;
+    // either way it publishes as an EXPLICIT null, so a sticky client clears a
+    // level this session no longer stands behind (e.g. after a restart).
+    effort: isCodex ? null : trackedEffort(session),
     email: getAccountEmail(),
     // Absolute path for the client's header workdir segment: session.workdir
     // can be relative (it is passed through from the resume/start args), so
