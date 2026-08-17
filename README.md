@@ -169,7 +169,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
 | `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
-| `!start --bypass [workdir]` | Claude only: spawn with `--dangerously-skip-permissions` instead of the default auto permission mode. Also order-independent and accepted by `!resume`, `!workdir`, and `!restart`; pass `--auto` instead to return to auto mode. See Permissions below. |
+| `!start --auto [workdir]` | Claude only: spawn with auto permission mode + Matron permission cards instead of the default `--dangerously-skip-permissions`. Also order-independent and accepted by `!resume`, `!workdir`, and `!restart`; pass `--bypass` instead to return to the default. See Permissions below. |
 | `!stop` | Stop the current session |
 | `!restart [--force] [--browser] [--bypass\|--auto]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser`/`--bypass`/`--auto` are Claude-only) |
 | `!resume [--claude\|--codex] <n\|id> [--browser] [--bypass\|--auto]` | Resume a previous session (`--browser`/`--bypass`/`--auto` are Claude-only) |
@@ -198,7 +198,7 @@ Any other message is forwarded directly to the selected agent. Claude Code slash
 
 ### Permissions
 
-Print-mode Claude sessions run with Claude Code's `auto` permission mode: routine work is auto-approved, dangerous actions are blocked, and the rare remaining prompts appear in Matron as Allow once / Always allow this tool (session) / Deny cards (an unanswered card denies itself after 5 minutes). Start a session with `--bypass` to restore the old `--dangerously-skip-permissions` behavior for that session; `--auto` returns it to auto mode. Both flags persist across restarts until changed again. Interactive (`!mode interactive`) and Codex sessions are unaffected — they still run bypassed. Note: Haiku-class models don't support auto mode and fall back to Claude Code's `default` mode, which prompts more often; the bridge warns about this at spawn time.
+Print-mode Claude sessions run with `--dangerously-skip-permissions` by default. Opting a session in with `--auto` switches it to Claude Code's `auto` permission mode: routine work is auto-approved, dangerous actions are blocked, and the remaining prompts appear in Matron as Allow once / Always allow this tool (session) / Deny cards (an unanswered card denies itself after 5 minutes). `--bypass` returns a session to the default. Both flags persist across restarts until changed again, and `MATRON_PERMISSION_MODE=auto` flips the box-wide default so every session runs in auto mode unless started with `--bypass`. Interactive (`!mode interactive`) and Codex sessions don't route through this flow — they always run bypassed. Note: Haiku-class models don't support auto mode and fall back to Claude Code's `default` mode, which prompts more often; the bridge warns about this at spawn time.
 
 ## Matron journal transport
 

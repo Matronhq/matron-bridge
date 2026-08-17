@@ -95,7 +95,7 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -155,6 +155,16 @@ if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAU
   console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
 }
 const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
+// Box-wide default for print-mode Claude sessions: 'bypass' spawns with
+// --dangerously-skip-permissions, 'auto' with Claude Code's auto permission
+// mode + the Matron permission-card prompt tool. Bypass is the default —
+// auto mode blocks too much routine work to impose on every session — so
+// auto is opt-in, per box here or per session via --auto.
+const MATRON_PERMISSION_MODE = process.env.MATRON_PERMISSION_MODE || 'bypass';
+if (!['bypass', 'auto'].includes(MATRON_PERMISSION_MODE)) {
+  console.warn(`[permissions] Unknown MATRON_PERMISSION_MODE=${JSON.stringify(process.env.MATRON_PERMISSION_MODE)}; defaulting to bypass.`);
+}
+const DEFAULT_BYPASS_MODE = MATRON_PERMISSION_MODE !== 'auto';
 // Idle reaping: a session is killed if no activity (incoming user message OR
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
@@ -1469,12 +1479,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  // bypassMode: explicit --bypass/--auto flag wins; otherwise the persisted
-  // value. Sessions persisted before this feature have no bypassMode and thus
-  // resume in auto mode — the intended migration (spec 2026-08-10).
-  const bypassMode = typeof options.bypass === 'boolean'
-    ? options.bypass
-    : (persistedForRoom?.bypassMode === true);
+  const bypassMode = resolveBypassMode(options.bypass, persistedForRoom?.bypassMode, DEFAULT_BYPASS_MODE);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   let showFileToken;
@@ -1542,8 +1547,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // sessions fall back to `default` permission mode and prompt for far more.
   if (!bypassMode && printModel && /haiku/i.test(printModel)) {
     const hw = notice('warning',
-      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to restore the old behavior.`,
-      `Model <code>${escapeHtml(printModel)}</code> doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use <code>--bypass</code> to restore the old behavior.`);
+      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to run without permission gating instead.`,
+      `Model <code>${escapeHtml(printModel)}</code> doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use <code>--bypass</code> to run without permission gating instead.`);
     Promise.resolve(sendToRoom(roomId, hw.plain, hw.html)).catch(() => {});
   }
   args.push(...identity.cliArgs);
@@ -5909,7 +5914,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
       const restarted = recreateSession(roomId, {
         mcpExtras: effectiveRestartExtras,
-        bypass: restartBypass != null ? restartBypass : existing.bypassMode === true,
+        // Pass undefined (not a coerced false) when nothing was persisted, so
+        // a pre-feature session falls through to the box default instead of
+        // being forced into auto mode by the coercion.
+        bypass: restartBypass != null ? restartBypass
+          : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
       }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
@@ -6139,7 +6148,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ...(selectedAgent === AGENT_CLAUDE
           ? { interactive: resumeState.interactiveMode }
           : {}),
-        bypass: resumeBypass != null ? resumeBypass : resumePersisted?.bypassMode === true,
+        // Same undefined-not-false rule as the /restart site above.
+        bypass: resumeBypass != null ? resumeBypass
+          : (typeof resumePersisted?.bypassMode === 'boolean' ? resumePersisted.bypassMode : undefined),
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
@@ -6406,7 +6417,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
         `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
-        `/start --bypass [workdir] — Skip auto permission mode and run with --dangerously-skip-permissions instead (--auto switches back); also accepted by /restart, /resume, /workdir\n` +
+        `/start --auto [workdir] — Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir\n` +
         `/stop — Stop the current session\n` +
         `/restart — Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)\n` +
         `/resume [--claude|--codex] <n|id> — Resume a session from that agent\n` +
@@ -6447,7 +6458,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
           ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
-          ['/start --bypass [workdir]', 'Skip auto permission mode and run with --dangerously-skip-permissions instead (--auto switches back); also accepted by /restart, /resume, /workdir'],
+          ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
           ['/stop', 'Stop the current session'],
           ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)'],
           ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
@@ -7879,13 +7890,18 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
 
 // The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
 // every session-confirmation reply (/start, /restart, /resume, /workdir).
-// bypassMode is undefined for provider sessions (codex, interactive) that
-// don't route through the print-mode permission flow, which is the '' case.
-// Optional chaining lets a possibly-null/undefined session (e.g. a failed
-// /restart) fall through to the same '' result as the old inline ternaries.
+// Shown only when the session deviates from the box default
+// (MATRON_PERMISSION_MODE): the norm needs no badge — on a default-bypass
+// box, stamping every session "permissions bypassed" is noise, and on an
+// opted-in auto box the same goes for the auto badge — but running counter
+// to the box's posture is worth a line. bypassMode is undefined for
+// provider sessions (codex, interactive) that don't route through the
+// print-mode permission flow, which is the '' case. Optional chaining lets
+// a possibly-null/undefined session (e.g. a failed /restart) fall through
+// to the same '' result as the old inline ternaries.
 function permissionNote(session) {
-  return session?.bypassMode === true ? ' · ⚠️ permissions bypassed'
-    : (session?.bypassMode === false ? ' · 🛡 auto permissions' : '');
+  if (typeof session?.bypassMode !== 'boolean' || session.bypassMode === DEFAULT_BYPASS_MODE) return '';
+  return session.bypassMode ? ' · ⚠️ permissions bypassed' : ' · 🛡 auto permissions';
 }
 
 // A perm:<id>:<verdict> tap (permission card). The registry is the source of

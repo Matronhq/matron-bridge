@@ -4,6 +4,7 @@ import {
   permissionButtons,
   parsePermTap,
   permissionSpawnArgs,
+  resolveBypassMode,
   createPermissionRegistry,
   resolvePermissionTimeoutMs,
   DENY_MESSAGE,
@@ -108,6 +109,30 @@ describe('permissionSpawnArgs', () => {
 
   it('bypass: the old skip-permissions flag', () => {
     expect(permissionSpawnArgs(true)).toEqual(['--dangerously-skip-permissions']);
+  });
+});
+
+describe('resolveBypassMode', () => {
+  it('defaults to bypass when nothing is set anywhere', () => {
+    expect(resolveBypassMode(undefined, undefined)).toBe(true);
+  });
+
+  it('an explicit flag wins over both persisted value and box default', () => {
+    expect(resolveBypassMode(false, true, true)).toBe(false);
+    expect(resolveBypassMode(true, false, false)).toBe(true);
+  });
+
+  it('the persisted value wins over the box default', () => {
+    expect(resolveBypassMode(undefined, false, true)).toBe(false);
+    expect(resolveBypassMode(undefined, true, false)).toBe(true);
+  });
+
+  it('MATRON_PERMISSION_MODE=auto flips the fallback', () => {
+    expect(resolveBypassMode(undefined, undefined, false)).toBe(false);
+  });
+
+  it('a pre-feature session (no persisted bypassMode) lands on the box default, never coerced to auto', () => {
+    expect(resolveBypassMode(null, undefined, true)).toBe(true);
   });
 });
 
