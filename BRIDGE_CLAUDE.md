@@ -46,7 +46,7 @@ The journal server has a full-text search API over every one of the user's conve
 - `GET /convo/:id/messages?around_seq=<seq>&limit=<n>` — context around a hit. This works on any of the user's conversations, including other boxes' sessions: foreign reads return indexed prose only, with `limit` clamped to 30, and are logged server-side. Plain `before_seq`/paging reads remain restricted to conversations this device owns or has joined (others 404).
 - Send a real-looking `User-Agent` (e.g. `curl/8.x`) — some deployments 403 the default Python one — and pace request bursts; the rate limiter answers 403 across the board for a while once tripped.
 
-Full spec: `docs/protocol.md` ("Journal search") in the matron-journal repo.
+Full API digest: `GET /help` on the same base URL (Bearer, returns markdown). Full spec: `docs/protocol.md` ("Journal search") in the matron-journal repo.
 
 ## Viewer Links
 
