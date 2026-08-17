@@ -8,6 +8,7 @@ import {
   notifyQueuedMessage,
   resolveQueueReleaseTap,
 } from '../lib/busy-queue.js';
+import { compactBatchSize } from '../lib/compact-priority.js';
 
 // Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
 // send/interrupt/!interrupt (flush now) and cancel (pop last) handling is
@@ -307,6 +308,21 @@ describe('index.js journal busy caller — notification seams wiring (source ins
     const args = src.slice(start, end);
     expect(args).toMatch(/\bnotify\b/);
     expect(args).toMatch(/\bformatQueueSummary\b/);
+  });
+
+  // busy-queue.js defaults allowSendOne to true, so a call site that forgets it
+  // offers "⚡ Send just this one" on Codex — where flushQueue can only defer,
+  // and the turn-end flush then sends the WHOLE queue. The button would
+  // silently mean "send all". BOTH notifyQueuedMessage call sites (queued text
+  // and queued media) must pass the capability.
+  it('passes allowSendOne, gated on the agent, at every notifyQueuedMessage call site', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const calls = [...src.matchAll(/notifyQueuedMessage\(session, preview, \{/g)];
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      const args = src.slice(call.index, src.indexOf('});', call.index));
+      expect(args).toMatch(/allowSendOne:\s*session\.agent\s*!==\s*AGENT_CODEX/);
+    }
   });
 });
 
@@ -643,6 +659,32 @@ describe('notifyQueuedMessage', () => {
     });
     expect(jumping.ids).toEqual(['send', 'cancel']);
     expect(jumping.optionIds).toEqual(['send', 'cancel']);
+  });
+
+  // On a Codex session send_one cannot be honoured: flushQueue can't hand a
+  // single message to a live `codex exec`, so it interrupts the turn and
+  // returns 'deferred' — and the turn-end flush that follows sends the WHOLE
+  // queue. The button would silently do "send all", which is worse than not
+  // offering it. The capability is injected by the call site (which has
+  // session.agent in hand) rather than busy-queue.js learning about agents.
+  it('structured path: send_one is withheld when the caller says the agent cannot honour it', async () => {
+    const sendButtonMessage = vi.fn(async () => '$tile');
+    const session = makeSession({ sendButtonMessage, queueNotifications: [] });
+    await notifyQueuedMessage(session, 'p', {
+      sendReply: vi.fn(),
+      queueRelease: { noteQueued: vi.fn() },
+      convoId: 'convo-1',
+      allowSendOne: false,
+    });
+    const buttonArgs = sendButtonMessage.mock.calls[0];
+    const payload = buttonArgs[buttonArgs.length - 1];
+
+    expect(payload.actions.map(a => a.id)).toEqual(['send', 'cancel']);
+    expect(payload.options.map(o => o.id)).toEqual(['send', 'cancel']);
+    // The Matrix tile loses it too — same capability, same card.
+    expect(buttonArgs[1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
+    // The question must not advertise an action that isn't there.
+    expect(payload.question).toBe('Send all 2 queued messages now, or cancel this one?');
   });
 
   // The `options` mirror is what keeps a pre-`queued_release` client's card
@@ -1216,22 +1258,71 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
 
   // A notification that outlives its queue entry makes every later positional
   // read (an indexed cancel, a batch split) land on the WRONG message.
+  //
+  // Position matters as much as alignment here. flushQueue's restoreQueuedBatch
+  // PREPENDS, which is right for every other caller because their batch is
+  // always a queue PREFIX — putting it back at the front puts it back where it
+  // was. send_one's batch is one entry from an ARBITRARY index, so a prepend
+  // silently reorders the queue. Both halves go back where they came from.
   it.each([
     ['a refused flush (session alive)', false],
     ['a deferred flush (Codex busy)', 'deferred'],
-  ])('%s puts the message AND its tile back at the front, still aligned', (_label, outcome) => {
+  ])('%s puts the message AND its tile back at their ORIGINAL index', (_label, outcome) => {
     const flushQueue = fakeFlushQueue(outcome);
     const session = threeSession();
     expect(tapSendOne(session, { flushQueue })).toBe(true);
 
-    // flushQueue's own restoreQueuedBatch re-prepends the blocks; the
-    // notification half is this module's job and must match it exactly.
+    // Byte-for-byte the queue we started with — not "b" jumped to the front.
     expect(session.queuedMessages).toEqual([
-      [{ type: 'text', text: 'b' }],
       [{ type: 'text', text: 'a' }],
+      [{ type: 'text', text: 'b' }],
       [{ type: 'text', text: 'c' }],
     ]);
-    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_b::0', 'pr_a::0', 'pr_c::0']);
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_a::0', 'pr_b::0', 'pr_c::0']);
+  });
+
+  // The reordering above is not cosmetic. A queued /compact is ALWAYS at index
+  // 0 (enqueue unshifts it), and compactBatchSize only isolates it there — a
+  // compact found anywhere else rides along in the merged batch by design. So
+  // restoring a refused send_one to the FRONT displaces the compact to index 1,
+  // the next flush merges the whole queue into one message, and "/compact"
+  // arrives mid-body: compaction silently never runs and the text around it is
+  // read as compaction instructions. Every send_one tap on a busy Codex session
+  // takes this path ('deferred', index.js flushQueue).
+  it.each([
+    ['refused', false],
+    ['deferred', 'deferred'],
+  ])('a %s flush leaves a jumping /compact at index 0, still isolated by the next flush', (_label, outcome) => {
+    const session = {
+      roomId: '!room:server',
+      queuedMessages: [
+        [{ type: 'text', text: '/compact' }],
+        [{ type: 'text', text: 'a' }],
+        [{ type: 'text', text: 'b' }],
+      ],
+      queueNotifications: [
+        { id: 'pr_c::0', eventId: '$ec', plain: '📨 Queued: /compact' },
+        { id: 'pr_a::0', eventId: '$ea', plain: '📨 Queued (2): a' },
+        { id: 'pr_b::0', eventId: '$eb', plain: '📨 Queued (3): b' },
+      ],
+    };
+    resolveQueueReleaseTap('send_one', session, {
+      flushQueue: fakeFlushQueue(outcome),
+      entry: { prompt_id: 'pr_b', itemIds: ['pr_b::0'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: () => [], dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+    });
+
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: '/compact' }],
+      [{ type: 'text', text: 'a' }],
+      [{ type: 'text', text: 'b' }],
+    ]);
+    expect(session.queueNotifications.map(n => n.id)).toEqual(['pr_c::0', 'pr_a::0', 'pr_b::0']);
+    // The consequence the ordering exists to protect: the compact still goes
+    // out ALONE rather than merged into the body of one big message.
+    expect(compactBatchSize(session.queuedMessages)).toBe(1);
   });
 
   it('a DROPPED flush (dead session) does not resurrect the tile — the queue entry is gone', () => {
@@ -1320,19 +1411,40 @@ describe('resolveQueueReleaseTap — legacy sendone:<n>', () => {
     expect(deps.editMessage).not.toHaveBeenCalled();
   });
 
-  it('a retained flush puts the message and its tile back at the front, and edits nothing', () => {
-    const session = makeSession();
+  // Taps index 1, not 0: at index 0 a restore-to-front and a restore-to-origin
+  // are indistinguishable, so the test would pass against the bug.
+  it('a retained flush puts the message and its tile back at their ORIGINAL index, and edits nothing', () => {
+    const session = makeSession({
+      queuedMessages: [
+        [{ type: 'text', text: '/compact' }],
+        [{ type: 'text', text: 'first' }],
+        [{ type: 'text', text: 'second' }],
+      ],
+      queueNotifications: [
+        { eventId: '$evC', plain: '📨 Queued: /compact' },
+        { eventId: '$ev1', plain: '📨 Queued (2): first' },
+        { eventId: '$ev2', plain: '📨 Queued (3): second' },
+      ],
+    });
     const deps = matrixDeps({
+      // Faithful restoreQueuedBatch: it PREPENDS, which is what makes putting
+      // the entry back at its own index this branch's job.
       flushQueue: vi.fn((s, queued) => {
         s.queuedMessages = [...queued, ...(s.queuedMessages || [])];
         return false;
       }),
     });
-    expect(resolveQueueReleaseTap('sendone:0', session, deps)).toBe(true);
-    expect(session.queuedMessages).toHaveLength(2);
-    expect(session.queueNotifications.map(n => n.plain)).toEqual([
-      '📨 Queued (1): first', '📨 Queued (2): second',
+    expect(resolveQueueReleaseTap('sendone:1', session, deps)).toBe(true);
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: '/compact' }],
+      [{ type: 'text', text: 'first' }],
+      [{ type: 'text', text: 'second' }],
     ]);
+    expect(session.queueNotifications.map(n => n.plain)).toEqual([
+      '📨 Queued: /compact', '📨 Queued (2): first', '📨 Queued (3): second',
+    ]);
+    // The compact is still isolated by the next flush, not merged mid-body.
+    expect(compactBatchSize(session.queuedMessages)).toBe(1);
     expect(deps.editMessage).not.toHaveBeenCalled();
   });
 });
