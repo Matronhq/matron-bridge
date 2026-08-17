@@ -310,15 +310,22 @@ describe('index.js journal busy caller — notification seams wiring (source ins
     expect(args).toMatch(/\bformatQueueSummary\b/);
   });
 
-  // busy-queue.js defaults allowSendOne to true, so a call site that forgets it
-  // offers "⚡ Send just this one" on Codex — where flushQueue can only defer,
-  // and the turn-end flush then sends the WHOLE queue. The button would
-  // silently mean "send all". BOTH notifyQueuedMessage call sites (queued text
-  // and queued media) must pass the capability.
+  // Both notifyQueuedMessage call sites (queued text and queued media) must
+  // pass the capability, gated on the agent.
+  //
+  // This is the SECOND line of defence, not the first — the fail-closed default
+  // in busy-queue.js is the first. A source pin can only match the call's
+  // shape, and an earlier version of this test keyed on the literal
+  // `notifyQueuedMessage(session, preview, {`: a call site written with the
+  // second argument named anything else sailed straight past it. Matching on
+  // the function name alone is what makes the pin naming-agnostic. The count is
+  // a floor rather than an equality so a legitimate new call site doesn't fail
+  // here for the wrong reason — it fails on the missing flag, which is the
+  // thing actually worth saying.
   it('passes allowSendOne, gated on the agent, at every notifyQueuedMessage call site', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const calls = [...src.matchAll(/notifyQueuedMessage\(session, preview, \{/g)];
-    expect(calls).toHaveLength(2);
+    const calls = [...src.matchAll(/notifyQueuedMessage\(/g)];
+    expect(calls.length).toBeGreaterThanOrEqual(2);
     for (const call of calls) {
       const args = src.slice(call.index, src.indexOf('});', call.index));
       expect(args).toMatch(/allowSendOne:\s*session\.agent\s*!==\s*AGENT_CODEX/);
@@ -456,7 +463,7 @@ describe('notifyQueuedMessage', () => {
       sendButtonMessage,
       queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): first' }],
     });
-    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(), htmlEscape: (s) => s });
+    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(), htmlEscape: (s) => s, allowSendOne: true });
     expect(sendButtonMessage).toHaveBeenCalledWith(
       '📨 Queued (2): second',
       [
@@ -527,6 +534,7 @@ describe('notifyQueuedMessage', () => {
       queueRelease: { noteQueued },
       convoId: 'convo-1',
       fullText: 'the full untruncated queued message body',
+      allowSendOne: true,
     });
 
     // Reservation happened synchronously with a matching prompt/item id.
@@ -570,6 +578,7 @@ describe('notifyQueuedMessage', () => {
       queueRelease: { noteQueued: vi.fn() },
       convoId: 'convo-1',
       fullText: 'full body',
+      allowSendOne: true,
     });
 
     const buttonArgs = sendButtonMessage.mock.calls[0];
@@ -593,6 +602,7 @@ describe('notifyQueuedMessage', () => {
         sendReply: vi.fn(),
         queueRelease: { noteQueued: vi.fn() },
         convoId: 'convo-1',
+        allowSendOne: true,
       });
       const buttonArgs = sendButtonMessage.mock.calls[0];
       return buttonArgs[buttonArgs.length - 1];
@@ -628,6 +638,7 @@ describe('notifyQueuedMessage', () => {
         queueRelease: { noteQueued: vi.fn() },
         convoId: 'convo-1',
         compactJump,
+        allowSendOne: true,
       });
       const buttonArgs = sendButtonMessage.mock.calls[0];
       const payload = buttonArgs[buttonArgs.length - 1];
@@ -684,6 +695,31 @@ describe('notifyQueuedMessage', () => {
     // The Matrix tile loses it too — same capability, same card.
     expect(buttonArgs[1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
     // The question must not advertise an action that isn't there.
+    expect(payload.question).toBe('Send all 2 queued messages now, or cancel this one?');
+  });
+
+  // Fail-closed default. The two ways of getting this wrong are not equally
+  // bad: a caller that forgets the flag under a permissive default ships a
+  // button that LIES to Codex users (tap "send just this one", the whole queue
+  // goes out) and nothing reports it, while under this default the same mistake
+  // merely withholds the button — a visible, benign regression. The source pin
+  // above cannot be relied on to catch the first case: it matches the call's
+  // shape, so a call site written differently slips past it.
+  it('structured path: withholds send_one unless the caller explicitly opts in', async () => {
+    const sendButtonMessage = vi.fn(async () => '$tile');
+    const session = makeSession({ sendButtonMessage, queueNotifications: [] });
+    await notifyQueuedMessage(session, 'p', {
+      sendReply: vi.fn(),
+      queueRelease: { noteQueued: vi.fn() },
+      convoId: 'convo-1',
+      // allowSendOne deliberately omitted — this is the forgetful call site.
+    });
+    const buttonArgs = sendButtonMessage.mock.calls[0];
+    const payload = buttonArgs[buttonArgs.length - 1];
+
+    expect(payload.actions.map(a => a.id)).toEqual(['send', 'cancel']);
+    expect(payload.options.map(o => o.id)).toEqual(['send', 'cancel']);
+    expect(buttonArgs[1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
     expect(payload.question).toBe('Send all 2 queued messages now, or cancel this one?');
   });
 
