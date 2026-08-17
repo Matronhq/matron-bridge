@@ -6439,7 +6439,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
-        `/timer <duration> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact); /timer lists, /timer cancel <id|all> cancels\n` +
+        `/timer <duration|time> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel <id|all> cancels\n` +
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
@@ -6482,7 +6482,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
-          ['/timer &lt;duration&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
+          ['/timer &lt;duration|time&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
           ['/tools', 'List available tools'],
           ['/help', 'Show this help message'],
         ]) +
@@ -6925,10 +6925,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         const record = timerStore.add({ convoId, roomId, text: parsed.message, delayMs: parsed.delayMs });
         // Wall-clock rendering includes the timezone name ("12:26 AM UTC") —
         // the server's clock is rarely the user's, so a bare time is
-        // ambiguous. Same-day timers show just the time; >=24h adds the date.
-        const at = parsed.delayMs >= 24 * 3600 * 1000
-          ? new Date(record.fireAt).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
-          : new Date(record.fireAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+        // ambiguous, and echoing the resolved moment is the only thing that
+        // catches a host/phone timezone mismatch on `/timer 00:10 <message>`.
+        // Same-day timers show just the time; anything landing on another
+        // local day adds the date. Keyed on the calendar day rather than
+        // ">=24h" because a clock time that rolled to tomorrow is under 24h
+        // away yet still not today — "at 12:10 AM" alone would read as tonight.
+        const fireAt = new Date(record.fireAt);
+        const at = fireAt.toDateString() === new Date(record.createdAt).toDateString()
+          ? fireAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
+          : fireAt.toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
         const summary =
           `⏰ Timer #${record.id} set — will send "${parsed.message}" in ${formatTimerDuration(parsed.delayMs)} (at ${at}). ` +
           `It survives session restarts and idle reaping.`;
@@ -6962,7 +6968,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // 'list'
       const active = timerStore.listForConvo(convoId);
       if (!active.length) {
-        await sendReply('No timers set. Usage: /timer <duration> <message> — e.g. /timer 2h hey, or /timer 30m /compact.');
+        await sendReply('No timers set. Usage: /timer <duration|time> <message> — e.g. /timer 2h hey, /timer 30m /compact, or /timer 09:00 standup.');
         break;
       }
       const lines = active.map(t => `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
