@@ -1240,9 +1240,12 @@ function journalStatus(session) {
     // handler. An absent field beats an invented one.
     modelOptions: isCodex ? null : modelOptions(),
     effortLevels: isCodex ? null : effortOptions(),
-    // Optimistically tracked, never read back (lib/effort-tracker.js); null
-    // while unknown, which omits the field.
-    effort: isCodex ? null : trackedEffort(session),
+    // Optimistically tracked, never read back (lib/effort-tracker.js).
+    // Tri-state, unlike every other field: Codex passes undefined (omitted,
+    // no opinion), Claude passes the tracked level — a string, or null while
+    // unknown, which publishes as an EXPLICIT null so a sticky client clears
+    // a level this session no longer stands behind (e.g. after a restart).
+    effort: isCodex ? undefined : trackedEffort(session),
     email: getAccountEmail(),
     // Absolute path for the client's header workdir segment: session.workdir
     // can be relative (it is passed through from the resume/start args), so

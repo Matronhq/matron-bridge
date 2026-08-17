@@ -227,17 +227,33 @@ describe('buildSessionStatus', () => {
     expect('effort_levels' in buildSessionStatus({ model: 'gpt-5.6-codex', effortLevels: [] })).toBe(false);
   });
 
-  it('carries the current effort level when tracked', () => {
+  it('carries the current effort level as a string when tracked', () => {
     expect(buildSessionStatus({ model: 'claude-fable-5', effort: 'xhigh' })).toEqual({
       model: 'claude-fable-5',
       effort: 'xhigh',
     });
   });
 
-  it('omits effort while it is UNKNOWN — an absent field, never a guess', () => {
-    expect('effort' in buildSessionStatus({ model: 'claude-fable-5', effort: null })).toBe(false);
-    expect('effort' in buildSessionStatus({ model: 'claude-fable-5', effort: '' })).toBe(false);
-    expect('effort' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
+  it('publishes an EXPLICIT null while effort is unknown — clients merge stickily, so absent means "unchanged"', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5', effort: null });
+    expect('effort' in status).toBe(true);
+    expect(status.effort).toBeNull();
+    // An empty string is unknown too, and must not publish as "".
+    expect(buildSessionStatus({ model: 'claude-fable-5', effort: '' }).effort).toBeNull();
+  });
+
+  it('omits effort entirely when the caller passes no opinion (Codex sessions, subagent frames)', () => {
+    expect('effort' in buildSessionStatus({ model: 'gpt-5.6-codex' })).toBe(false);
+    expect('effort' in buildSessionStatus({ model: 'gpt-5.6-codex', effort: undefined })).toBe(false);
+  });
+
+  it('re-publishes null on EVERY frame while unknown, so a client that missed one clear still converges', () => {
+    // Not a one-shot clear: three consecutive frames of an untracked session
+    // all carry the null, so a dropped/throttled frame cannot strand a client
+    // on a stale level.
+    for (let i = 0; i < 3; i++) {
+      expect(buildSessionStatus({ model: 'claude-fable-5', effort: null }).effort).toBeNull();
+    }
   });
 });
 
@@ -435,7 +451,9 @@ describe('index.js wiring', () => {
     // all. Both fields are omitted rather than guessed.
     expect(body).toMatch(/modelOptions:\s*isCodex\s*\?\s*null\s*:\s*modelOptions\(\)/);
     expect(body).toMatch(/effortLevels:\s*isCodex\s*\?\s*null\s*:\s*effortOptions\(\)/);
-    expect(body).toMatch(/effort:\s*isCodex\s*\?\s*null\s*:\s*trackedEffort\(session\)/);
+    // Codex passes undefined (field omitted); Claude passes the tracked value,
+    // which is null while unknown and publishes as an explicit null.
+    expect(body).toMatch(/effort:\s*isCodex\s*\?\s*undefined\s*:\s*trackedEffort\(session\)/);
   });
 
   it('journalStatus threads the resolved session workdir into the frame', () => {

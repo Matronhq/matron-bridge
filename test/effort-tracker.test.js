@@ -10,6 +10,7 @@ import {
   resetEffortTracking,
   trackedEffort,
 } from '../lib/effort-tracker.js';
+import { buildSessionStatus } from '../lib/session-status.js';
 
 // The "Change effort level?" menu exactly as the PromptDetector classifies it
 // (see the fixture in test/prompt-detector.test.js).
@@ -101,6 +102,22 @@ describe('effort tracking', () => {
     resetEffortTracking(session);
     noteEffortIdle(session);
     expect(trackedEffort(session)).toBeNull();
+  });
+
+  // The reset rule only does its job if the reset is OBSERVABLE. Clients merge
+  // status fields stickily, so an omitted effort reads as "unchanged" and the
+  // app would keep rendering the pre-restart level — exactly the false
+  // confidence the reset exists to prevent. Guard the tracker→frame round trip.
+  it('publishes an explicit null after a restart/resume reset, not an absent field', () => {
+    const session = {};
+    noteEffortWrite(session, 'ultracode');
+    noteEffortIdle(session);
+    expect(buildSessionStatus({ effort: trackedEffort(session) }).effort).toBe('ultracode');
+
+    resetEffortTracking(session);
+    const frame = buildSessionStatus({ effort: trackedEffort(session) });
+    expect('effort' in frame).toBe(true);
+    expect(frame.effort).toBeNull();
   });
 
   it('ignores a confirmation with no pending write (the host-terminal /effort gap)', () => {
