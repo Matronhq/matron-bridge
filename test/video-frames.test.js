@@ -289,6 +289,24 @@ describe('extractVideoFrames', () => {
     })).rejects.toThrow(/no frames/i);
   });
 
+  it('falls back to copy+unlink when rename crosses filesystems (EXDEV)', async () => {
+    // On the Linux bridge boxes os.tmpdir() is commonly tmpfs while the
+    // session workdir is on disk — renameSync throws EXDEV across devices.
+    const fakeFs = makeFakeFs({ producedFrames: ['out-001.jpg'] });
+    const copies = [];
+    fakeFs.impl.renameSync = () => { const e = new Error('EXDEV: cross-device link'); e.code = 'EXDEV'; throw e; };
+    fakeFs.impl.copyFileSync = (from, to) => { copies.push({ from, to }); };
+    const exec = async (cmd) => (cmd === 'ffprobe'
+      ? { stdout: probeJson({}), stderr: '' }
+      : { stdout: '', stderr: showinfoStderr([0]) });
+    const result = await extractVideoFrames(Buffer.from('vid'), 'video/mp4', {
+      outDir: '/frames/dest', exec, fs: fakeFs.impl,
+    });
+    expect(copies).toHaveLength(1);
+    expect(copies[0].to).toBe('/frames/dest/frame-01-at-0m00s.jpg');
+    expect(result.frames[0].path).toBe('/frames/dest/frame-01-at-0m00s.jpg');
+  });
+
   it('removes the temp working dir after a successful run', async () => {
     const fakeFs = makeFakeFs({ producedFrames: ['out-001.jpg'] });
     const exec = async (cmd) => (cmd === 'ffprobe'
