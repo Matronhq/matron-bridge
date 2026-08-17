@@ -208,6 +208,37 @@ describe('buildSessionStatus', () => {
     expect('vitals' in buildSessionStatus({ model: 'claude-fable-5', vitals: null })).toBe(false);
     expect('vitals' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
   });
+
+  it('carries the composer argument lists as model_options / effort_levels', () => {
+    const status = buildSessionStatus({
+      model: 'claude-fable-5',
+      modelOptions: [{ value: 'opus', label: 'Opus' }],
+      effortLevels: [{ value: 'high', label: 'High' }],
+    });
+    expect(status.model_options).toEqual([{ value: 'opus', label: 'Opus' }]);
+    expect(status.effort_levels).toEqual([{ value: 'high', label: 'High' }]);
+  });
+
+  it('omits model_options / effort_levels when the agent offers none', () => {
+    const status = buildSessionStatus({ model: 'gpt-5.6-codex', modelOptions: null, effortLevels: null });
+    expect('model_options' in status).toBe(false);
+    expect('effort_levels' in status).toBe(false);
+    expect('model_options' in buildSessionStatus({ model: 'gpt-5.6-codex', modelOptions: [] })).toBe(false);
+    expect('effort_levels' in buildSessionStatus({ model: 'gpt-5.6-codex', effortLevels: [] })).toBe(false);
+  });
+
+  it('carries the current effort level when tracked', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', effort: 'xhigh' })).toEqual({
+      model: 'claude-fable-5',
+      effort: 'xhigh',
+    });
+  });
+
+  it('omits effort while it is UNKNOWN — an absent field, never a guess', () => {
+    expect('effort' in buildSessionStatus({ model: 'claude-fable-5', effort: null })).toBe(false);
+    expect('effort' in buildSessionStatus({ model: 'claude-fable-5', effort: '' })).toBe(false);
+    expect('effort' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
+  });
 });
 
 describe('emailFromClaudeConfig', () => {
@@ -393,6 +424,18 @@ describe('index.js wiring', () => {
     const body = src.slice(start, end);
     expect(body).toContain('buildSessionStatus(');
     expect(body).toContain('publishStatus(');
+  });
+
+  it('journalStatus scopes model_options / effort_levels / effort to Claude sessions', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    // Codex takes a free-text model id (`codex --model <id>`) the bridge never
+    // validates, so it gets no offer list; /effort isn't exposed for Codex at
+    // all. Both fields are omitted rather than guessed.
+    expect(body).toMatch(/modelOptions:\s*isCodex\s*\?\s*null\s*:\s*modelOptions\(\)/);
+    expect(body).toMatch(/effortLevels:\s*isCodex\s*\?\s*null\s*:\s*effortOptions\(\)/);
+    expect(body).toMatch(/effort:\s*isCodex\s*\?\s*null\s*:\s*trackedEffort\(session\)/);
   });
 
   it('journalStatus threads the resolved session workdir into the frame', () => {
