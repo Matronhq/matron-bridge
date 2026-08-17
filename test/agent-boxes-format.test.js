@@ -107,6 +107,15 @@ describe('formatBox', () => {
     expect(text).toBe('box7 (device 7) — online\n  disk: 41G free of 228G (18% free)');
   });
 
+  it('carries into the next unit when rounding would render a bare 1024', () => {
+    const box = {
+      device_id: 7, name: 'box7', online: true, folders: [],
+      // 1 TiB - 1 byte free: picks G, but rounds to 1024 — must read 1.0T.
+      disk: { free_bytes: 1_099_511_627_775, total_bytes: 1_099_511_627_776 },
+    };
+    expect(formatBox(box)).toContain('  disk: 1.0T free of 1T (100% free)');
+  });
+
   it('renders small free space with one decimal so a nearly-full box reads precisely', () => {
     const box = {
       device_id: 7, name: 'box7', online: true, folders: [],
