@@ -101,6 +101,27 @@ describe('videoFramesMessage', () => {
     expect(msg).toMatch(/selectively/i);
   });
 
+  it('appends a narration section with frame-style timestamps when segments are given', () => {
+    const msg = videoFramesMessage({
+      name: 'RPReplay_Final.mp4', durationSeconds: 13.2, kind: 'screen',
+      frames, dir: '/w/clip-frames',
+      narration: [
+        { start: 0.4, text: "So here's the checkout page." },
+        { start: 7.1, text: 'And when I tap Pay, it freezes.' },
+      ],
+    });
+    expect(msg).toContain('Narration');
+    expect(msg).toContain('[0m00s] So here\'s the checkout page.');
+    expect(msg).toContain('[0m07s] And when I tap Pay, it freezes.');
+  });
+
+  it('omits the narration section when segments are absent or empty', () => {
+    const bare = videoFramesMessage({ name: 'c.mp4', durationSeconds: 5, kind: 'screen', frames, dir: '/d' });
+    expect(bare).not.toContain('Narration');
+    const empty = videoFramesMessage({ name: 'c.mp4', durationSeconds: 5, kind: 'screen', frames, dir: '/d', narration: [] });
+    expect(empty).not.toContain('Narration');
+  });
+
   it('labels camera and unknown kinds without claiming screen recording', () => {
     const camera = videoFramesMessage({ name: 'IMG_1.mov', durationSeconds: 60, kind: 'camera', frames, dir: '/d' });
     expect(camera).toContain('60s video');
@@ -158,6 +179,8 @@ describe('extractVideoFrames', () => {
     expect(result.kind).toBe('screen');
     expect(result.strategy).toBe('scene');
     expect(result.durationSeconds).toBeCloseTo(47.5);
+    // No audio stream in the probe → the caller must not attempt narration.
+    expect(result.hasAudio).toBe(false);
     expect(result.frames).toEqual([
       { path: '/frames/dest/frame-01-at-0m00s.jpg', seconds: 0 },
       { path: '/frames/dest/frame-02-at-0m04s.jpg', seconds: 4.06667 },
@@ -189,7 +212,13 @@ describe('extractVideoFrames', () => {
     const exec = async (cmd, args) => {
       execCalls.push({ cmd, args });
       if (cmd === 'ffprobe') {
-        return { stdout: probeJson({ tags: { 'com.apple.quicktime.make': 'Apple' }, duration: '60' }), stderr: '' };
+        return {
+          stdout: JSON.stringify({
+            format: { duration: '60', tags: { 'com.apple.quicktime.make': 'Apple' } },
+            streams: [{ codec_type: 'video' }, { codec_type: 'audio' }],
+          }),
+          stderr: '',
+        };
       }
       return { stdout: '', stderr: '' };
     };
@@ -199,6 +228,7 @@ describe('extractVideoFrames', () => {
 
     expect(result.kind).toBe('camera');
     expect(result.strategy).toBe('uniform');
+    expect(result.hasAudio).toBe(true);
     // 60s / 30 max frames = 2s, floored at the 5s minimum interval.
     expect(result.frames).toEqual([
       { path: '/frames/dest/frame-01-at-0m00s.jpg', seconds: 0 },

@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn } from 'child_process';
-import { transcribeAudio } from './lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler } from './lib/send-attachment.js';
@@ -7429,7 +7429,19 @@ const journalMediaRouter = createJournalMediaRouter({
     const baseDir = session.iv ? ivUploadDir(session.roomId) : session.workdir;
     const outDir = deduplicateFilename(baseDir, `${stem}-frames`);
     const result = await extractVideoFrames(buffer, mime, { outDir });
-    console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s) in ${outDir}`);
+    console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s, audio=${result.hasAudio}) in ${outDir}`);
+    // Narration: the user's commentary track, timestamped to cross-reference
+    // the frame names. Best-effort — a whisper failure loses the narration,
+    // never the frames — and skipped outright when the recording has no
+    // audio stream (mic-off screen recordings, the common case).
+    let narration = null;
+    if (result.hasAudio) {
+      try {
+        narration = await transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
+      } catch (e) {
+        console.warn(`[journal-media] video narration transcription failed for ${safeName}: ${e.message} — delivering frames without it`);
+      }
+    }
     const blocks = [];
     if (caption) blocks.push({ type: 'text', text: caption });
     blocks.push({
@@ -7440,6 +7452,7 @@ const journalMediaRouter = createJournalMediaRouter({
         kind: result.kind,
         frames: result.frames,
         dir: outDir,
+        narration,
       }),
     });
     return blocks;
