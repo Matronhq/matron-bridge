@@ -88,7 +88,7 @@ import {
 import { processShowFile } from './lib/show-file-handler.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
-import { buildActivity, buildLimits } from './lib/spawn-capacity.js';
+import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
@@ -763,6 +763,9 @@ const journalRpcHandler = createRpcRequestHandler({
   // from whatever usageLimitsCache holds right now.
   getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
   getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  // Free space on the default-workdir filesystem — a full box is a bad spawn
+  // target however idle it looks. One statfs syscall, answered inline.
+  getDisk: () => buildDisk({ path: DEFAULT_WORKDIR }),
   // Which account a new session here would burn quota against, so the chooser
   // can tell boxes on different logins apart. Same cache as the status frames.
   getAccountEmail: () => getAccountEmail(),
