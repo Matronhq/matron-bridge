@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
+import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler } from './lib/send-attachment.js';
 import { createServer } from 'http';
@@ -7417,6 +7418,32 @@ function journalOnText(session, body, { username }) {
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  // A video becomes a directory of timestamped key-frame JPEGs plus one text
+  // turn listing them — claude Reads frames selectively, so a long recording
+  // costs context only for the frames actually opened. Frames land next to
+  // where the file itself would have been saved (iv upload dir / workdir).
+  // Throws propagate to the router, which falls back to raw-file delivery.
+  buildVideoBlocks: async (session, { buffer, mime, name, caption }) => {
+    const safeName = safeMediaFilename(name || 'video');
+    const stem = safeName.replace(/\.[^.]+$/, '') || 'video';
+    const baseDir = session.iv ? ivUploadDir(session.roomId) : session.workdir;
+    const outDir = deduplicateFilename(baseDir, `${stem}-frames`);
+    const result = await extractVideoFrames(buffer, mime, { outDir });
+    console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s) in ${outDir}`);
+    const blocks = [];
+    if (caption) blocks.push({ type: 'text', text: caption });
+    blocks.push({
+      type: 'text',
+      text: videoFramesMessage({
+        name: safeName,
+        durationSeconds: result.durationSeconds,
+        kind: result.kind,
+        frames: result.frames,
+        dir: outDir,
+      }),
+    });
+    return blocks;
+  },
   buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption }) => {
     const safeName = safeMediaFilename(name);
     // Downscale/skip decision for the INLINE copy only (iv mode never inlines,
