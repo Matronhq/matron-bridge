@@ -297,6 +297,17 @@ describe('index.js journal busy caller — notification seams wiring (source ins
     expect(args).toMatch(/\beditMessage\b/);
     expect(args).toMatch(/\bstripQueueNotificationLinks\b/);
   });
+
+  it('passes notify AND formatQueueSummary to resolveQueueReleaseTap (tap sends must echo the batch)', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('resolveQueueReleaseTap(answer.choice, session, {');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('});', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/\bnotify\b/);
+    expect(args).toMatch(/\bformatQueueSummary\b/);
+  });
 });
 
 describe('handleBusyQueueMagicWord — cancel (Matrix pin, full seams)', () => {
@@ -601,7 +612,13 @@ describe('cancelQueuedItem', () => {
         live.splice(live.findIndex(entry => entry.itemId === itemId), 1);
       }),
     };
-    const emitRelease = vi.fn();
+    // The real emitRelease write-ahead precedes the destructive splice and runs
+    // the mutate thunk only on a durable put (loop #536). The stub mimics a
+    // durable emit: run the thunk, return true.
+    const emitRelease = vi.fn((_convoId, _fields, { mutate } = {}) => {
+      mutate?.();
+      return true;
+    });
 
     expect(cancelQueuedItem(session, {
       itemId: 'pr_2::0',
@@ -621,7 +638,31 @@ describe('cancelQueuedItem', () => {
       promptId: 'pr_2',
       action: 'cancel',
       releasedIds: ['pr_2::0'],
+    }, expect.objectContaining({ mutate: expect.any(Function) }));
+  });
+
+  it('fail-closed: a non-durable emitRelease (write-ahead failed) leaves the queue intact and drops nothing', () => {
+    const session = makeSession({
+      queueNotifications: [
+        { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: 'second', id: 'pr_2::0' },
+      ],
     });
+    const queueRelease = { dropItem: vi.fn() };
+    // emitRelease returns false WITHOUT running the mutate thunk (disk fault).
+    const emitRelease = vi.fn(() => false);
+
+    expect(cancelQueuedItem(session, {
+      itemId: 'pr_2::0',
+      promptId: 'pr_2',
+      convoId: 'convo-1',
+      queueRelease,
+      emitRelease,
+    })).toBe(false);
+
+    expect(session.queuedMessages).toHaveLength(2);       // nothing spliced
+    expect(session.queueNotifications).toHaveLength(2);
+    expect(queueRelease.dropItem).not.toHaveBeenCalled(); // card stays actionable
   });
 
   it('does nothing when the stable id no longer maps to the queue', () => {
@@ -811,9 +852,66 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
     ]);
   });
 
+  it('send: echoes the batch content at the point of sending (card retires with the preview)', () => {
+    const notify = vi.fn();
+    const session = entrySession();
+    resolveQueueReleaseTap('send', session, {
+      flushQueue: vi.fn(() => true),
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify,
+      formatQueueSummary: (queued) => ({
+        plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
+        html: '',
+      }),
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toBe('⚡ Sending 2 queued messages now:\n  1. a\n  2. b');
+  });
+
+  it('send: a rejected flush echoes nothing — the messages did not go out', () => {
+    const notify = vi.fn();
+    const session = entrySession();
+    resolveQueueReleaseTap('send', session, {
+      flushQueue: vi.fn(() => false),
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify,
+      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+    });
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('send: a caller without the summary seam (legacy shape) still flushes, just without the echo', () => {
+    const notify = vi.fn();
+    const session = entrySession();
+    const flushQueue = vi.fn(() => true);
+    const handled = resolveQueueReleaseTap('send', session, {
+      flushQueue,
+      stripQueueNotificationLinks: vi.fn(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0', 'pr_1::1'] },
+      convoId: 'convo-1',
+      queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
+      emitRelease: vi.fn(),
+      notify,
+    });
+    expect(handled).toBe(true);
+    expect(flushQueue).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it('cancel: drops ONLY the tapped item by stable id and emits its cancel release', () => {
     const dropItem = vi.fn();
-    const emitRelease = vi.fn();
+    // Queued-release durability (loop #536): cancelQueuedItem now write-aheads
+    // through emitRelease and runs the destructive splice via the mutate thunk
+    // only on a durable put. The stub mimics a successful put by invoking mutate.
+    const emitRelease = vi.fn((_convoId, _fields, { mutate } = {}) => { mutate?.(); return true; });
     const session = entrySession();
     const handled = resolveQueueReleaseTap('cancel', session, {
       flushQueue: vi.fn(),
@@ -830,7 +928,7 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       promptId: 'pr_1',
       action: 'cancel',
       releasedIds: ['pr_1::0'],
-    });
+    }, expect.objectContaining({ mutate: expect.any(Function) }));
   });
 
   it('an entry present with an unknown action returns false (not handled)', () => {
@@ -1048,27 +1146,39 @@ describe('notifyQueuedMessage — compact jump tile', () => {
 });
 
 describe('queued-release publisher wiring', () => {
-  it('emitRelease publishes exactly one structured prompt_reply per call', () => {
+  it('emitRelease write-aheads before publishing exactly one structured prompt_reply with a deterministic idem_key', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds })');
+    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
     expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}\n\nfunction journalUpsertConvo', start);
+    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     expect(end).toBeGreaterThan(start);
 
     const publishPromptReply = vi.fn();
+    const put = vi.fn(() => true); // durable write-ahead
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
     const emitRelease = runInNewContext(
       `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, Date },
+      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
     );
 
     try {
-      emitRelease('convo-1', {
+      const result = emitRelease('convo-1', {
         promptId: 'pr_123',
         action: 'cancel',
         releasedIds: ['pr_123::0'],
       });
 
+      expect(result).toBe(true);
+      // Write-ahead persisted a `pending` record keyed (promptId, itemId, action)
+      // BEFORE the publish.
+      expect(put).toHaveBeenCalledTimes(1);
+      expect(put).toHaveBeenCalledWith('pr_123 pr_123::0 cancel', expect.objectContaining({
+        convoId: 'convo-1',
+        promptId: 'pr_123',
+        itemId: 'pr_123::0',
+        action: 'cancel',
+        status: 'pending',
+      }));
       expect(publishPromptReply).toHaveBeenCalledTimes(1);
       expect(publishPromptReply).toHaveBeenCalledWith('convo-1', {
         kind: 'queued_release',
@@ -1076,16 +1186,39 @@ describe('queued-release publisher wiring', () => {
         action: 'cancel',
         released: ['pr_123::0'],
         at: 1_722_000_000_000,
-      });
+      }, { idemKey: 'qr pr_123 pr_123::0 cancel' });
     } finally {
       now.mockRestore();
     }
   });
 
+  it('emitRelease fail-closes when the write-ahead put returns false: no mutate, no publish', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
+    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
+    const publishPromptReply = vi.fn();
+    const put = vi.fn(() => false); // disk fault
+    const mutate = vi.fn();
+    const emitRelease = runInNewContext(
+      `(${src.slice(start, end + 2)})`,
+      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
+    );
+
+    const result = emitRelease('convo-1', {
+      promptId: 'pr_9',
+      action: 'send',
+      releasedIds: ['pr_9::0'],
+    }, { mutate });
+
+    expect(result).toBe(false);
+    expect(mutate).not.toHaveBeenCalled();
+    expect(publishPromptReply).not.toHaveBeenCalled();
+  });
+
   it('the durable publisher exposes prompt_reply through safePublish', () => {
     const src = readFileSync(new URL('../lib/journal-publisher.js', import.meta.url), 'utf-8');
     expect(src).toMatch(
-      /publishPromptReply\(convoId,\s*payload\)\s*\{\s*safePublish\(convoId,\s*['"]prompt_reply['"],\s*payload\);\s*\}/,
+      /publishPromptReply\(convoId,\s*payload,\s*options\)\s*\{[\s\S]*?safePublish\(convoId,\s*['"]prompt_reply['"],\s*payload,\s*options\);\s*\}/,
     );
   });
 
@@ -1105,7 +1238,7 @@ describe('index.js queued-send finalizer', () => {
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
 
-    const emitRelease = vi.fn();
+    const emitRelease = vi.fn(() => true); // durable emit — finalizeSentQueue's fail-closed gate drops only on success
     const dropItem = vi.fn();
     const journalPublishNotice = vi.fn();
     const listLive = vi.fn(() => [
@@ -1325,9 +1458,39 @@ describe('index.js flushPendingSessionQueue — compact-first split (source insp
     expect(body).toMatch(/if \(sent === true\) session\.queueNotifications = notifications\.slice\(batchSize\)/);
   });
 
-  it('tells the user the rest is waiting on the compaction', () => {
-    expect(body).toMatch(/Sending \/compact first/);
-    expect(body).toMatch(/once compaction finishes/);
+  // The wording moved to lib/queue-flush-notice.js, shared with the three
+  // explicit-flush paths, and is pinned byte-for-byte there by
+  // test/queue-flush-notice.test.js. What THIS site still has to get right is
+  // the delegation, so that is what is pinned here: the turn-end style (using
+  // sendNow would announce "⚡ … now" for a flush the user never asked for),
+  // and passing the deferred count — drop it and a compact split silently
+  // announces the whole batch as sent when only the /compact went out.
+  it('tells the user the rest is waiting on the compaction, via the shared notice', () => {
+    expect(body).toMatch(/queueFlushNotice\('turnEnd', \{/);
+    expect(body).toMatch(/deferred: deferred\.length/);
+    expect(body).toMatch(/summary: formatQueueSummary\(queued\)/);
+  });
+});
+
+// The /interrupt HTTP endpoint is the fourth flush path and the only one that
+// had no announcement coverage at all before the notice was single-sourced.
+describe('index.js /interrupt endpoint — flush announcement (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const start = src.indexOf("} else if (url.pathname === '/interrupt') {");
+  const body = src.slice(start, src.indexOf('\n      } else if (url.pathname ===', start + 10));
+
+  it('announces through the shared notice in the explicit-send style', () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(body).toMatch(/queueFlushNotice\('sendNow', \{/);
+    expect(body).toMatch(/deferred: deferred\.length/);
+  });
+
+  // An endpoint-triggered flush is an explicit send, so it must not fall back
+  // to the turn-end wording, and it must not rebuild the sentence by hand.
+  it('does not hand-build the announcement', () => {
+    expect(body).not.toMatch(/Sending \/compact/);
+    expect(body).not.toMatch(/queued message\$\{/);
+    expect(body).not.toMatch(/turnEnd/);
   });
 });
 

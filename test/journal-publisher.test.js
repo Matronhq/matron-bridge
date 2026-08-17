@@ -1623,6 +1623,75 @@ describe('createJournalPublisher — agent-chat room ops', () => {
     await fake.close();
   });
 
+  it('dispatches inbound kind:spawn frames to onSpawnFrame', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onSpawnFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50); // hello_ok round-trip
+    const frame = { kind: 'spawn', event: 'pending', request_id: 'r' };
+    fake.connections[0].ws.send(JSON.stringify(frame));
+    await waitFor(() => seen.length === 1);
+    expect(seen[0]).toEqual(frame);
+    pub.close();
+    await fake.close();
+  });
+
+  it('ignores a malformed spawn frame (missing event) and survives it', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onSpawnFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    const push = (f) => fake.connections[0].ws.send(JSON.stringify(f));
+    push({ kind: 'spawn', request_id: 'r' });              // no event
+    push({ kind: 'spawn', event: 42, request_id: 'r' });   // non-string event
+    push({ kind: 'spawn', event: 'outcome' });             // no request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: 7 });   // non-string request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: '' });  // empty request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: 'x'.repeat(129) }); // over the 128 wire cap
+    push({ kind: 'spawn', event: 'pending', request_id: 'r-ok' });
+    await waitFor(() => seen.length === 1);
+    expect(seen[0].request_id).toBe('r-ok');
+    pub.close();
+    await fake.close();
+  });
+
+  it('the absence of onSpawnFrame does not throw on an inbound spawn frame', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    expect(() => fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'r' }))).not.toThrow();
+    await delay(50);
+    pub.close();
+    await fake.close();
+  });
+
+  it('a throwing onSpawnFrame warns and does not kill the socket handler', async () => {
+    const fake = await startFakeServer();
+    const warnings = [];
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: (m) => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+      onSpawnFrame: (f) => { seen.push(f); if (f.request_id === 'boom') throw new Error('boom'); },
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'boom' }));
+    await waitFor(() => warnings.some((w) => w.includes('onSpawnFrame handler threw')));
+    fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'after' }));
+    await waitFor(() => seen.length === 2);
+    pub.close();
+    await fake.close();
+  });
+
   it('dispatches inbound error frames to onOpError with {code, ref, detail, roomId:null when absent}, after the warn-once', async () => {
     const fake = await startFakeServer({
       onFrame: (msg) => (msg.op === 'agent_invite'

@@ -16,7 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20.x, 22.x]
+        # Matches the floor declared in package.json engines (>=22.0.0), set in
+        # #23 "require Node 22". Kept as a matrix so another version is a
+        # one-line addition.
+        node-version: [22.x]
 
     steps:
       - name: Checkout
