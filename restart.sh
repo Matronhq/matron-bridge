@@ -6,6 +6,19 @@ cd "$(dirname "$0")"
 
 PORT=9802
 
+# This script is the non-systemd bounce (launchd/manual installs). Under systemd
+# it is actively harmful: it kills the unit's process, systemd respawns it at
+# RestartSec=5, and the nohup instance started below grabs the port first — so
+# the surviving bridge is unsupervised and systemd's respawn fails to bind.
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet matron-bridge.service; then
+  echo "ERROR: matron-bridge is running under systemd (matron-bridge.service)." >&2
+  echo "Running this script would collide with systemd's respawn on port $PORT." >&2
+  echo "Use instead:  sudo systemctl restart matron-bridge" >&2
+  echo "From inside a bridge session (this kills your own session's process):" >&2
+  echo "  sudo systemd-run --on-active=20 --unit=bridge-restart systemctl restart matron-bridge" >&2
+  exit 1
+fi
+
 echo "Stopping existing bridge processes..."
 
 # Kill by process pattern
