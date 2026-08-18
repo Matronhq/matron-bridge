@@ -27,7 +27,7 @@ import {
   knownMcpExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
-import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { modelFromEvent, modelOptions, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import {
   resolveInteractive,
@@ -40,7 +40,15 @@ import {
   eventConfirmsSession,
   shouldRunAccountFlowReturn,
 } from './lib/session-mode.js';
-import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
+import { switchEffortInSession, effortButtons, effortOptions, VALID_EFFORT_HINT } from './lib/effort-command.js';
+import {
+  noteEffortWrite,
+  noteEffortConfirmationPrompt,
+  noteEffortConfirmationAnswer,
+  noteEffortIdle,
+  resetEffortTracking,
+  trackedEffort,
+} from './lib/effort-tracker.js';
 // formatDuration aliased: index.js has its own uptime formatDuration (no
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
@@ -1081,6 +1089,13 @@ function journalActivity(session, state, detail) {
   if (!convoId) return;
   if (!activityStateChanged(session._journalActivityState, state)) return;
   session._journalActivityState = state;
+  // A pending `/effort` write with no confirmation in sight settles here:
+  // this is the bridge's existing "claude stopped and is waiting on the user"
+  // seam, the one a TUI prompt would have preceded. Deliberately AFTER the
+  // dedup guard, so only a real transition INTO idle settles a write — the
+  // unconditional idle re-publishes (iv.on('prompt'),
+  // handleInteractiveScreenUpdate) must not. See lib/effort-tracker.js.
+  if (state === 'idle') noteEffortIdle(session);
   journalPublisher.publishActivity(convoId, state, detail);
 }
 
@@ -1218,6 +1233,19 @@ function journalStatus(session) {
     // Account rate limits are Claude-account-specific; Codex frames carry none,
     // keeping the Codex limits array empty (buildSessionStatus omits it).
     limits: isCodex ? [] : (usageLimitsCache.lines || []),
+    // Composer argument offers for /model and /effort, session-scoped. Codex
+    // states EMPTY rather than staying silent: its model id is free text passed
+    // straight to `codex --model` (the bridge validates nothing and holds no id
+    // list) and effort isn't exposed for it at all — see the '!effort' handler.
+    // Silence would merge stickily, so a mid-session /switch claude→codex would
+    // leave Claude's offers standing on a session that refuses them.
+    modelOptions: isCodex ? [] : modelOptions(),
+    effortLevels: isCodex ? [] : effortOptions(),
+    // Optimistically tracked, never read back (lib/effort-tracker.js). Null for
+    // Codex (not applicable) and for a Claude session whose level is unknown;
+    // either way it publishes as an EXPLICIT null, so a sticky client clears a
+    // level this session no longer stands behind (e.g. after a restart).
+    effort: isCodex ? null : trackedEffort(session),
     email: getAccountEmail(),
     // Absolute path for the client's header workdir segment: session.workdir
     // can be relative (it is passed through from the resume/start args), so
@@ -2390,6 +2418,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // A real structured prompt supersedes any best-effort unclassified-prompt
     // notice we may have surfaced for an earlier render of this screen.
     session.pendingUnclassifiedPrompt = false;
+    // Arm a pending /effort write against its "Change effort level?"
+    // confirmation BEFORE the idle activity below: that idle transition would
+    // otherwise settle the very write this menu is asking about.
+    noteEffortConfirmationPrompt(session, prompt);
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
     // first-run modals, /login, unauthenticated "please run /login"
@@ -2861,6 +2893,7 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
         : { kind: p.kind, key: opt.key };
       console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} (remark dropped: no free-text slot)`);
       if (session.iv.respondToPrompt(response) !== true) return false;
+      noteEffortConfirmationAnswer(session, p, opt.label);
       session.pendingInteractivePrompt = null;
       mirrorAnswer(`${numberPrefix}${opt.label}`);
       ack(opt.label, { numberPrefix, note: "— couldn't attach your note to this menu; send it as a separate message" });
@@ -2872,6 +2905,9 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
       : { kind: p.kind, key: opt.key };
     console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → kind=${response.kind} key=${response.key} label="${opt.label}"`);
     if (session.iv.respondToPrompt(response) !== true) return false;
+    // An answered "Change effort level?" menu is the only confirmation the
+    // effort tracker gets — accept commits the pending write, decline drops it.
+    noteEffortConfirmationAnswer(session, p, opt.label);
     session.pendingInteractivePrompt = null;
     mirrorAnswer(`${numberPrefix}${opt.label}`);
     ack(opt.label, { numberPrefix });
@@ -6796,7 +6832,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const arg = parts[1];
       if (arg) {
-        switchEffortInSession(session, arg, sendReply);
+        switchEffortAndTrack(session, arg, sendReply);
         break;
       }
       // No-arg: offer buttons. Bare /effort in the TUI opens a "Change effort
@@ -7400,6 +7436,8 @@ function journalRoutePromptReply(session, { choice, text }) {
         const resp = promptResponseForButton(p, resolved.index);
         if (resp) {
           if (session.iv.respondToPrompt(resp) !== true) return null;
+          // Same effort-confirmation settle as the typed-reply path.
+          noteEffortConfirmationAnswer(session, p, resolved.option.label);
           session.pendingInteractivePrompt = null;
           session.pendingUnclassifiedPrompt = false;
           recordUserAnswer(session, resolved.option.label, { mirrorToJournal: false });
@@ -7635,7 +7673,7 @@ function journalOnPromptReply(session, answer, { username }) {
     const ctx = journalSessionCommandCtx(session);
     handlePickerValue(answer.choice, session.roomId, session, {
       applyModelSwitch,
-      switchEffortInSession,
+      switchEffortInSession: switchEffortAndTrack,
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
       sendTimerNow: sendTimerNowFromButton,
@@ -9604,6 +9642,18 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   return next;
 }
 
+// Drive an /effort write and record it as PENDING for the status frame's
+// `effort` field. The record is taken only when switchEffortInSession reports
+// the write actually reached the PTY, so a refused or failed write never
+// shows up as the session's effort. Every path that writes /effort goes
+// through here (the !effort command and the effort: picker button) — see
+// lib/effort-tracker.js for what turns a pending write into a published one.
+function switchEffortAndTrack(session, arg, send) {
+  const written = switchEffortInSession(session, arg, send);
+  if (written) noteEffortWrite(session, arg);
+  return written;
+}
+
 // Apply a /model switch for either mode. Interactive sessions type /model into
 // the live TUI (immediate); print sessions restart the claude -p process with
 // --model <alias> --resume (history preserved). Used by the !model command and
@@ -9790,6 +9840,12 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next._journalState = existing._journalState;
   next._journalActivityState = existing._journalActivityState;
   next._journalConvoEstablished = existing._journalConvoEstablished;
+  // Effort tracking is deliberately NOT carried across the swap: the
+  // replacement session's effort comes from Claude Code's own default, so a
+  // carried value would publish something false. The replacement is a fresh
+  // session object, so this only pins the contract against a future addition
+  // to the carry-forward list above.
+  resetEffortTracking(next);
   if (sessionId) {
     persistSession(roomId, sessionId, workdir, originRoomId, {
       agentSessions: existing._agentSessions,
