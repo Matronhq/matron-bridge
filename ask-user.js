@@ -294,6 +294,53 @@ server.tool(
 );
 
 server.tool(
+  'agent_sessions',
+  "List this user's addressable agent sessions for direct coordination. Each entry includes its conversation id, title, state, and whether it is this session; never target an entry where is_self is true.",
+  {},
+  async () => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_sessions failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(data.sessions || [], null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_message',
+  "Send a concise coordination line to another of the operator's agent sessions. Choose target_convo from agent_sessions; use this for outcomes, questions, and decisions rather than running commentary.",
+  {
+    target_convo: z.string().min(1).describe('Conversation id of the target session, from agent_sessions'),
+    body: z.string().min(1).describe('The coordination line to send'),
+  },
+  async ({ target_convo, body }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, target_convo, body }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_message failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'agent_chat_start',
   "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {

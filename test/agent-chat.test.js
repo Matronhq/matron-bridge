@@ -28,6 +28,10 @@ function makeFixture(overrides = {}) {
     fetchMessages: async () => ({ events: [] }),
     upsertConvo: (convoId, opts) => calls.push({ call: 'upsertConvo', convoId, opts }),
     publishText: (convoId, payload) => calls.push({ call: 'publishText', convoId, payload }),
+    sendPeerMessage: vi.fn(async (args) => {
+      calls.push({ call: 'sendPeerMessage', args });
+      return { sent: true, seq: 99, duplicate: false, delivered: true, offline: false };
+    }),
     ...overrides.publisher,
   };
   const registry = createAgentRooms({ log: { warn: () => {} } });
@@ -71,7 +75,7 @@ describe('createAgentChatHandlers', () => {
   describe('caller-session gate (all handlers)', () => {
     it('rejects a missing or non-string roomId with 400', async () => {
       const { handlers } = makeFixture();
-      for (const h of ['roster', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
+      for (const h of ['roster', 'agentSessions', 'agentMessage', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
         expect((await handlers[h]({})).status).toBe(400);
         expect((await handlers[h]({ roomId: 42 })).status).toBe(400);
       }
@@ -82,6 +86,84 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.roster({ roomId: '!nope' });
       expect(res.status).toBe(404);
       expect(res.body.error).toMatch(/no active session/i);
+    });
+  });
+
+  describe('agentMessage', () => {
+    it('rejects a missing target or empty body before the transport emit exists', async () => {
+      const { handlers, calls } = makeFixture();
+
+      expect((await handlers.agentMessage({ roomId: '!sess', body: 'coordinate this' })).status).toBe(400);
+      expect((await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: '' })).status).toBe(400);
+      expect((await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: '   ' })).status).toBe(400);
+      expect(calls).toEqual([]);
+    });
+
+    it('emits with caller-bound attribution and maps transport success to only queued:true', async () => {
+      const { handlers, calls } = makeFixture();
+      const res = await handlers.agentMessage({
+        roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this',
+        from_convo: 'model-forged',
+      });
+      expect(res).toEqual({ status: 200, body: { queued: true } });
+      // fromConvo is the caller's JOURNAL convo id (journalConvoIdFor stub → 'convo-sess'),
+      // NOT the roomId '!sess' and NOT the model-forged value (spoof ignored).
+      expect(calls).toEqual([{
+        call: 'sendPeerMessage',
+        args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'coordinate this' },
+      }]);
+    });
+
+    it('409s when the session has no journal convo bound yet (fail-loud)', async () => {
+      const { handlers, sessions } = makeFixture();
+      sessions.set('!nocvo', { busy: false, alive: true }); // no convoId → journalConvoIdFor null
+      const res = await handlers.agentMessage({ roomId: '!nocvo', target_convo: 'convo-remote', body: 'x' });
+      expect(res.status).toBe(409);
+    });
+
+    it('surfaces transport-horizon exhaustion as uncertain', async () => {
+      const { handlers } = makeFixture({
+        publisher: { sendPeerMessage: vi.fn(async () => ({ queued: false, uncertain: true })) },
+      });
+      const res = await handlers.agentMessage({
+        roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this',
+      });
+      expect(res).toEqual({ status: 200, body: { queued: false, uncertain: true } });
+    });
+  });
+
+  describe('agentSessions', () => {
+    it('lists same-box and cross-box sessions with state, raw kind, and only the caller flagged as self', async () => {
+      const conversations = [
+        // caller's own JOURNAL convo id is 'convo-sess' (journalConvoIdFor stub → s.convoId),
+        // NOT the roomId '!sess' — is_self must key on the journal convo id.
+        { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1 },
+        { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1 },
+        { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7 },
+      ];
+      const { handlers } = makeFixture({
+        publisher: { fetchRoster: async () => ({ ...ROSTER, conversations }) },
+      });
+
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+
+      expect(res).toEqual({
+        status: 200,
+        body: {
+          sessions: [
+            { convo_id: 'convo-sess', title: 'This session', session_state: 'running', is_self: true },
+            { convo_id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', is_self: false },
+            { convo_id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', is_self: false },
+          ],
+        },
+      });
+    });
+
+    it('502s when the roster fetch fails', async () => {
+      const { handlers } = makeFixture({ publisher: { fetchRoster: async () => null } });
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/journal unreachable/i);
     });
   });
 
@@ -994,6 +1076,8 @@ describe('createAgentChatHandlers', () => {
 describe('index.js routes + ask-user.js tools (source inspection)', () => {
   const ROUTES = [
     ['/agent-roster', 'roster'],
+    ['/agent-sessions', 'agentSessions'],
+    ['/agent-message', 'agentMessage'],
     ['/agent-chat-start', 'chatStart'],
     ['/agent-chat-send', 'chatSend'],
     ['/agent-chat-accept', 'chatAccept'],
@@ -1003,13 +1087,13 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['/agent-chat-read', 'chatRead'],
   ];
   const TOOLS = [
-    'agent_roster', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
+    'agent_roster', 'agent_sessions', 'agent_message', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
     'agent_chat_refuse', 'agent_chat_join', 'agent_chat_leave', 'agent_chat_read',
   ];
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
   const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
 
-  it('mounts all eight loopback routes on their handlers via the throw-isolating adapter', () => {
+  it('mounts all agent-chat loopback routes on their handlers via the throw-isolating adapter', () => {
     for (const [route, handler] of ROUTES) {
       expect(indexSrc).toMatch(new RegExp(
         `url\\.pathname === '${route}'[\\s\\S]{0,120}respondAgentChatRoute\\(res, data, agentChatHandlers\\.${handler},`));
@@ -1109,7 +1193,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(body).toMatch(/r\.guestSessionRoomId != null[\s\S]{0,600}setGuestState\(r\.roomId, 'left'\)/);
   });
 
-  it('declares all eight MCP tools in ask-user.js', () => {
+  it('declares all agent-chat MCP tools in ask-user.js', () => {
     for (const name of TOOLS) {
       expect(askUserSrc).toMatch(new RegExp(`server\\.tool\\(\\s*\\n\\s*'${name}',`));
     }
@@ -1120,6 +1204,8 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   // must fail here.
   const TOOL_WIRING = [
     ['agent_roster', '/agent-roster', ['roomId: ROOM_ID']],
+    ['agent_sessions', '/agent-sessions', ['roomId: ROOM_ID']],
+    ['agent_message', '/agent-message', ['roomId: ROOM_ID', 'target_convo', 'body']],
     ['agent_chat_start', '/agent-chat-start', ['roomId: ROOM_ID', 'target_convo_id', 'topic', 'justification', 'message']],
     ['agent_chat_send', '/agent-chat-send', ['roomId: ROOM_ID', 'room_id', 'message', 'wait_seconds']],
     ['agent_chat_accept', '/agent-chat-accept', ['roomId: ROOM_ID', 'room_id']],
@@ -1140,6 +1226,16 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
       expect(block, `${name} fetches ${path}`).toContain('${BRIDGE_API}' + path + '`');
       for (const key of keys) expect(block, `${name} body carries ${key}`).toContain(key);
     }
+  });
+
+  it('agent_message exposes exactly target_convo and body as model-facing parameters', () => {
+    const block = toolBlock('agent_message');
+    const schema = block.slice(block.indexOf('{'), block.indexOf('async ('));
+    expect(schema).toMatch(/target_convo: z\.string\(\)\.min\(1\)/);
+    expect(schema).toMatch(/body: z\.string\(\)\.min\(1\)/);
+    expect(schema).not.toMatch(/\bfrom_convo\b|\broomId\b/);
+    expect((schema.match(/^\s+[a-z_]+:/gm) || []).map((line) => line.trim().split(':')[0]))
+      .toEqual(['target_convo', 'body']);
   });
 
   it('keeps the no-polling etiquette in the tool descriptions', () => {
