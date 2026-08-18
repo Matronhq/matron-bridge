@@ -103,7 +103,8 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, decidePermissionOutcome, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
+import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -1638,6 +1639,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     mcpExtras,
     bypassMode,
     permAllowedTools: new Set(),
+    // Spawn-time MCP permission snapshot ({mcpAllow,mcpDeny,mcpAsk} from the
+    // session's layered .claude settings), built ONCE here and immutable for the
+    // session's life — the POST /permission-request classifier reads it to
+    // decide allow-silent / deny-visible / ask-card. Built for every session
+    // (cheap, fail-closed): only auto-mode sessions ever route MCP calls through
+    // the permission_request tool, but a bypass session simply never consults it.
+    permissionSnapshot: buildPermissionSnapshot({ workdir: cwd }),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -6477,6 +6485,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/limits — Show subscription usage limits (session & weekly)\n` +
         `/timer <duration|time> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel <id|all> cancels\n` +
         `/tools — List available tools\n` +
+        `/permissions — List session-allowed tools; /permissions revoke <name> (or all) removes a grant\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
@@ -6520,6 +6529,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
           ['/timer &lt;duration|time&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
           ['/tools', 'List available tools'],
+          ['/permissions', 'List session-allowed tools; <code>/permissions revoke &lt;name&gt;</code> (or <code>all</code>) removes a grant'],
           ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
@@ -7061,6 +7071,49 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       await sendHtml(plainMsg, htmlMsg);
+      break;
+    }
+
+    case '!permissions': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      const sub = (parts[1] || '').toLowerCase();
+      if (sub === 'revoke') {
+        const target = parts[2];
+        if (!target) {
+          await sendReply('Usage: /permissions revoke <tool-name> (exact name, e.g. mcp__webflow__pages_update). /permissions lists current grants.');
+          break;
+        }
+        if (target.toLowerCase() === 'all') {
+          const count = session.permAllowedTools?.size ?? 0;
+          session.permAllowedTools?.clear();
+          await sendReply(count > 0
+            ? `Revoked all ${count} session grant${count === 1 ? '' : 's'}.`
+            : 'No session grants to revoke.');
+          break;
+        }
+        const removed = revokeSessionGrant(session.permAllowedTools, target);
+        await sendReply(removed
+          ? `Revoked session grant: ${target}. Claude will be re-prompted next time it uses this tool.`
+          : `${target} isn't a current session grant. /permissions lists what's granted.`);
+        break;
+      }
+      // Bare /permissions — list the session's "Always allow" grants.
+      const grants = listSessionGrants(session.permAllowedTools);
+      if (grants.length === 0) {
+        await sendReply('No tools are session-allowed. Tap "Always allow" on a permission card to grant one for this session (cleared on restart).');
+        break;
+      }
+      const plain = `Session-allowed tools (${grants.length}) — cleared on restart:\n` +
+        grants.map(t => `  ${t}`).join('\n') +
+        `\n\nRevoke with /permissions revoke <name> (or /permissions revoke all).`;
+      const html = `<b>Session-allowed tools (${grants.length})</b> — cleared on restart<ul>` +
+        grants.map(t => `<li><code>${escapeHtml(t)}</code></li>`).join('') +
+        `</ul>Revoke with <code>/permissions revoke &lt;name&gt;</code> (or <code>/permissions revoke all</code>).`;
+      await sendHtml(plain, html);
       break;
     }
 
@@ -9022,6 +9075,25 @@ const apiServer = createServer(async (req, res) => {
         if (permSession.permAllowedTools?.has(toolName)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ behavior: 'allow' }));
+          return;
+        }
+        // Policy classifier (spawn-time snapshot). Runs AFTER the allowlist
+        // short-circuit, BEFORE the card mint. allow → silent allow (same tier
+        // as the allowlist above); deny → immediate deny + a visible room notice
+        // so a policy block isn't silent; anything else (ask / default-gated /
+        // uncertain) falls through to the card mint below, unchanged.
+        const outcome = decidePermissionOutcome(permSession.permissionSnapshot, toolName);
+        if (outcome.kind === 'allow') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(outcome.body));
+          return;
+        }
+        if (outcome.kind === 'deny') {
+          // Fire-and-forget the room notice: the deny response must not block on
+          // journal delivery, and a failed notice can't change the verdict.
+          Promise.resolve(sendToRoom(roomId, outcome.notice)).catch(() => {});
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(outcome.body));
           return;
         }
         const { id: permRequestId } = permissionRegistry.create({ roomId, toolName });
