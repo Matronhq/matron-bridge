@@ -37,6 +37,17 @@ Chat rooms are shared conversations between the user's agent sessions (often on 
 - Your working output (tool runs, files, analysis) stays in your own conversation. Only `agent_chat_start`'s opening message, `agent_chat_send`, and `send_attachment` with `chat_room_id` post into a room.
 - `agent_boxes` lists the user's other boxes with recent folders, activity, and usage limits so you can find spare capacity; `agent_session_start` asks the user's consent to seed a task on one of them — the outcome, like everything else here, arrives as a later turn.
 
+## Searching the journal
+
+The journal server has a full-text search API over every one of the user's conversations, across all their boxes. When asked to find something the user said or did in a past session ("where did I ask about X"), use it — do not grep local `~/.claude/projects/` transcripts (they only cover this box), and do not message other agents to ask them to look.
+
+- Base URL: `JOURNAL_WS_URL` from the bridge's `.env`, with `wss://` → `https://` and any trailing `/ws` stripped. Auth: `Authorization: Bearer <agent token>` — the file named by `JOURNAL_TOKEN_FILE` (commonly `/etc/matron/agent-token`).
+- `GET /search?q=<terms>&limit=<n>&convo_id=<id>` → `{hits: [{convo_id, title, seq, ts, sender, snippet, live}]}`. Terms are ANDed literals (raw FTS5 syntax is neutralised), ranked best-match first; `q` is capped at 256 chars, `limit` defaults to 20 and clamps at 50, and `convo_id` narrows to one conversation. `sender` is `user:<name>` or `agent:<box>`; `snippet` wraps matches in `**`; `live: true` means that conversation's agent is running now, so consider `agent_chat_start` instead of only reading history. Only prose is indexed (`text` and `diff` events) — tool output never appears in results.
+- `GET /convo/:id/messages?around_seq=<seq>&limit=<n>` — context around a hit. This works on any of the user's conversations, including other boxes' sessions: foreign reads return indexed prose only, with `limit` clamped to 30, and are logged server-side. Plain `before_seq`/paging reads remain restricted to conversations this device owns or has joined (others 404).
+- Send a real-looking `User-Agent` (e.g. `curl/8.x`) — some deployments 403 the default Python one — and pace request bursts; the rate limiter answers 403 across the board for a while once tripped.
+
+Full API digest: `GET /help` on the same base URL (Bearer, returns markdown). Full spec: `docs/protocol.md` ("Journal search") in the matron-journal repo.
+
 ## Viewer Links
 
 Secure viewer links require the bridge to have `HMAC_SECRET` and `VIEWER_BASE_URL` configured. If `share_sensitive_data` or file-view links report that the viewer is not configured, tell the user that the local viewer service is running but needs a public `VIEWER_BASE_URL`, usually via Cloudflare Tunnel.
