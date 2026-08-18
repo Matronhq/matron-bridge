@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.bak
+.journal-token
 *.log
 .mcp-config-generated*.json
 journal-cursor.json
