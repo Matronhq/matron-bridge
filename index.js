@@ -7365,6 +7365,11 @@ async function journalRouteTextToSession(session, body) {
       convoId: journalConvoIdFor(session),
       fullText: trimmed,
       compactJump,
+      // Codex can't be handed a single queued message while a turn is live:
+      // flushQueue interrupts and returns 'deferred', then the turn-end flush
+      // sends the whole queue — so "send just this one" would silently mean
+      // "send all". Withhold the action rather than offer one that lies.
+      allowSendOne: session.agent !== AGENT_CODEX,
     });
     return;
   }
@@ -7543,6 +7548,8 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText,
+      // Same capability gate as the text path above.
+      allowSendOne: session.agent !== AGENT_CODEX,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);

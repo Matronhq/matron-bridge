@@ -78,6 +78,41 @@ describe('queueFlushNotice — sendNow (magic word, card tap, /interrupt)', () =
   });
 });
 
+// "Send just this one" flushes ONE message and deliberately leaves the rest
+// queued with their cards live. That is a different shape from `deferred`,
+// which means "held back by a compact split and will be sent automatically" —
+// so it gets its own option rather than reusing that noun. Without the tail the
+// user sees "⚡ Sending 1 queued message now" with no hint that the other two
+// are still waiting, which reads like the rest were dropped.
+describe('queueFlushNotice — remaining (send just this one)', () => {
+  it('lists the sent message and says how many stay queued', () => {
+    expect(queueFlushNotice('sendNow', { queued: 1, summary, remaining: 2 }).plain)
+      .toBe('⚡ Sending 1 queued message now:\n  1. first message\n  2. second message\n— the other 2 messages stay queued.');
+  });
+
+  it('agrees the verb for a single remaining message', () => {
+    expect(queueFlushNotice('sendNow', { queued: 1, summary, remaining: 1 }).plain)
+      .toBe('⚡ Sending 1 queued message now:\n  1. first message\n  2. second message\n— the other 1 message stays queued.');
+  });
+
+  it('says nothing extra when the queue is now empty', () => {
+    expect(queueFlushNotice('sendNow', { queued: 1, summary, remaining: 0 }).plain)
+      .toBe('⚡ Sending 1 queued message now:\n  1. first message\n  2. second message');
+  });
+
+  it('carries the tail into the html channel too', () => {
+    expect(queueFlushNotice('sendNow', { queued: 1, summary, remaining: 2 }).html)
+      .toBe('<b>⚡ Sending 1 queued message now:</b><ol><li>first message</li><li>second message</li></ol> — the other 2 messages stay queued.');
+  });
+
+  // A compact split is the louder fact and already owns the whole notice; the
+  // two are never combined at any call site.
+  it('a deferred notice ignores remaining — the compact split takes precedence', () => {
+    expect(queueFlushNotice('sendNow', { deferred: 2, remaining: 3 }).plain)
+      .toBe('⚡ Sending /compact now — the other 2 messages will be sent once compaction finishes.');
+  });
+});
+
 describe('queueFlushNotice — cross-style invariants', () => {
   // The two styles differ ONLY in sigil, tense and the deferred noun. Anything
   // else diverging means one of them was edited without the other.

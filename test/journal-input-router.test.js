@@ -1418,9 +1418,19 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     });
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
 
+    // 'send_one' ("send just this one, keep the rest queued") is a wire action
+    // in its own right — a card offering it is dead if the router refuses the
+    // reply as invalid, which is exactly what happens to any value not in
+    // QUEUED_RELEASE_ACTIONS.
+    consumer(tap('send_one'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2);
+    expect(deps.routePromptReply.mock.calls[1][1]).toEqual({
+      target_seq: CARD_SEQ, choice: 'send_one', text: null,
+    });
+
     // Unknown action on a known card → warn + user notice, no route.
     consumer(tap('frobnicate'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
     expect(warnings.some(w => /invalid queued_release action/.test(w))).toBe(true);
 
@@ -1431,7 +1441,7 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     // never falling through to the ordinary answer path.
     deps.noticeQueuedReleaseIgnored.mockClear();
     consumer(tap('send'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // still unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // still unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'tombstoned' }));
   });
 });
