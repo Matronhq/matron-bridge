@@ -48,6 +48,19 @@ describe('announce-once', () => {
     expect(shouldAnnounceOnline(MARKER, CONVO, { fs })).toBe(true);
   });
 
+  it('swallows and logs a failed marker write (fail-open: worst case is one repeat announcement, never a dead bridge)', () => {
+    const fs = fakeFs();
+    fs.writeFileSync = vi.fn(() => { const e = new Error('no space left on device'); e.code = 'ENOSPC'; throw e; });
+    const log = { warn: vi.fn() };
+    // Runs during top-level module evaluation in index.js — a rethrow here
+    // would abort boot before main() ever runs.
+    expect(() => recordOnlineAnnounced(MARKER, CONVO, { fs, log })).not.toThrow();
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn.mock.calls[0][0]).toMatch(/announce-once/);
+    // With no marker on disk, the next boot simply announces again.
+    expect(shouldAnnounceOnline(MARKER, CONVO, { fs })).toBe(true);
+  });
+
   it('records the marker atomically (temp sibling + rename, target never opened directly)', () => {
     const fs = fakeFs();
     recordOnlineAnnounced(MARKER, CONVO, { fs });
