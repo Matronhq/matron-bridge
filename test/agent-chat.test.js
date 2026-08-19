@@ -60,8 +60,12 @@ function makeFixture(overrides = {}) {
   // Mute seams (2026-08-19): the loud announcement into the other member's
   // own chat, and the 🔊 Unmute card / its retirement.
   const publishSessionNotice = vi.fn((sessionKey, text) => calls.push({ call: 'publishSessionNotice', sessionKey, text }));
-  const publishMuteCard = vi.fn((args) => calls.push({ call: 'publishMuteCard', ...args }));
+  const publishMuteCard = vi.fn((args) => { calls.push({ call: 'publishMuteCard', ...args }); return true; });
   const retireMuteCard = vi.fn((roomId, sessionKey) => calls.push({ call: 'retireMuteCard', roomId, sessionKey }));
+  const dropPendingRoomMessages = vi.fn((sessionKey, roomId) => {
+    calls.push({ call: 'dropPendingRoomMessages', sessionKey, roomId });
+    return overrides.droppedCount ?? 0;
+  });
   const handlers = createAgentChatHandlers({
     sessions, publisher, rooms, invites,
     awaitRoomMessage: overrides.awaitRoomMessage,
@@ -70,10 +74,10 @@ function makeFixture(overrides = {}) {
     journalConvoIdFor: (s) => s.convoId || null,
     serverLabel: '2',
     deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
-    publishSessionNotice, publishMuteCard, retireMuteCard,
+    publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages,
     log,
   });
-  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer, publishSessionNotice, publishMuteCard, retireMuteCard };
+  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer, publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages };
 }
 
 describe('createAgentChatHandlers', () => {
@@ -1796,6 +1800,26 @@ describe('mute wiring (source inspection)', () => {
     }
     // The user-frame branch publishes the 💬 echo and then the 🔇 line.
     expect(body).toMatch(/disposition === 'muted-user'[\s\S]{0,600}formatRoomMessageNotice\([\s\S]{0,400}ROOM_MUTED_NOT_DELIVERED_NOTICE/);
+    // …and the branch RETURNS. Without this the ordering assertions above all
+    // still hold while a muted session receives everything anyway — the notices
+    // publish, execution falls through, and the user gets a 🔇 line followed by
+    // the delivery it just denied. The whole gate is that one keyword.
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,900}\n {4}return;\n {2}\}/);
+    // The pre-mute backlog drain stays ABOVE the gate: those messages were
+    // accepted before the mute, and agent_chat_mute discards this room's share
+    // of them explicitly (roomDelivery.dropRoom) rather than stranding them.
+    expect(body.indexOf('maybeFlushRoomDelivery(session);')).toBeLessThan(gate);
+  });
+
+  it('gives the mute handler a seam to drop what the room already had queued', () => {
+    const wiring = indexSrc.slice(indexSrc.indexOf('const agentChatHandlers = createAgentChatHandlers({'));
+    const block = wiring.slice(0, wiring.indexOf('});'));
+    expect(block).toMatch(/dropPendingRoomMessages: \(sessionKey, roomId\) => roomDelivery\.dropRoom\(sessionKey, roomId\)/);
+  });
+
+  it('the unmute tap takes the local hop so a same-bridge peer AGENT hears it', () => {
+    const body = fnBody('resolveRoomMuteTap');
+    expect(body).toMatch(/room\.guestSessionRoomId != null[\s\S]{0,300}routeLocalRoomMessage\(roomId, sessionKey, line\)/);
   });
 
   it('reserves the card identity BEFORE publishing it, and offers the room-scoped value', () => {
@@ -1808,7 +1832,11 @@ describe('mute wiring (source inspection)', () => {
     // generically off it and reply with the option VALUE. A card with only
     // `actions` would render as a free-text box and its reply would be
     // refused, leaving a dead button.
-    expect(body).toMatch(/options: \[\{ id: 'unmute', label: '🔊 Unmute', value: unmuteChoiceValue\(roomId\) \}\]/);
+    expect(body).toMatch(/options: \[\{ id: ROOM_MUTE_ACTION_ID, label: '🔊 Unmute', value: unmuteChoiceValue\(roomId\) \}\]/);
+    // The action id and the option value are the SAME constant + its derived
+    // form (lib/room-mute-cards.js roomMuteChoices), not two hand-kept lists —
+    // which is how lib/busy-queue.js records an action going dead on a client.
+    expect(body).toMatch(/actions: \[\{ id: ROOM_MUTE_ACTION_ID,/);
     expect(body).toMatch(/mode: 'pick_one'/);
     expect(body).toMatch(/kind: ROOM_MUTE_KIND/);
   });
@@ -1821,7 +1849,7 @@ describe('mute wiring (source inspection)', () => {
     expect(clear).toBeGreaterThan(guard);
     // Both audiences are told, and both are told that nothing is replayed.
     expect(body).toMatch(/journalPublishNotice\(convoId,[\s\S]{0,300}agent_chat_read/);
-    expect(body).toMatch(/journalPublisher\.publishText\(roomId,[\s\S]{0,300}agent_chat_read/);
+    expect(body).toMatch(/const line = `🔊 [\s\S]{0,300}agent_chat_read[\s\S]{0,200}journalPublisher\.publishText\(roomId, \{ body: line/);
   });
 
   it('routes a verified tap through the roomMute flag, never by value shape', () => {
@@ -1863,5 +1891,144 @@ describe('mute wiring (source inspection)', () => {
     const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
     expect(block).toMatch(/looping, spamming, or malfunctioning/);
     expect(block).toMatch(/you cannot: a room stays open for the life of both sessions/);
+  });
+});
+
+// Findings from the whole-branch review of the mute/persistent-rooms work.
+// Each is a silent-failure seam: the caller was told the thing worked.
+describe('review findings (mute + reuse seams)', () => {
+  const good = { roomId: '!sess', target_convo_id: 'convo-remote', justification: 'need eyes', message: 'hi' };
+  const BOTH_ENDS = { ...ROSTER, conversations: [
+    ...ROSTER.conversations,
+    { id: 'convo-sess', title: 'Owner work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 444 },
+  ] };
+
+  // C1. findLivePair counts a PENDING binding as live, but posting into a room
+  // needs more than that: roomAccessError('send') admits 'joined', or an OWNER
+  // still 'pending'. The reuse branch skipped that gate entirely.
+  it('REGRESSION (C1): a guest that has not accepted yet cannot post by re-starting the chat', async () => {
+    const f = makeFixture({ publisher: { fetchRoster: async () => BOTH_ENDS }, inviteLocalOutcome: { kind: 'pending_idle' } });
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-self', claudeSessionId: 'gg' });
+    const first = await f.handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+    // index.js binds the guest side when it delivers the local invite.
+    f.rooms.record(first.body.room_id, { guestSessionRoomId: '!guest', guestState: 'pending' });
+    f.calls.length = 0;
+
+    const res = await f.handlers.chatStart({ ...good, roomId: '!guest', target_convo_id: 'convo-sess', message: 'hi A' });
+    // Not ok:true. routeLocalRoomFrame drops a non-'joined' recipient and the
+    // journal drops the own-device echo, so "sent" would have been a lie — and
+    // the owner would have gone on waiting for an answer to its invite.
+    expect(res.status).toBe(409);
+    expect(res.body.room_id).toBe(first.body.room_id);
+    expect(res.body.note).toMatch(/agent_chat_accept/);
+    expect(f.calls.filter((c) => c.call === 'publishText')).toHaveLength(0);
+    expect(f.routeLocalRoomMessage).not.toHaveBeenCalled();
+    // …and emphatically NOT a second room.
+    expect(f.calls.filter((c) => c.call === 'upsertConvo')).toHaveLength(0);
+  });
+
+  it('the OWNER may still post into its own not-yet-accepted room (unchanged)', async () => {
+    const f = makeFixture({ inviteOutcome: { kind: 'pending_idle' } });
+    const first = await f.handlers.chatStart(good);
+    f.calls.length = 0;
+    const again = await f.handlers.chatStart({ ...good, message: 'still there?' });
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.ok).toBe(true);
+    expect(f.calls.filter((c) => c.call === 'publishText')).toHaveLength(1);
+  });
+
+  // C2. The gate only stops NEW frames. A peer that floods while the agent is
+  // mid-turn fills the pending inbox; the agent can only call mute during that
+  // same turn, and the turn-end flush then injected the whole flood anyway.
+  it('REGRESSION (C2): muting drops what the room already has queued for this session', async () => {
+    const f = makeFixture({ droppedCount: 4 });
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'M:ab ↔️ dev-2' });
+    const res = await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'flooding' });
+    expect(f.dropPendingRoomMessages).toHaveBeenCalledWith('!sess', 'room-1');
+    // The ⏳ those messages published is owed an outcome — silently dropping
+    // them would leave it hanging forever.
+    const notice = f.calls.find((c) => c.call === 'publishSessionNotice' && /4 queued/.test(c.text));
+    expect(notice.sessionKey).toBe('!sess');
+    expect(res.body.dropped).toBe(4);
+  });
+
+  it('says nothing about a dropped backlog when there was none', async () => {
+    const f = makeFixture();
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    expect(f.calls.filter((c) => c.call === 'publishSessionNotice' && /queued/.test(c.text))).toHaveLength(0);
+  });
+
+  // C3. publisher.publishText alone never reaches a SAME-BRIDGE peer: the
+  // journal drops the own-device echo. The announcement has to take the local
+  // hop like every other room post, or the peer agent is left talking into a
+  // void — the exact state BRIDGE_CLAUDE.md tells agents not to create.
+  it('REGRESSION (C3): the mute and unmute lines reach a same-bridge peer AGENT, not just its user', async () => {
+    const f = makeFixture();
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest' });
+    f.rooms.record('room-l', {
+      role: 'owner', state: 'joined', sessionRoomId: '!sess',
+      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab ↔️ M:cd',
+    });
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-l', reason: 'looping' });
+    expect(f.routeLocalRoomMessage).toHaveBeenCalledWith('room-l', '!sess', expect.stringMatching(/^🔇 /));
+    f.routeLocalRoomMessage.mockClear();
+    await f.handlers.chatUnmute({ roomId: '!sess', room_id: 'room-l' });
+    expect(f.routeLocalRoomMessage).toHaveBeenCalledWith('room-l', '!sess', expect.stringMatching(/^🔊 /));
+  });
+
+  it('mutes from the GUEST binding of a local room, announcing to the owner', async () => {
+    const f = makeFixture();
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest', claudeSessionId: 'cd' });
+    f.rooms.record('room-l', {
+      role: 'owner', state: 'joined', sessionRoomId: '!sess',
+      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab ↔️ M:cd',
+    });
+    const res = await f.handlers.chatMute({ roomId: '!guest', room_id: 'room-l', reason: 'owner is spamming' });
+    expect(res.status).toBe(200);
+    expect(f.rooms.isMuted('room-l', '!guest')).toBe(true);
+    expect(f.rooms.isMuted('room-l', '!sess')).toBe(false);
+    // The "other member" is the OWNER when the guest is the one muting.
+    expect(f.publishSessionNotice).toHaveBeenCalledWith('!sess', expect.stringMatching(/^🔇 /));
+    expect(f.publishMuteCard).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: '!guest', roomId: 'room-l' }));
+    expect(f.dropPendingRoomMessages).toHaveBeenCalledWith('!guest', 'room-l');
+  });
+
+  // C4. "This chat is broken, I'll start a fresh one" is the natural recovery,
+  // and it hands back the very room whose replies are being dropped.
+  it('REGRESSION (C4): reusing a room the caller has MUTED says so', async () => {
+    const f = makeFixture();
+    const first = await f.handlers.chatStart(good);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: first.body.room_id, reason: 'looping' });
+    const again = await f.handlers.chatStart({ ...good, message: 'fresh start?' });
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.note).toMatch(/MUTED/);
+    expect(again.body.note).toMatch(/agent_chat_unmute/);
+  });
+
+  // I4. The card is best-effort (no live session convo, or a throwing seam),
+  // but the tool result promised the user could tap it either way.
+  it('does not promise an Unmute card that was never published', async () => {
+    const f = makeFixture();
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+    f.publishMuteCard.mockReturnValue(false);
+    const res = await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    expect(res.body.note).not.toMatch(/taps Unmute/);
+    expect(res.body.card).toBe(false);
+  });
+
+  // A muted sender's waiter can never be resolved (deliverRoomFrameTo returns
+  // above roomReplyWaiters.resolve), so the wait is pure dead time.
+  it('does not burn a wait_seconds a mute guarantees will time out', async () => {
+    const awaitRoomMessage = vi.fn(async () => null);
+    const f = makeFixture({ awaitRoomMessage });
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi', wait_seconds: 60 });
+    expect(awaitRoomMessage).not.toHaveBeenCalled();
+    // …but an unmuted send still waits exactly as before.
+    await f.handlers.chatUnmute({ roomId: '!sess', room_id: 'room-1' });
+    await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi', wait_seconds: 5 });
+    expect(awaitRoomMessage).toHaveBeenCalledWith('room-1', 5000, '!sess');
   });
 });

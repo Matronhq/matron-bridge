@@ -454,3 +454,43 @@ describe('roomFrameDisposition', () => {
     expect(ROOM_MUTED_NOT_DELIVERED_NOTICE).toBe('🔇 Not delivered — this chat is muted.');
   });
 });
+
+// dropRoom (2026-08-19): agent_chat_mute has to act on the backlog, not only
+// on new frames — see the mute gate in index.js deliverRoomFrameTo.
+describe('dropRoom', () => {
+  const msg = (roomId, body) => ({ roomId, roomTitle: roomId, from: 'dev-2', body });
+  const busy = { alive: true, busy: true };
+  const idle = { alive: true, busy: false };
+
+  it("discards only the named room's queued messages and reports the count", () => {
+    const { delivery, injectTurn } = makeDelivery();
+    for (let i = 0; i < 3; i++) delivery.deliver(busy, '!s', msg('spammy', `flood ${i}`));
+    delivery.deliver(busy, '!s', msg('quiet', 'something useful'));
+    expect(delivery.pendingCount('!s')).toBe(4);
+    expect(delivery.dropRoom('!s', 'spammy')).toBe(3);
+    expect(delivery.pendingCount('!s')).toBe(1);
+    // The survivor is the other room's message, and it still flushes.
+    delivery.flush(idle, '!s');
+    const text = injectTurn.mock.calls.at(-1)[1];
+    expect(text).toContain('something useful');
+    expect(text).not.toContain('flood');
+  });
+
+  it('is a no-op for an unknown session or room', () => {
+    const { delivery } = makeDelivery();
+    expect(delivery.dropRoom('!nobody', 'r1')).toBe(0);
+    delivery.deliver(busy, '!s', msg('r1', 'hi'));
+    expect(delivery.dropRoom('!s', 'other')).toBe(0);
+    expect(delivery.pendingCount('!s')).toBe(1);
+  });
+
+  it("clears the room's eviction counter, so no \"earlier messages omitted\" footnote survives it", () => {
+    const { delivery, injectTurn } = makeDelivery();
+    // Overflow MAX_PENDING for one room so its omitted-counter is non-zero…
+    for (let i = 0; i < 60; i++) delivery.deliver(busy, '!s', msg('spammy', `flood ${i}`));
+    delivery.deliver(busy, '!s', msg('quiet', 'useful'));
+    delivery.dropRoom('!s', 'spammy');
+    delivery.flush(idle, '!s');
+    expect(injectTurn.mock.calls.at(-1)[1]).not.toMatch(/omitted/);
+  });
+});

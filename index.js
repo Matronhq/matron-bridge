@@ -109,10 +109,10 @@ import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE } from './lib/room-delivery.js';
-import { unmuteChoiceValue, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
+import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
-import { createAgentChatHandlers } from './lib/agent-chat.js';
+import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
@@ -8207,13 +8207,12 @@ function deliverRoomFrameTo(room, frame) {
   }
 }
 
-// How a session names itself in a mute announcement — the device name plus
-// the session short, because a same-bridge room's two ends share the device
-// name and "mac muted this" would name neither of them.
+// How a session names itself in a mute announcement. One implementation,
+// shared with lib/agent-chat.js's own announcements (roomAgentLabel) — the two
+// lines sit in the same room transcript, so a drift between them would read as
+// two different speakers.
 function roomMuteAgentLabel(session) {
-  const name = journalPublisher.identity()?.name || SERVER_LABEL || 'an agent';
-  const short = String(session?.claudeSessionId || session?.roomId || '').trim().slice(0, 2);
-  return short ? `${name} [${short}]` : name;
+  return roomAgentLabel(journalPublisher.identity()?.name || SERVER_LABEL, session);
 }
 
 // The "🔊 Unmute" card agent_chat_mute publishes into the MUTING agent's own
@@ -8231,10 +8230,13 @@ function roomMuteAgentLabel(session) {
 //
 // The card's identity is reserved BEFORE the publish, so the seq bound by the
 // echo can never belong to a card we hadn't registered.
+// Returns whether a card was actually published: a session with no journal
+// conversation yet has nowhere to put one, and the tool result must not promise
+// the user a button that does not exist.
 function publishRoomMuteCard({ sessionKey, roomId, roomTitle, reason, agentName } = {}) {
   const session = sessions.get(sessionKey);
   const convoId = journalConvoIdFor(session);
-  if (!session || !convoId) return;
+  if (!session || !convoId) return false;
   const promptId = `rm_${randomUUID()}`;
   const where = quotedField(roomTitle || roomId);
   const summary = `🔇 ${agentName} muted "${where}": ${reason}`;
@@ -8243,13 +8245,14 @@ function publishRoomMuteCard({ sessionKey, roomId, roomTitle, reason, agentName 
     kind: ROOM_MUTE_KIND,
     prompt_id: promptId,
     question: `${summary} — unmute it?`,
-    actions: [{ id: 'unmute', label: '🔊 Unmute', intent: 'primary' }],
+    actions: [{ id: ROOM_MUTE_ACTION_ID, label: '🔊 Unmute', intent: 'primary' }],
     // The value names the room, so this card can only ever unmute its own
     // chat — the router checks it against the registered room before acting.
-    options: [{ id: 'unmute', label: '🔊 Unmute', value: unmuteChoiceValue(roomId) }],
+    options: [{ id: ROOM_MUTE_ACTION_ID, label: '🔊 Unmute', value: unmuteChoiceValue(roomId) }],
     mode: 'pick_one',
     body: summary,
   });
+  return true;
 }
 
 // The user tapped 🔊 Unmute. The router has already proven provenance (the
@@ -8271,10 +8274,16 @@ function resolveRoomMuteTap(session, { roomId, sessionKey } = {}) {
   // replayed, so the gap is real and the agent has to go and read it.
   journalPublishNotice(convoId,
     `🔊 Unmuted "${where}" — new messages are delivered again. Anything sent while it was muted was not delivered; the agent can catch up with agent_chat_read.`);
-  journalPublisher.publishText(roomId, {
-    body: `🔊 ${roomMuteAgentLabel(session)} unmuted by user — messages sent while it was muted were not delivered; catching up with agent_chat_read.`,
-    from: 'agent',
-  });
+  const line = `🔊 ${roomMuteAgentLabel(session)} unmuted by user — messages sent while it was muted were not delivered; catching up with agent_chat_read.`;
+  journalPublisher.publishText(roomId, { body: line, from: 'agent' });
+  // A same-bridge peer never hears the journal echo of an own-device frame, so
+  // the room line alone would reach every audience except the peer AGENT — the
+  // one that needs to know it can be heard again. Same hop chatSend takes.
+  if (room.guestSessionRoomId != null) {
+    try { routeLocalRoomMessage(roomId, sessionKey, line); } catch (e) {
+      try { console.warn(`[agent-chat] unmute local routing threw: ${e.message}`); } catch { /* logging must never throw */ }
+    }
+  }
 }
 
 // Which local session an inbound invite/join request is FOR — see
@@ -8868,6 +8877,10 @@ const agentChatHandlers = createAgentChatHandlers({
   // overrule it with one tap.
   publishMuteCard: publishRoomMuteCard,
   retireMuteCard: (roomId, sessionKey) => journalInputConsumer.roomMuteCards.retire(roomId, sessionKey),
+  // A mute has to reach the backlog too: the gate in deliverRoomFrameTo only
+  // stops NEW frames, and what a flooding peer already queued would otherwise
+  // be injected wholesale at the next turn-end seam.
+  dropPendingRoomMessages: (sessionKey, roomId) => roomDelivery.dropRoom(sessionKey, roomId),
   log: console,
 });
 
