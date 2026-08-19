@@ -338,3 +338,135 @@ describe('guest bindings (local rooms)', () => {
     expect(reloaded.bindingFor('r1', '!guest')).toEqual({ role: 'guest', state: 'pending', binding: 'guest' });
   });
 });
+
+// Reuse-first chatStart (2026-08-19): one persistent room per session pair.
+// The registry is the only thing that can answer "do these two already have a
+// live room?", so the lookup lives here rather than being re-derived by every
+// caller out of list().
+describe('findLivePair (reuse-first lookup)', () => {
+  const REMOTE = {
+    role: 'owner', state: 'joined', sessionRoomId: '!sess1',
+    peerDeviceId: 7, targetConvoId: 'convo-remote',
+  };
+
+  it('finds a joined remote room for the same (session, device, target convo)', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', REMOTE);
+    expect(rooms.findLivePair('!sess1', { peerDeviceId: 7, targetConvoId: 'convo-remote' }))
+      .toMatchObject({ roomId: 'r1' });
+  });
+
+  it('does not cross pairs: a different target convo or device is a different room', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', REMOTE);
+    expect(rooms.findLivePair('!sess1', { peerDeviceId: 7, targetConvoId: 'convo-other' })).toBeNull();
+    expect(rooms.findLivePair('!sess1', { peerDeviceId: 9, targetConvoId: 'convo-remote' })).toBeNull();
+    // …and a different CALLER session never reuses someone else's room.
+    expect(rooms.findLivePair('!sess2', { peerDeviceId: 7, targetConvoId: 'convo-remote' })).toBeNull();
+  });
+
+  it('never resurrects a terminal room — left, refused and expired are all skipped', () => {
+    for (const state of ['left', 'refused', 'expired']) {
+      const { rooms } = makeStore();
+      rooms.record('r1', { ...REMOTE, state });
+      expect(rooms.findLivePair('!sess1', { peerDeviceId: 7, targetConvoId: 'convo-remote' })).toBeNull();
+    }
+  });
+
+  it('a still-pending invite counts as live only inside the invite TTL (the reaper prunes the rest)', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', { ...REMOTE, state: 'pending' });
+    expect(rooms.findLivePair('!sess1', { peerDeviceId: 7, targetConvoId: 'convo-remote' }))
+      .toMatchObject({ roomId: 'r1' });
+    // Past the TTL the reaper would have dropped it at the next load, so it
+    // must not be handed back as reusable in memory either.
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(INVITE_TTL_MS + 1);
+      expect(rooms.findLivePair('!sess1', { peerDeviceId: 7, targetConvoId: 'convo-remote' })).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('rooms recorded before targetConvoId existed are never reused (fail safe)', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', { role: 'owner', state: 'joined', sessionRoomId: '!sess1', peerDeviceId: 7 });
+    expect(rooms.findLivePair('!sess1', { peerDeviceId: 7, targetConvoId: 'convo-remote' })).toBeNull();
+  });
+
+  it('a LOCAL room matches from either end, and only while BOTH bindings are live', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', {
+      role: 'owner', state: 'joined', sessionRoomId: '!owner',
+      guestSessionRoomId: '!guest', guestState: 'joined',
+      peerDeviceId: 1, targetConvoId: 'convo-guest',
+    });
+    const q = { peerDeviceId: 1, targetConvoId: 'convo-guest', peerSessionRoomId: '!guest' };
+    expect(rooms.findLivePair('!owner', q)).toMatchObject({ roomId: 'r1' });
+    // The guest leaving kills reuse for the owner too — the room is dead.
+    rooms.setGuestState('r1', 'left');
+    expect(rooms.findLivePair('!owner', q)).toBeNull();
+  });
+
+  it('a LOCAL room whose other binding is a DIFFERENT session is not this pair', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', {
+      role: 'owner', state: 'joined', sessionRoomId: '!owner',
+      guestSessionRoomId: '!someone-else', guestState: 'joined',
+      peerDeviceId: 1, targetConvoId: 'convo-guest',
+    });
+    expect(rooms.findLivePair('!owner', { peerDeviceId: 1, targetConvoId: 'convo-guest', peerSessionRoomId: '!guest' })).toBeNull();
+  });
+});
+
+// Per-side mute (2026-08-19). Mute is purely local to this bridge: it stops
+// room frames reaching ONE member's session. It rides on the registry record
+// so it inherits exactly the registry's durability — nothing new invented.
+describe('mute bindings', () => {
+  const LOCAL_PAIR = {
+    role: 'owner', state: 'joined', sessionRoomId: '!owner',
+    guestSessionRoomId: '!guest', guestState: 'joined',
+  };
+
+  it('mutes the CALLER\'s side only, and reports it per binding', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', LOCAL_PAIR);
+    expect(rooms.isMuted('r1', '!owner')).toBe(false);
+    expect(rooms.setMuted('r1', '!owner', true, { reason: 'peer is looping' })).toMatchObject({ muted: true, mutedReason: 'peer is looping' });
+    expect(rooms.isMuted('r1', '!owner')).toBe(true);
+    expect(rooms.isMuted('r1', '!guest')).toBe(false);
+    // …and the guest side is its own switch.
+    rooms.setMuted('r1', '!guest', true, { reason: 'spamming' });
+    expect(rooms.get('r1')).toMatchObject({ muted: true, guestMuted: true, guestMutedReason: 'spamming' });
+    expect(rooms.setMuted('r1', '!owner', false)).toMatchObject({ muted: false, mutedReason: null });
+    expect(rooms.isMuted('r1', '!owner')).toBe(false);
+    expect(rooms.isMuted('r1', '!guest')).toBe(true);
+  });
+
+  it('refuses a room or a session it has no binding for', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', LOCAL_PAIR);
+    expect(rooms.setMuted('nope', '!owner', true)).toBeNull();
+    expect(rooms.setMuted('r1', '!stranger', true)).toBeNull();
+    expect(rooms.isMuted('nope', '!owner')).toBe(false);
+    expect(rooms.isMuted('r1', '!stranger')).toBe(false);
+  });
+
+  it('survives whatever durability the registry has (persistence round-trip)', () => {
+    const save = vi.fn();
+    const { rooms } = makeStore({ save });
+    rooms.record('r1', { role: 'guest', state: 'joined', sessionRoomId: '!sess1' });
+    rooms.setMuted('r1', '!sess1', true, { reason: 'malfunctioning' });
+    const persisted = save.mock.calls.at(-1)[0];
+    const { rooms: reloaded } = makeStore({ initial: persisted });
+    expect(reloaded.isMuted('r1', '!sess1')).toBe(true);
+    expect(reloaded.get('r1').mutedReason).toBe('malfunctioning');
+  });
+
+  it('a partial re-record does not clear a mute', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', { role: 'guest', state: 'pending', sessionRoomId: '!sess1' });
+    rooms.setMuted('r1', '!sess1', true, { reason: 'why' });
+    rooms.record('r1', { state: 'joined' });
+    expect(rooms.isMuted('r1', '!sess1')).toBe(true);
+  });
+});

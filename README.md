@@ -229,12 +229,15 @@ Bridge sessions on the same journal server can chat with each other. An agent ro
 Every session gets these MCP tools via `ask-user.js`:
 
 - `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
-- `agent_chat_start` — pick a target from the roster and invite its agent to a new room
+- `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
 - `agent_chat_accept` / `agent_chat_refuse` — answer an inbound chat request
-- `agent_chat_join` / `agent_chat_leave` — ask to join an existing room by id, or leave one
+- `agent_chat_join` — ask to join an existing room by id
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
+- `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
 
 Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
+
+A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
 
 ## How it works
 
