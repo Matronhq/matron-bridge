@@ -1837,12 +1837,39 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(queued).toBeGreaterThan(resolve);
     });
 
-    it('gates ⏳ to peer agents, like the 💬 notice it follows', () => {
-      // A `user:` frame is Dan typing into the room convo himself; he gets no
-      // 💬 line for it, so a bare ⏳ would have nothing to attach to.
-      expect(frame).toMatch(/const isPeerAgent = sender\.startsWith\('agent:'\)/);
-      expect(frame).toMatch(/if \(isPeerAgent\) \{/);
-      expect(frame).toMatch(/if \(isPeerAgent && queuedBefore === 0/);
+    it('gates ⏳ on the SAME label that gates the 💬 notice it follows', () => {
+      // One decision, one gate: a bare ⏳ with no 💬 above it would have
+      // nothing to attach to, and a 💬 with no ⏳ under it would leave a
+      // queued message looking delivered. The label (and the withholding of
+      // it for an unrecognised sender) is roomEchoLabel's call — pinned
+      // behaviourally in test/room-delivery.test.js.
+      expect(frame).toMatch(/const echoFrom = roomEchoLabel\(sender, from\)/);
+      expect(frame).toMatch(/if \(echoFrom\) \{/);
+      expect(frame).toMatch(/if \(echoFrom && queuedBefore === 0/);
+    });
+
+    it("echoes Dan's OWN room messages into the member chats too", () => {
+      // Dan, 2026-08-19: a `user:` frame used to be suppressed here ("he can
+      // already see it in the room"), which hid the thing the room convo
+      // can't show — WHICH member chats took the message straight away and
+      // which queued it behind a running turn. The echo's job is that
+      // receipt, not the content.
+      expect(frame).not.toMatch(/isPeerAgent/);
+      const notice = frame.indexOf('journalPublishNotice(');
+      const queued = frame.indexOf('ROOM_MESSAGE_QUEUED_NOTICE');
+      expect(notice).toBeGreaterThan(-1);
+      expect(queued).toBeGreaterThan(notice);
+    });
+
+    it('publishes the 💬 echo BEFORE the reply-waiter short-circuit', () => {
+      // A message that resolves an agent's `wait_seconds` waiter never
+      // becomes a turn at all — it returns as the tool result. Publishing
+      // the echo first is what keeps that exchange visible to Dan (and it
+      // correctly gets no ⏳: nothing was queued).
+      const notice = frame.indexOf('formatRoomMessageNotice(');
+      const resolve = frame.indexOf('roomReplyWaiters.resolve(');
+      expect(notice).toBeGreaterThan(-1);
+      expect(resolve).toBeGreaterThan(notice);
     });
 
     it('drains an older batch BEFORE publishing this message\'s notice', () => {

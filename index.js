@@ -109,7 +109,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -8296,10 +8296,12 @@ function deliverRoomFrameTo(room, frame) {
   // sits above whatever the agent does about it, and so a reply consumed
   // inline by agent_chat_send's wait — which never becomes a turn at all —
   // is still visible to the user.
-  // Peer AGENTS only. A `user:` frame here is Dan typing into the room convo
-  // himself — he can already see it there, and re-rendering his own words in
-  // another conversation, in the bridge's assistant voice, would read as
-  // something a remote agent said.
+  // Dan's OWN room messages are echoed too, as "You" (lib/room-delivery.js
+  // roomEchoLabel). He can of course read them back in the room convo — but
+  // the room convo cannot tell him what this pipeline is FOR: which member
+  // chat took the message straight away, and which parked it behind a
+  // running turn (⏳, closed by 📨). The echo carries that receipt; the
+  // content is incidental.
   // Self-heal for a stranded pending inbox (Task 6 review, I4): several
   // paths clear busy WITHOUT passing a turn-end flush seam (esc-cancel,
   // interrupt-wedge, resume-failed, the prompt paths). If the session is
@@ -8310,11 +8312,11 @@ function deliverRoomFrameTo(room, frame) {
   // things happened: any ⏳ from an earlier batch is closed by its 📨 above
   // the 💬 line for the message that arrived after it.
   maybeFlushRoomDelivery(session);
-  const isPeerAgent = sender.startsWith('agent:');
-  if (isPeerAgent) {
+  const echoFrom = roomEchoLabel(sender, from);
+  if (echoFrom) {
     journalPublishNotice(
       journalConvoIdFor(session),
-      formatRoomMessageNotice({ from, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
+      formatRoomMessageNotice({ from: echoFrom, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
     );
   }
   // A reply consumed by an agent_chat_send wait already reached the agent
@@ -8337,7 +8339,7 @@ function deliverRoomFrameTo(room, frame) {
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
   });
-  if (isPeerAgent && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
+  if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
     journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
   }
 }
