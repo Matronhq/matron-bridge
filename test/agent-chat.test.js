@@ -44,7 +44,10 @@ function makeFixture(overrides = {}) {
     leave: vi.fn(async () => overrides.leaveOutcome ?? { kind: 'left' }),
     ...overrides.invites,
   };
-  const sessions = new Map([['!sess', { busy: false, alive: true, convoId: 'convo-sess' }]]);
+  // claudeSessionId, because the room title's self tag shorts the SAME id
+  // withSessionShort puts on ordinary session titles (index.js passes
+  // `session.claudeSessionId || session.roomId`).
+  const sessions = new Map([['!sess', { busy: false, alive: true, convoId: 'convo-sess', claudeSessionId: 'ab12cd34', ...overrides.session }]]);
   // The index.js pendingJoinRequests seam: who is join-requesting a room
   // this bridge owns — held OUTSIDE the rooms registry (C1).
   const pendingJoin = new Map();
@@ -176,7 +179,7 @@ describe('createAgentChatHandlers', () => {
       // then the local inject — a request delivered before the waiters exist
       // can settle into the void.
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'inviteLocal', 'deliverLocalInvite']);
-      expect(calls[0].opts.title).toBe(`↔️ [${chatRoomId.slice(0, 2)}] mac ↔ Local work — ci triage`);
+      expect(calls[0].opts.title).toBe(`↔️ [${chatRoomId.slice(0, 2)}] M:ab ↔️ Local work — ci triage`);
       expect(calls[2].fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 1, peerName: 'Local work' });
       expect(invites.invite).not.toHaveBeenCalled();
       expect(deliverLocalInvite).toHaveBeenCalledWith(expect.objectContaining({
@@ -196,11 +199,13 @@ describe('createAgentChatHandlers', () => {
       expect(chatRoomId).toMatch(/^[0-9a-f-]{36}$/);
 
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'invite']);
-      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: `↔️ [${chatRoomId.slice(0, 2)}] mac ↔ dev-2 — ci triage`, sessionState: 'waiting' } });
+      // The peer's conversation title ('Remote work') never earned a session
+      // short, so that half of the tag falls back to its plain device name.
+      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: `↔️ [${chatRoomId.slice(0, 2)}] M:ab ↔️ dev-2 — ci triage`, sessionState: 'waiting' } });
       expect(calls[1]).toEqual({ call: 'publishText', convoId: chatRoomId, payload: { body: 'hi, seen the red build?', from: 'agent' } });
       expect(calls[2].fields).toEqual({
         role: 'owner', state: 'pending', sessionRoomId: '!sess',
-        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: `↔️ [${chatRoomId.slice(0, 2)}] mac ↔ dev-2 — ci triage`,
+        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: `↔️ [${chatRoomId.slice(0, 2)}] M:ab ↔️ dev-2 — ci triage`,
       });
       // targetConvoId rides along with the device: the caller picked a
       // specific conversation, and without it the receiving bridge is left
@@ -220,7 +225,128 @@ describe('createAgentChatHandlers', () => {
     it('omits the topic suffix from the title when no topic given', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: undefined });
-      expect(calls[0].opts.title).toBe(`↔️ [${calls[0].convoId.slice(0, 2)}] mac ↔ dev-2`);
+      expect(calls[0].opts.title).toBe(`↔️ [${calls[0].convoId.slice(0, 2)}] M:ab ↔️ dev-2`);
+    });
+
+    // The title is what the apps render in the chat list, and the two tags in
+    // it are the same `Letter:short` pair the apps put beside every other
+    // chat (MatronShared SessionTag). A room called "mac ↔ dev-2" said which
+    // BOXES were talking but not which of the four sessions on them — Dan,
+    // 2026-08-19. The machine prefix `↔️ [xx] ` is untouched: the apps parse
+    // it for the coloured room tag.
+    describe('per-session tags in the room title', () => {
+      const withPeerTitle = (title) => ({ publisher: { fetchRoster: async () => ({
+        ...ROSTER,
+        conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title } : c)),
+      }) } });
+      const titleOf = (calls) => calls[0].opts.title.slice(`↔️ [${calls[0].convoId.slice(0, 2)}] `.length);
+
+      it('tags the peer from the short baked into its conversation title', async () => {
+        const { handlers, calls } = makeFixture(withPeerTitle('[2h] Remote work'));
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+      });
+
+      it('reads the peer short from behind a leading marker', async () => {
+        // A session another agent spawned carries 🐣 ahead of its short; a
+        // room the peer itself owns carries ↔️ or the legacy 🔗.
+        for (const marker of ['🐣', '↔️', '🔗']) {
+          const { handlers, calls } = makeFixture(withPeerTitle(`${marker} [2h] Remote work`));
+          await handlers.chatStart(good);
+          expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+        }
+      });
+
+      it('falls back to the plain device name when the peer has no short', async () => {
+        // Seed titles never earned one, and a bare "D:" says nothing.
+        const { handlers, calls } = makeFixture(withPeerTitle('Remote work'));
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:ab ↔️ dev-2 — ci triage');
+      });
+
+      it('falls back to our own device name when THIS session has no short', async () => {
+        const { handlers, calls } = makeFixture({
+          ...withPeerTitle('[2h] Remote work'), session: { claudeSessionId: undefined },
+        });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('mac ↔️ D:2h — ci triage');
+      });
+
+      it('shorts the room id when the native session id is not known yet', async () => {
+        // Same input as withSessionShort on an ordinary title: a session that
+        // has not reported a Claude session id still has its room id.
+        const { handlers, calls } = makeFixture({
+          ...withPeerTitle('[2h] Remote work'), session: { claudeSessionId: undefined, roomId: 'zz9' },
+        });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:zz ↔️ D:2h — ci triage');
+      });
+
+      it('derives both letters against the whole roster, not from initials', async () => {
+        // Two boxes called dev-y and dev-z must come out Y and Z, exactly as
+        // the apps colour them — both would otherwise be D.
+        const { handlers, calls } = makeFixture({ publisher: {
+          identity: () => ({ deviceId: 1, name: 'dev-y' }),
+          fetchRoster: async () => ({
+            agents: [{ device_id: 1, name: 'dev-y' }, { device_id: 7, name: 'dev-z' }],
+            conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title: '[2h] Remote work' } : c)),
+          }),
+        } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('Y:ab ↔️ Z:2h — ci triage');
+      });
+
+      it('derives our own letter even when the roster omits us', async () => {
+        const { handlers, calls } = makeFixture({ publisher: {
+          identity: () => ({ deviceId: 1, name: 'dev-y' }),
+          fetchRoster: async () => ({
+            agents: [{ device_id: 7, name: 'dev-z' }],
+            conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title: '[2h] Remote work' } : c)),
+          }),
+        } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('Y:ab ↔️ Z:2h — ci triage');
+      });
+
+      it('prefers a tag character the journal supplies for a box', async () => {
+        // tag_char is the app's per-device override (Settings → Devices →
+        // Tag Character). The journal does not send it yet, so the field is
+        // read defensively and never required.
+        const { handlers, calls } = makeFixture({ publisher: {
+          fetchRoster: async () => ({
+            agents: [{ device_id: 1, name: 'mac', tag_char: '🍎' }, { device_id: 7, name: 'dev-2', tag_char: '2' }],
+            conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title: '[2h] Remote work' } : c)),
+          }),
+        } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('🍎:ab ↔️ 2:2h — ci triage');
+      });
+
+      it('tags BOTH ends of a same-bridge room, one box letter twice', async () => {
+        const { handlers, calls } = makeFixture({ publisher: { fetchRoster: async () => ({
+          ...ROSTER,
+          conversations: ROSTER.conversations.map((c) => (c.id === 'convo-self' ? { ...c, title: '[2h] Local work' } : c)),
+        }) } });
+        await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+        expect(titleOf(calls)).toBe('M:ab ↔️ M:2h — ci triage');
+      });
+
+      it('falls back to the peer CONVO title on a same-bridge room with no short', async () => {
+        // "mac ↔️ mac" names nobody: the two ends of a local room share one
+        // device name, so the fallback side keeps the conversation title.
+        const { handlers, calls } = makeFixture();
+        await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+        expect(titleOf(calls)).toBe('M:ab ↔️ Local work — ci triage');
+      });
+
+      it('names an unknown peer device rather than tagging a nameless box', async () => {
+        const { handlers, calls } = makeFixture({ publisher: { fetchRoster: async () => ({
+          agents: [{ device_id: 1, name: 'mac' }],
+          conversations: ROSTER.conversations,
+        }) } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:ab ↔️ device 7 — ci triage');
+      });
     });
 
     it('fails CLOSED on a null identity: no room minted, no side effects', async () => {
@@ -234,7 +360,7 @@ describe('createAgentChatHandlers', () => {
     it('caps the title at 120 chars, link prefix included', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: 'x'.repeat(300) });
-      expect(calls[0].opts.title.startsWith(`↔️ [${calls[0].convoId.slice(0, 2)}] mac ↔ dev-2 — xxx`)).toBe(true);
+      expect(calls[0].opts.title.startsWith(`↔️ [${calls[0].convoId.slice(0, 2)}] M:ab ↔️ dev-2 — xxx`)).toBe(true);
       expect(calls[0].opts.title).toHaveLength(120);
     });
 
