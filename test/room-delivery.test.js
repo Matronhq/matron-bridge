@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, ROOM_MESSAGE_QUEUED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
 
 function makeDelivery({ injectResult = true } = {}) {
   const injectTurn = vi.fn(() => injectResult);
@@ -421,5 +421,36 @@ describe('the queued-state notices', () => {
     // …and the rest of the sentence agrees in number with the count.
     expect(formatRoomDeliveryFailedNotice(1)).toContain("1 queued message to this chat — it's still in the room");
     expect(out).toContain("2 queued messages to this chat — they're still in the room");
+  });
+});
+
+// Mute (2026-08-19): a muted member's session takes NO room frames at all.
+// The decision is pulled out of index.js's deliverRoomFrameTo so it can be
+// tested without booting the bridge — the wiring itself is source-pinned in
+// test/agent-chat.test.js.
+describe('roomFrameDisposition', () => {
+  it('delivers normally when the recipient binding is not muted', () => {
+    expect(roomFrameDisposition({ muted: false, sender: 'user:dan' })).toBe('deliver');
+    expect(roomFrameDisposition({ muted: false, sender: 'agent:dev-2' })).toBe('deliver');
+  });
+
+  it('a muted member still SEES the user\'s own message, marked undelivered', () => {
+    // Dan typed into the room himself: silently swallowing it would look
+    // exactly like the message being lost. He gets the 💬 echo and then the
+    // 🔇 line in place of the ⏳ the busy path would have published.
+    expect(roomFrameDisposition({ muted: true, sender: 'user:dan' })).toBe('muted-user');
+  });
+
+  it('a muted member\'s PEER agent frames are dropped with no notices at all', () => {
+    // The whole point of the mute is that a looping peer stops shouting into
+    // this chat — a notice per dropped frame would reproduce the spam. The
+    // history stays readable with agent_chat_read.
+    expect(roomFrameDisposition({ muted: true, sender: 'agent:dev-2' })).toBe('muted-drop');
+    expect(roomFrameDisposition({ muted: true, sender: 'bridge' })).toBe('muted-drop');
+    expect(roomFrameDisposition({ muted: true, sender: null })).toBe('muted-drop');
+  });
+
+  it('names the non-delivery in the user\'s own words, not a silent gap', () => {
+    expect(ROOM_MUTED_NOT_DELIVERED_NOTICE).toBe('🔇 Not delivered — this chat is muted.');
   });
 });
