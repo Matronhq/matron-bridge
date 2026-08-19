@@ -2056,6 +2056,19 @@ describe('room mute card taps', () => {
     expect(deps.noticeRoomMuteIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'retired' }));
   });
 
+  it('accepts the bare action id as well as the option value (I2)', () => {
+    // The apps send the option VALUE, but the card also carries
+    // `actions: [{id:'unmute'}]` for clients with structured handling. Two
+    // hand-kept lists is exactly how lib/busy-queue.js documents an action
+    // going dead on one client — provenance is already proven by target_seq,
+    // so accepting both costs nothing.
+    const { deps, consumer } = armed();
+    consumer(tap('unmute'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toMatchObject({ roomId: ROOM });
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+  });
+
   it('refuses a choice the card never offered — the value must name THIS card\'s room', () => {
     const { deps, consumer, warnings } = armed();
     consumer(tap('unmute:some-other-room'));

@@ -470,3 +470,68 @@ describe('mute bindings', () => {
     expect(rooms.isMuted('r1', '!sess1')).toBe(true);
   });
 });
+
+// I1 (whole-branch review): `updatedAt` is bumped by ANY write to the record —
+// the other binding's setState, a setMuted, a partial re-record — so judging a
+// pending binding's age by it means a stale invite looks fresh forever. Rooms
+// carry a per-binding pending stamp instead.
+describe('findLivePair pending freshness is per binding', () => {
+  it('a pending invite does not get fresher because the OTHER side was written', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', {
+      role: 'owner', state: 'joined', sessionRoomId: '!owner',
+      guestSessionRoomId: '!guest', guestState: 'pending',
+    });
+    const q = { peerSessionRoomId: '!owner', targetConvoId: 'convo-x' };
+    expect(rooms.findLivePair('!guest', q)).toMatchObject({ roomId: 'r1' });
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(INVITE_TTL_MS + 1);
+      // A write that has nothing to do with the invite — muting the owner side.
+      rooms.setMuted('r1', '!owner', true, { reason: 'noisy' });
+      expect(rooms.get('r1').updatedAt).toBe(Date.now());
+      // The guest's invite is still stale: nothing answered it.
+      expect(rooms.findLivePair('!guest', q)).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a fresh pending stamp is written each time a binding re-enters pending', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!owner', peerDeviceId: 7, targetConvoId: 'convo-x' });
+    const q = { peerDeviceId: 7, targetConvoId: 'convo-x' };
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(INVITE_TTL_MS + 1);
+      expect(rooms.findLivePair('!owner', q)).toBeNull();
+      // A brand new invite for the same room restarts the clock.
+      rooms.record('r1', { state: 'pending' });
+      expect(rooms.findLivePair('!owner', q)).toMatchObject({ roomId: 'r1' });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('legacy records with no pending stamp fall back to updatedAt', () => {
+    // Written by a previous bridge version; must not become permanently
+    // unreusable OR permanently live.
+    const { rooms } = makeStore({ initial: { r1: {
+      role: 'owner', state: 'pending', sessionRoomId: '!owner', peerDeviceId: 7,
+      targetConvoId: 'convo-x', updatedAt: Date.now(), createdAt: Date.now(),
+    } } });
+    const q = { peerDeviceId: 7, targetConvoId: 'convo-x' };
+    expect(rooms.findLivePair('!owner', q)).toMatchObject({ roomId: 'r1' });
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(INVITE_TTL_MS + 1);
+      expect(rooms.findLivePair('!owner', q)).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a JOINED binding never expires — only pending ones are on a clock', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', { role: 'owner', state: 'joined', sessionRoomId: '!owner', peerDeviceId: 7, targetConvoId: 'convo-x' });
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(INVITE_TTL_MS * 100);
+      expect(rooms.findLivePair('!owner', { peerDeviceId: 7, targetConvoId: 'convo-x' })).toMatchObject({ roomId: 'r1' });
+    } finally { vi.useRealTimers(); }
+  });
+});
