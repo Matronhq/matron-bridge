@@ -34,9 +34,19 @@ brew install cloudflared
 
 ```bash
 npm install
+npm run setup   # guided: asks for your journal URL + agent token, tests the connection, writes .env
+npm start
+```
+
+The wizard stores the agent token in a gitignored `.journal-token` file (mode 600),
+generates `HMAC_SECRET`, and leaves every other setting on its documented default.
+Re-run it any time to change answers; the previous `.env` is backed up to `.env.bak`.
+
+Prefer to configure by hand (or provisioning non-interactively)?
+
+```bash
 cp .env.example .env
 # Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, and HMAC_SECRET (openssl rand -hex 32) for file/secret links
-npm start
 ```
 
 ### Enable Codex
