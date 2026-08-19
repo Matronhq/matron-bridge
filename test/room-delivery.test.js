@@ -362,8 +362,8 @@ describe('formatRoomMessageNotice', () => {
 
   it('renders the user\'s own echo in the second person', () => {
     expect(formatRoomMessageNotice({
-      from: SELF_ECHO_LABEL, body: 'ship it', roomTitle: '↔️ [ab] M:cd ↔️ D:ef — ci triage', roomId: 'r1',
-    })).toBe('💬 You in "↔️ [ab] M:cd ↔️ D:ef — ci triage": ship it');
+      from: SELF_ECHO_LABEL, body: 'ship it', roomTitle: 'M:cd ↔️ D:ef — ci triage', roomId: 'r1',
+    })).toBe('💬 You in "M:cd ↔️ D:ef — ci triage": ship it');
   });
 });
 
