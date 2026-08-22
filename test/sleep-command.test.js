@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import {
-  sleepConfig, sleepButtons, sleepCardText, performSleep,
-  DEFAULT_WAKE_HINT, SLEEP_NOT_CONFIGURED,
+  sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand,
+  DEFAULT_WAKE_HINT, SLEEP_NOT_CONFIGURED, SLEEP_SETTLE_MS,
 } from '../lib/sleep-command.js';
 
 describe('sleepConfig', () => {
@@ -120,5 +121,80 @@ describe('performSleep', () => {
     const result = await performSleep({ command: 'poweroff', ...s });
     expect(result.ok).toBe(true);
     expect(s.exec).toHaveBeenCalledWith('poweroff');
+  });
+});
+
+describe('runSleepCommand', () => {
+  // A stand-in for a real ChildProcess: an EventEmitter with the stderr
+  // stream and unref() the seam actually touches.
+  function fakeChild() {
+    const child = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.unref = vi.fn();
+    return child;
+  }
+
+  function harness() {
+    const child = fakeChild();
+    const timers = [];
+    return {
+      child,
+      timers,
+      spawn: vi.fn(() => child),
+      setTimer: (fn, ms) => { timers.push({ fn, ms }); return 'handle'; },
+      fire: () => timers.forEach(t => t.fn()),
+    };
+  }
+
+  it('runs the command through sh -c, detached, so it outlives this process', () => {
+    const h = harness();
+    runSleepCommand('poweroff', h);
+    expect(h.spawn).toHaveBeenCalledWith('/bin/sh', ['-c', 'poweroff'],
+      expect.objectContaining({ detached: true }));
+  });
+
+  it('rejects when the spawn itself fails, instead of crashing the bridge', async () => {
+    // An unhandled 'error' event on a ChildProcess terminates the process.
+    // fork(2) returning EAGAIN under memory pressure is a real way to get one.
+    const h = harness();
+    const promise = runSleepCommand('poweroff', h);
+    h.child.emit('error', new Error('spawn EAGAIN'));
+    await expect(promise).rejects.toThrow('spawn EAGAIN');
+  });
+
+  it('rejects on a non-zero exit so a failed sleep is never reported as success', async () => {
+    const h = harness();
+    const promise = runSleepCommand('sudo systemctl poweroff', h);
+    h.child.stderr.emit('data', Buffer.from('sudo: a password is required\n'));
+    h.child.emit('exit', 1);
+    await expect(promise).rejects.toThrow(/sudo: a password is required/);
+  });
+
+  it('resolves on a clean exit', async () => {
+    const h = harness();
+    const promise = runSleepCommand('poweroff', h);
+    h.child.emit('exit', 0);
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it('resolves once the command is still running at the settle window', async () => {
+    // The shutdown is under way and this process is about to be torn down —
+    // waiting for an exit that will never be observed would hang the reply.
+    const h = harness();
+    const promise = runSleepCommand('poweroff', h);
+    expect(h.timers[0].ms).toBe(SLEEP_SETTLE_MS);
+    h.fire();
+    await expect(promise).resolves.toBeUndefined();
+    expect(h.child.unref).toHaveBeenCalled();
+  });
+
+  it('caps how much stderr it retains from a failing command', async () => {
+    const h = harness();
+    const promise = runSleepCommand('poweroff', h);
+    h.child.stderr.emit('data', Buffer.from('x'.repeat(10_000)));
+    h.child.emit('exit', 1);
+    await expect(promise).rejects.toThrow(/x{100}/);
+    const err = await promise.catch(e => e);
+    expect(err.message.length).toBeLessThan(3000);
   });
 });

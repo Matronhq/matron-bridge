@@ -53,7 +53,7 @@ import {
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
 import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton } from './lib/timer-command.js';
-import { sleepConfig, sleepButtons, sleepCardText, performSleep, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
+import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
@@ -7835,7 +7835,8 @@ function journalOnPromptReply(session, answer, { username }) {
     // the router verified the choice against the offered values of a picker
     // frame this bridge published.
     const skipsAliveGate = typeof answer.choice === 'string'
-      && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:') || answer.choice.startsWith('resume:'));
+      && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:')
+        || answer.choice.startsWith('resume:') || answer.choice.startsWith('sleep:'));
     if (!session.alive && !skipsAliveGate) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
@@ -8119,24 +8120,22 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
 //     point of its publish -> flush -> exec ordering is settling the goodbye
 //     before the host command tears this process down.
 //
-// Sessions are killed first, exactly as gracefulShutdown does: the host
-// command is about to stop the machine, and a clean agent teardown here beats
-// whatever SIGKILL the shutdown eventually delivers.
+// Sessions are deliberately NOT killed here. A command that works makes
+// systemd stop this unit, and gracefulShutdown already kills every session and
+// flushes on the way out — so doing it up front buys nothing, and on a command
+// that FAILS (passworded sudo) it would leave a live bridge with every session
+// destroyed and a user who was just told the box was going away.
 async function confirmSleepFromButton(session, sendReply) {
   const { command } = sleepConfig();
   await performSleep({
     command,
     publish: async text => { await sendReply(text); },
     flush: () => journalPublisher.flush({ timeoutMs: FLUSH_TIMEOUT_MS }),
-    exec: async cmd => {
-      for (const [, s] of sessions) killSession(s);
-      // Detached + unref'd: the command outlives this process by design, so
-      // it must not be reaped when the shutdown it triggers kills the bridge.
-      // `sh -c` is safe here precisely because `cmd` is deployer-set config,
-      // never chat input — see the invariant above.
-      const child = spawn('/bin/sh', ['-c', cmd], { detached: true, stdio: 'ignore' });
-      child.unref();
-    },
+    // runSleepCommand owns the spawn and its two failure modes (an
+    // asynchronous 'error', which unhandled would take the bridge down with
+    // it, and an early non-zero exit). `sh -c` is safe precisely because `cmd`
+    // is deployer-set config, never chat input — see the invariant above.
+    exec: cmd => runSleepCommand(cmd, { spawn }),
   });
 }
 

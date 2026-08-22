@@ -57,6 +57,25 @@ describe('/sleep wiring', () => {
     ).toMatch(/flush:.*journalPublisher\.flush/s);
   });
 
+  it('exempts sleep: taps from the session-alive gate', () => {
+    // /sleep is box-scoped: whether an AGENT session is alive has nothing to
+    // do with whether the machine can power off. Without the exemption a tap
+    // on a dead-but-present session (mid-teardown, idle-reaped, or a Codex
+    // logical session between turns) burns the single-use card and answers a
+    // sleep request with a message about model/effort/mode switching.
+    const body = bodyOf('const skipsAliveGate', 'if (!session.alive');
+    expect(body).toContain("startsWith('sleep:')");
+  });
+
+  it('does not kill sessions before the host command has succeeded', () => {
+    // A failed command (passworded sudo) would otherwise leave a live bridge
+    // with every session destroyed. On a command that DOES work, systemd
+    // SIGTERMs the bridge into gracefulShutdown, which kills sessions and
+    // flushes already — so doing it here is both redundant and destructive.
+    const body = bodyOf('async function confirmSleepFromButton(', '\n// A tap on the same card');
+    expect(body).not.toMatch(/killSession/);
+  });
+
   it('executes the configured command, never chat text', () => {
     const body = bodyOf('async function confirmSleepFromButton(', '\nasync function ');
     expect(
@@ -65,9 +84,10 @@ describe('/sleep wiring', () => {
     ).toMatch(/sleepConfig\(\)/);
     expect(
       body,
-      "the shell must run performSleep's `cmd` argument verbatim; interpolating anything "
-      + 'else into the command line is how chat text would reach a shell',
-    ).toMatch(/spawn\('\/bin\/sh', \['-c', cmd\]/);
+      "the shell must run performSleep's `cmd` argument verbatim, via the tested "
+      + 'runSleepCommand seam; interpolating anything else into the command line is how '
+      + 'chat text would reach a shell',
+    ).toMatch(/runSleepCommand\(cmd, \{ spawn \}\)/);
   });
 
   it('wires confirmSleep and cancelSleep into the picker dispatcher', () => {
