@@ -58,6 +58,25 @@ describe('--model wiring in the /start command family (source inspection)', () =
     expect(BLOCKS['!resume']()).toMatch(/const resumeArg = resumeModelFlag\.rest\[0\]/);
   });
 
+  // The no-session-id branch delegates to !sessions and RETURNS, so anything
+  // checked after it is unreachable for `/resume --model …` (Bugbot, PR
+  // #243). Anchored on the delegation call itself, not on any comment.
+  it('!resume answers a --model typed with no session id before falling back to the list', () => {
+    const block = BLOCKS['!resume']();
+    // Anchor on the delegation CALL, not on its argument text: an argument
+    // spelled any other way would leave indexOf finding a later, unmoved
+    // copy and the pin would pass through a real reordering. !resume makes
+    // exactly one nested handleCommand call, so this is unambiguous.
+    expect(block.match(/handleCommand\(roomId,/g)).toHaveLength(1);
+    const delegation = block.indexOf('handleCommand(roomId,');
+    expect(delegation).toBeGreaterThan(-1);
+    for (const anchor of ['resumeModelFlag.present', 'resumeModelFlag.error', 'CODEX_MODEL_FLAG_REFUSAL']) {
+      const at = block.indexOf(anchor);
+      expect(at).toBeGreaterThan(-1);
+      expect(at).toBeLessThan(delegation);
+    }
+  });
+
   it('!workdir reads its path positional from the extractor output', () => {
     expect(BLOCKS['!workdir']()).toContain('workdirModelFlag.rest.join(\' \')');
   });
@@ -97,6 +116,16 @@ describe('--model wiring in the /start command family (source inspection)', () =
     expect(block).toContain('...(model ? { model } : {})');
     expect(block).toContain('mcpExtras.length > 0 || model');
     expect(block).toContain('model ? { model } : undefined');
+  });
+
+  // journal-rpc.js gates model selection on the box's default agent and
+  // fails CLOSED, so an unwired dep costs the picker rather than starting
+  // Codex on a Claude alias — but the wire itself still has to be there.
+  it('the RPC handler is given the real DEFAULT_AGENT', () => {
+    const start = indexSource.indexOf('createRpcRequestHandler({');
+    expect(start).toBeGreaterThan(-1);
+    const block = indexSource.slice(start, indexSource.indexOf('\n});', start));
+    expect(block).toMatch(/^\s*defaultAgent: DEFAULT_AGENT,$/m);
   });
 
   it('the /help text documents --model', () => {

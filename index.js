@@ -773,6 +773,10 @@ const journalRpcHandler = createRpcRequestHandler({
   listPersistedSessions: () => Object.values(loadPersistedSessions()),
   listRememberedFolders: () => recentFolders.list(),
   defaultWorkdir: DEFAULT_WORKDIR,
+  // Gates model selection (the `model` param and the picker's
+  // model_options) — an RPC start mints a fresh convo, so this box default
+  // is the agent it will run as. Claude-only; see lib/journal-rpc.js.
+  defaultAgent: DEFAULT_AGENT,
   expandHome,
   // Capacity thunks (2026-08-10 capacity spec): answered from cache, never
   // blocking a reply on a subprocess. getLimits kicks a background refresh
@@ -6052,6 +6056,31 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const resumeArg = resumeModelFlag.rest[0]?.replace(/\.+$/, '') || undefined;
 
       if (!resumeArg) {
+        // A --model typed with nothing to resume must be answered, not
+        // dropped: without this the sessions list below is the reply to
+        // `/resume --model`, `/resume --model gpt-5` and a perfectly valid
+        // `/resume --model opus` alike (Bugbot, PR #243). There is no session
+        // id here to infer an agent from, so the flag is judged against the
+        // room's own agent — the same inputs the full resume below starts
+        // from, minus the id-prefix inference it has and this branch cannot.
+        if (resumeModelFlag.present) {
+          const listAgent = resolveAgent({
+            option: resumeAgentFlags.agent,
+            persisted: sessions.get(roomId)?.agent || getPersistedSession(roomId)?.agent,
+            fallback: DEFAULT_AGENT,
+          });
+          if (listAgent === AGENT_CODEX) {
+            await sendReply(CODEX_MODEL_FLAG_REFUSAL);
+            return;
+          }
+          if (resumeModelFlag.error) {
+            await sendReply(resumeModelFlag.error);
+            return;
+          }
+          // Valid alias, nothing to apply it to. Say so, then still show the
+          // list — it is what you need in order to name a session.
+          await sendReply(`--model applies to the session you resume, so it needs one: /resume <n|id> --model ${resumeModelFlag.model}.`);
+        }
         // No arg — show sessions list inline
         const flag = resumeAgentFlags.agent ? ` --${resumeAgentFlags.agent}` : '';
         await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml, sender);
