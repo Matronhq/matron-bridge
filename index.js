@@ -27,7 +27,7 @@ import {
   knownMcpExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
-import { modelFromEvent, modelOptions, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { aliasLabel, extractModelFlag, modelFromEvent, modelOptions, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import {
   resolveInteractive,
@@ -729,22 +729,31 @@ const subagentRunningStore = createSubagentRunningStore({ log: console });
 // origin-room replies — an RPC start has no origin chat room. Returns the
 // session; the RPC handler answers with its claudeSessionId (the journal
 // convo id — NOT the room key, which is bridge-internal).
-function journalStartSessionForRpc({ workdir, mcpExtras }) {
+function journalStartSessionForRpc({ workdir, mcpExtras, model = null }) {
   const sessionRoomId = newSessionConvoId();
   const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
   const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
   const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
     sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
-  const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
+  const session = createSession(sessionRoomId, workdir, undefined, {
+    mcpExtras,
+    ...(model ? { model } : {}),
+  });
   session.originRoomId = null;
   session.sendCallback = sessionSendReply;
   session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
-  // Same persistence rule as !start: claudeSessionId is known immediately
-  // (pre-assigned at spawn), so persist extras now rather than losing them
-  // to a bridge restart before the first transcript-driven persist.
-  if (mcpExtras.length > 0 && session.claudeSessionId) {
-    persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null);
+  // Same rules as !start: the requested model is the session's model from the
+  // first turn, and it must be set before persisting (the live snapshot reads
+  // currentModel). claudeSessionId is known immediately (pre-assigned at
+  // spawn), so persist extras/model now rather than losing them to a bridge
+  // restart before the first transcript-driven persist. model travels via the
+  // explicit `extra` — persistSession auto-carries mcpExtras but deliberately
+  // not model.
+  if (model) session.currentModel = model;
+  if ((mcpExtras.length > 0 || model) && session.claudeSessionId) {
+    persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null,
+      model ? { model } : undefined);
   }
   return session;
 }
@@ -764,6 +773,10 @@ const journalRpcHandler = createRpcRequestHandler({
   listPersistedSessions: () => Object.values(loadPersistedSessions()),
   listRememberedFolders: () => recentFolders.list(),
   defaultWorkdir: DEFAULT_WORKDIR,
+  // Gates model selection (the `model` param and the picker's
+  // model_options) — an RPC start mints a fresh convo, so this box default
+  // is the agent it will run as. Claude-only; see lib/journal-rpc.js.
+  defaultAgent: DEFAULT_AGENT,
   expandHome,
   // Capacity thunks (2026-08-10 capacity spec): answered from cache, never
   // blocking a reply on a subprocess. getLimits kicks a background refresh
@@ -5798,6 +5811,14 @@ function fetchUsageLimitsText(cwd) {
   });
 }
 
+// --model takes a Claude model alias (lib/model-aliases.js). Codex model ids
+// are a different namespace — validating one against Claude's aliases would
+// reject every real Codex model, and skipping validation would hand an
+// unchecked string to the spawn. Codex sessions set their model the way they
+// always have: `/model <model-id>` once the session is running.
+const CODEX_MODEL_FLAG_REFUSAL =
+  '--model selects a Claude model alias and is Claude-only. Start Codex without --model, then use /model <model-id> in the new conversation (or /model default for your Codex config default).';
+
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
@@ -5816,12 +5837,26 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(agentFlags.error);
         return;
       }
+      const startModelFlag = extractModelFlag(agentFlags.rest);
       const selectedAgent = resolveAgent({ option: agentFlags.agent, fallback: DEFAULT_AGENT });
       if (selectedAgent === AGENT_CODEX && mcpExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
         return;
       }
-      const arg = agentFlags.rest[0];
+      // --model names a CLAUDE model alias. Codex model ids are a different
+      // namespace entirely, so refuse the flag rather than validate a Codex
+      // id against Claude's aliases (or pass an unvalidated one through) —
+      // same shape of refusal as --browser above.
+      if (selectedAgent === AGENT_CODEX && startModelFlag.present) {
+        await sendReply(CODEX_MODEL_FLAG_REFUSAL);
+        return;
+      }
+      if (startModelFlag.error) {
+        await sendReply(startModelFlag.error);
+        return;
+      }
+      const startModel = startModelFlag.model;
+      const arg = startModelFlag.rest[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
       let workdir = DEFAULT_WORKDIR;
@@ -5850,17 +5885,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const session = createSession(sessionRoomId, workdir, undefined, {
         agent: selectedAgent, mcpExtras,
+        ...(startModel ? { model: startModel } : {}),
         ...(startBypass != null ? { bypass: startBypass } : {}),
       });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      // The requested model IS this session's model from the first turn — the
+      // spawn already carries --model, so say so rather than waiting for the
+      // first assistant event to observe it (same move applyModelSwitch makes
+      // on its replacement session). persistSession's live snapshot reads
+      // currentModel, so this must be set BEFORE persisting.
+      if (startModel) session.currentModel = startModel;
       // claudeSessionId is known immediately (pre-assigned in both modes),
-      // so persist mcpExtras now — otherwise a bridge restart before the
-      // first transcript-driven persist would lose the user's opt-in.
-      if (mcpExtras.length > 0 && session.claudeSessionId) {
-        persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
+      // so persist mcpExtras/model now — otherwise a bridge restart before
+      // the first transcript-driven persist would lose the user's opt-in.
+      // model goes through the explicit `extra` argument: persistSession
+      // auto-carries mcpExtras but deliberately not model (in-TUI /model
+      // picks are session-scoped and must not be persisted).
+      if ((mcpExtras.length > 0 || startModel) && session.claudeSessionId) {
+        persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId,
+          startModel ? { model: startModel } : undefined);
       }
 
       // Confirm in the origin room/convo. No matrix.to room link: Matron is
@@ -5868,7 +5914,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
       const permNote = permissionNote(session);
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${extrasNote}${permNote}.`);
+      const startModelNote = startModel ? ` on ${aliasLabel(startModel)}` : '';
+      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.`);
       break;
     }
 
@@ -5918,6 +5965,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`A ${agentLabel(existing.agent)} conversation can't be resumed by ${agentLabel(restartAgentFlags.agent)}. Use /start --${restartAgentFlags.agent} for a new conversation.`);
         return;
       }
+      const restartModelFlag = extractModelFlag(restartAgentFlags.rest);
+      if (existing.agent === AGENT_CODEX && restartModelFlag.present) {
+        await sendReply(CODEX_MODEL_FLAG_REFUSAL);
+        return;
+      }
+      if (restartModelFlag.error) {
+        await sendReply(restartModelFlag.error);
+        return;
+      }
       if (existing.agent === AGENT_CODEX && restartFlagExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
         return;
@@ -5953,18 +6009,29 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
       const restarted = recreateSession(roomId, {
         mcpExtras: effectiveRestartExtras,
+        // No --model preserves the live model: recreateSession already
+        // carries existing.currentModel across the swap.
+        ...(restartModelFlag.model ? { model: restartModelFlag.model } : {}),
         // Pass undefined (not a coerced false) when nothing was persisted, so
         // a pre-feature session falls through to the box default instead of
         // being forced into auto mode by the coercion.
         bypass: restartBypass != null ? restartBypass
           : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
       }, { sendReply, sendHtml });
+      // Persist AFTER the recreate: recreateSession persists mid-flight from
+      // the replacement's live snapshot, which cannot know the new model yet.
+      if (restartModelFlag.model && restarted) {
+        restarted.currentModel = restartModelFlag.model;
+        persistSession(roomId, restarted.claudeSessionId, restarted.workdir, restarted.originRoomId,
+          { model: restartModelFlag.model });
+      }
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
+      const restartModelLine = restartModelFlag.model ? `\nModel: ${aliasLabel(restartModelFlag.model)}` : '';
       const restartPermNote = permissionNote(restarted);
       await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}${restartPermNote}`
+        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}${restartModelLine}${restartPermNote}`
       );
       break;
     }
@@ -5982,9 +6049,38 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(resumeAgentFlags.error);
         return;
       }
-      const resumeArg = resumeAgentFlags.rest[0]?.replace(/\.+$/, '') || undefined;
+      // Parsed here so the session-id positional below is read from a token
+      // list with the flag removed; the agent-dependent checks wait until
+      // selectedAgent is final (an id prefix can pick the agent for you).
+      const resumeModelFlag = extractModelFlag(resumeAgentFlags.rest);
+      const resumeArg = resumeModelFlag.rest[0]?.replace(/\.+$/, '') || undefined;
 
       if (!resumeArg) {
+        // A --model typed with nothing to resume must be answered, not
+        // dropped: without this the sessions list below is the reply to
+        // `/resume --model`, `/resume --model gpt-5` and a perfectly valid
+        // `/resume --model opus` alike (Bugbot, PR #243). There is no session
+        // id here to infer an agent from, so the flag is judged against the
+        // room's own agent — the same inputs the full resume below starts
+        // from, minus the id-prefix inference it has and this branch cannot.
+        if (resumeModelFlag.present) {
+          const listAgent = resolveAgent({
+            option: resumeAgentFlags.agent,
+            persisted: sessions.get(roomId)?.agent || getPersistedSession(roomId)?.agent,
+            fallback: DEFAULT_AGENT,
+          });
+          if (listAgent === AGENT_CODEX) {
+            await sendReply(CODEX_MODEL_FLAG_REFUSAL);
+            return;
+          }
+          if (resumeModelFlag.error) {
+            await sendReply(resumeModelFlag.error);
+            return;
+          }
+          // Valid alias, nothing to apply it to. Say so, then still show the
+          // list — it is what you need in order to name a session.
+          await sendReply(`--model applies to the session you resume, so it needs one: /resume <n|id> --model ${resumeModelFlag.model}.`);
+        }
         // No arg — show sessions list inline
         const flag = resumeAgentFlags.agent ? ` --${resumeAgentFlags.agent}` : '';
         await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml, sender);
@@ -6037,6 +6133,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         else if (claudeMatches.size === 1) selectedAgent = AGENT_CLAUDE;
       }
 
+      if (selectedAgent === AGENT_CODEX && resumeModelFlag.present) {
+        await sendReply(CODEX_MODEL_FLAG_REFUSAL);
+        return;
+      }
+      if (resumeModelFlag.error) {
+        await sendReply(resumeModelFlag.error);
+        return;
+      }
       if (selectedAgent === AGENT_CODEX) {
         if (resumeExtras.length > 0) {
           await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
@@ -6180,7 +6284,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : resumeState.mcpExtras;
       const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, {
         agent: selectedAgent,
-        model: resumeState.model,
+        // An explicit --model overrides what this session last ran on.
+        model: resumeModelFlag.model || resumeState.model,
         mcpExtras: effectiveResumeExtras,
         journalConvoId: resumePersisted?.journalConvoId,
         agentSessions: inheritedAgentSessions,
@@ -6202,6 +6307,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
       session._agentSessions = inheritedAgentSessions;
+      // The model this session just spawned with IS its current model — the
+      // spawn already carries --model. Without this the persist below writes
+      // `model: session.currentModel || null` as null and the selection is
+      // dropped on the next resume, --model flag or carried value alike.
+      const resumedModel = resumeModelFlag.model || resumeState.model || null;
+      if (resumedModel) session.currentModel = resumedModel;
       hydrateAgentState(session, {
         ...(resumePersisted || {}),
         agent: selectedAgent,
@@ -6233,11 +6344,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       });
 
       const resumePermNote = permissionNote(session);
+      const resumeModelLine = resumeModelFlag.model ? `\nModel: ${aliasLabel(resumeModelFlag.model)}` : '';
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
-      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${resumePermNote}\n\nSend any message to continue.`;
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${resumeModelLine}${resumePermNote}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(session.workdir)}</code>${escapeHtml(resumePermNote)}<br/><br/>` +
+        `Workdir: <code>${escapeHtml(session.workdir)}</code>` +
+        `${resumeModelFlag.model ? `<br/>Model: <code>${escapeHtml(aliasLabel(resumeModelFlag.model))}</code>` : ''}` +
+        `${escapeHtml(resumePermNote)}<br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
@@ -6256,12 +6370,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(workdirAgentFlags.error);
         return;
       }
+      const workdirModelFlag = extractModelFlag(workdirAgentFlags.rest);
       const selectedAgent = resolveAgent({ option: workdirAgentFlags.agent, fallback: DEFAULT_AGENT });
       if (selectedAgent === AGENT_CODEX && workdirExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
         return;
       }
-      const newDir = workdirAgentFlags.rest.join(' ');
+      if (selectedAgent === AGENT_CODEX && workdirModelFlag.present) {
+        await sendReply(CODEX_MODEL_FLAG_REFUSAL);
+        return;
+      }
+      if (workdirModelFlag.error) {
+        await sendReply(workdirModelFlag.error);
+        return;
+      }
+      const workdirModel = workdirModelFlag.model;
+      // Joined, not [0]: a workdir may contain spaces.
+      const newDir = workdirModelFlag.rest.join(' ');
       if (!newDir) {
         const session = sessions.get(roomId);
         const current = session?.workdir || DEFAULT_WORKDIR;
@@ -6292,22 +6417,30 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const session = createSession(sessionRoomId, resolved, undefined, {
         agent: selectedAgent, mcpExtras: workdirExtras,
+        ...(workdirModel ? { model: workdirModel } : {}),
         ...(workdirBypass != null ? { bypass: workdirBypass } : {}),
       });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
-      if (workdirExtras.length > 0 && session.claudeSessionId) {
-        persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
+      // Same rule as !start: set currentModel before persisting (the live
+      // snapshot reads it) and pass model through the explicit `extra`.
+      if (workdirModel) session.currentModel = workdirModel;
+      if ((workdirExtras.length > 0 || workdirModel) && session.claudeSessionId) {
+        persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId,
+          workdirModel ? { model: workdirModel } : undefined);
       }
 
       const workdirPermNote = permissionNote(session);
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}`);
-      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
+      const workdirModelLine = workdirModel ? `\nModel: ${aliasLabel(workdirModel)}` : '';
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}${workdirModelLine}`);
+      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${workdirModelLine}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
         `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(resolved)}</code>${escapeHtml(workdirPermNote)}<br/><br/>` +
+        `Workdir: <code>${escapeHtml(resolved)}</code>` +
+        `${workdirModel ? `<br/>Model: <code>${escapeHtml(aliasLabel(workdirModel))}</code>` : ''}` +
+        `${escapeHtml(workdirPermNote)}<br/><br/>` +
         `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
       await sessionSendHtml(wdPlain, wdHtml);
       break;
@@ -6457,6 +6590,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
         `/start --auto [workdir] — Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir\n` +
+        `/start --model <alias> [workdir] — Start on a specific Claude model (${VALID_ALIAS_HINT}, or a full claude-* name); also accepted by /restart, /resume, /workdir. Claude only\n` +
         `/stop — Stop the current session\n` +
         `/restart — Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)\n` +
         `/resume [--claude|--codex] <n|id> — Resume a session from that agent\n` +
@@ -6498,6 +6632,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
           ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
+          ['/start --model &lt;alias&gt; [workdir]', `Start on a specific Claude model (${escapeHtml(VALID_ALIAS_HINT)}, or a full <code>claude-*</code> name); also accepted by /restart, /resume, /workdir. Claude only`],
           ['/stop', 'Stop the current session'],
           ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)'],
           ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
