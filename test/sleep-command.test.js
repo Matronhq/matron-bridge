@@ -170,6 +170,17 @@ describe('runSleepCommand', () => {
     await expect(promise).rejects.toThrow(/sudo: a password is required/);
   });
 
+  it('treats a signal kill as the shutdown reaping us, not as a failure', async () => {
+    // `exit` reports code === null when the child was killed by a signal, and
+    // a real poweroff SIGTERMs everything inside the settle window. Reporting
+    // that as "still awake" contradicts a machine that is genuinely going
+    // down — the opposite of the honest failure this seam exists for.
+    const h = harness();
+    const promise = runSleepCommand('poweroff', h);
+    h.child.emit('exit', null, 'SIGTERM');
+    await expect(promise).resolves.toBeUndefined();
+  });
+
   it('resolves on a clean exit', async () => {
     const h = harness();
     const promise = runSleepCommand('poweroff', h);

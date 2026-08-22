@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash: `node_modules/` matches a directory only, so a SYMLINK
+# named node_modules (what you get pointing a git worktree at the main
+# checkout's install) stays unignored and rides along in `git add -A`.
+node_modules
 .env
 *.log
 .mcp-config-generated*.json
