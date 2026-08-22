@@ -1,7 +1,50 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import http from 'node:http';
 import { createJournalMediaRouter } from '../lib/journal-media.js';
+import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
+
+function delay(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+// A fake journal blob store that serves the blobs it's given and STALLS on
+// everything else: headers written, body never sent, socket held open. That's
+// the real-world half-dead connection (cellular drop mid-download) the
+// fetchMedia abort deadline exists to bound — no fake can reproduce it from
+// the injected-mock side, so this test drives the router through the real
+// publisher.fetchMedia.
+function startStallingBlobServer(bodies) {
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    const id = decodeURIComponent((req.url || '').replace(/^\/media\//, ''));
+    const body = bodies[id];
+    if (!body) {
+      // Never res.end() — the client hangs in res.arrayBuffer() forever.
+      res.writeHead(200, { 'content-type': 'image/png' });
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(body.length) });
+    res.end(body);
+  });
+  server.on('connection', (s) => {
+    sockets.add(s);
+    s.on('close', () => sockets.delete(s));
+  });
+  return new Promise((resolve, reject) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        port: server.address().port,
+        close: () => new Promise((r) => {
+          for (const s of sockets) s.destroy();
+          server.close(r);
+        }),
+      });
+    });
+    server.on('error', reject);
+  });
+}
 
 // Same fully-injected harness as journal-media.test.js — see there for the
 // rationale. These tests cover the multi-attachment batch path: frames
@@ -357,5 +400,50 @@ describe('createJournalMediaRouter — multi-attachment batches', () => {
 
     expect(deps.queueMedia).not.toHaveBeenCalled();
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+  });
+
+  it('a sibling whose download never completes cannot stall the batch forever (fetch abort deadline)', async () => {
+    // The in-flight hold parks the quiet timer for the whole of a frame's
+    // processing, which is only safe because every step of that processing is
+    // itself bounded. A blob fetch that hangs in the body read (server wrote
+    // headers, then the connection went dead) is the one step that used to
+    // have no ceiling: the hold was never released, the quiet timer never
+    // re-armed, and the sibling frame that HAD arrived was never delivered.
+    // Driven through the real publisher.fetchMedia — an injected mock can't
+    // exercise the deadline that lives inside it.
+    const blobs = await startStallingBlobServer({ 'blob-ok.png': Buffer.from('img') });
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${blobs.port}/ws`,
+      token: 'tok',
+      log: silentLog,
+      backoffBaseMs: 15,
+      backoffCapMs: 60,
+      fetchMediaTimeoutMs: 200,
+    });
+    // A quiet window far longer than the test: delivery here can only come
+    // from the stalled frame settling, never from the partial-batch timer.
+    const { route, deps } = makeRouter({ fetchMedia: pub.fetchMedia, batchQuietMs: 600_000 });
+
+    try {
+      await route(session, frame('ok.png', { id: 'BS1', index: 1, total: 2 }), ctx);
+      expect(deps.injectBlocks).not.toHaveBeenCalled();
+
+      const stalled = route(session, frame('stall.png', { id: 'BS1', index: 2, total: 2 }), ctx);
+      const outcome = await Promise.race([
+        stalled.then(() => 'settled'),
+        delay(3_000).then(() => 'hung'),
+      ]);
+      expect(outcome).toBe('settled');
+
+      // The stalled frame deposited null, which completed the batch: the
+      // frame that did arrive reaches claude, and the user is told about the
+      // one that didn't.
+      expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+      expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text)).toEqual(['saved:ok.png']);
+      expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/fetch/));
+    } finally {
+      pub.close();
+      await blobs.close();
+    }
   });
 });

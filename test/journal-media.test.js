@@ -360,6 +360,9 @@ describe('createJournalMediaRouter — video (frame extraction)', () => {
     expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1); // raw-file fallback
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
     expect(warnings.some((w) => /frame extraction failed/.test(w))).toBe(true);
+    // The fallback is otherwise invisible: the user sees a normal "sent a
+    // video" echo and claude gets an unreadable binary. Say so.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/raw file/));
   });
 
   it('falls back to the plain file path when buildVideoBlocks returns null/empty', async () => {
@@ -370,6 +373,9 @@ describe('createJournalMediaRouter — video (frame extraction)', () => {
     await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
     expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1);
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    // Extraction ran and produced nothing — same user-visible outcome as a
+    // throw, same notice.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/raw file/));
   });
 
   it('routes video as a plain file when no buildVideoBlocks seam is wired (backwards compatible)', async () => {
@@ -377,6 +383,9 @@ describe('createJournalMediaRouter — video (frame extraction)', () => {
     await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
     expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1);
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    // No extraction was ever attempted here, so there's nothing to apologise
+    // for — the fallback notice belongs to a FAILED extraction only.
+    expect(deps.publishNotice).not.toHaveBeenCalled();
   });
 
   it('a busy session QUEUES the video frames entry (mirrorToJournal:false, 🎬 preview)', async () => {
