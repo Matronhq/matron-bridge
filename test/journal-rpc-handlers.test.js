@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createRpcRequestHandler, composeSpawnOpeningTurn } from '../lib/journal-rpc.js';
+import { modelOptions, isValidModelArg } from '../lib/model-aliases.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 const REQ = (method, params, id = 'r1') => ({ request_id: id, from_device_id: 7, method, params });
@@ -155,6 +156,26 @@ describe('recent_folders', () => {
     expect('limits' in result).toBe(false);
     expect('disk' in result).toBe(false);
     expect(result.folders.map((f) => f.path)).toEqual(['/w/a', '/home/dan']);
+  });
+
+  // model_options is what fills the apps' New Chat model picker BEFORE a
+  // session exists (a status frame's model_options only arrives once one
+  // does). Always present, stable order, default first.
+  it('always carries model_options: {value,label} pairs, default first', () => {
+    const { handler, responses } = harness();
+    handler(REQ('recent_folders', {}));
+    const options = responses[0].result.model_options;
+    expect(Array.isArray(options)).toBe(true);
+    expect(options[0]).toEqual({ value: 'default', label: 'Default' });
+    expect(options).toEqual(modelOptions());
+    for (const o of options) {
+      expect(Object.keys(o).sort()).toEqual(['label', 'value']);
+      expect(typeof o.value).toBe('string');
+      expect(typeof o.label).toBe('string');
+    }
+    // Every offered value must survive the `start` handler's own validation,
+    // or the picker offers a model that answers bad_model.
+    for (const o of options) expect(isValidModelArg(o.value)).toBe(true);
   });
 
   it('attaches the account block when an email is known', () => {
@@ -354,6 +375,75 @@ describe('start', () => {
       handler(REQ('start', { room_id: 'room-42', prompt: 'do the thing' }));
       expect(stopped).toEqual([session]);
       expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'unsupported_mode', detail: 'spawn-room wiring absent' } });
+    });
+  });
+
+  // Wire contract: `model` is an optional Claude model alias (or full
+  // claude-* name), validated here so a typo can't reach the spawn as a
+  // bogus --model argument.
+  describe('model param', () => {
+    it('a valid alias reaches startSession, normalized', () => {
+      const calls = [];
+      const { handler, responses } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { workdir: '~/yearbook-app', model: 'Opus[1M]' }));
+      expect(calls).toEqual([{ workdir: '/home/dan/yearbook-app', mcpExtras: [], model: 'opus[1m]' }]);
+      expect(responses[0].ok).toBe(true);
+    });
+
+    it('a full claude-* model name is accepted', () => {
+      const calls = [];
+      const { handler } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { model: 'claude-opus-4-8' }));
+      expect(calls[0].model).toBe('claude-opus-4-8');
+    });
+
+    it('an omitted model leaves the key off the startSession call entirely', () => {
+      const calls = [];
+      const { handler } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', {}));
+      expect('model' in calls[0]).toBe(false);
+    });
+
+    it('bad_model on an unknown alias — and no session is spawned', () => {
+      const calls = [];
+      const { handler, responses } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { model: 'gpt-5' }));
+      expect(calls).toEqual([]);
+      expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'bad_model', detail: 'gpt-5' } });
+    });
+
+    it('bad_model on a non-string model, reporting the type rather than [object Object]', () => {
+      for (const model of [42, {}, true]) {
+        const { handler, responses } = harness();
+        handler(REQ('start', { model }));
+        expect(responses[0].ok).toBe(false);
+        expect(responses[0].error.code).toBe('bad_model');
+        expect(responses[0].error.detail).toBe(typeof model);
+      }
+    });
+
+    // JSON's two spellings of "the user picked nothing" (and the empty
+    // string a bound text field sends) read as absent — the same rule the
+    // prompt/from_name params above use. Bricking New Chat over an
+    // explicit null would be a poor trade for strictness.
+    it('null and empty string mean "no pick", not an error', () => {
+      for (const model of [null, '']) {
+        const calls = [];
+        const { handler, responses } = harness({
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+        });
+        handler(REQ('start', { model }));
+        expect(responses[0].ok).toBe(true);
+        expect('model' in calls[0]).toBe(false);
+      }
     });
   });
 });
