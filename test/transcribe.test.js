@@ -22,7 +22,7 @@ vi.mock('fs', () => ({
 
 import { execFile } from 'child_process';
 import fs from 'fs';
-import { transcribeAudio, MIME_TO_EXT } from '../lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments, parseWhisperSegments, MIME_TO_EXT } from '../lib/transcribe.js';
 
 function mockExecFile(ffmpegResult, whisperResult) {
   const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
@@ -228,5 +228,84 @@ describe('transcribeAudio', () => {
 
     const whisperCall = execFileCalls.find(c => c.cmd.includes('whisper-cli'));
     expect(whisperCall.args).toContain('de');
+  });
+});
+
+describe('parseWhisperSegments', () => {
+  it('parses timestamped whisper-cli lines into {start, text}', () => {
+    const stdout = [
+      '[00:00:00.000 --> 00:00:04.320]   So here\'s the checkout page.',
+      '[00:00:04.320 --> 00:00:07.100]   And when I tap Pay, it freezes.',
+    ].join('\n');
+    expect(parseWhisperSegments(stdout)).toEqual([
+      { start: 0, text: "So here's the checkout page." },
+      { start: 4.32, text: 'And when I tap Pay, it freezes.' },
+    ]);
+  });
+
+  it('handles hour-scale timestamps', () => {
+    const stdout = '[01:01:01.500 --> 01:01:03.000]  late remark';
+    expect(parseWhisperSegments(stdout)).toEqual([{ start: 3661.5, text: 'late remark' }]);
+  });
+
+  it('drops non-speech markers and empty segments', () => {
+    const stdout = [
+      '[00:00:00.000 --> 00:00:02.000]  [BLANK_AUDIO]',
+      '[00:00:02.000 --> 00:00:04.000]  (typing sounds)',
+      '[00:00:04.000 --> 00:00:05.000]   ',
+      '[00:00:05.000 --> 00:00:06.000]  real words',
+      'whisper diagnostic line without brackets',
+    ].join('\n');
+    expect(parseWhisperSegments(stdout)).toEqual([{ start: 5, text: 'real words' }]);
+  });
+});
+
+describe('transcribeAudioSegments', () => {
+  const fakeBuffer = Buffer.from('fake video data');
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    execFileCalls.length = 0;
+  });
+
+  it('runs whisper WITH timestamps and returns parsed segments', async () => {
+    mockExecFile(
+      { stdout: '', stderr: '' },
+      { stdout: '[00:00:00.000 --> 00:00:03.000]  hello there, watch this closely' },
+    );
+    const segments = await transcribeAudioSegments(fakeBuffer, 'video/mp4', CONFIG);
+    expect(segments).toEqual([{ start: 0, text: 'hello there, watch this closely' }]);
+    const whisperCall = execFileCalls.find((c) => c.cmd.includes('whisper-cli'));
+    expect(whisperCall.args).not.toContain('--no-timestamps');
+  });
+
+  it('accepts a video container: input keeps the video extension, ffmpeg drops the video track', async () => {
+    mockExecFile({ stdout: '' }, { stdout: '[00:00:00.000 --> 00:00:01.000] x' });
+    await transcribeAudioSegments(fakeBuffer, 'video/quicktime', CONFIG);
+    const writtenPath = fs.writeFileSync.mock.calls[0][0];
+    expect(writtenPath).toMatch(/input\.mov$/);
+    const ffmpegCall = execFileCalls.find((c) => c.cmd === 'ffmpeg');
+    expect(ffmpegCall.args).toContain('-vn');
+  });
+
+  it('returns [] for silence instead of throwing (a mute recording is not an error)', async () => {
+    mockExecFile({ stdout: '' }, { stdout: '[00:00:00.000 --> 00:00:09.000]  [BLANK_AUDIO]' });
+    const segments = await transcribeAudioSegments(fakeBuffer, 'video/mp4', CONFIG);
+    expect(segments).toEqual([]);
+  });
+
+  it('drops whisper\'s silence hallucination (a lone tiny segment like "you")', async () => {
+    // Verified against a real near-silent screen recording: whisper emits a
+    // single hallucinated "you"/"Thank you." — a fake narration section is
+    // worse than none.
+    mockExecFile({ stdout: '' }, { stdout: '[00:00:00.000 --> 00:00:09.000]  you' });
+    const segments = await transcribeAudioSegments(fakeBuffer, 'video/mp4', CONFIG);
+    expect(segments).toEqual([]);
+  });
+
+  it('cleans up temp files on whisper error', async () => {
+    mockExecFile({ stdout: '' }, { error: new Error('whisper died') });
+    await expect(transcribeAudioSegments(fakeBuffer, 'video/mp4', CONFIG)).rejects.toThrow('whisper died');
+    expect(fs.rmSync).toHaveBeenCalledWith(expect.stringContaining('voice-'), { recursive: true, force: true });
   });
 });

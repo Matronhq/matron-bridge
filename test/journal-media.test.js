@@ -308,3 +308,101 @@ describe('createJournalMediaRouter — busy session queues instead of injecting'
     expect(deps.queueMedia).not.toHaveBeenCalled();
   });
 });
+
+describe('createJournalMediaRouter — video (frame extraction)', () => {
+  const videoFetch = () => vi.fn(async () => ({ buffer: Buffer.from('mov'), contentType: 'video/quicktime' }));
+  const videoBlocks = [{ type: 'text', text: '🎬 Video attached: clip.mov (13s screen recording). 4 key frames…' }];
+
+  it('a video content-type routes through buildVideoBlocks and injects its blocks', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, { type: 'file', blobRef: 'vid-1', contentType: 'video/quicktime', name: 'clip.mov', caption: 'find the bug' }, ctx);
+
+    expect(deps.buildVideoBlocks).toHaveBeenCalledTimes(1);
+    const [sess, args] = deps.buildVideoBlocks.mock.calls[0];
+    expect(sess).toBe(session);
+    expect(args).toMatchObject({ mime: 'video/quicktime', name: 'clip.mov', caption: 'find the bug' });
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, videoBlocks);
+    expect(deps.buildSavedBlocks).not.toHaveBeenCalled();
+    expect(deps.transcribe).not.toHaveBeenCalled();
+  });
+
+  it('room echo says "a video", not "a file"', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+    expect(deps.echoToRoom.mock.calls[0][1]).toMatch(/sent a video/);
+  });
+
+  it('detects video from the fetched content-type when the frame declared octet-stream', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'application/octet-stream', name: 'clip.mov' }, ctx);
+    expect(deps.buildVideoBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].mime).toBe('video/quicktime');
+  });
+
+  it('falls back to the plain file path when extraction throws (raw video still delivered)', async () => {
+    const warnings = [];
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => { throw new Error('ffmpeg not found'); }),
+      log: { warn: (...a) => warnings.push(a.join(' ')), error: () => {} },
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1); // raw-file fallback
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(warnings.some((w) => /frame extraction failed/.test(w))).toBe(true);
+    // The fallback is otherwise invisible: the user sees a normal "sent a
+    // video" echo and claude gets an unreadable binary. Say so.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/raw file/));
+  });
+
+  it('falls back to the plain file path when buildVideoBlocks returns null/empty', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => null),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    // Extraction ran and produced nothing — same user-visible outcome as a
+    // throw, same notice.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/raw file/));
+  });
+
+  it('routes video as a plain file when no buildVideoBlocks seam is wired (backwards compatible)', async () => {
+    const { route, deps } = makeRouter({ fetchMedia: videoFetch() });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    // No extraction was ever attempted here, so there's nothing to apologise
+    // for — the fallback notice belongs to a FAILED extraction only.
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('a busy session QUEUES the video frames entry (mirrorToJournal:false, 🎬 preview)', async () => {
+    const busySession = { claudeSessionId: 'convo-1', roomId: '!r:s', busy: true };
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(busySession, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.queueMedia).toHaveBeenCalledTimes(1);
+    const [, entry] = deps.queueMedia.mock.calls[0];
+    expect(entry).toMatchObject({
+      blocks: videoBlocks,
+      mirrorToJournal: false,
+      preview: '🎬 clip.mov',
+    });
+  });
+});
