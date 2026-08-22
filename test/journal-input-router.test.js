@@ -802,6 +802,8 @@ describe('promptExpectsReply', () => {
     // Load-bearing for /timer: the set card must not advance the staleness
     // guard, or setting a timer would make the NEXT genuine reply "stale".
     expect(promptExpectsReply({ options: [{ id: 'timer-cancel-5', label: '🚫 Cancel timer' }] })).toBe(false);
+    // Same for the /sleep confirmation card.
+    expect(promptExpectsReply({ options: [{ id: 'sleep-confirm', label: '😴 Sleep now' }] })).toBe(false);
   });
 
   it('is false for queue-notification action buttons (cancel/interrupt)', () => {
@@ -1222,6 +1224,9 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     ['mode:print', [{ id: 'mode-print', value: 'mode:print' }]],
     // The /timer set-confirmation card's Cancel button rides the same path.
     ['timer:cancel:5', [{ id: 'timer-cancel-5', value: 'timer:cancel:5' }]],
+    // The /sleep confirmation card too — a tap that fell through to
+    // pending-prompt routing would silently fail to stop the box.
+    ['sleep:confirm', [{ id: 'sleep-confirm', value: 'sleep:confirm' }, { id: 'sleep-cancel', value: 'sleep:cancel' }]],
   ])(
     'a %s tap whose target_seq identifies its picker frame routes (flagged picker) even past a later answerable prompt',
     (choice, opts) => {
