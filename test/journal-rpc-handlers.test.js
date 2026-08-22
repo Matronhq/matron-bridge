@@ -13,6 +13,10 @@ function harness(overrides = {}) {
     stopSession: () => {},
     listPersistedSessions: () => [],
     defaultWorkdir: '/home/dan',
+    // index.js wires the real DEFAULT_AGENT here. Model selection is offered
+    // only when this says claude, so the harness has to state it — see the
+    // "codex-default box" tests for what an unwired/codex value does.
+    defaultAgent: 'claude',
     expandHome: (p) => p.replace(/^~(?=\/|$)/, '/home/dan'),
     statSync: () => ({ isDirectory: () => true }),
     log: silentLog,
@@ -176,6 +180,21 @@ describe('recent_folders', () => {
     // Every offered value must survive the `start` handler's own validation,
     // or the picker offers a model that answers bad_model.
     for (const o of options) expect(isValidModelArg(o.value)).toBe(true);
+  });
+
+  // A Codex-default box cannot start a session on a Claude alias, so the New
+  // Chat picker must not offer one (CodeRabbit, PR #243). Fails CLOSED: an
+  // unwired defaultAgent offers nothing rather than offering aliases that
+  // can never start.
+  it('omits model_options on a codex-default box, and when defaultAgent is unwired', () => {
+    for (const defaultAgent of ['codex', 'CODEX', undefined, null, 'nonsense']) {
+      const { handler, responses } = harness({ defaultAgent });
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].ok).toBe(true);
+      expect('model_options' in responses[0].result).toBe(false);
+      // The rest of the reply is unaffected.
+      expect(responses[0].result.folders).toEqual([{ path: '/home/dan', last_used: null }]);
+    }
   });
 
   it('attaches the account block when an email is known', () => {
@@ -428,6 +447,36 @@ describe('start', () => {
         expect(responses[0].error.code).toBe('bad_model');
         expect(responses[0].error.detail).toBe(typeof model);
       }
+    });
+
+    // A fresh RPC start has no persisted room state, so its agent IS the
+    // box default — a Claude alias would reach a Codex spawn as
+    // `--model opus` (CodeRabbit, PR #243). Refused whether or not the alias
+    // is a valid Claude one, and refused when defaultAgent is unwired.
+    it('refuses any model on a codex-default box, before alias validation, spawning nothing', () => {
+      for (const defaultAgent of ['codex', undefined, 'nonsense']) {
+        const calls = [];
+        const { handler, responses } = harness({
+          defaultAgent,
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+        });
+        handler(REQ('start', { model: 'opus' }));
+        expect(calls).toEqual([]);
+        expect(responses[0].ok).toBe(false);
+        expect(responses[0].error.code).toBe('bad_model');
+        expect(responses[0].error.detail).toMatch(/codex/i);
+      }
+    });
+
+    it('a codex-default box still starts fine with no model', () => {
+      const calls = [];
+      const { handler, responses } = harness({
+        defaultAgent: 'codex',
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { workdir: '~/yearbook-app' }));
+      expect(responses[0].ok).toBe(true);
+      expect(calls).toEqual([{ workdir: '/home/dan/yearbook-app', mcpExtras: [] }]);
     });
 
     // JSON's two spellings of "the user picked nothing" (and the empty
