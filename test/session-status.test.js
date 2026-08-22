@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
+import { join, basename } from 'path';
 import { fileURLToPath } from 'url';
 import {
   contextWindowFor,
@@ -208,6 +209,63 @@ describe('buildSessionStatus', () => {
     expect('vitals' in buildSessionStatus({ model: 'claude-fable-5', vitals: null })).toBe(false);
     expect('vitals' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
   });
+
+  it('carries the composer argument lists as model_options / effort_levels', () => {
+    const status = buildSessionStatus({
+      model: 'claude-fable-5',
+      modelOptions: [{ value: 'opus', label: 'Opus' }],
+      effortLevels: [{ value: 'high', label: 'High' }],
+    });
+    expect(status.model_options).toEqual([{ value: 'opus', label: 'Opus' }]);
+    expect(status.effort_levels).toEqual([{ value: 'high', label: 'High' }]);
+  });
+
+  it('publishes EMPTY lists as empties — "this agent offers nothing", not "no opinion"', () => {
+    // Codex says this. Under a sticky merge, omitting the lists after a
+    // mid-session /switch claude→codex would leave Claude's seven effort
+    // levels offered on a session whose /effort refuses them.
+    const status = buildSessionStatus({ model: 'gpt-5.6-codex', modelOptions: [], effortLevels: [] });
+    expect(status.model_options).toEqual([]);
+    expect(status.effort_levels).toEqual([]);
+  });
+
+  it('omits the lists only when the caller has no opinion at all (old bridges, subagent frames)', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5' });
+    expect('model_options' in status).toBe(false);
+    expect('effort_levels' in status).toBe(false);
+    const explicit = buildSessionStatus({ model: 'claude-fable-5', modelOptions: undefined, effortLevels: undefined });
+    expect('model_options' in explicit).toBe(false);
+    expect('effort_levels' in explicit).toBe(false);
+  });
+
+  it('carries the current effort level as a string when tracked', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', effort: 'xhigh' })).toEqual({
+      model: 'claude-fable-5',
+      effort: 'xhigh',
+    });
+  });
+
+  it('publishes an EXPLICIT null while effort is unknown — clients merge stickily, so absent means "unchanged"', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5', effort: null });
+    expect('effort' in status).toBe(true);
+    expect(status.effort).toBeNull();
+    // An empty string is unknown too, and must not publish as "".
+    expect(buildSessionStatus({ model: 'claude-fable-5', effort: '' }).effort).toBeNull();
+  });
+
+  it('omits effort entirely when the caller passes no opinion (Codex sessions, subagent frames)', () => {
+    expect('effort' in buildSessionStatus({ model: 'gpt-5.6-codex' })).toBe(false);
+    expect('effort' in buildSessionStatus({ model: 'gpt-5.6-codex', effort: undefined })).toBe(false);
+  });
+
+  it('re-publishes null on EVERY frame while unknown, so a client that missed one clear still converges', () => {
+    // Not a one-shot clear: three consecutive frames of an untracked session
+    // all carry the null, so a dropped/throttled frame cannot strand a client
+    // on a stale level.
+    for (let i = 0; i < 3; i++) {
+      expect(buildSessionStatus({ model: 'claude-fable-5', effort: null }).effort).toBeNull();
+    }
+  });
 });
 
 describe('emailFromClaudeConfig', () => {
@@ -386,6 +444,35 @@ describe('index.js wiring', () => {
     expect(body).toMatch(/limits:\s*isCodex\s*\?\s*\[\]/);
   });
 
+  it('every status publisher in the tree builds its frame with buildSessionStatus', () => {
+    // Replace-not-merge replay means a partial frame is not merely incomplete
+    // — it REPLACES a good one for any client that cold-starts after it. So
+    // the invariant is per-publisher, not per-call-site: every module that
+    // calls publishStatus must build the frame through buildSessionStatus.
+    // If this fails, a new publisher appeared — route it through
+    // buildSessionStatus rather than widening the list.
+    const libDir = fileURLToPath(new URL('../lib', import.meta.url));
+    const roots = [
+      fileURLToPath(new URL('../index.js', import.meta.url)),
+      ...readdirSync(libDir).filter(f => f.endsWith('.js')).map(f => join(libDir, f)),
+    ];
+    const publishers = [];
+    for (const file of roots) {
+      const body = readFileSync(file, 'utf-8');
+      // The publisher module DEFINES publishStatus; it doesn't call one.
+      if (file.endsWith('journal-publisher.js')) continue;
+      if (/publishStatus\??\.?\(/.test(body)) publishers.push([basename(file), body]);
+    }
+    expect(publishers.map(([name]) => name).sort()).toEqual([
+      'codex-event-format.js',
+      'index.js',
+      'subagent-convos.js',
+    ]);
+    for (const [name, body] of publishers) {
+      expect(body, `${name} publishes status frames`).toContain('buildSessionStatus(');
+    }
+  });
+
   it('defines a journalStatus helper that publishes via publishStatus', () => {
     const start = src.indexOf('function journalStatus(');
     expect(start).toBeGreaterThan(-1);
@@ -393,6 +480,30 @@ describe('index.js wiring', () => {
     const body = src.slice(start, end);
     expect(body).toContain('buildSessionStatus(');
     expect(body).toContain('publishStatus(');
+  });
+
+  it('journalStatus scopes model_options / effort_levels / effort to Claude sessions', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    // Codex takes a free-text model id (`codex --model <id>`) the bridge never
+    // validates, so it has nothing to offer; /effort isn't exposed for Codex at
+    // all. It says so with EMPTY lists and a null effort rather than by staying
+    // silent — under a sticky merge, silence would leave a Claude session's
+    // offers (and a stale "· xhigh") standing after a mid-session switch.
+    expect(body).toMatch(/modelOptions:\s*isCodex\s*\?\s*\[\]\s*:\s*modelOptions\(\)/);
+    expect(body).toMatch(/effortLevels:\s*isCodex\s*\?\s*\[\]\s*:\s*effortOptions\(\)/);
+    expect(body).toMatch(/effort:\s*isCodex\s*\?\s*null\s*:\s*trackedEffort\(session\)/);
+  });
+
+  it('journalStatus has exactly ONE frame-building path, so no branch can emit a partial repaint', () => {
+    // The journal's replay cache is replace-not-merge (last frame wins
+    // verbatim). A second, leaner buildSessionStatus call for some fast path
+    // would therefore be able to strand a cold-starting client without the
+    // composer's argument lists.
+    const start = src.indexOf('function journalStatus(');
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    expect(body.match(/buildSessionStatus\(/g)).toHaveLength(1);
   });
 
   it('journalStatus threads the resolved session workdir into the frame', () => {
