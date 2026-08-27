@@ -105,6 +105,7 @@ import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -1623,6 +1624,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    // Claude Code waits on an MCP tool call FOREVER by default; a wedged MCP
+    // server (2026-08-27: Roblox Studio's long-poll channel after a plugin
+    // self-update) therefore hangs the whole turn with no visible cause.
+    // Back-stop at 10 min — generous on purpose, because the ask-user MCP
+    // tools legitimately block for minutes waiting on a human (secret forms,
+    // permission cards). Operator override via the bridge's own env wins.
+    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT || '600000',
   };
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
@@ -1735,9 +1743,24 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     debug('stderr:', text);
   });
 
+  // Slow-tool notices (lib/slow-tool-notice.js): one chat line when a tool
+  // call is still in flight past the threshold, so a wedged tool reads as
+  // "still running X — you can cancel" instead of unexplained silence.
+  // sendCallback is read at fire time (it is attached after session
+  // creation); alive gates a timer surviving into a killed session.
+  session.slowToolNotices = createSlowToolNotices({
+    thresholdMs: resolveSlowToolNoticeMs(process.env.MATRON_SLOW_TOOL_NOTICE_MS),
+    notify: ({ toolName, elapsedMs, reminder }) => {
+      if (!session.alive || typeof session.sendCallback !== 'function') return;
+      session.sendCallback(renderSlowToolNotice({ toolName, elapsedMs, reminder }));
+    },
+    log: debug,
+  });
+
   proc.on('close', (exitCode) => {
     session.alive = false;
     debug(`Claude process exited with code ${exitCode}`);
+    session.slowToolNotices?.reset();
 
     teardownSubagentTracking(session);
 
@@ -3787,6 +3810,11 @@ function handleClaudeEvent(session, event) {
         const toolName = block.name;
         const input = block.input || {};
 
+        // Arm the slow-tool notice for this call. Print-mode stream only
+        // (iv-mode replays transcripts on its own clock); idempotent across
+        // the partial/final replays of the same content block.
+        if (!session.iv) session.slowToolNotices?.toolStarted(block.id, toolName);
+
         if (toolName === 'ExitPlanMode' && !session.iv) {
           // Print-mode only: stash the tool_use_id so a "build" reply can
           // emit the matching tool_result later. iv-mode handles approval
@@ -3989,6 +4017,9 @@ function handleClaudeEvent(session, event) {
     }
 
     case 'result': {
+      // The turn is over however it ended (success, error, interrupt): no
+      // tool call is in flight, so no slow-tool notice may survive it.
+      session.slowToolNotices?.reset();
       // Handle fatal errors (e.g. failed resume with invalid session ID)
       // first, regardless of mode — iv-mode resumes can also fail and need
       // the crash-restart loop short-circuited (otherwise the exit handler
@@ -4340,6 +4371,9 @@ function handleClaudeEvent(session, event) {
         for (const block of userContent) {
           // Mark live-output complete on tool_result for any tracked Bash command.
           if (block.type === 'tool_result' && block.tool_use_id) {
+            // The call came back — disarm its slow-tool notice (tombstones
+            // an untracked id so a late tool_use replay can't re-arm).
+            if (!session.iv) session.slowToolNotices?.toolEnded(block.tool_use_id);
             // A Task tool_result means the subagent it spawned has completed —
             // finish that child convo (no-op for every non-Task tool_result).
             session.subagentConvos?.noteTaskResult(block.tool_use_id);
@@ -10285,6 +10319,10 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   // dangling.
   sweepToolStreams(session);
   clearPendingInterrupt(session);
+  // Same before-the-alive-check stance: a process that dies without ever
+  // delivering tool_result must not leave a slow-tool timer to fire into
+  // the dead session.
+  session.slowToolNotices?.reset();
 
   if (!session.alive) return;
   try {
