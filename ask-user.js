@@ -373,6 +373,43 @@ server.tool(
 );
 
 server.tool(
+  'restart_session',
+  "Restart THIS session's own agent process — the way to get browser tools (chrome-devtools MCP) mid-conversation, or to move onto a different model, without asking the user to do it. The conversation, workdir and history are kept; only the underlying process is respawned. continue_with is a message the bridge sends back into the restarted session as its first turn, so the work carries on unattended — write it as an instruction to your future self, including whatever context the restart is about to cost you. The restart does NOT happen instantly: it is parked until your current turn ends, so finish up and stop working rather than starting anything new after calling this. There is a small budget of consecutive self-restarts; once it runs out you must ask the user. Never call this in a loop.",
+  {
+    continue_with: z.string().max(2000).describe('The message to send into the restarted session as its first turn. Written for your future self: what you were doing, what to do next.'),
+    browser: z.boolean().optional().describe('Restart with browser tools (chrome-devtools MCP) enabled. Omit to keep the session\'s current MCP servers.'),
+    model: z.string().optional().describe('Optional Claude model alias to restart onto: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* name). Omit to keep the current model.'),
+    reason: z.string().max(200).optional().describe('Short reason shown to the user in chat, e.g. "need to screenshot the rendered page".'),
+  },
+  async ({ continue_with, browser, model, reason }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/restart-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomId: ROOM_ID,
+          continue_with,
+          ...(browser != null ? { browser } : {}),
+          ...(model ? { model } : {}),
+          ...(reason ? { reason } : {}),
+        }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        // The refusal text is the useful part — a bad model alias or an
+        // exhausted budget is something the agent can act on.
+        return { content: [{ type: 'text', text: `restart_session refused: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: data.parked
+        ? 'Restart parked — it runs the moment this turn ends. Wrap up now: say what you were doing and stop. Do not start new work, and do not call this tool again. Your continuation message will arrive as the first turn of the restarted session.'
+        : 'Restarting now. Your continuation message will arrive as the first turn of the restarted session.' }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'agent_chat_send',
   'Send a message into an agent chat room. Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary. Optional wait_seconds (max 60) blocks your turn for up to that long waiting for a reply — use it only for a short back-and-forth with a peer you know is idle; a busy or unjoined peer will burn the whole wait. Either way, replies always arrive as later turns regardless, so never poll.',
   {

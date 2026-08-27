@@ -99,6 +99,7 @@ import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publishe
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
+import { createSelfRestartHandler } from './lib/self-restart.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
@@ -7340,6 +7341,12 @@ async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
 
+  // The user is back in the loop, so restart_session gets a fresh budget.
+  // Deliberately NOT in sendToSession: the auto-continue message a
+  // self-restart queues flows through there, so a session would refresh its
+  // own budget every time and the cap would never bind.
+  session._agentRestartCount = 0;
+
   // Bridge-intercepted !/ commands run FIRST, before any prompt/menu
   // resolution below — exactly where Matrix's room.message handler checks
   // them (before the message is even routed to a session at all) — so e.g.
@@ -8960,6 +8967,41 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   log: console,
 });
 
+// Backs the `restart_session` MCP tool: a session respawning its own agent
+// process (usually to pick up browser tools) and handing the replacement a
+// message so the work carries on unattended. The rules live in
+// lib/self-restart.js; these deps are the session state they act on.
+const selfRestartHandler = createSelfRestartHandler({
+  getSession: (roomId) => sessions.get(roomId) || null,
+  // Queued, NOT sent: recreateSession copies queuedMessages onto the
+  // replacement and flushes them once it can take input (the resume-ready
+  // watcher in iv mode), which is exactly the delivery this needs. Left
+  // unmarked by markJournalOrigin on purpose — the journal has no row for
+  // bridge-composed text, so the flush's mirror is what shows the user what
+  // the session told itself to do.
+  queueContinuation: (session, text) => {
+    const entry = [{ type: 'text', text }];
+    if (!session.queuedMessages) session.queuedMessages = [];
+    session.queuedMessages.push(entry);
+    return () => {
+      const i = session.queuedMessages?.indexOf(entry) ?? -1;
+      if (i >= 0) session.queuedMessages.splice(i, 1);
+    };
+  },
+  // The same stash a user's mid-turn /restart parks on, replayed by
+  // dispatchDeferredCommand at whichever turn-end seam fires first.
+  park: (session, command) => { session._deferredCommandText = command; },
+  dispatch: (session, command) => {
+    session._deferredCommandText = command;
+    dispatchDeferredCommand(session);
+  },
+  notify: (session, text) => {
+    const n = notice('info', text);
+    if (session.sendHtml) session.sendHtml(n.plain, n.html);
+    else if (session.sendCallback) session.sendCallback(text);
+  },
+});
+
 // Adapter wrapper for the eight agent-chat loopback routes: a throw inside a
 // handler must surface as that route's own 500 with the real message — not
 // bubble to the request body's outer catch and masquerade as
@@ -9284,6 +9326,12 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-session-start') {
         await respondAgentChatRoute(res, data, agentSpawnHandlers.sessionStart,
           (status, b) => debug(`agent-session-start ${status} ${b.spawn_id || ''} ${b.status || b.error || ''}`));
+        return;
+      }
+
+      if (url.pathname === '/restart-session') {
+        await respondAgentChatRoute(res, data, selfRestartHandler,
+          (status, b) => debug(`restart-session ${status} ${b.parked ? 'parked' : ''} ${b.error || ''}`));
         return;
       }
 
@@ -10016,6 +10064,10 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next._agentSessions = existing._agentSessions;
   next.totalUsage = existing.totalUsage;
   next.turnCount = existing.turnCount;
+  // The self-restart loop budget MUST cross the swap: a restart that reset it
+  // would hand every self-restart a fresh 3 and the cap would never bind.
+  // Only an inbound user message clears it (journalRouteTextToSession).
+  next._agentRestartCount = existing._agentRestartCount;
   next._journalBuffer = existing._journalBuffer;
   next._journalTitleHint = existing._journalTitleHint;
   next._journalState = existing._journalState;
