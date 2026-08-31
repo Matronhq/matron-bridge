@@ -17,12 +17,16 @@ vi.mock('fs', () => ({
     mkdtempSync: vi.fn((prefix) => `${prefix}XXXXXX`),
     writeFileSync: vi.fn(),
     rmSync: vi.fn(),
+    // The install preflight; whisper + model present unless a test says
+    // otherwise. vi.clearAllMocks() wipes implementations, so each suite's
+    // beforeEach restores it.
+    existsSync: vi.fn(() => true),
   },
 }));
 
 import { execFile } from 'child_process';
 import fs from 'fs';
-import { transcribeAudio, transcribeAudioSegments, parseWhisperSegments, MIME_TO_EXT } from '../lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments, parseWhisperSegments, MIME_TO_EXT, TRANSCRIBE_UNAVAILABLE } from '../lib/transcribe.js';
 
 function mockExecFile(ffmpegResult, whisperResult) {
   const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
@@ -62,6 +66,7 @@ describe('transcribeAudio', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    fs.existsSync.mockImplementation(() => true);
     execFileCalls.length = 0;
   });
 
@@ -218,6 +223,45 @@ describe('transcribeAudio', () => {
     expect(fs.rmSync).toHaveBeenCalledTimes(1);
   });
 
+  // An uninstalled box and an unusable recording used to be indistinguishable
+  // to callers — both surfaced as "could not transcribe that voice note",
+  // with the actionable half (`spawn ffmpeg ENOENT`) buried in the log.
+  it('reports a missing whisper-cli as an install gap, before spending an ffmpeg run', async () => {
+    mockExecFile({ stdout: '' }, { stdout: 'text' });
+    fs.existsSync.mockImplementation((p) => !String(p).includes('whisper-cli'));
+
+    await expect(transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG))
+      .rejects.toMatchObject({ code: TRANSCRIBE_UNAVAILABLE, dependency: 'whisper.cpp' });
+    expect(execFileCalls).toEqual([]);
+  });
+
+  it('reports a missing model file as an install gap', async () => {
+    mockExecFile({ stdout: '' }, { stdout: 'text' });
+    fs.existsSync.mockImplementation((p) => p !== CONFIG.modelPath);
+
+    await expect(transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG))
+      .rejects.toMatchObject({ code: TRANSCRIBE_UNAVAILABLE, dependency: 'the whisper model' });
+  });
+
+  it('reports a missing ffmpeg as an install gap', async () => {
+    const enoent = Object.assign(new Error('spawn ffmpeg ENOENT'), { code: 'ENOENT' });
+    mockExecFile({ error: enoent }, { stdout: '' });
+
+    await expect(transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG))
+      .rejects.toMatchObject({ code: TRANSCRIBE_UNAVAILABLE, dependency: 'ffmpeg' });
+    expect(fs.rmSync).toHaveBeenCalledTimes(1);
+  });
+
+  // ffmpeg IS installed and rejected the audio: exit status, not spawn ENOENT.
+  // Telling the user to install ffmpeg here would send them in circles.
+  it('does not mistake a genuine ffmpeg failure for a missing ffmpeg', async () => {
+    const failed = Object.assign(new Error('Invalid data found when processing input'), { code: 1 });
+    mockExecFile({ error: failed }, { stdout: '' });
+
+    await expect(transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG))
+      .rejects.toMatchObject({ code: 1 });
+  });
+
   it('respects custom language config', async () => {
     mockExecFile(
       { stdout: '' },
@@ -265,6 +309,7 @@ describe('transcribeAudioSegments', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    fs.existsSync.mockImplementation(() => true);
     execFileCalls.length = 0;
   });
 
@@ -301,6 +346,17 @@ describe('transcribeAudioSegments', () => {
     mockExecFile({ stdout: '' }, { stdout: '[00:00:00.000 --> 00:00:09.000]  you' });
     const segments = await transcribeAudioSegments(fakeBuffer, 'video/mp4', CONFIG);
     expect(segments).toEqual([]);
+  });
+
+  // The video-narration path shares the preflight, so index.js can tell "no
+  // whisper on this box" from "this recording wouldn't transcribe" in its log.
+  it('reports an install gap rather than attempting the extraction', async () => {
+    mockExecFile({ stdout: '' }, { stdout: '' });
+    fs.existsSync.mockImplementation(() => false);
+
+    await expect(transcribeAudioSegments(fakeBuffer, 'video/mp4', CONFIG))
+      .rejects.toMatchObject({ code: TRANSCRIBE_UNAVAILABLE });
+    expect(execFileCalls).toEqual([]);
   });
 
   it('cleans up temp files on whisper error', async () => {
