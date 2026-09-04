@@ -109,9 +109,11 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE } from './lib/room-delivery.js';
+import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
+import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
-import { createAgentChatHandlers } from './lib/agent-chat.js';
+import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
@@ -7817,6 +7819,15 @@ function journalOnPromptReply(session, answer, { username }) {
     });
     return;
   }
+  // 🔊 Unmute tap. The router sets `answer.roomMute` ONLY when the reply's
+  // target_seq named a mute card this bridge published AND the choice was that
+  // card's own offered value — same provenance discipline as the queue and
+  // picker branches, so a genuine answer that merely looks like `unmute:x` is
+  // never dispatched as one.
+  if (answer?.roomMute) {
+    resolveRoomMuteTap(session, answer.roomMute);
+    return;
+  }
   // Picker taps (/model, /effort, /mode): the router is the single source of
   // truth for picker-vs-answer. It sets `answer.picker` ONLY when the reply's
   // target_seq named a picker frame the bridge published AND the choice was one
@@ -8296,10 +8307,12 @@ function deliverRoomFrameTo(room, frame) {
   // sits above whatever the agent does about it, and so a reply consumed
   // inline by agent_chat_send's wait — which never becomes a turn at all —
   // is still visible to the user.
-  // Peer AGENTS only. A `user:` frame here is Dan typing into the room convo
-  // himself — he can already see it there, and re-rendering his own words in
-  // another conversation, in the bridge's assistant voice, would read as
-  // something a remote agent said.
+  // Dan's OWN room messages are echoed too, as "You" (lib/room-delivery.js
+  // roomEchoLabel). He can of course read them back in the room convo — but
+  // the room convo cannot tell him what this pipeline is FOR: which member
+  // chat took the message straight away, and which parked it behind a
+  // running turn (⏳, closed by 📨). The echo carries that receipt; the
+  // content is incidental.
   // Self-heal for a stranded pending inbox (Task 6 review, I4): several
   // paths clear busy WITHOUT passing a turn-end flush seam (esc-cancel,
   // interrupt-wedge, resume-failed, the prompt paths). If the session is
@@ -8310,11 +8323,38 @@ function deliverRoomFrameTo(room, frame) {
   // things happened: any ⏳ from an earlier batch is closed by its 📨 above
   // the 💬 line for the message that arrived after it.
   maybeFlushRoomDelivery(session);
-  const isPeerAgent = sender.startsWith('agent:');
-  if (isPeerAgent) {
+  const echoFrom = roomEchoLabel(sender, from);
+  // Mute gate (2026-08-19). agent_chat_mute replaced agent_chat_leave as the
+  // way out of a room the agent can't work with, so a muted binding takes NO
+  // delivery at all: no injected turn, no pending-inbox growth, and no reply
+  // waiter — which is why it sits above all three. Only the decision lives in
+  // lib/room-delivery.js (roomFrameDisposition), because index.js can't be
+  // imported by a test.
+  const disposition = roomFrameDisposition({
+    muted: agentRooms.isMuted(frame.convo_id, room.sessionRoomId),
+    sender,
+  });
+  if (disposition !== 'deliver') {
+    // A `user:` frame is something Dan typed into the room himself, so
+    // swallowing it silently would look exactly like the message being lost.
+    // He gets the 💬 echo and then the 🔇 line in the ⏳'s place — the same
+    // seam, the same job: say what happened to it. Peer AGENT frames get
+    // nothing at all: a notice per dropped frame would relay the very spam
+    // the mute was reached for. Either way agent_chat_read still reads the
+    // room back in full.
+    if (disposition === 'muted-user' && echoFrom) {
+      journalPublishNotice(
+        journalConvoIdFor(session),
+        formatRoomMessageNotice({ from: echoFrom, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
+      );
+      journalPublishNotice(journalConvoIdFor(session), ROOM_MUTED_NOT_DELIVERED_NOTICE);
+    }
+    return;
+  }
+  if (echoFrom) {
     journalPublishNotice(
       journalConvoIdFor(session),
-      formatRoomMessageNotice({ from, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
+      formatRoomMessageNotice({ from: echoFrom, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
     );
   }
   // A reply consumed by an agent_chat_send wait already reached the agent
@@ -8337,8 +8377,87 @@ function deliverRoomFrameTo(room, frame) {
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
   });
-  if (isPeerAgent && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
+  if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
     journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
+  }
+}
+
+// How a session names itself in a mute announcement. One implementation,
+// shared with lib/agent-chat.js's own announcements (roomAgentLabel) — the two
+// lines sit in the same room transcript, so a drift between them would read as
+// two different speakers.
+function roomMuteAgentLabel(session) {
+  return roomAgentLabel(journalPublisher.identity()?.name || SERVER_LABEL, session);
+}
+
+// The "🔊 Unmute" card agent_chat_mute publishes into the MUTING agent's own
+// conversation. The agent decided to stop listening to its peer; this is how
+// the user overrules that with one tap.
+//
+// Shape and publish mechanism are the queued_release card's (lib/busy-queue.js
+// notifyQueuedMessage): a `prompt` frame carrying {kind, prompt_id, question,
+// actions, options, mode, body}. `options` is the load-bearing half — the apps
+// render prompt cards generically off it and reply with the option VALUE
+// (MatronShared JournalTimelineMapper.askUserEvent / AskUserSheetViewModel
+// .selectedValues), never switching on `kind` — so this renders on every
+// shipped client with no app-side change. `actions` rides along for shape
+// parity with the queued cards and for clients that grow structured handling.
+//
+// The card's identity is reserved BEFORE the publish, so the seq bound by the
+// echo can never belong to a card we hadn't registered.
+// Returns whether a card was actually published: a session with no journal
+// conversation yet has nowhere to put one, and the tool result must not promise
+// the user a button that does not exist.
+function publishRoomMuteCard({ sessionKey, roomId, roomTitle, reason, agentName } = {}) {
+  const session = sessions.get(sessionKey);
+  const convoId = journalConvoIdFor(session);
+  if (!session || !convoId) return false;
+  const promptId = `rm_${randomUUID()}`;
+  const where = quotedField(roomTitle || roomId);
+  const summary = `🔇 ${agentName} muted "${where}": ${reason}`;
+  journalInputConsumer.roomMuteCards.note(convoId, { promptId, roomId, sessionKey });
+  journalPublish(session, 'publishPrompt', {
+    kind: ROOM_MUTE_KIND,
+    prompt_id: promptId,
+    question: `${summary} — unmute it?`,
+    actions: [{ id: ROOM_MUTE_ACTION_ID, label: '🔊 Unmute', intent: 'primary' }],
+    // The value names the room, so this card can only ever unmute its own
+    // chat — the router checks it against the registered room before acting.
+    options: [{ id: ROOM_MUTE_ACTION_ID, label: '🔊 Unmute', value: unmuteChoiceValue(roomId) }],
+    mode: 'pick_one',
+    body: summary,
+  });
+  return true;
+}
+
+// The user tapped 🔊 Unmute. The router has already proven provenance (the
+// reply's target_seq named a card this bridge published) and retired the card,
+// so this only has to make the state match and say so in both places.
+function resolveRoomMuteTap(session, { roomId, sessionKey } = {}) {
+  const convoId = journalConvoIdFor(session);
+  const room = agentRooms.get(roomId);
+  // Belt and braces over the card retirement: the agent may have unmuted
+  // itself between the tap being sent and it arriving. Never report an unmute
+  // that was not this tap's doing.
+  if (!room || !agentRooms.isMuted(roomId, sessionKey)) {
+    journalPublishNotice(convoId, 'That chat has already been unmuted — nothing to do.');
+    return;
+  }
+  agentRooms.setMuted(roomId, sessionKey, false);
+  const where = quotedField(room.title || room.topic || roomId);
+  // Both halves say what did NOT happen as well as what did: nothing is
+  // replayed, so the gap is real and the agent has to go and read it.
+  journalPublishNotice(convoId,
+    `🔊 Unmuted "${where}" — new messages are delivered again. Anything sent while it was muted was not delivered; the agent can catch up with agent_chat_read.`);
+  const line = `🔊 ${roomMuteAgentLabel(session)} unmuted by user — messages sent while it was muted were not delivered; catching up with agent_chat_read.`;
+  journalPublisher.publishText(roomId, { body: line, from: 'agent' });
+  // A same-bridge peer never hears the journal echo of an own-device frame, so
+  // the room line alone would reach every audience except the peer AGENT — the
+  // one that needs to know it can be heard again. Same hop chatSend takes.
+  if (room.guestSessionRoomId != null) {
+    try { routeLocalRoomMessage(roomId, sessionKey, line); } catch (e) {
+      try { console.warn(`[agent-chat] unmute local routing threw: ${e.message}`); } catch { /* logging must never throw */ }
+    }
   }
 }
 
@@ -8614,6 +8733,13 @@ const journalInputConsumer = createJournalInputConsumer({
     journalPublishNotice(convoId, reason === 'tombstoned'
       ? "That queued message was already sent or cancelled — nothing to do."
       : "That action isn't available for this queued message anymore.");
+  },
+  noticeRoomMuteIgnored: (convoId, { reason } = {}) => {
+    // A tap on a 🔊 Unmute card that can no longer be actioned. Same stance as
+    // the queued-card notices above: a pressed button always gets an answer.
+    journalPublishNotice(convoId, reason === 'retired'
+      ? 'That chat has already been unmuted — nothing to do.'
+      : "That action isn't available for this mute card anymore.");
   },
   noticeGhostPromptReply: (convoId) => {
     // The tapped card is from before the bridge restarted; its session is
@@ -8916,6 +9042,20 @@ const agentChatHandlers = createAgentChatHandlers({
   }),
   routeLocalRoomMessage,
   notifyRoomPeer: (roomId, sessionKey, text) => journalNotifyRoomEvent(roomId, text, { sessionKey }),
+  // Mute seams (2026-08-19). agent_chat_mute is loud on purpose: a member
+  // going quiet looks like a bug from the other side, so the other LOCAL
+  // member's own chat is told in plain text…
+  publishSessionNotice: (sessionKey, text) => {
+    journalPublishNotice(journalConvoIdFor(sessions.get(sessionKey)), text);
+  },
+  // …and the muting agent's own chat gets the 🔊 Unmute card, so the user can
+  // overrule it with one tap.
+  publishMuteCard: publishRoomMuteCard,
+  retireMuteCard: (roomId, sessionKey) => journalInputConsumer.roomMuteCards.retire(roomId, sessionKey),
+  // A mute has to reach the backlog too: the gate in deliverRoomFrameTo only
+  // stops NEW frames, and what a flooding peer already queued would otherwise
+  // be injected wholesale at the next turn-end seam.
+  dropPendingRoomMessages: (sessionKey, roomId) => roomDelivery.dropRoom(sessionKey, roomId),
   log: console,
 });
 
@@ -9266,6 +9406,18 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-chat-leave') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatLeave,
           (status, b) => debug(`agent-chat-leave ${status} ${data?.room_id} ${b.error || 'ok'}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-mute') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatMute,
+          (status, b) => debug(`agent-chat-mute ${status} ${data?.room_id} ${b.error || 'ok'}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-unmute') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatUnmute,
+          (status, b) => debug(`agent-chat-unmute ${status} ${data?.room_id} ${b.error || 'ok'}`));
         return;
       }
 

@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs';
 import { describe, it, expect, vi } from 'vitest';
-import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from '../lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, sessionShortFromTitle, titleMarkerFor } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
   it('titles the convo from the workdir basename, with no server-label prefix', async () => {
@@ -300,6 +300,51 @@ describe('withSessionShort (2-char session-id title prefix)', () => {
   it('puts a marker ahead of the short, and ahead of a bare title', () => {
     expect(withSessionShort('b53e6542', 'port the tests', '🐣')).toBe('🐣 [b5] port the tests');
     expect(withSessionShort(undefined, 'port the tests', '🐣')).toBe('🐣 port the tests');
+  });
+});
+
+// withSessionShort's inverse: reading a short back OUT of a title another
+// bridge published (agent-chat room titles name the peer by its session
+// tag). The two must share one boundary rule, or a title this bridge minted
+// would fail to parse on the box that reads it — hence the round trips.
+describe('sessionShortFromTitle', () => {
+  it('peels the short off a published title', () => {
+    expect(sessionShortFromTitle('[2h] Remote work')).toBe('2h');
+  });
+
+  it('reads THROUGH every marker the bridge puts ahead of the short', () => {
+    // ↔️ = agent-chat room (#225), 🔗 = its pre-#228 legacy twin, 🐣 = a
+    // session another agent spawned (#227).
+    expect(sessionShortFromTitle('↔️ [2h] mac ↔️ dev-2 — ci triage')).toBe('2h');
+    expect(sessionShortFromTitle('🔗 [2h] mac ↔ dev-2')).toBe('2h');
+    expect(sessionShortFromTitle('🐣 [2h] port the tests')).toBe('2h');
+  });
+
+  it('round-trips whatever withSessionShort wrote', () => {
+    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'css token migration'))).toBe('b5');
+    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'port the tests', '🐣'))).toBe('b5');
+    // …and a title that never earned a short comes back empty, not '[u'.
+    expect(sessionShortFromTitle(withSessionShort('', 'untagged'))).toBe('');
+  });
+
+  it('returns nothing for bracketed text that is not a short', () => {
+    // Same closed set as the apps' splitTitle: exactly two alphanumerics,
+    // a trailing space, and a non-empty title after it. Anything else is
+    // ordinary title text that happens to start with a bracket.
+    expect(sessionShortFromTitle('Remote work')).toBe('');
+    expect(sessionShortFromTitle('[abc] three chars')).toBe('');
+    expect(sessionShortFromTitle('[a] one char')).toBe('');
+    expect(sessionShortFromTitle('[a ] space')).toBe('');
+    expect(sessionShortFromTitle('[2h]no space')).toBe('');
+    expect(sessionShortFromTitle('[2h] ')).toBe('');
+    expect(sessionShortFromTitle('[2h]')).toBe('');
+    expect(sessionShortFromTitle('🐣 no short here')).toBe('');
+  });
+
+  it('never throws on a missing or non-string title', () => {
+    expect(sessionShortFromTitle(undefined)).toBe('');
+    expect(sessionShortFromTitle(null)).toBe('');
+    expect(sessionShortFromTitle(42)).toBe('');
   });
 });
 
