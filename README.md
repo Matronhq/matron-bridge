@@ -34,9 +34,19 @@ brew install cloudflared
 
 ```bash
 npm install
+npm run setup   # guided: asks for your journal URL + agent token, tests the connection, writes .env
+npm start
+```
+
+The wizard stores the agent token in a gitignored `.journal-token` file (mode 600),
+generates `HMAC_SECRET`, and leaves every other setting on its documented default.
+Re-run it any time to change answers; the previous `.env` is backed up to `.env.bak`.
+
+Prefer to configure by hand (or provisioning non-interactively)?
+
+```bash
 cp .env.example .env
 # Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, and HMAC_SECRET (openssl rand -hex 32) for file/secret links
-npm start
 ```
 
 ### Enable Codex
@@ -139,6 +149,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `ALLOWED_USER_IDS` | Comma-separated allowlist of authorized user identities for this bridge (its sender label for journal-originated session commands) | `""` (any user) |
 | `DEFAULT_WORKDIR` | Default working directory for coding-agent sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `MATRON_DEFAULT_AGENT` | Default coding agent (`claude` or `codex`); override per command with `--claude` / `--codex` | `claude` |
+| `MATRON_DEFAULT_MODEL` | Claude model for fresh starts when none is picked (New Chat picker, `/start` without `--model`); an alias such as `fable`, `opus`, `sonnet` or a full `claude-*` name. The `default` alias resolves to this too. Resumed rooms keep their own model. Claude only; reported to the picker as `default_model`. | `fable` |
 | `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
 | `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
@@ -153,6 +164,8 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
+| `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
+| `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
 | `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
@@ -160,6 +173,24 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-5.6-luna` by default) | — |
 | `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
 | `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |
+
+## Memory & MCP tuning
+
+Sessions are lean by default so the bridge runs on small VPS boxes. Only the
+bridge's own `ask-user` MCP loads per session; everything else is opt-in.
+
+- **Stdio MCP extras** — defined under `mcpExtras` in `mcp-config.json`
+  (committed; e.g. `browser`) or `mcp-config.local.json` (gitignored,
+  per-machine; e.g. `circleci`). Enable per session with `!start --<name>`
+  (e.g. `!start --browser --circleci`). Sessions run with `--strict-mcp-config`,
+  so servers from your personal `~/.claude.json` do NOT leak in.
+- **Per-machine default** — `MCP_DEFAULT_EXTRAS=circleci` turns an extra on for
+  every session on this machine. Explicit `--flags` stack on top (no per-session
+  opt-out; change the env and restart to go lean).
+- **Plugin MCP servers** (context7, serena, …) — disabled by default via an
+  empty `CLAUDE_CODE_PLUGIN_CACHE_DIR`. Set `BRIDGE_PLUGIN_CACHE_DIR` to
+  `~/.claude/plugins` (all plugins) or a curated dir to re-enable. Your
+  interactive `~/.claude` (creds, transcripts) is never modified.
 
 ## Commands
 
@@ -222,6 +253,8 @@ What rides the journal connection:
 | `JOURNAL_STREAM_INTERVAL_MS` | Streaming-overlay coalescing floor (at most one in-progress frame per conversation+message per window) | `200` |
 
 Provision the agent token on the journal server with `matron-admin agent add <user> <device-name>`.
+
+The journal also exposes an HTTP **search API** (`GET /search?q=` on the https base derived from `JOURNAL_WS_URL`, authenticated with the same agent token) that full-text searches every one of the user's conversations across all their devices, plus an `around_seq` context mode on `GET /convo/:id/messages` for reading prose around a hit. Bridge sessions are told how to use it in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`; the full spec lives in matron-journal's [`docs/protocol.md`](https://github.com/Matronhq/matron-journal/blob/master/docs/protocol.md) ("Journal search").
 
 ## Agent-to-agent chat
 

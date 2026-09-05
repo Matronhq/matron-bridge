@@ -2,23 +2,25 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   createSlowToolNotices,
   resolveSlowToolNoticeMs,
+  resolveSlowToolReminderMs,
   isNoticeEligible,
   formatElapsed,
   renderSlowToolNotice,
   DEFAULT_SLOW_TOOL_NOTICE_MS,
+  DEFAULT_SLOW_TOOL_REMINDER_MS,
   MAX_SLOW_TOOL_NOTICE_MS,
-  REMINDER_MULTIPLIER,
 } from '../lib/slow-tool-notice.js';
 
 // Deterministic timer harness: timers fire manually via advance(), matching
 // the createPermissionRegistry test style (no fake global clocks).
-function makeHarness({ thresholdMs = 1000, notify } = {}) {
+function makeHarness({ thresholdMs = 1000, reminderMs = 3000, notify } = {}) {
   let nowMs = 0;
   let nextId = 1;
   const pending = new Map();
   const fired = [];
   const tracker = createSlowToolNotices({
     thresholdMs,
+    reminderMs,
     setTimeout: (fn, ms) => {
       const id = nextId++;
       pending.set(id, { fn, at: nowMs + ms });
@@ -41,6 +43,13 @@ function makeHarness({ thresholdMs = 1000, notify } = {}) {
 }
 
 describe('resolveSlowToolNoticeMs', () => {
+  it('defaults to 3 minutes, reminder to 10', () => {
+    expect(DEFAULT_SLOW_TOOL_NOTICE_MS).toBe(180_000);
+    expect(DEFAULT_SLOW_TOOL_REMINDER_MS).toBe(600_000);
+    expect(resolveSlowToolReminderMs(undefined)).toBe(DEFAULT_SLOW_TOOL_REMINDER_MS);
+    expect(resolveSlowToolReminderMs('0')).toBe(0);
+    expect(resolveSlowToolReminderMs('900000')).toBe(900_000);
+  });
   it('defaults when unset or invalid', () => {
     expect(resolveSlowToolNoticeMs(undefined)).toBe(DEFAULT_SLOW_TOOL_NOTICE_MS);
     expect(resolveSlowToolNoticeMs('')).toBe(DEFAULT_SLOW_TOOL_NOTICE_MS);
@@ -94,7 +103,7 @@ describe('formatElapsed / renderSlowToolNotice', () => {
 });
 
 describe('createSlowToolNotices', () => {
-  it('fires a notice at the threshold and a reminder at 5x, then stops', () => {
+  it('fires a notice at the threshold and a reminder at the reminder mark, then stops', () => {
     const { tracker, advance, fired } = makeHarness();
     tracker.toolStarted('t1', 'mcp__Roblox_Studio__run_code');
     advance(999);
@@ -102,11 +111,24 @@ describe('createSlowToolNotices', () => {
     advance(1);
     expect(fired).toHaveLength(1);
     expect(fired[0]).toMatchObject({ toolUseId: 't1', reminder: false, elapsedMs: 1000 });
-    advance(1000 * REMINDER_MULTIPLIER);
+    advance(1999);
+    expect(fired).toHaveLength(1); // reminder is measured from tool start (3000), not from the notice
+    advance(1);
     expect(fired).toHaveLength(2);
-    expect(fired[1].reminder).toBe(true);
+    expect(fired[1]).toMatchObject({ reminder: true, elapsedMs: 3000 });
     advance(100_000);
     expect(fired).toHaveLength(2);
+  });
+
+  it('a reminder at or before the notice, or disabled, arms only the notice', () => {
+    for (const reminderMs of [0, 500, 1000]) {
+      const { tracker, advance, fired, pending } = makeHarness({ reminderMs });
+      tracker.toolStarted('t1', 'Bash');
+      expect(pending.size).toBe(1);
+      advance(100_000);
+      expect(fired).toHaveLength(1);
+      expect(fired[0].reminder).toBe(false);
+    }
   });
 
   it('a completed tool fires nothing', () => {

@@ -15,7 +15,7 @@ function setup() {
   const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, planQueueFlush, console,
     sessions: new Map([['room', session]]), pendingMediaMirror: () => [], journalMirrorUserMedia: vi.fn(),
     commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), finalizeSentQueue: vi.fn(),
-    journalPublishNotice: vi.fn(), dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
+    journalPublishNotice: vi.fn(), journalConvoIdFor: () => 'convo', dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
   });
   vm.runInContext(['restoreQueuedBatch', 'flushQueue'].map(sourceOf).join('\n'), context);
   const batch = [[{ type: 'text', text: 'Also check the test' }]];
@@ -23,6 +23,13 @@ function setup() {
   return { session, context, batch, snapshot, ack: value => ack(value), flush: () => context.flushQueue(session, batch, snapshot) };
 }
 describe('bridge send-now steering', () => {
+  it('retains messages for a parked restart without attempting native steering', () => {
+    const h = setup(); h.session._deferredCommandText = '!restart --browser';
+    expect(h.flush()).toBe(false);
+    expect(h.session.queuedMessages).toEqual(h.batch);
+    expect(h.session.codex.steer).not.toHaveBeenCalled();
+    expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();
+  });
   it('does not interrupt or retire queued cards until Codex acknowledges input', async () => {
     const h = setup(); expect(h.flush()).toBe('deferred');
     expect(h.session.codex.interrupt).not.toHaveBeenCalled(); expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();

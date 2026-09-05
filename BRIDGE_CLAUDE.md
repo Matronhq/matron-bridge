@@ -38,7 +38,19 @@ Chat rooms are shared conversations between the user's agent sessions (often on 
 - Never poll. Pending invites, answers, and peer replies all arrive automatically as later turns — if a result is `pending`, continue your own work. Use `agent_chat_read` for one-shot catch-up, never in a loop.
 - Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary.
 - Your working output (tool runs, files, analysis) stays in your own conversation. Only `agent_chat_start`'s opening message, `agent_chat_send`, and `send_attachment` with `chat_room_id` post into a room.
-- `agent_boxes` lists the user's other boxes with recent folders, activity, and usage limits so you can find spare capacity; `agent_session_start` asks the user's consent to seed a task on one of them — the outcome, like everything else here, arrives as a later turn.
+- `agent_boxes` lists the user's boxes — this one included, marked "this box" — with recent folders, activity, and usage limits so you can find spare capacity or hand over on the same machine; `agent_session_start` asks the user's consent to seed a task on one of them — the outcome, like everything else here, arrives as a later turn.
+
+## Searching the journal
+
+The journal server has a full-text search API over every one of the user's conversations, across all their boxes. When asked to find something the user said or did in a past session ("where did I ask about X"), use it — do not grep local `~/.claude/projects/` transcripts (they only cover this box), and do not message other agents to ask them to look.
+
+- Base URL: `JOURNAL_WS_URL` from the bridge's `.env`, with `wss://` → `https://` and any trailing `/ws` stripped. Auth: `Authorization: Bearer <agent token>` — the contents of the file named by `JOURNAL_TOKEN_FILE` (commonly `/etc/matron/agent-token`), or `JOURNAL_TOKEN` itself when `JOURNAL_TOKEN_FILE` is unset; the bridge resolves them in that order.
+- The token can search every conversation the user has, and everything you run and print is mirrored into the journal. So never print, echo, or paste it: read it inside the request itself — `curl -sS -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" ...` — so neither the command line nor its output ever contains the value, and never use `curl -v`/`--trace`, which print request headers.
+- `GET /search?q=<terms>&limit=<n>&convo_id=<id>` → `{hits: [{convo_id, title, seq, ts, sender, snippet, live}]}`. URL-encode `q` (spaces, `&`, `#`, non-ASCII) before building the URL. Terms are ANDed literals (raw FTS5 syntax is neutralised), ranked best-match first; `q` is capped at 256 chars, `limit` defaults to 20 and clamps at 50, and `convo_id` narrows to one conversation. `sender` is `user:<name>` or `agent:<box>`; `snippet` wraps matches in `**`; `live: true` means that conversation's agent is running now, so consider `agent_chat_start` instead of only reading history. Only prose is indexed (`text` and `diff` events) — tool output never appears in results.
+- `GET /convo/:id/messages?around_seq=<seq>&limit=<n>` — context around a hit. This works on any of the user's conversations, including other boxes' sessions: foreign reads return indexed prose only, with `limit` clamped to 30, and are logged server-side. Plain `before_seq`/paging reads remain restricted to conversations this device owns or has joined (others 404).
+- Send a real-looking `User-Agent` (e.g. `curl/8.x`) — some deployments 403 the default Python one — and pace request bursts; the rate limiter answers 403 across the board for a while once tripped.
+
+Full API digest: `GET /help` on the same base URL (Bearer, returns markdown). Full spec: `docs/protocol.md` ("Journal search") in the matron-journal repo.
 
 ## Viewer Links
 
@@ -46,8 +58,17 @@ Secure viewer links require the bridge to have `HMAC_SECRET` and `VIEWER_BASE_UR
 
 ## Browser tools (chrome-devtools MCP)
 
-Browser-automation MCPs are off by default in bridge sessions because each one keeps a full headless Chrome + Xvfb alive (~400 MB) for the entire session, and most sessions don't need them. If you decide you need browser tools — e.g. to take a screenshot, drive a page, inspect network traffic, run a Lighthouse-style trace — you cannot enable them from inside this session.
+Browser-automation MCPs are off by default in bridge sessions because each one keeps a full headless Chrome + Xvfb alive (~400 MB) for the entire session, and most sessions don't need them. If you decide you need browser tools — e.g. to take a screenshot, drive a page, inspect network traffic, run a Lighthouse-style trace — call `restart_session` with `browser: true` and a `continue_with` message. You do not need to ask the user first.
 
-Tell the user: "I need browser tools to do X. Please run `/restart --browser` — that keeps this exact session intact and just respawns the underlying claude process with chrome-devtools loaded. (`--browser` also works on `/start`, `/resume`, and `/workdir` if you'd rather create a new session.)"
+Other opt-in MCP extras use the same flag form (e.g. `/start --circleci`); which extras exist depends on this machine's `mcp-config.json` / `mcp-config.local.json`.
 
-Do not silently fall back to `Bash`-driven `curl`/`wget` for tasks that genuinely require a browser (interactive pages, JS rendering, screenshots) — surface the opt-in request to the user instead.
+Do not silently fall back to `Bash`-driven `curl`/`wget` for tasks that genuinely require a browser (interactive pages, JS rendering, screenshots) — restart with browser tools instead.
+
+## Restarting your own session (`restart_session`)
+
+`restart_session` respawns this session's underlying claude process while keeping the conversation, workdir and history. Use it to pick up browser tools, or to move onto a different model for the next phase of work (`model: "opus"`). The user is told in chat; they don't have to do anything.
+
+- **It is parked, not immediate.** The restart runs when your current turn ends. After calling the tool, say what you were doing and stop — anything you start afterwards is thrown away mid-flight.
+- **`continue_with` is a message to your future self**, delivered as the first turn of the restarted session. The restarted process has the conversation but not your working state, so write down what you were doing, what you had established, and the exact next step. "Carry on" is not enough.
+- **The budget is small and deliberate.** A few consecutive self-restarts, then the tool refuses and you must ask the user. Any message from the user hands back a fresh budget. If a restart didn't achieve what you expected, don't try again with different flags — say so and ask.
+- The user sees the continuation message in the journal, marked as auto-continue. Write it as something you'd be happy for them to read.

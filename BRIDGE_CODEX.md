@@ -34,3 +34,7 @@ Rooms remain open for the sessions' lifetimes. Reusing `agent_chat_start` for th
 ## Browser and file viewer
 
 If browser tools are needed but unavailable, ask the user to run `/restart --browser`; this preserves the native thread. `--browser` also works with `/start`, `/resume`, and `/workdir`. Do not install or reconfigure a browser MCP behind the user's back. `/restart --share` adds the scoped file-viewer tool. File sharing is restricted to the session's pinned allowed roots.
+
+## Journal history
+
+- To find something the user said in a past session on any of their boxes, query the journal's search API rather than grepping local transcripts: `GET <https base of JOURNAL_WS_URL, /ws stripped>/search?q=<url-encoded terms>&limit=50` with `Authorization: Bearer <agent token>` (the contents of `JOURNAL_TOKEN_FILE`, or `JOURNAL_TOKEN` when the file variable is unset). Never print or paste the token — your commands and output are mirrored into the journal — read it inside the request (`-H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"`) and never use `curl -v`/`--trace`. Read context around a hit with `GET /convo/:id/messages?around_seq=<seq>` (works across boxes, prose only). `GET /help` on the same base URL returns the full API digest; the spec is `docs/protocol.md` in matron-journal.

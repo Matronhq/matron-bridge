@@ -327,7 +327,7 @@ server.tool(
 
 server.tool(
   'agent_boxes',
-  "List the user's other agent boxes (machines) as spawn targets, with recent folders, current activity, and account usage limits. Use this when the user asks to run work on another machine or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
+  "List the user's agent boxes (machines) as spawn targets — including this one, marked \"this box\" — with recent folders, current activity, and account usage limits. Use this when the user asks to start a new session here or on another machine, or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
   {},
   async () => {
     try {
@@ -341,7 +341,7 @@ server.tool(
         return { content: [{ type: 'text', text: `agent_boxes failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       const boxes = data.boxes || [];
-      if (!boxes.length) return { content: [{ type: 'text', text: 'No other boxes found.' }] };
+      if (!boxes.length) return { content: [{ type: 'text', text: 'No boxes found.' }] };
       return { content: [{ type: 'text', text: boxes.map(formatBox).join('\n\n') }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
@@ -351,7 +351,7 @@ server.tool(
 
 server.tool(
   'agent_session_start',
-  "Ask the user's consent to start a new agent session on another of their boxes, seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
+  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
   {
     device_id: z.number().int().describe('Target box device id, from agent_boxes'),
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
@@ -371,6 +371,43 @@ server.tool(
         return { content: [{ type: 'text', text: `agent_session_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval. Continue your own work; the outcome will arrive as a later turn.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'restart_session',
+  "Restart THIS session's own agent process — the way to get browser tools (chrome-devtools MCP) mid-conversation, or to move onto a different model, without asking the user to do it. The conversation, workdir and history are kept; only the underlying process is respawned. continue_with is a message the bridge sends back into the restarted session as its first turn, so the work carries on unattended — write it as an instruction to your future self, including whatever context the restart is about to cost you. The restart does NOT happen instantly: it is parked until your current turn ends, so finish up and stop working rather than starting anything new after calling this. There is a small budget of consecutive self-restarts; once it runs out you must ask the user. Never call this in a loop.",
+  {
+    continue_with: z.string().max(2000).describe('The message to send into the restarted session as its first turn. Written for your future self: what you were doing, what to do next.'),
+    browser: z.boolean().optional().describe('Restart with browser tools (chrome-devtools MCP) enabled. Omit to keep the session\'s current MCP servers.'),
+    model: z.string().optional().describe('Optional Claude model alias to restart onto: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* name). Omit to keep the current model.'),
+    reason: z.string().max(200).optional().describe('Short reason shown to the user in chat, e.g. "need to screenshot the rendered page".'),
+  },
+  async ({ continue_with, browser, model, reason }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/restart-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomId: ROOM_ID,
+          continue_with,
+          ...(browser != null ? { browser } : {}),
+          ...(model ? { model } : {}),
+          ...(reason ? { reason } : {}),
+        }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        // The refusal text is the useful part — a bad model alias or an
+        // exhausted budget is something the agent can act on.
+        return { content: [{ type: 'text', text: `restart_session refused: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: data.parked
+        ? 'Restart parked — it runs the moment this turn ends. Wrap up now: say what you were doing and stop. Do not start new work, and do not call this tool again. Your continuation message will arrive as the first turn of the restarted session.'
+        : 'Restarting now. Your continuation message will arrive as the first turn of the restarted session.' }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
