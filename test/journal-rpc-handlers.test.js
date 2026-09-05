@@ -132,6 +132,21 @@ describe('recent_folders', () => {
     expect(responses[0].result.folders).toBeDefined();
   });
 
+  it('reports default_model when the box has one and the agent is claude', () => {
+    const { handler, responses } = harness({ defaultModel: 'fable' });
+    handler(REQ('recent_folders', {}));
+    expect(responses[0].result.default_model).toBe('fable');
+    expect(responses[0].result.model_options).toEqual(modelOptions());
+  });
+
+  it('omits default_model when unset, invalid, or on a codex-default box', () => {
+    for (const overrides of [{}, { defaultModel: null }, { defaultModel: 'gpt-5' }, { defaultModel: 'fable', defaultAgent: 'codex' }]) {
+      const { handler, responses } = harness(overrides);
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].result).not.toHaveProperty('default_model');
+    }
+  });
+
   it('omits activity, limits, and disk when the thunks return null', () => {
     const { handler, responses } = harness({
       getActivity: () => null,

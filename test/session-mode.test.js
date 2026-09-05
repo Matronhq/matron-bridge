@@ -32,6 +32,20 @@ describe('resolveModel', () => {
     expect(resolveModel({ option: undefined, persisted: 'opus' })).toBe('opus');
     expect(resolveModel({ option: undefined, persisted: undefined })).toBeUndefined();
   });
+
+  it('falls back to the box default only when nothing was picked or persisted', () => {
+    expect(resolveModel({ option: undefined, persisted: undefined, fallback: 'fable' })).toBe('fable');
+    expect(resolveModel({ option: 'sonnet', persisted: undefined, fallback: 'fable' })).toBe('sonnet');
+    expect(resolveModel({ option: undefined, persisted: 'opus', fallback: 'fable' })).toBe('opus');
+    expect(resolveModel({ option: undefined, persisted: undefined, fallback: null })).toBeUndefined();
+  });
+
+  it("resolves the 'default' alias to the box default when one is configured", () => {
+    expect(resolveModel({ option: 'default', persisted: undefined, fallback: 'fable' })).toBe('fable');
+    expect(resolveModel({ option: undefined, persisted: 'default', fallback: 'fable' })).toBe('fable');
+    // No box default: 'default' passes through to Claude Code as-is.
+    expect(resolveModel({ option: 'default', persisted: undefined })).toBe('default');
+  });
 });
 
 describe('normalizeModeArg', () => {
