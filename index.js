@@ -101,6 +101,7 @@ import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
+import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
@@ -228,6 +229,8 @@ const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical li
 const DEBUG = process.env.DEBUG === '1';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+// One-time "Bridge online" marker — see lib/announce-once.js.
+const ANNOUNCE_MARKER_FILE = path.join(os.homedir(), '.claude-matrix-announced.json');
 // Durable folder history for the picker (`recent_folders` RPC) — outlives
 // the session records above, which stale-resume cleanup deletes.
 const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json');
@@ -497,10 +500,20 @@ if (JOURNAL_ENABLED) {
   // other publish here). No Matrix dependency: this convo has no Matrix
   // room, only a journal conversation.
   journalPublisher.upsertConvo(JOURNAL_CONTROL_CONVO_ID, { title: `${os.hostname()} bridge`, sessionState: 'running' });
-  journalPublisher.publishText(JOURNAL_CONTROL_CONVO_ID, {
-    body: 'Bridge online. Commands: "new [directory]" — start a session; "list" — active sessions; "help" — this text.',
-    from: 'assistant',
-  });
+  // First boot for this control convo only — idle-stopped boxes wake several
+  // times a day, and a fresh message here on every boot bumps the control
+  // convo to the top of the chat list each time. `help` prints the same text.
+  if (shouldAnnounceOnline(ANNOUNCE_MARKER_FILE, JOURNAL_CONTROL_CONVO_ID)) {
+    // publishText reports whether the frame was accepted onto the outgoing
+    // queue (evicted-on-overflow → false), not delivery. Only an accepted
+    // publish records the marker: a refused one would otherwise silence
+    // every later boot for a message nobody ever received.
+    const accepted = journalPublisher.publishText(JOURNAL_CONTROL_CONVO_ID, {
+      body: 'Bridge online. Commands: "new [directory]" — start a session; "list" — active sessions; "help" — this text.',
+      from: 'assistant',
+    });
+    if (accepted) recordOnlineAnnounced(ANNOUNCE_MARKER_FILE, JOURNAL_CONTROL_CONVO_ID);
+  }
 }
 
 function expandHome(p) {

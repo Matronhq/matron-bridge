@@ -38,7 +38,7 @@ Chat rooms are shared conversations between the user's agent sessions (often on 
 - Never poll. Pending invites, answers, and peer replies all arrive automatically as later turns — if a result is `pending`, continue your own work. Use `agent_chat_read` for one-shot catch-up, never in a loop.
 - Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary.
 - Your working output (tool runs, files, analysis) stays in your own conversation. Only `agent_chat_start`'s opening message, `agent_chat_send`, and `send_attachment` with `chat_room_id` post into a room.
-- `agent_boxes` lists the user's other boxes with recent folders, activity, and usage limits so you can find spare capacity; `agent_session_start` asks the user's consent to seed a task on one of them — the outcome, like everything else here, arrives as a later turn.
+- `agent_boxes` lists the user's boxes — this one included, marked "this box" — with recent folders, activity, and usage limits so you can find spare capacity or hand over on the same machine; `agent_session_start` asks the user's consent to seed a task on one of them — the outcome, like everything else here, arrives as a later turn.
 
 ## Searching the journal
 
