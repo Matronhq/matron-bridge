@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { handleCodexControl, listCodexThreads, mergeCodexThreads, offerCodexBuild } from '../lib/codex-controls.js';
 import { codexMcpConfig } from '../lib/codex-mcp.js';
+import { normalizeCodexSandbox } from '../lib/codex-session.js';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 function setup() {
@@ -9,6 +10,22 @@ function setup() {
   return { session, opts, run: text => handleCodexControl(session, text, opts) };
 }
 describe('Codex native controls', () => {
+  it('defaults Matron to YOLO while respecting configured sandbox modes', () => {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    const declaration = source.match(/^const CODEX_SANDBOX_MODE = .+;$/m)[0];
+    for (const [value, expected] of [[undefined, 'danger-full-access'], ['workspace-write', 'workspace-write'], ['read-only', 'read-only'], ['invalid', 'workspace-write']]) {
+      expect(vm.runInNewContext(`${declaration}\nCODEX_SANDBOX_MODE`, {
+        process: { env: { CODEX_SANDBOX_MODE: value } }, normalizeCodexSandbox,
+      })).toBe(expected);
+    }
+  });
+  it('keeps an unanswered plan question actionable instead of superseding it with Build', () => {
+    const h = setup(); h.session.codex.planMode = true; h.session._codexHadAssistantMessage = true;
+    h.session.codexPrompts = { active: { kind: 'async-question' } };
+    offerCodexBuild(h.session);
+    expect(h.session.sendButtonMessage).not.toHaveBeenCalled();
+    expect(h.session._codexBuildValue).toBeUndefined();
+  });
   it('enters read-only plan mode, publishes Build, and only implements on explicit approval', async () => {
     const h = setup(); await h.run('/plan examine the bridge');
     expect(h.session.codex.planMode).toBe(true); expect(h.opts.send).toHaveBeenCalledWith('examine the bridge');

@@ -63,6 +63,21 @@ describe('native Codex session lifecycle', () => {
     h.session.kill();
   });
 
+  it('uses YOLO permissions on start/resume and restores them after read-only Plan mode', async () => {
+    for (const threadId of [null, 'saved']) {
+      const h = setup({ threadId, sandbox: 'danger-full-access' }); h.send(); await settle();
+      expect(h.clients[0].request).toHaveBeenCalledWith(threadId ? 'thread/resume' : 'thread/start',
+        expect.objectContaining({ sandbox: 'danger-full-access', approvalPolicy: 'never' }), expect.anything());
+      h.complete(); h.session.planMode = true; h.send(); await settle();
+      expect(h.clients[1].request).toHaveBeenCalledWith('thread/resume',
+        expect.objectContaining({ sandbox: 'read-only', approvalPolicy: 'never' }), expect.anything());
+      h.complete(); h.session.planMode = false; h.send(); await settle();
+      expect(h.clients[2].request).toHaveBeenCalledWith('thread/resume',
+        expect.objectContaining({ sandbox: 'danger-full-access', approvalPolicy: 'never' }), expect.anything());
+      h.session.kill();
+    }
+  });
+
   it('resumes IDs, resets model/effort defaults, and rebuilds MCP for Plan/Build', async () => {
     const h = setup({ threadId: 'saved', model: 'special', effort: 'high', config: { mcp_servers: { bridge: { enabled: true } } } });
     h.send(); await settle(); h.complete();

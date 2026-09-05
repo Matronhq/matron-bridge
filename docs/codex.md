@@ -28,6 +28,8 @@ The bridge:
 
 The installed Codex CLI remains responsible for model access, authentication, user/project configuration, `AGENTS.md`, skills, rules, MCP servers, and tool execution.
 
+Both blocking questions and `request_user_input_async` appear as Matron question cards with selectable options and free-text replies. Async questions stay available after normal turn completion until answered or expired; Codex can continue working meanwhile. Replies include the question text and use native steering during a turn or start a new turn afterward. Blocking permission requests take priority, and interruption, reconnection, or shutdown clears outstanding cards.
+
 ### Optional live view for Codex launched by a Claude session
 
 This wrapper-based view is separate from the native app-server backend above.
@@ -131,7 +133,7 @@ The Codex-specific `.env` settings are:
 | Variable | Purpose | Default |
 |---|---|---|
 | `MATRON_DEFAULT_AGENT` | Provider used when a command has neither an explicit provider flag nor a persisted provider choice | `claude` |
-| `CODEX_SANDBOX_MODE` | Sandbox applied to every remote Codex turn: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
+| `CODEX_SANDBOX_MODE` | Sandbox outside Plan mode: `read-only`, `workspace-write`, or `danger-full-access` (YOLO, no approvals) | `danger-full-access` |
 | `MATRON_CODEX_TRANSPORT` | `app-server`, or `exec` for legacy rollback without native interactive features | `app-server` |
 | `CODEX_NETWORK_ACCESS` | Command network access in workspace-write mode: `true` or `false`; empty inherits Codex configuration | unset |
 | `BRIDGE_CODEX_MD_PATH` | Developer-instructions file supplied to bridge-spawned Codex turns | repository `BRIDGE_CODEX.md` |
@@ -140,7 +142,7 @@ Example:
 
 ```dotenv
 MATRON_DEFAULT_AGENT=codex
-CODEX_SANDBOX_MODE=workspace-write
+CODEX_SANDBOX_MODE=danger-full-access
 CODEX_NETWORK_ACCESS=
 BRIDGE_CODEX_MD_PATH=
 ```
@@ -151,7 +153,9 @@ Codex still loads its normal configuration for the bridge user's account. Put mo
 
 ## Sandbox and approvals
 
-The native backend uses `approval_policy="on-request"` and `approvals_reviewer="user"`. Command, file-change, and permission requests wait for Matron approval cards, not a terminal. Cards expire with denial, are bound to individual requests, and are cleared on interruption or teardown. Unknown request types fail closed. This supports GitHub network operations and protected Git writes without enabling unrestricted network access globally. See [OpenAI's sandbox and approvals documentation](https://learn.chatgpt.com/docs/agent-approvals-security).
+Matron defaults to YOLO: `danger-full-access` with `approval_policy="never"`, disabling Codex sandbox restrictions and approval prompts. An explicit `CODEX_SANDBOX_MODE=workspace-write` or `read-only` enables sandboxing and native `approval_policy="on-request"` with `approvals_reviewer="user"`. Existing explicit sandbox settings remain effective.
+
+In those sandboxed modes, command, file-change, and permission requests wait for Matron approval cards. Cards expire with denial, are bound to individual requests, and are cleared on interruption or teardown. Unknown request types fail closed. See [OpenAI's sandbox and approvals documentation](https://learn.chatgpt.com/docs/agent-approvals-security).
 
 | Mode | Appropriate use |
 |---|---|

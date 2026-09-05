@@ -3,9 +3,9 @@ import { CodexPromptQueue } from '../lib/codex-prompts.js';
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const approval = (id = 1, method = 'item/commandExecution/requestApproval') => ({ id, method, params: { command: 'gh pr create', threadId: 'parent', turnId: 'turn' } });
 function setup() {
-  const respond = vi.fn(() => true), reject = vi.fn(), publish = vi.fn(() => true), notice = vi.fn();
-  const queue = new CodexPromptQueue({ respond, reject, publish, notice, timeoutMs: 1000 });
-  return { queue, respond, reject, publish, notice, choose: index => queue.answer({ choice: queue.active.options[index].value }) };
+  const respond = vi.fn(() => true), reject = vi.fn(), publish = vi.fn(() => true), notice = vi.fn(), submitAsync = vi.fn(() => true), onPending = vi.fn();
+  const queue = new CodexPromptQueue({ respond, reject, publish, notice, submitAsync, onPending, timeoutMs: 1000 });
+  return { queue, respond, reject, publish, notice, submitAsync, onPending, choose: index => queue.answer({ choice: queue.active.options[index].value }) };
 }
 afterEach(() => vi.useRealTimers());
 describe('native Codex approval and question cards', () => {
@@ -82,5 +82,67 @@ describe('native Codex approval and question cards', () => {
   it('fails closed if the card cannot be delivered', async () => {
     const h = setup(); h.publish.mockReturnValue(false); h.queue.add(approval()); await settle();
     expect(h.queue.active).toBeNull(); expect(h.respond).toHaveBeenCalledWith(1, { decision: 'decline' });
+  });
+});
+
+describe('asynchronous Codex question cards', () => {
+  it('renders string options and delivers all answers as contextual user input', async () => {
+    const h = setup();
+    h.queue.addAsync('message-1', [{ title: 'Which feature?', options: ['Tokens', 'Models'] }, { title: 'Any details?', options: null }]);
+    await settle();
+    expect(h.publish).toHaveBeenLastCalledWith(expect.objectContaining({
+      question: '(1/2) Which feature?', options: [expect.objectContaining({ label: 'Tokens' }), expect.objectContaining({ label: 'Models' })],
+    }));
+    expect(h.onPending).toHaveBeenLastCalledWith(false);
+    const oldChoice = h.queue.active.options[0].value;
+    expect(h.choose(1)).toBe('Models');
+    expect(h.submitAsync).not.toHaveBeenCalled();
+    expect(h.queue.answer({ choice: oldChoice })).toBeNull();
+    await settle();
+    expect(h.publish).toHaveBeenLastCalledWith({ question: '(2/2) Any details?', options: [], mode: 'pick_one' });
+    expect(h.queue.answer({ text: 'Show all models' })).toBe('Show all models');
+    expect(h.submitAsync).toHaveBeenCalledWith('Which feature?\nModels\n\nAny details?\nShow all models');
+    expect(h.respond).not.toHaveBeenCalled();
+    h.queue.addAsync('message-1', [{ title: 'Duplicate?' }]);
+    expect(h.queue.active).toBeNull();
+  });
+  it('keeps async answers separate from approval decisions and resumes their cards', async () => {
+    const h = setup(); h.queue.addAsync('message-1', [{ title: 'Continue?', options: ['Allow once'] }]); await settle();
+    const asyncChoice = h.queue.active.options[0].value;
+    h.queue.add(approval()); await settle();
+    expect(h.queue.active.kind).toBe('approval');
+    expect(h.queue.answer({ choice: asyncChoice, text: 'Allow once' })).toBeNull();
+    expect(h.respond).not.toHaveBeenCalled();
+    h.choose(2); await settle();
+    expect(h.respond).toHaveBeenCalledWith(1, { decision: 'decline' });
+    expect(h.publish).toHaveBeenLastCalledWith(expect.objectContaining({ question: 'Continue?' }));
+    h.queue.clear({ preserveAsync: true });
+    expect(h.choose(0)).toBe('Allow once');
+    expect(h.submitAsync).toHaveBeenCalledWith('Continue?\nAllow once');
+    expect(h.respond).toHaveBeenCalledTimes(1);
+  });
+  it('retains an answer for retry when the delivery path refuses it', () => {
+    const h = setup(); h.queue.addAsync('message-1', [{ title: 'Name?' }]);
+    h.submitAsync.mockReturnValueOnce(false);
+    expect(h.queue.answer({ text: 'Matron' })).toBeNull();
+    expect(h.queue.active).not.toBeNull();
+    expect(h.queue.answer({ text: 'Matron' })).toBe('Matron');
+    expect(h.queue.active).toBeNull();
+  });
+  it('expires or clears async cards without responding to a nonexistent RPC', async () => {
+    vi.useFakeTimers(); const h = setup(); h.queue.addAsync('message-1', [{ title: 'Name?' }]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.queue.active).toBeNull(); expect(h.notice).toHaveBeenCalled();
+    h.queue.addAsync('message-2', [{ title: 'Name?' }]); h.queue.clear();
+    expect(h.queue.active).toBeNull(); expect(h.respond).not.toHaveBeenCalled(); expect(h.submitAsync).not.toHaveBeenCalled();
+  });
+  it('ignores malformed questions and removes undeliverable cards', async () => {
+    const h = setup();
+    for (const questions of [null, [], [{ title: 7 }], [{ title: 'Where?', options: 'Here' }], [{ title: 'Where?', options: [null] }]]) {
+      h.queue.addAsync('invalid', questions);
+    }
+    expect(h.queue.active).toBeNull();
+    h.publish.mockReturnValue(false); h.queue.addAsync('message-1', [{ title: 'Where?' }]); await settle();
+    expect(h.queue.active).toBeNull(); expect(h.respond).not.toHaveBeenCalled(); expect(h.submitAsync).not.toHaveBeenCalled();
   });
 });
