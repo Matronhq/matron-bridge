@@ -60,12 +60,14 @@ describe('isNoticeEligible', () => {
   it('excludes user-blocking tools and ask-user MCP tools', () => {
     expect(isNoticeEligible('AskUserQuestion')).toBe(false);
     expect(isNoticeEligible('ExitPlanMode')).toBe(false);
-    expect(isNoticeEligible('Task')).toBe(false);
     expect(isNoticeEligible('mcp__ask-user__request_secret')).toBe(false);
   });
-  it('includes ordinary and MCP tools', () => {
+  it('includes ordinary, MCP and subagent tools', () => {
     expect(isNoticeEligible('Bash')).toBe(true);
     expect(isNoticeEligible('mcp__Roblox_Studio__run_script_in_play_mode')).toBe(true);
+    expect(isNoticeEligible('mcp__chrome-devtools__get_network_request')).toBe(true);
+    expect(isNoticeEligible('Task')).toBe(true);
+    expect(isNoticeEligible('Agent')).toBe(true);
   });
   it('rejects junk', () => {
     expect(isNoticeEligible('')).toBe(false);
