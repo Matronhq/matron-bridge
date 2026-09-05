@@ -150,15 +150,18 @@ function testConnection(url, token) {
 }
 
 async function main() {
-  if (!process.stdin.isTTY) {
-    console.error('setup/wizard.mjs needs an interactive terminal.');
+  // Both ends must be a TTY: readline only masks askHidden's keystrokes in
+  // terminal mode, which follows stdout, so a redirected stdout would echo
+  // the token in cleartext even with an interactive stdin.
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('setup/wizard.mjs needs an interactive terminal (stdin and stdout).');
     console.error('For non-interactive installs, copy .env.example to .env and edit it.');
     process.exit(1);
   }
 
   // historySize 0: readline keeps every answer in its up-arrow history, which
   // would let a later prompt in the same run recall the token askHidden hid.
-  rl = createInterface({ input: process.stdin, output: process.stdout, historySize: 0 });
+  rl = createInterface({ input: process.stdin, output: process.stdout, historySize: 0, terminal: true });
 
   console.log('');
   console.log('=== Matron Bridge setup ===');

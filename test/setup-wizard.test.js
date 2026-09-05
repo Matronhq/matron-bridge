@@ -75,4 +75,10 @@ describe('wizard readline setup', () => {
     const src = fs.readFileSync(path.join(REPO_DIR, 'setup', 'wizard.mjs'), 'utf8');
     expect(src).toMatch(/createInterface\(\{[^}]*historySize: 0[^}]*\}\)/);
   });
+
+  it('requires a TTY on stdout too, since readline only masks the hidden token in terminal mode', () => {
+    const src = fs.readFileSync(path.join(REPO_DIR, 'setup', 'wizard.mjs'), 'utf8');
+    expect(src).toMatch(/!process\.stdin\.isTTY \|\| !process\.stdout\.isTTY/);
+    expect(src).toMatch(/createInterface\(\{[^}]*terminal: true[^}]*\}\)/);
+  });
 });
