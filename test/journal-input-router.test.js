@@ -1418,9 +1418,19 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     });
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
 
+    // 'send_one' ("send just this one, keep the rest queued") is a wire action
+    // in its own right — a card offering it is dead if the router refuses the
+    // reply as invalid, which is exactly what happens to any value not in
+    // QUEUED_RELEASE_ACTIONS.
+    consumer(tap('send_one'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2);
+    expect(deps.routePromptReply.mock.calls[1][1]).toEqual({
+      target_seq: CARD_SEQ, choice: 'send_one', text: null,
+    });
+
     // Unknown action on a known card → warn + user notice, no route.
     consumer(tap('frobnicate'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
     expect(warnings.some(w => /invalid queued_release action/.test(w))).toBe(true);
 
@@ -1431,7 +1441,7 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     // never falling through to the ordinary answer path.
     deps.noticeQueuedReleaseIgnored.mockClear();
     consumer(tap('send'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // still unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // still unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'tombstoned' }));
   });
 });
@@ -1827,12 +1837,39 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(queued).toBeGreaterThan(resolve);
     });
 
-    it('gates ⏳ to peer agents, like the 💬 notice it follows', () => {
-      // A `user:` frame is Dan typing into the room convo himself; he gets no
-      // 💬 line for it, so a bare ⏳ would have nothing to attach to.
-      expect(frame).toMatch(/const isPeerAgent = sender\.startsWith\('agent:'\)/);
-      expect(frame).toMatch(/if \(isPeerAgent\) \{/);
-      expect(frame).toMatch(/if \(isPeerAgent && queuedBefore === 0/);
+    it('gates ⏳ on the SAME label that gates the 💬 notice it follows', () => {
+      // One decision, one gate: a bare ⏳ with no 💬 above it would have
+      // nothing to attach to, and a 💬 with no ⏳ under it would leave a
+      // queued message looking delivered. The label (and the withholding of
+      // it for an unrecognised sender) is roomEchoLabel's call — pinned
+      // behaviourally in test/room-delivery.test.js.
+      expect(frame).toMatch(/const echoFrom = roomEchoLabel\(sender, from\)/);
+      expect(frame).toMatch(/if \(echoFrom\) \{/);
+      expect(frame).toMatch(/if \(echoFrom && queuedBefore === 0/);
+    });
+
+    it("echoes Dan's OWN room messages into the member chats too", () => {
+      // Dan, 2026-08-19: a `user:` frame used to be suppressed here ("he can
+      // already see it in the room"), which hid the thing the room convo
+      // can't show — WHICH member chats took the message straight away and
+      // which queued it behind a running turn. The echo's job is that
+      // receipt, not the content.
+      expect(frame).not.toMatch(/isPeerAgent/);
+      const notice = frame.indexOf('journalPublishNotice(');
+      const queued = frame.indexOf('ROOM_MESSAGE_QUEUED_NOTICE');
+      expect(notice).toBeGreaterThan(-1);
+      expect(queued).toBeGreaterThan(notice);
+    });
+
+    it('publishes the 💬 echo BEFORE the reply-waiter short-circuit', () => {
+      // A message that resolves an agent's `wait_seconds` waiter never
+      // becomes a turn at all — it returns as the tool result. Publishing
+      // the echo first is what keeps that exchange visible to Dan (and it
+      // correctly gets no ⏳: nothing was queued).
+      const notice = frame.indexOf('formatRoomMessageNotice(');
+      const resolve = frame.indexOf('roomReplyWaiters.resolve(');
+      expect(notice).toBeGreaterThan(-1);
+      expect(resolve).toBeGreaterThan(notice);
     });
 
     it('drains an older batch BEFORE publishing this message\'s notice', () => {
@@ -1926,5 +1963,151 @@ describe('isResumePickerTap', () => {
 describe('isPickerFrame with resume options', () => {
   it('classifies a resume- option frame as a picker', () => {
     expect(isPickerFrame({ options: [{ id: 'resume-abc123def456', value: 'resume:abc123def456' }] })).toBe(true);
+  });
+});
+
+// The 🔊 Unmute card (2026-08-19). agent_chat_mute publishes a prompt card
+// into the muting agent's own conversation; the user's tap is the way back.
+// Classified by target_seq like a queued_release card and for the same reason:
+// the choice value alone proves nothing (an AskUserQuestion option may be
+// labelled literally `unmute:whatever`), so only a seq the bridge itself
+// reserved and published may be actioned.
+describe('room mute card taps', () => {
+  const CONVO = 'convo-mute';
+  const CARD_SEQ = 91;
+  const PROMPT = 'pr_mute_1';
+  const ROOM = 'room-abc';
+
+  function makeDeps(overrides = {}) {
+    const warnings = [];
+    return {
+      deps: {
+        isControlConvo: () => false,
+        handleControlCommand: vi.fn(),
+        findSessionByConvoId: vi.fn(() => ({ claudeSessionId: CONVO })),
+        routeTextToSession: vi.fn(),
+        routePromptReply: vi.fn(),
+        noticeUnknownConvo: vi.fn(),
+        noticeStalePromptReply: vi.fn(),
+        noticeRoomMuteIgnored: vi.fn(),
+        log: { warn: (m) => warnings.push(m), error: () => {} },
+        ...overrides,
+      },
+      warnings,
+    };
+  }
+
+  const cardEcho = () => baseFrame({
+    seq: CARD_SEQ, sender: 'agent:mac', type: 'prompt', convo_id: CONVO,
+    payload: {
+      kind: 'room_mute', prompt_id: PROMPT, question: 'Unmute this chat?',
+      options: [{ id: 'unmute', label: '🔊 Unmute', value: `unmute:${ROOM}` }],
+      mode: 'pick_one',
+    },
+  });
+
+  const tap = (choice, targetSeq = CARD_SEQ) => baseFrame({
+    seq: 300, sender: 'user:dan', type: 'prompt_reply', convo_id: CONVO,
+    payload: { target_seq: targetSeq, choice, text: null },
+  });
+
+  function armed(overrides) {
+    const made = makeDeps(overrides);
+    const consumer = createJournalInputConsumer(made.deps);
+    consumer.roomMuteCards.note(CONVO, { promptId: PROMPT, roomId: ROOM, sessionKey: '!sess' });
+    consumer(cardEcho());
+    return { ...made, consumer };
+  }
+
+  it('a mute card never advances the answerable-prompt staleness guard', () => {
+    expect(promptExpectsReply({
+      kind: 'room_mute', question: 'Unmute this chat?',
+      options: [{ id: 'unmute', label: '🔊 Unmute', value: `unmute:${ROOM}` }],
+    })).toBe(false);
+  });
+
+  it('routes the tap with the card entry attached, then retires it', () => {
+    const { deps, consumer } = armed();
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({
+      target_seq: CARD_SEQ,
+      choice: `unmute:${ROOM}`,
+      roomMute: { roomId: ROOM, sessionKey: '!sess', promptId: PROMPT },
+    });
+    // Not an ordinary answer: no staleness refusal, no "answered:" echo path.
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('a double tap is a no-op with an honest message, never a second unmute', () => {
+    const { deps, consumer } = armed();
+    consumer(tap(`unmute:${ROOM}`));
+    deps.routePromptReply.mockClear();
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeRoomMuteIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'retired' }));
+  });
+
+  it('a tap on a card the AGENT already retired (agent_chat_unmute) is refused, not honoured', () => {
+    const { deps, consumer } = armed();
+    consumer.roomMuteCards.retire(ROOM, '!sess');
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeRoomMuteIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'retired' }));
+  });
+
+  it('accepts the bare action id as well as the option value (I2)', () => {
+    // The apps send the option VALUE, but the card also carries
+    // `actions: [{id:'unmute'}]` for clients with structured handling. Two
+    // hand-kept lists is exactly how lib/busy-queue.js documents an action
+    // going dead on one client — provenance is already proven by target_seq,
+    // so accepting both costs nothing.
+    const { deps, consumer } = armed();
+    consumer(tap('unmute'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toMatchObject({ roomId: ROOM });
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+  });
+
+  it('refuses a choice the card never offered — the value must name THIS card\'s room', () => {
+    const { deps, consumer, warnings } = armed();
+    consumer(tap('unmute:some-other-room'));
+    consumer(tap('yes'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeRoomMuteIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
+    expect(warnings.some(w => /invalid room_mute action/.test(w))).toBe(true);
+  });
+
+  it('a seq the bridge never reserved stays an ordinary reply (provenance, not value shape)', () => {
+    const { deps, consumer } = armed();
+    // Same-looking choice, different (unregistered) target seq: it must flow
+    // through the normal answer path, not silently unmute anything.
+    consumer(tap(`unmute:${ROOM}`, 555));
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toBeUndefined();
+  });
+
+  it('a card frame published by a CLIENT cannot register itself as tappable', () => {
+    const { deps } = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    // No note() reservation, and a user: sender: neither half is satisfied.
+    consumer(baseFrame({
+      seq: CARD_SEQ, sender: 'user:dan', type: 'prompt', convo_id: CONVO,
+      payload: {
+        kind: 'room_mute', prompt_id: PROMPT,
+        options: [{ id: 'unmute', label: '🔊 Unmute', value: `unmute:${ROOM}` }],
+      },
+    }));
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toBeUndefined();
+  });
+
+  it('session teardown evicts the card registry with the rest of the convo state', () => {
+    const { deps, consumer } = armed();
+    consumer.evictConvo(CONVO);
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toBeUndefined();
   });
 });

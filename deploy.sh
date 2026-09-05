@@ -4,12 +4,17 @@
 # Pull → sync deps → PREFLIGHT (verify the new code can actually boot) →
 # restart. The preflight runs while the OLD process is still serving, so a
 # broken deploy leaves the running bridge untouched instead of crash-looping:
-# launchd's KeepAlive would otherwise relaunch a non-booting build forever
-# (this is the exact failure mode a bare restart hit — pulled code that added
-# `sharp` as a top-level import, with node_modules not yet synced).
+# launchd's KeepAlive / systemd's Restart=always would otherwise relaunch a
+# non-booting build forever (this is the exact failure mode a bare restart
+# hit — pulled code that added `sharp` as a top-level import, with
+# node_modules not yet synced).
 #
 # This is the deliberate, infrequent "ship latest" path. `restart.sh` stays as
 # the dumb "just bounce the current code" bounce; it never touches deps.
+#
+# Works on both hosts the bridge runs on:
+#   macOS  — LaunchAgent, restarted with `launchctl kickstart -k`
+#   Linux  — systemd unit (setup/service-linux.sh), restarted with `systemctl`
 #
 # Usage:
 #   ./deploy.sh            pull, install, preflight, restart, record old PID
@@ -18,31 +23,73 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Label of the installed LaunchAgent, discovered rather than hardcoded. Two
-# names are in the wild: setup/service-macos.sh installs
-# "chat.matron.matron-bridge", while machines set up before the repo rename
-# still run "chat.matron.claude-matrix-bridge" — launchd never renames a
-# service just because its repo moved. Hardcoding either one breaks the other
-# half of the installs: the pull, the npm install and the whole preflight
-# succeed, then launchctl says "Could not find service" and the deploy aborts
-# with the OLD code still serving. A pull that looks like a ship.
-#
-# So ask launchd which of them it actually has. Whichever answers is the one
-# that would be restarted.
-DOMAIN="gui/$(id -u)"
-SERVICE=""
-for candidate in chat.matron.matron-bridge chat.matron.claude-matrix-bridge; do
-  if launchctl print "$DOMAIN/$candidate" >/dev/null 2>&1; then
-    SERVICE="$candidate"
-    break
-  fi
-done
-TARGET="$DOMAIN/${SERVICE:-chat.matron.matron-bridge}"
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$1" >&2; exit 1; }
+
+# Which service manager owns the bridge on this host. Everything
+# manager-specific — the "does the service exist?" preflight, the old-PID
+# lookup and the restart itself — is behind these three functions so the
+# pull/install/preflight body stays identical on both platforms.
+case "$(uname -s)" in
+  Darwin)
+    # Label of the installed LaunchAgent, discovered rather than hardcoded. Two
+    # names are in the wild: setup/service-macos.sh installs
+    # "chat.matron.matron-bridge", while machines set up before the repo rename
+    # still run "chat.matron.claude-matrix-bridge" — launchd never renames a
+    # service just because its repo moved. Hardcoding either one breaks the
+    # other half of the installs: the pull, the npm install and the whole
+    # preflight succeed, then launchctl says "Could not find service" and the
+    # deploy aborts with the OLD code still serving. A pull that looks like a
+    # ship.
+    #
+    # So ask launchd which of them it actually has. Whichever answers is the
+    # one that would be restarted.
+    DOMAIN="gui/$(id -u)"
+    SERVICE=""
+    for candidate in chat.matron.matron-bridge chat.matron.claude-matrix-bridge; do
+      if launchctl print "$DOMAIN/$candidate" >/dev/null 2>&1; then
+        SERVICE="$candidate"
+        break
+      fi
+    done
+    TARGET="$DOMAIN/${SERVICE:-chat.matron.matron-bridge}"
+
+    service_exists() { launchctl print "$TARGET" >/dev/null 2>&1; }
+    service_pid()    { launchctl print "$TARGET" 2>/dev/null | awk -F'= ' '/ pid = /{print $2; exit}' || true; }
+    # kickstart -k kills the running instance; KeepAlive relaunches it on the
+    # freshly-synced code.
+    service_restart() { launchctl kickstart -k "$TARGET"; }
+    VERIFY_HINT="launchctl print $TARGET | grep 'pid ='"
+    ;;
+  Linux)
+    # setup/service-linux.sh installs a system-level unit, so restarting needs
+    # root. Non-interactive sudo only: this script is usually run from inside a
+    # bridge session, where a password prompt would hang forever.
+    SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+      sudo -n true 2>/dev/null \
+        || fail "restarting matron-bridge needs passwordless sudo for systemctl (sudo -n failed)"
+      SUDO="sudo -n"
+    fi
+    TARGET="matron-bridge"
+
+    service_exists() { systemctl cat "$TARGET" >/dev/null 2>&1; }
+    service_pid()    { systemctl show "$TARGET" -p MainPID --value 2>/dev/null || true; }
+    # --no-block: hand the restart to systemd and return at once. A blocking
+    # restart never returns to us — the process running this script is
+    # typically a child of the bridge being restarted, so it dies mid-wait
+    # and the closing messages are lost. systemd (PID 1) finishes the job
+    # either way.
+    service_restart() { $SUDO systemctl restart --no-block "$TARGET"; }
+    VERIFY_HINT="systemctl show $TARGET -p MainPID -p ActiveState"
+    ;;
+  *)
+    fail "unsupported platform: $(uname -s) — deploy.sh knows launchd (macOS) and systemd (Linux)"
+    ;;
+esac
 
 # 1. Pull latest master. --ff-only: never rewrite or diverge the live tree.
 step "git pull --ff-only origin master"
@@ -78,7 +125,7 @@ node --input-type=module \
   || fail "the new code cannot import its dependencies — refusing to restart a broken build"
 
 echo "  - the service we are about to restart exists?"
-launchctl print "$TARGET" >/dev/null 2>&1 \
+service_exists \
   || fail "no such service: $TARGET — nothing would be restarted, and the old code would keep serving"
 
 echo "  preflight OK — the new code imports and boots"
@@ -88,14 +135,13 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-# 4. Restart via launchd. kickstart -k kills the running instance; KeepAlive
-#    relaunches it on the freshly-synced code. Record the old PID so the
-#    restart can be verified afterwards (this kickstart kills the process
-#    hosting whatever invoked us, so we can't reliably check the new PID here).
-OLD_PID=$(launchctl print "$TARGET" 2>/dev/null | awk -F'= ' '/ pid = /{print $2; exit}' || true)
+# 4. Restart via the service manager. Record the old PID so the restart can
+#    be verified afterwards (the restart kills the process hosting whatever
+#    invoked us, so we can't reliably check the new PID here).
+OLD_PID=$(service_pid)
 echo "${OLD_PID:-none}" > /tmp/matron-deploy-oldpid
-step "launchctl kickstart -k $TARGET  (old PID: ${OLD_PID:-none})"
-launchctl kickstart -k "$TARGET"
+step "restart $TARGET  (old PID: ${OLD_PID:-none})"
+service_restart
 
 echo "Restart requested. Old PID was ${OLD_PID:-none} (saved to /tmp/matron-deploy-oldpid)."
-echo "Verify: launchctl print $TARGET | grep 'pid =' — the PID should differ and stay up."
+echo "Verify: $VERIFY_HINT — the PID should differ and stay up."
