@@ -73,6 +73,17 @@ async function askYesNo(question, defYes) {
   return answer.startsWith('y');
 }
 
+// Read a file that may legitimately not exist yet (a first run has no .env).
+// Reading and handling ENOENT avoids the existsSync-then-read race.
+function readIfExists(p) {
+  try {
+    return fs.readFileSync(p, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return '';
+    throw e;
+  }
+}
+
 export function parseEnv(text) {
   const out = {};
   for (const line of text.split('\n')) {
@@ -151,7 +162,7 @@ async function main() {
   console.log('machine (create one there with: node bin/matron-admin agent add <name>).');
   console.log('');
 
-  const existing = fs.existsSync(ENV_PATH) ? parseEnv(fs.readFileSync(ENV_PATH, 'utf8')) : {};
+  const existing = parseEnv(readIfExists(ENV_PATH));
   const example = fs.readFileSync(EXAMPLE_PATH, 'utf8');
 
   // --- journal URL ---
@@ -226,9 +237,14 @@ async function main() {
 
   const env = buildEnv(example, existing, owned);
 
-  if (fs.existsSync(ENV_PATH)) {
+  // Copy and handle ENOENT rather than existsSync-then-copy: the check-then-
+  // act pair is a race (CodeQL js/file-system-race), and "no previous .env"
+  // is the only outcome the check was guarding.
+  try {
     fs.copyFileSync(ENV_PATH, `${ENV_PATH}.bak`);
     console.log(`(previous .env backed up to .env.bak)`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
   }
   fs.writeFileSync(ENV_PATH, env, { mode: 0o600 });
   fs.chmodSync(ENV_PATH, 0o600);
