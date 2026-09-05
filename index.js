@@ -28,7 +28,7 @@ import {
   knownMcpExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
-import { aliasLabel, extractModelFlag, modelFromEvent, modelOptions, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import {
   resolveInteractive,
@@ -166,6 +166,20 @@ const DEFAULT_AGENT = resolveAgent({ fallback: process.env.MATRON_DEFAULT_AGENT 
 if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAULT_AGENT)) {
   console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
 }
+// Box-wide default Claude model for FRESH starts (New Chat picker with no
+// pick, /start without --model). A resumed room keeps the model it last ran
+// on. Claude-only: Codex takes its model from its own config. Unset means
+// Claude Code's own default; an unknown alias is dropped with a warning so a
+// typo here can't make every spawn fail on a bogus --model.
+const DEFAULT_MODEL = (() => {
+  const raw = process.env.MATRON_DEFAULT_MODEL;
+  if (!raw || !raw.trim()) return null;
+  if (!isValidModelArg(raw)) {
+    console.warn(`[model] Unknown MATRON_DEFAULT_MODEL=${JSON.stringify(raw)}; using Claude Code's default. Try: ${VALID_ALIAS_HINT} (or a full claude-* name).`);
+    return null;
+  }
+  return normalizeModelArg(raw);
+})();
 const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
 // Box-wide default for print-mode Claude sessions: 'bypass' spawns with
 // --dangerously-skip-permissions, 'auto' with Claude Code's auto permission
@@ -781,6 +795,10 @@ const journalRpcHandler = createRpcRequestHandler({
   // model_options) — an RPC start mints a fresh convo, so this box default
   // is the agent it will run as. Claude-only; see lib/journal-rpc.js.
   defaultAgent: DEFAULT_AGENT,
+  // Reported to the New Chat picker as `default_model` so it can preselect
+  // what a no-pick start will actually run on (the spawn applies it via
+  // resolveModel's fallback, so this is a label, not a second code path).
+  defaultModel: DEFAULT_MODEL,
   expandHome,
   // Capacity thunks (2026-08-10 capacity spec): answered from cache, never
   // blocking a reply on a subprocess. getLimits kicks a background refresh
@@ -1587,7 +1605,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   ];
   const printModel = options.model === null
     ? undefined
-    : resolveModel({ option: options.model, persisted: persistedMode?.model });
+    : resolveModel({ option: options.model, persisted: persistedMode?.model, fallback: DEFAULT_MODEL, resumed: identity.resumed });
   if (printModel) {
     args.push('--model', printModel);
   }
@@ -2318,7 +2336,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const sessionId = identity.sessionId;
   const model = options.model === null
     ? undefined
-    : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
+    : resolveModel({ option: options.model, persisted: persistedForRoom?.model, fallback: DEFAULT_MODEL, resumed: identity.resumed });
 
   const settings = {
     hooks: {
