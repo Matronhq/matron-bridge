@@ -4,6 +4,7 @@ node_modules/
 .journal-token
 *.log
 .mcp-config-generated*.json
+mcp-config.local.json
 journal-cursor.json
 
 node_modules
