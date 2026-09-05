@@ -12,6 +12,11 @@ Useful upstream references:
 
 Each user turn starts one `codex exec --json` child process. The prompt is written to stdin rather than placed in the process arguments. After the first turn, the bridge records the native Codex thread ID and continues it with `codex exec resume <thread-id>` on later turns.
 
+Completed assistant messages appear as Codex emits them, including progress
+updates before a tool finishes. Delivery is per message, not per token. The
+conversation stays busy until the child exits, so queued input still waits for
+the current turn to finish.
+
 The bridge:
 
 - runs Codex in the conversation's working directory;

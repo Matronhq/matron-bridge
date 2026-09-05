@@ -2040,6 +2040,8 @@ function codexToolIndicator(item) {
 }
 
 function handleCodexEvent(session, event) {
+  // A killed/replaced child can still drain stdout while shutting down.
+  if (!session.alive) return;
   // Progress touch for restart carry-on — the Codex-side counterpart of the
   // touch in handleClaudeEvent. Debounced and no-op without a marker.
   inflightMarker.touch(journalConvoIdFor(session));
@@ -2101,6 +2103,9 @@ function handleCodexEvent(session, event) {
       const item = event.item || {};
       if (item.type === 'agent_message' && typeof item.text === 'string' && item.text.trim()) {
         session.responseBuffer += (session.responseBuffer ? '\n\n' : '') + item.text;
+        // exec emits complete messages, including progress before tools run.
+        // Deliver each now; only turn-exit may release busy/queued input.
+        flushResponse(session);
       }
       if (codexToolIndicator(item) && session._journalActivityState === 'tool') {
         journalActivity(session, 'thinking');
