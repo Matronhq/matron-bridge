@@ -147,7 +147,7 @@ import {
   resolveNativeSessionIdForPersistence,
   snapshotAgentState,
 } from './lib/agent-handoff.js';
-import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
+import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, normalizeCodexNetworkAccess } from './lib/codex-session.js';
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
@@ -173,6 +173,7 @@ if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAU
   console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
 }
 const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
+const CODEX_NETWORK_ACCESS = normalizeCodexNetworkAccess(process.env.CODEX_NETWORK_ACCESS);
 // Explicit rollback; never silently replay a failed app-server turn via exec.
 const CODEX_APP_SERVER = process.env.MATRON_CODEX_TRANSPORT !== 'exec';
 const codexThreadLists = new Map();
@@ -1977,6 +1978,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     model,
     effort: persistedCodexState.effort || null,
     sandbox: CODEX_SANDBOX_MODE,
+    networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
     env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,

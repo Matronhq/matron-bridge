@@ -7,6 +7,7 @@ import {
   buildCodexExecArgs,
   contentBlocksToCodexPrompt,
   normalizeCodexSandbox,
+  normalizeCodexNetworkAccess,
 } from '../lib/codex-session.js';
 
 function fakeChild() {
@@ -36,6 +37,45 @@ describe('Codex programmatic session', () => {
 
   it('falls back to workspace-write for an invalid sandbox', () => {
     expect(normalizeCodexSandbox('root-everything')).toBe('workspace-write');
+  });
+
+  it('inherits network policy unless explicitly configured', () => {
+    expect(normalizeCodexNetworkAccess(undefined)).toBeNull();
+    expect(normalizeCodexNetworkAccess('')).toBeNull();
+    expect(normalizeCodexNetworkAccess('invalid')).toBeNull();
+    expect(normalizeCodexNetworkAccess(' TRUE ')).toBe(true);
+    expect(normalizeCodexNetworkAccess(false)).toBe(false);
+    expect(buildCodexExecArgs().join(' ')).not.toContain('network_access');
+  });
+
+  it('sets network access on initial and resumed turns without widening the filesystem sandbox', () => {
+    for (const threadId of [null, 'thread-1']) {
+      for (const networkAccess of [true, false]) {
+        const args = buildCodexExecArgs({ threadId, networkAccess });
+        expect(args).toContain(`sandbox_workspace_write.network_access=${networkAccess}`);
+        expect(args).toContain('sandbox_mode="workspace-write"');
+        expect(args).toContain('approval_policy="never"');
+      }
+    }
+    for (const sandbox of ['read-only', 'danger-full-access']) {
+      expect(buildCodexExecArgs({ sandbox, networkAccess: true }).join(' ')).not.toContain('network_access');
+    }
+  });
+
+  it('carries the network setting from the session adapter into each spawn', () => {
+    const child = fakeChild();
+    const children = [child, fakeChild()];
+    const spawnImpl = vi.fn(() => children.shift());
+    const session = new CodexExecSession({ cwd: '/repo', networkAccess: true, spawnImpl });
+    session.send([{ type: 'text', text: 'first turn' }]);
+    child.stdout.write('{"type":"thread.started","thread_id":"thread-1"}\n');
+    child.emit('close', 0, null);
+    session.send([{ type: 'text', text: 'resumed turn' }]);
+    expect(spawnImpl).toHaveBeenCalledTimes(2);
+    for (const [, args] of spawnImpl.mock.calls) {
+      expect(args).toContain('sandbox_workspace_write.network_access=true');
+    }
+    expect(spawnImpl.mock.calls[1][1]).toContain('resume');
   });
 
   it('turns only text blocks into the stdin prompt', () => {

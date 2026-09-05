@@ -133,6 +133,7 @@ The Codex-specific `.env` settings are:
 | `MATRON_DEFAULT_AGENT` | Provider used when a command has neither an explicit provider flag nor a persisted provider choice | `claude` |
 | `CODEX_SANDBOX_MODE` | Sandbox applied to every remote Codex turn: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
 | `MATRON_CODEX_TRANSPORT` | `app-server`, or `exec` for legacy rollback without native interactive features | `app-server` |
+| `CODEX_NETWORK_ACCESS` | Command network access in workspace-write mode: `true` or `false`; empty inherits Codex configuration | unset |
 | `BRIDGE_CODEX_MD_PATH` | Developer-instructions file supplied to bridge-spawned Codex turns | repository `BRIDGE_CODEX.md` |
 
 Example:
@@ -140,6 +141,7 @@ Example:
 ```dotenv
 MATRON_DEFAULT_AGENT=codex
 CODEX_SANDBOX_MODE=workspace-write
+CODEX_NETWORK_ACCESS=
 BRIDGE_CODEX_MD_PATH=
 ```
 
@@ -161,7 +163,7 @@ Use the least-privileged mode that can complete the work. Legacy `MATRON_CODEX_T
 
 `/plan [task]` or `/mode plan` selects a read-only sandbox with escalations denied and configured MCP servers disabled (MCP tools run outside the shell sandbox). After the plan, choose Build or type `build` to restore normal sandbox/approval settings and implement it. `/plan off` leaves Plan mode without starting work. This is Matron's explicit planning workflow, not an undocumented native collaboration-mode setting.
 
-`workspace-write` does not itself enable command network access. If a workflow needs network access, configure it deliberately in the Codex CLI settings for the bridge user. Do not switch to `danger-full-access` merely to solve an authentication, PATH, or MCP configuration problem.
+`workspace-write` does not itself enable command network access. Native sessions can request approval when needed. Operators who want command networking enabled without individual network approvals can explicitly set `CODEX_NETWORK_ACCESS=true` in the bridge's `.env`. The bridge supplies `sandbox_workspace_write.network_access=true` on initial and resumed threads while retaining workspace-write file restrictions and the transport's approval policy (`on-request` for native sessions, `never` for legacy exec). Set it to `false` to disable networking within the sandbox, or leave it empty to inherit the bridge user's Codex configuration. This setting applies only to workspace-write mode outside Plan mode, does not grant protected Git writes, and cannot override externally enforced policies. Restart the bridge after changing `.env`.
 
 ## Start and resume Codex sessions
 
@@ -292,7 +294,7 @@ If those commands work only under another account, authenticate the actual servi
 
 ### A command is blocked or network access fails
 
-First confirm `/mode` is not Plan and `CODEX_SANDBOX_MODE` is appropriate. In app-server mode Codex can request an approval card for GitHub/network and protected-path operations. In legacy exec mode it cannot. Enabling `[sandbox_workspace_write] network_access = true` is an explicit, broader operator choice; it is not required for the approval-card path and does not by itself remove protected-path restrictions. Restart matron-bridge after changing `.env`, then restart/resume the conversation to apply the new backend. External managed policies can still prohibit an operation.
+First confirm `/mode` is not Plan and `CODEX_SANDBOX_MODE` is appropriate. In app-server mode Codex can request an approval card for GitHub/network and protected-path operations. In legacy exec mode it cannot. Setting `CODEX_NETWORK_ACCESS=true` (or `[sandbox_workspace_write] network_access = true` in Codex configuration) is an explicit, broader operator choice; it is not required for the approval-card path and does not by itself remove protected-path restrictions. Restart matron-bridge after changing `.env`, then restart/resume the conversation to apply the new backend. An already-running turn retains its original settings. External managed policies can still prohibit an operation.
 
 ### `/switch` is refused
 
