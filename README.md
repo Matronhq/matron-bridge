@@ -181,12 +181,12 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!working` | Toggle tool call visibility |
 | `!mcp` | Show MCP server status |
 | `!model [model-id\|default]` | Show or change the active provider's model |
-| `!mode [interactive\|print]` | Show or switch the Claude session between PTY-interactive and `--print` mode (Codex is programmatic-only); see `MATRON_INTERACTIVE_MODE` above |
+| `!mode [mode]` | Claude: `interactive` or `print`. Codex: `plan` (read-only) or `default` (Build) |
 | `!login` / `!logout` | Log in to / out of your Anthropic account (auto-switches the session to interactive mode) |
-| `!effort [level]` | Show or set reasoning effort (Claude only; use Codex config for Codex) |
+| `!effort [level]` | Show or set model-supported reasoning effort; Codex also supports `default` |
 | `!cost` | Show session cost |
 | `!usage` | Show token usage stats |
-| `!limits` | Show subscription limits when the active backend exposes them (not available for Codex) |
+| `!limits` | Show the active provider's subscription limits and reset times when available |
 | `!timer <duration> <message>` | Send a message to this chat later (e.g. `!timer 30m /compact`); `!timer` lists pending timers, `!timer cancel <id\|all>` cancels |
 | `!context` | Claude's context report trimmed to the model and token headline; `!context-full` prints the untrimmed report |
 | `!tools` | List available tools |
@@ -198,7 +198,7 @@ Any other message is forwarded directly to the selected agent. Claude Code slash
 
 ### Permissions
 
-Print-mode Claude sessions run with `--dangerously-skip-permissions` by default. Opting a session in with `--auto` switches it to Claude Code's `auto` permission mode: routine work is auto-approved, dangerous actions are blocked, and the remaining prompts appear in Matron as Allow once / Always allow this tool (session) / Deny cards (an unanswered card denies itself after 5 minutes). `--bypass` returns a session to the default. Both flags persist across restarts until changed again, and `MATRON_PERMISSION_MODE=auto` flips the box-wide default so every session runs in auto mode unless started with `--bypass`. Interactive (`!mode interactive`) and Codex sessions don't route through this flow — they always run bypassed. Note: Haiku-class models don't support auto mode and fall back to Claude Code's `default` mode, which prompts more often; the bridge warns about this at spawn time.
+Print-mode Claude sessions run with `--dangerously-skip-permissions` by default. Opting a session in with `--auto` switches it to Claude Code's `auto` permission mode: routine work is auto-approved, dangerous actions are blocked, and the remaining prompts appear in Matron as Allow once / Always allow this tool (session) / Deny cards (an unanswered card denies itself after 5 minutes). `--bypass` returns a session to the default. Both flags persist across restarts until changed again, and `MATRON_PERMISSION_MODE=auto` flips the box-wide default for Claude print sessions. Interactive Claude sessions run bypassed. Native Codex instead uses its configured sandbox and on-request approval cards; it is not bypassed by these Claude flags. `MATRON_CODEX_TRANSPORT=exec` selects the legacy Codex backend, where approvals cannot be answered. See [Codex setup and security](docs/codex.md). Note: Haiku-class models don't support auto mode and fall back to Claude Code's `default` mode, which prompts more often; the bridge warns about this at spawn time.
 
 ## Matron journal transport
 
@@ -242,12 +242,12 @@ A room between two sessions stays open for as long as both live — agents have 
 ## How it works
 
 1. User messages arrive via the matron-journal WebSocket connection
-2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`, or Codex is run with `codex exec --json`
-3. User messages are sent as Claude stream JSON or as a Codex stdin prompt
+2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`, or Codex uses a persistent stdio app-server
+3. User messages are sent as Claude stream JSON or Codex native turn/steer requests
 4. Structured JSON events are parsed from stdout and normalized into the shared bridge session lifecycle
 5. The complete response is published to the journal when the provider reports that the turn is complete
 6. Long responses are split at 32K-char boundaries
-7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `exec resume <thread-id>`
+7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `thread/resume`
 8. Agent handoffs persist one native session ID per provider plus a shared transcript cursor; the next prompt carries a bounded unseen transcript delta
 9. Crashed sessions auto-restart up to 3 times
 10. Messages sent while an agent is busy are queued and sent when the turn completes

@@ -148,13 +148,17 @@ import {
   snapshotAgentState,
 } from './lib/agent-handoff.js';
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
+import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
+import { wireCodexAppSession } from './lib/codex-app-wiring.js';
+import { codexMcpConfig } from './lib/codex-mcp.js';
+import { handleCodexControl, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
-const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat bridge. Work autonomously within the configured sandbox; interactive approvals are unavailable.';
+const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work within the configured sandbox. Use native approval requests for actions requiring extra permission. Never post secrets in chat.';
 
 // --- Config ---
 
@@ -169,6 +173,9 @@ if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAU
   console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
 }
 const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
+// Explicit rollback; never silently replay a failed app-server turn via exec.
+const CODEX_APP_SERVER = process.env.MATRON_CODEX_TRANSPORT !== 'exec';
+const codexThreadLists = new Map();
 // Box-wide default for print-mode Claude sessions: 'bypass' spawns with
 // --dangerously-skip-permissions, 'auto' with Claude Code's auto permission
 // mode + the Matron permission-card prompt tool. Bypass is the default —
@@ -1202,8 +1209,10 @@ async function refreshCodexTelemetry(session, { force = false } = {}) {
     return refreshCodexTelemetry(session);
   }
   const threadId = session.claudeSessionId;
+  const revision = session._codexUsageRevision || 0;
   session._codexTelemetryInflight = codexTelemetryReader.read(threadId).then(telemetry => {
     if (!session.alive || sessions.get(session.roomId) !== session || session.claudeSessionId !== threadId) return;
+    if ((session._codexUsageRevision || 0) !== revision || session.codex?.usage) return;
     if (telemetry.usage) session._codexNativeUsage = telemetry.usage;
     if (telemetry.context) {
       session._lastContextTokens = telemetry.context.tokens;
@@ -1939,10 +1948,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
 
 // --- Codex programmatic sessions ---
 //
-// Codex's stable non-interactive contract is one `codex exec --json` process
-// per turn. The CodexExecSession adapter retains the thread ID and starts a
-// fresh child for each message; this wrapper presents the same logical session
-// shape the rest of the bridge expects from Claude's long-lived process.
+// Native app-server is long-lived, with exec retained as an explicit rollback.
+// Both expose a logical turn lifecycle to the shared bridge session code.
 function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persisted = getPersistedSession(roomId);
@@ -1951,15 +1958,31 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   const model = options.model === null
     ? undefined
     : (options.model ?? persistedCodexState.model ?? undefined);
-  const codex = new CodexExecSession({
+  const mcpExtras = options.mcpExtras ?? persistedCodexState.mcpExtras ?? persisted?.mcpExtras ?? [];
+  const extras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (CODEX_APP_SERVER && extras.includes('share')) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
+  const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
+  const codex = new Adapter({
     cwd,
     threadId: resumeSessionId || null,
     model,
     effort: persistedCodexState.effort || null,
     sandbox: CODEX_SANDBOX_MODE,
-    developerInstructions: CODEX_BRIDGE_PROMPT,
-    env: { ...process.env },
+    developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
+    env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
+    config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
+      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
   });
+  codex.planMode = CODEX_APP_SERVER && persisted?.codexPlanMode === true;
 
   const session = {
     agent: AGENT_CODEX,
@@ -1967,7 +1990,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     proc: null,
     roomId,
     workdir: cwd,
-    mcpExtras: [],
+    mcpExtras,
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -1975,7 +2000,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
-    showBashOutput: false,
+    showBashOutput: CODEX_APP_SERVER && persisted?.showBashOutput !== false,
     alive: true,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
@@ -2005,11 +2030,21 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     _codexLastError: null,
   };
 
+  if (CODEX_APP_SERVER) wireCodexAppSession(session, {
+    publisher: journalPublisher, convoIdFor: journalConvoIdFor, runningStore: subagentRunningStore,
+    stream: journalStream, activity: journalActivity, status: journalStatus,
+    notice: (s, message) => journalPublishNotice(journalConvoIdFor(s), message),
+    publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
+      payload.question, escapeHtml(payload.question), payload) ?? false,
+    publishText: (s, message) => { s.responseBuffer += message; flushResponse(s); }, enabled: JOURNAL_ENABLED,
+  });
+
   codex.on('spawn', ({ child, args }) => {
     session.proc = child;
     session._codexTurnFinished = false;
     session._codexLastError = null;
     session._codexCompletedUsage = null;
+    session._codexHadAssistantMessage = false;
     clearInterval(session._codexTelemetryTimer);
     session._codexTelemetryTimer = setInterval(() => {
       void refreshCodexTelemetry(session);
@@ -2020,7 +2055,16 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     debug(`Working directory: ${cwd}`);
   });
   codex.on('event', event => {
-    debug('Codex event:', JSON.stringify(event));
+    if (session.codexSafeOutput) {
+      if (typeof event.message === 'string') event = { ...event, message: session.codexSafeOutput(event.message) };
+      if (typeof event.error?.message === 'string') event = { ...event, error: { ...event.error, message: session.codexSafeOutput(event.error.message) } };
+    }
+    if (session.codexSafeOutput && event.item) {
+      event = { ...event, item: { ...event.item,
+        ...(event.item.text != null ? { text: session.codexSafeOutput(event.item.text) } : {}),
+        ...(event.item.command != null ? { command: session.codexSafeOutput(event.item.command) } : {}) } };
+    }
+    debug('Codex event:', event.type);
     handleCodexEvent(session, event);
   });
   codex.on('parse-error', ({ line }) => debug('Failed to parse Codex JSON line:', line));
@@ -2031,7 +2075,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     clearInterval(session._codexTelemetryTimer);
     void refreshCodexTelemetry(session, { force: true });
     if (session.alive) void refreshCodexMetadata(session);
-    session.proc = null;
+    session.proc = codex.transport === 'app-server' ? codex.child : null;
     if (session._codexTurnFinished) return;
     if (!session.alive) {
       // killSession normally performs this synchronously so a replacement
@@ -2056,6 +2100,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       return;
     }
     finishCodexTurn(session, { usage: session._codexCompletedUsage });
+    if (CODEX_APP_SERVER) void offerCodexBuild(session);
   });
 
   session.resetTimeout = () => {};
@@ -2147,6 +2192,7 @@ function handleCodexEvent(session, event) {
     case 'item.completed': {
       const item = event.item || {};
       if (item.type === 'agent_message' && typeof item.text === 'string' && item.text.trim()) {
+        session._codexHadAssistantMessage = true;
         session.responseBuffer += (session.responseBuffer ? '\n\n' : '') + item.text;
         // exec emits complete messages, including progress before tools run.
         // Deliver each now; only turn-exit may release busy/queued input.
@@ -2186,6 +2232,7 @@ function handleCodexEvent(session, event) {
 }
 
 function flushPendingSessionQueue(session) {
+  if (session._codexSteerPending || session._codexUncertainSteer) return false;
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queue = session.queuedMessages;
   const notifications = session.queueNotifications || [];
@@ -2267,7 +2314,7 @@ function finishCodexTurn(session, {
   if (usage) {
     // Prefer the fresh native snapshot fetched on turn-exit. If that record
     // is unavailable, expose the exec totals instead of an earlier snapshot.
-    session._codexNativeUsage = null;
+    if (!session.codex?.usage) session._codexNativeUsage = null;
     session.totalUsage.input_tokens += usage.input_tokens || 0;
     session.totalUsage.output_tokens += usage.output_tokens || 0;
     session.totalUsage.cache_read += usage.cached_input_tokens || 0;
@@ -2306,7 +2353,7 @@ function finishCodexTurn(session, {
     else if (session.sendCallback) session.sendCallback(message);
   }
 
-  if (!preserveQueue) {
+  if (!preserveQueue && !session._codexSteerPending && !session._codexUncertainSteer) {
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
     // the queue (and the roomId-keyed room-delivery inbox) carries into the
     // replacement session; see dispatchDeferredCommand. (killSession's
@@ -4642,6 +4689,11 @@ function flushResponse(session) {
 // false, unchanged from before.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
   if (!session.alive || session._autoStopped) return false;
+  const nativeCompact = session.codex?.transport === 'app-server' && contentBlocks.length === 1
+    && contentBlocks[0]?.type === 'text' && isCompactCommand(contentBlocks[0].text);
+  if (nativeCompact && contentBlocks[0].text.trim() !== '/compact') {
+    return reportSessionSendFailure(session, 'Native Codex compaction does not accept custom instructions. Use /compact by itself.');
+  }
 
   const historyText = contentBlocks
     .filter(block => block?.type === 'text' && typeof block.text === 'string')
@@ -4670,7 +4722,8 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   // Reject unsupported Codex inputs before changing activity state or
   // journaling them. A false return is important: callers gate chat history,
   // media mirroring, and first-message naming on actual dispatch.
-  if (session.agent === AGENT_CODEX && (!historyText || !contentBlocksToCodexPrompt(contentBlocks))) {
+  if (session.agent === AGENT_CODEX && (session.codex?.transport === 'app-server'
+    ? !codexInput(contentBlocks).length : (!historyText || !contentBlocksToCodexPrompt(contentBlocks)))) {
     return reportSessionSendFailure(
       session,
       'Codex programmatic mode needs a text prompt or a saved-file path.',
@@ -4720,14 +4773,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     }
   }
 
-  const preparedHandoff = applyPendingAgentHandoff(session, contentBlocks);
+  const preparedHandoff = nativeCompact ? { blocks: contentBlocks, pending: null } : applyPendingAgentHandoff(session, contentBlocks);
   contentBlocks = preparedHandoff.blocks;
 
   if (session.agent === AGENT_CODEX) {
-    // codex exec accepts one text prompt per process. Media builders always
-    // include an absolute-path text annotation; binary/base64 blocks are
-    // intentionally omitted here because Codex can inspect the saved file.
-    const sent = session.codex?.send(contentBlocks) === true;
+    // Native input preserves images; the legacy adapter uses saved-file paths.
+    session._codexBuildValue = null;
+    const sent = (nativeCompact ? session.codex.compact() : session.codex?.send(contentBlocks)) === true;
     if (sent) {
       commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (!skipJournalMirror && journalText) {
@@ -5100,6 +5152,40 @@ function restoreQueuedBatch(session, queued) {
 
 function flushQueue(session, queued, releaseSnapshot = null) {
   const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
+  session._codexUncertainSteer = false; // an explicit retry may release held input
+  if (session.codex?.transport === 'app-server' && session.busy && !hasQueuedCompact(queued)) {
+    if (session._codexSteerPending) { restoreQueuedBatch(session, queued); return false; }
+    const { blocks, mirrorText } = planQueueFlush(queued);
+    const notifications = (session.queueNotifications || []).slice(0, queued.length);
+    session._codexSteerPending = { queued };
+    void session.codex.steer(blocks).then(sent => {
+      session._codexSteerPending = false;
+      if (!session.alive || sessions.get(session.roomId) !== session) return;
+      if (sent) {
+        commitDispatchedUserTurn(session, blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n'), null);
+        if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
+        for (const entry of queued) for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+        finalizeSentQueue(snapshot.convoId, snapshot.entries);
+        session.queueNotifications = (session.queueNotifications || []).filter(n => !notifications.includes(n));
+      } else {
+        restoreQueuedBatch(session, queued);
+        session._codexUncertainSteer = session.codex.steerUncertain === true;
+        journalPublishNotice(snapshot.convoId, session._codexUncertainSteer
+          ? 'Codex did not confirm delivery. Your messages are retained, but will not resend automatically. Check the response before choosing Send or Cancel.'
+          : 'Codex could not steer this turn. Your messages are still queued for its end.');
+      }
+      if (!session.busy && !session._codexUncertainSteer) {
+        if (!dispatchDeferredCommand(session) && !flushPendingSessionQueue(session)) maybeFlushRoomDelivery(session);
+      }
+    }).catch(() => {
+      session._codexSteerPending = false;
+      if (!session.alive) return;
+      restoreQueuedBatch(session, queued);
+      session._codexUncertainSteer = true;
+      journalPublishNotice(snapshot.convoId, 'Could not confirm Codex delivery. Messages retained; check before resending.');
+    });
+    return 'deferred';
+  }
   if (session.agent === AGENT_CODEX && session.busy) {
     // Claude's stream-json stdin can accept a forced follow-up while the
     // current process is alive; codex exec cannot. Preserve the detached
@@ -5912,7 +5998,30 @@ function fetchUsageLimitsText(cwd) {
 const CODEX_MODEL_FLAG_REFUSAL =
   '--model selects a Claude model alias and is Claude-only. Start Codex without --model, then use /model <model-id> in the new conversation (or /model default for your Codex config default).';
 
+function runCodexControl(session, text, reply) {
+  return handleCodexControl(session, text, {
+    beforeDispatch: () => journalPublisher.flushCursor(),
+    reply: reply || journalSessionCommandCtx(session).sendReply,
+    status: journalStatus,
+    persist: extra => persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, extra),
+    send: body => sendTextToSession(session, body, { skipJournalMirror: true }),
+  });
+}
+
+async function availableCodexThreads(workdir, { cached = false, roomId = '' } = {}) {
+  const key = `${roomId}:${workdir || '*'}`;
+  if (cached && codexThreadLists.has(key)) return codexThreadLists.get(key);
+  const persisted = listPersistedAgentSessions(AGENT_CODEX, workdir);
+  if (!CODEX_APP_SERVER) return persisted;
+  const items = mergeCodexThreads(await listCodexThreads(workdir), persisted);
+  if (codexThreadLists.size >= 100) codexThreadLists.delete(codexThreadLists.keys().next().value);
+  codexThreadLists.set(key, workdir ? items.slice(0, 15) : items);
+  return items;
+}
+
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
+  const nativeSession = sessions.get(roomId);
+  if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
@@ -5932,7 +6041,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const startModelFlag = extractModelFlag(agentFlags.rest);
       const selectedAgent = resolveAgent({ option: agentFlags.agent, fallback: DEFAULT_AGENT });
-      if (selectedAgent === AGENT_CODEX && mcpExtras.length > 0) {
+      if (selectedAgent === AGENT_CODEX && !CODEX_APP_SERVER && mcpExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
         return;
       }
@@ -6067,7 +6176,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(restartModelFlag.error);
         return;
       }
-      if (existing.agent === AGENT_CODEX && restartFlagExtras.length > 0) {
+      if (existing.agent === AGENT_CODEX && !CODEX_APP_SERVER && restartFlagExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
         return;
       }
@@ -6235,11 +6344,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       if (selectedAgent === AGENT_CODEX) {
-        if (resumeExtras.length > 0) {
+        if (!CODEX_APP_SERVER && resumeExtras.length > 0) {
           await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
           return;
         }
-        const localEntries = listPersistedAgentSessions(AGENT_CODEX, resumeWorkdir);
+        let localEntries;
+        try { localEntries = await availableCodexThreads(isNaN(num) ? null : resumeWorkdir, { cached: !isNaN(num), roomId }); }
+        catch { localEntries = listPersistedAgentSessions(AGENT_CODEX, isNaN(num) ? null : resumeWorkdir); }
         if (!isNaN(num)) {
           if (num < 1 || num > localEntries.length) {
             await sendReply(`Codex session number not found: ${resumeArg}\nUse /sessions --codex to list bridge-owned Codex sessions.`);
@@ -6248,7 +6359,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           resumePersisted = localEntries[num - 1];
         } else {
           const resolution = matchSessionIdPrefix(
-            listPersistedAgentSessions(AGENT_CODEX),
+            localEntries,
             resumeArg,
           );
           if (resolution.ambiguous) {
@@ -6465,7 +6576,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const workdirModelFlag = extractModelFlag(workdirAgentFlags.rest);
       const selectedAgent = resolveAgent({ option: workdirAgentFlags.agent, fallback: DEFAULT_AGENT });
-      if (selectedAgent === AGENT_CODEX && workdirExtras.length > 0) {
+      if (selectedAgent === AGENT_CODEX && !CODEX_APP_SERVER && workdirExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
         return;
       }
@@ -6640,7 +6751,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       let items;
       if (selectedAgent === AGENT_CODEX) {
-        items = listPersistedAgentSessions(AGENT_CODEX, workdir).slice(0, 15);
+        try { items = (await availableCodexThreads(workdir, { roomId })).slice(0, 15); }
+        catch {
+          await sendReply('Could not list native Codex threads; showing bridge-recorded sessions only.');
+          items = listPersistedAgentSessions(AGENT_CODEX, workdir).slice(0, 15);
+          codexThreadLists.set(`${roomId}:${workdir}`, items);
+        }
       } else {
         const projectDir = projectDirFor(workdir);
         if (!(await pathExists(projectDir))) {
@@ -7483,6 +7599,7 @@ function clearQueueNotifications(session) {
 async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
+  if (session.codex?.transport === 'app-server' && await runCodexControl(session, trimmed)) return;
 
   // Bridge-intercepted !/ commands run FIRST, before any prompt/menu
   // resolution below — exactly where Matrix's room.message handler checks
@@ -7508,6 +7625,13 @@ async function journalRouteTextToSession(session, body) {
     },
   });
   if (dispatchedCommand) return;
+
+  if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
+    const answer = session.codexPrompts.answer({ text: trimmed });
+    if (answer) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    else journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
+    return;
+  }
 
   if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
     session.pendingUnclassifiedPrompt = false;
@@ -7709,6 +7833,16 @@ async function journalRouteTextToSession(session, body) {
 // nothing could be resolved (no pending prompt, or an unmatched choice with
 // no usable free text).
 function journalRoutePromptReply(session, { choice, text }) {
+  if (session.codexPrompts?.active) {
+    const answer = session.codexPrompts.answer({ choice, text });
+    if (answer) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    return answer;
+  }
+  if (session._codexBuildValue && choice === session._codexBuildValue && !session.busy) {
+    session._codexBuildValue = null;
+    void runCodexControl(session, 'build');
+    return 'Build';
+  }
   // iv-mode: a structured, button-shaped pending prompt. promptButtons(p)
   // reproduces the exact `options` shape journaled for the `prompt` event
   // (see lib/prompt-buttons.js) — matching against it is matching against
@@ -10048,7 +10182,7 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
     // null is an explicit provider-local default and prevents createSession
     // from falling back to the outgoing provider's legacy top-level model.
     model: targetState.model,
-    mcpExtras: target === AGENT_CLAUDE ? targetState.mcpExtras : [],
+    mcpExtras: targetState.mcpExtras,
     journalConvoId: stableConvoId,
     ...(target === AGENT_CLAUDE
       ? { interactive: targetState.interactiveMode ?? INTERACTIVE_MODE }
@@ -10314,6 +10448,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;
   next.queueNotifications = existing.queueNotifications;
+  next._codexUncertainSteer = existing._codexUncertainSteer;
   journalInputConsumer.queueRelease.carryForward(
     journalConvoIdFor(existing),
     journalConvoIdFor(next),
@@ -10435,6 +10570,12 @@ function clearPendingInterrupt(session) {
 
 function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}) {
   if (!session) return;
+  if (preserveQueue && session._codexSteerPending?.queued) {
+    restoreQueuedBatch(session, session._codexSteerPending.queued);
+    session._codexSteerPending = false;
+    session._codexUncertainSteer = true;
+    journalPublishNotice(journalConvoIdFor(session), 'Restart interrupted a send-now acknowledgement. Messages are retained but held; check the response before resending.');
+  }
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
   // stops it, but belt-and-braces. Also settles child convos (finishAll).

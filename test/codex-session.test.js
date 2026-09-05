@@ -192,7 +192,7 @@ describe('Codex bridge wiring', () => {
     const body = src.slice(start, end);
 
     expect(body).toMatch(
-      /session\.agent === AGENT_CODEX[\s\S]*return reportSessionSendFailure\([\s\S]*const sent = session\.codex\?\.send/,
+      /session\.agent === AGENT_CODEX[\s\S]*return reportSessionSendFailure\([\s\S]*const sent = [^\n]*session\.codex\?\.send/,
     );
     expect(body).toMatch(/if \(sent\) \{[\s\S]*commitDispatchedUserTurn/);
     expect(body).toMatch(/if \(!sent\) \{[\s\S]*return reportSessionSendFailure/);
