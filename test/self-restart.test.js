@@ -3,8 +3,7 @@ import {
   SELF_RESTART_MAX,
   CONTINUE_MAX_CHARS,
   CONTINUATION_PREFIX,
-  planSelfRestart,
-} from '../lib/self-restart.js';
+  planSelfRestart, parseSelfRestartMax } from '../lib/self-restart.js';
 
 // A session restarting ITSELF (the restart_session MCP tool): the agent asks
 // the bridge to respawn its own claude process — typically to pick up browser
@@ -143,5 +142,18 @@ describe('planSelfRestart — Codex sessions', () => {
     const res = planSelfRestart(ok({ agent: 'codex', browser: false }));
     expect(res.error).toBeUndefined();
     expect(res.command).toBe('!restart --force');
+  });
+});
+
+describe('parseSelfRestartMax (MATRON_SELF_RESTART_MAX)', () => {
+  it('uses the default when unset or not a number, so the cap always binds', () => {
+    expect(parseSelfRestartMax(undefined)).toBe(3);
+    expect(parseSelfRestartMax('')).toBe(3);
+    expect(parseSelfRestartMax('lots')).toBe(3);
+    expect(parseSelfRestartMax('-1')).toBe(3);
+  });
+  it('accepts a non-negative integer, including 0 (self-restart off)', () => {
+    expect(parseSelfRestartMax('5')).toBe(5);
+    expect(parseSelfRestartMax('0')).toBe(0);
   });
 });

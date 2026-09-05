@@ -108,6 +108,30 @@ describe('index.js self-restart loop budget', () => {
     expect(body).not.toMatch(/_selfRestartPending/);
   });
 
+  it('resets the count when the user sends media too (voice note, photo)', () => {
+    const start = src.indexOf('function journalOnMedia(');
+    const body = src.slice(start, src.indexOf('\n}', start));
+    expect(body).toMatch(/_agentRestartCount = 0/);
+  });
+
+  it('clears the pending flag when the deferred command fails, so a retry is not 409d', () => {
+    const start = src.indexOf('function dispatchDeferredCommand(');
+    const body = src.slice(start, src.indexOf('\n}', start));
+    expect(body).toMatch(/\.catch\(/);
+    expect(body).toMatch(/_selfRestartPending = false/);
+  });
+
+  it('keeps explicit queue releases from draining into a session with a parked restart', () => {
+    // send / send_one / the magic word all go through flushQueue; the queue
+    // carries into the replacement, so a parked !restart must hold it.
+    const start = src.indexOf('function flushQueue(');
+    const body = src.slice(start, src.indexOf('\n}', start));
+    const guard = body.indexOf("_deferredCommandText.startsWith('!restart')");
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(body.indexOf('dispatchMergedFlush('));
+    expect(body.slice(guard, guard + 400)).toMatch(/restoreQueuedBatch\(session, queued\)/);
+  });
+
   it('resets the count when the user sends text, handing back a fresh budget', () => {
     const start = src.indexOf('async function journalRouteTextToSession');
     const body = src.slice(start, start + 1200);

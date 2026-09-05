@@ -2237,6 +2237,10 @@ function dispatchDeferredCommand(session) {
   if (!session.alive || sessions.get(session.roomId) !== session) return false;
   const ctx = journalSessionCommandCtx(session);
   handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).catch((err) => {
+    // The command failed, so nothing is pending any more. For a self-restart
+    // this is what lets restart_session be called again instead of 409ing
+    // on the flag the failed !restart left behind.
+    session._selfRestartPending = false;
     try { ctx.sendReply(`Deferred ${text.split(' ')[0].replace(/^!/, '/')} failed: ${err?.message || err}`); } catch { /* reply sink gone */ }
   });
   return true;
@@ -5088,6 +5092,17 @@ function restoreQueuedBatch(session, queued) {
 
 function flushQueue(session, queued, releaseSnapshot = null) {
   const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
+  // A restart is parked for this session (a user's mid-turn /restart, or a
+  // self-restart waiting for the turn-end seam). The queue carries into the
+  // replacement — recreateSession copies queuedMessages — so draining it now
+  // would hand the batch to a process about to be torn down and leave the
+  // replacement starting idle. Keep the batch, exactly as a refused flush
+  // does below, and say why nothing went out.
+  if (typeof session._deferredCommandText === 'string' && session._deferredCommandText.startsWith('!restart')) {
+    restoreQueuedBatch(session, queued);
+    journalPublishNotice(journalConvoIdFor(session), '⏳ A restart is pending for this session — queued messages go to the restarted session instead.');
+    return false;
+  }
   if (session.agent === AGENT_CODEX && session.busy) {
     // Claude's stream-json stdin can accept a forced follow-up while the
     // current process is alive; codex exec cannot. Preserve the detached
@@ -7862,6 +7877,11 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
 }
 
 function journalOnMedia(session, media, ctx) {
+  // A voice note or a photo is the user back in the loop just as much as
+  // typed text is, so it refreshes the self-restart budget too (text resets
+  // in journalRouteTextToSession). Both routes are user-origin only — the
+  // auto-continue a self-restart queues never enters here.
+  session._agentRestartCount = 0;
   journalMediaRouter(session, media, ctx);
 }
 
