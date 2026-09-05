@@ -137,7 +137,8 @@ describe('index.js self-restart loop budget', () => {
     const guard = body.indexOf("_deferredCommandText.startsWith('!restart')");
     expect(guard).toBeGreaterThan(-1);
     expect(guard).toBeLessThan(body.indexOf('dispatchMergedFlush('));
-    expect(body.slice(guard, guard + 400)).toMatch(/restoreQueuedBatch\(session, queued\)/);
+    expect(body.slice(guard, guard + 400)).toMatch(/restore\(\)/);
+    expect(body).toMatch(/const restore = \(\) => \{\s*restoreQueuedBatch\(session, queued\)/);
   });
 
   it('resets the count when the user sends text, handing back a fresh budget', () => {
