@@ -89,6 +89,51 @@ describe('native Codex session lifecycle', () => {
     h.session.kill();
   });
 
+  it.each([true, false, 'true', 'false'])('applies explicit workspace networking (%s) on start and resume', async networkAccess => {
+    for (const threadId of [null, 'saved']) {
+      const h = setup({ threadId, networkAccess });
+      h.send(); await settle();
+      expect(h.clients[0].request).toHaveBeenCalledWith(threadId ? 'thread/resume' : 'thread/start',
+        expect.objectContaining({ sandbox: 'workspace-write', approvalPolicy: 'on-request',
+          config: expect.objectContaining({ 'sandbox_workspace_write.network_access': String(networkAccess) === 'true' }) }),
+        expect.anything());
+      h.session.kill();
+    }
+  });
+
+  it.each([null, undefined, '', 'invalid'])('inherits workspace networking when not explicitly configured (%s)', async networkAccess => {
+    const h = setup({ networkAccess });
+    h.send(); await settle();
+    const params = h.clients[0].request.mock.calls.find(([method]) => method === 'thread/start')[1];
+    expect(params.config).not.toHaveProperty('sandbox_workspace_write.network_access');
+    h.session.kill();
+  });
+
+  it.each(['read-only', 'danger-full-access'])('does not apply workspace network settings to %s', async sandbox => {
+    const h = setup({ sandbox, networkAccess: true });
+    h.send(); await settle();
+    const params = h.clients[0].request.mock.calls.find(([method]) => method === 'thread/start')[1];
+    expect(params.sandbox).toBe(sandbox);
+    expect(params.config).not.toHaveProperty('sandbox_workspace_write.network_access');
+    h.session.kill();
+  });
+
+  it('does not enable workspace networking in Plan and restores it on Build', async () => {
+    const h = setup({ networkAccess: true });
+    h.session.planMode = true;
+    h.send(); await settle();
+    const params = h.clients[0].request.mock.calls.find(([method]) => method === 'thread/start')[1];
+    expect(params).toMatchObject({ sandbox: 'read-only', approvalPolicy: 'never' });
+    expect(params.config).not.toHaveProperty('sandbox_workspace_write.network_access');
+    h.complete(); h.session.planMode = false;
+    h.send(); await settle();
+    expect(h.clients[1].request).toHaveBeenCalledWith('thread/resume', expect.objectContaining({
+      sandbox: 'workspace-write', approvalPolicy: 'on-request',
+      config: expect.objectContaining({ 'sandbox_workspace_write.network_access': true }),
+    }), expect.anything());
+    h.session.kill();
+  });
+
   it('interrupts startup without sending a model turn', async () => {
     const h = setup(); h.send(); h.session.interrupt(); await settle();
     expect(h.clients[0].request.mock.calls.some(([m]) => m === 'turn/start')).toBe(false);

@@ -46,7 +46,18 @@ try {
   assert.ok(!disabled.data?.some(server => Object.keys(server.tools || {}).length), 'Plan-mode tool disable did not take effect');
   const listed = await client.request('thread/list', { cwd: bridgeDir, sourceKinds: ['cli', 'vscode', 'exec', 'appServer'], archived: false, sortKey: 'updated_at', limit: 1 });
   assert.ok(Array.isArray(listed.data));
-  console.log('PASS: initialize, scoped MCP discovery, plan-mode MCP disable, native thread listing. No model turns or tools executed.');
+  for (const networkAccess of [true, false]) {
+    client.close();
+    client = new CodexRpcClient({ cwd: bridgeDir });
+    client.on('request', request => client.rejectRequest(request.id));
+    await client.connect();
+    const network = await client.request('thread/start', { cwd: bridgeDir, ephemeral: true,
+      sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'user',
+      config: { ...codexPlanConfig(config, defaults), 'sandbox_workspace_write.network_access': networkAccess } });
+    assert.equal(network.sandbox.type, 'workspaceWrite');
+    assert.equal(network.sandbox.networkAccess, networkAccess);
+  }
+  console.log('PASS: initialize, scoped MCP discovery, plan-mode MCP disable, native thread listing, explicit network settings. No model turns or tools executed.');
 } finally {
   client.close();
 }
