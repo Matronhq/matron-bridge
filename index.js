@@ -1872,6 +1872,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted._agentSessions = session._agentSessions;
         restarted.totalUsage = session.totalUsage;
         restarted.turnCount = session.turnCount;
+        // The self-restart loop budget crosses a crash restart too. Without
+        // this, a self-restart that then crashes came back with a fresh 3
+        // and the cap never bound (bugbot, PR #247).
+        restarted._agentRestartCount = session._agentRestartCount;
         // Carry journal-mirror state too: traffic buffered before the first
         // session_id arrived would otherwise be silently dropped, keeping
         // _journalState preserves the change-dedup across the restart, and
@@ -2598,6 +2602,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted._agentSessions = session._agentSessions;
         restarted.totalUsage = session.totalUsage;
         restarted.turnCount = session.turnCount;
+        // The self-restart loop budget crosses a crash restart too. Without
+        // this, a self-restart that then crashes came back with a fresh 3
+        // and the cap never bound (bugbot, PR #247).
+        restarted._agentRestartCount = session._agentRestartCount;
         // Carry journal-mirror state (see the matching print-mode block).
         restarted._journalBuffer = session._journalBuffer;
         restarted._journalTitleHint = session._journalTitleHint;

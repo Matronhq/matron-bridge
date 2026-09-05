@@ -144,3 +144,33 @@ describe('/restart-session — failure leaves nothing half-done', () => {
     expect(session._agentRestartCount ?? 0).toBe(0);
   });
 });
+
+describe('/restart-session — one restart per swap', () => {
+  it('409s a second call while the first is still parked, touching nothing', async () => {
+    const { handler, session, calls } = harness();
+    expect((await handler(body())).status).toBe(200);
+    const before = calls.length;
+    const second = await handler(body({ continue_with: 'Something else.' }));
+    expect(second.status).toBe(409);
+    expect(second.body.error).toMatch(/already pending/);
+    // No second continuation, no replaced parked command, no extra budget.
+    expect(calls.length).toBe(before);
+    expect(session.queuedMessages).toHaveLength(1);
+    expect(session._agentRestartCount).toBe(1);
+  });
+
+  it('409s a second call after an idle restart was dispatched too', async () => {
+    const { handler, calls } = harness({ session: { busy: false } });
+    await handler(body());
+    const before = calls.length;
+    expect((await handler(body())).status).toBe(409);
+    expect(calls.length).toBe(before);
+  });
+
+  it('does not mark the session pending when parking failed, so a retry is allowed', async () => {
+    const { handler, session } = harness({ park: () => { throw new Error('boom'); } });
+    expect((await handler(body())).status).toBe(500);
+    expect(session._selfRestartPending).toBeUndefined();
+    expect((await handler(body())).status).toBe(500);
+  });
+});

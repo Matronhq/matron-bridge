@@ -89,6 +89,25 @@ describe('index.js self-restart loop budget', () => {
     expect(body).toMatch(/next\._agentRestartCount = existing\._agentRestartCount/);
   });
 
+  it('carries the count across BOTH crash auto-restarts (print-mode and iv-mode)', () => {
+    // recreateSession is not the only session swap: a crash auto-restart
+    // builds its own replacement. Each of those must carry the budget too,
+    // or a self-restart that crashes comes back with a fresh 3.
+    const marker = 'restarted.restartCount = session.restartCount + 1;';
+    const sites = [];
+    for (let i = src.indexOf(marker); i !== -1; i = src.indexOf(marker, i + 1)) sites.push(i);
+    expect(sites).toHaveLength(2);
+    for (const at of sites) {
+      expect(src.slice(at, at + 4000)).toMatch(/restarted\._agentRestartCount = session\._agentRestartCount/);
+    }
+  });
+
+  it('does not carry the pending flag across the swap, so the replacement may restart again', () => {
+    const start = src.indexOf('function recreateSession');
+    const body = src.slice(start, src.indexOf('\n}', start));
+    expect(body).not.toMatch(/_selfRestartPending/);
+  });
+
   it('resets the count when the user sends text, handing back a fresh budget', () => {
     const start = src.indexOf('async function journalRouteTextToSession');
     const body = src.slice(start, start + 1200);
