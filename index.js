@@ -193,7 +193,7 @@ const DEFAULT_MODEL = (() => {
   }
   return normalizeModelArg(raw);
 })();
-const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
+const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'danger-full-access');
 const CODEX_NETWORK_ACCESS = normalizeCodexNetworkAccess(process.env.CODEX_NETWORK_ACCESS);
 // Explicit rollback; never silently replay a failed app-server turn via exec.
 const CODEX_APP_SERVER = process.env.MATRON_CODEX_TRANSPORT !== 'exec';
