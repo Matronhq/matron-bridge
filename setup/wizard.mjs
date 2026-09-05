@@ -118,7 +118,10 @@ export function buildEnv(example, existing, owned) {
   for (const [key, value] of Object.entries(applied)) {
     const line = `${key}=${value}`;
     const re = new RegExp(`^${key}=.*$`, 'm');
-    env = re.test(env) ? env.replace(re, line) : `${env}${line}\n`;
+    // Function replacement: a string replacement interprets `$&`, `$$`, `$'`
+    // and friends inside the value, silently rewriting a secret or path that
+    // contains them on every re-run.
+    env = re.test(env) ? env.replace(re, () => line) : `${env}${line}\n`;
   }
   return env;
 }
@@ -153,7 +156,9 @@ async function main() {
     process.exit(1);
   }
 
-  rl = createInterface({ input: process.stdin, output: process.stdout });
+  // historySize 0: readline keeps every answer in its up-arrow history, which
+  // would let a later prompt in the same run recall the token askHidden hid.
+  rl = createInterface({ input: process.stdin, output: process.stdout, historySize: 0 });
 
   console.log('');
   console.log('=== Matron Bridge setup ===');

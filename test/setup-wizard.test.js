@@ -61,3 +61,18 @@ describe('journal URL default on re-run', () => {
     expect(previousJournalUrl({})).toBe('');
   });
 });
+
+describe('buildEnv value safety', () => {
+  it('writes values containing $ sequences literally (no String.replace interpolation)', () => {
+    const example = 'HMAC_SECRET=\nDEFAULT_WORKDIR=\n';
+    const out = buildEnv(example, { HMAC_SECRET: 'ab$&cd$$ef$\'gh' }, { DEFAULT_WORKDIR: '/srv/$app' });
+    expect(out).toBe("HMAC_SECRET=ab$&cd$$ef$'gh\nDEFAULT_WORKDIR=/srv/$app\n");
+  });
+});
+
+describe('wizard readline setup', () => {
+  it('disables readline history so the hidden token cannot be recalled with the up arrow', () => {
+    const src = fs.readFileSync(path.join(REPO_DIR, 'setup', 'wizard.mjs'), 'utf8');
+    expect(src).toMatch(/createInterface\(\{[^}]*historySize: 0[^}]*\}\)/);
+  });
+});
