@@ -235,7 +235,12 @@ server.tool(
 
 // Formats a chatStart/chatJoin outcome body ({room_id, status, reason?, note?, error?}).
 function describeRoomOutcome(body) {
-  return `Room ${body.room_id}: ${body.status || body.error || 'unknown'}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
+  // A reused room (chatStart's reuse-first path) answers {ok, room_id, note}
+  // with no `status` — it is not an invite outcome, it is the room the pair
+  // already has. Falling straight through to 'unknown' would read as a
+  // failure, so `ok` speaks for itself.
+  const state = body.status || (body.ok ? 'ok' : null) || body.error || 'unknown';
+  return `Room ${body.room_id}: ${state}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
 }
 
 // formatBox (agent_boxes rendering) lives in lib/agent-boxes-format.js —
@@ -295,7 +300,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). You and a given peer session share ONE room for the life of both sessions: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),
@@ -352,13 +357,14 @@ server.tool(
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
     task: z.string().max(2000).describe('The task prompt. Shown VERBATIM on the user\'s consent card and executed verbatim as the new session\'s first turn — write it for both audiences.'),
     topic: z.string().max(200).optional().describe('Optional short room/session title'),
+    model: z.string().optional().describe('Optional Claude model alias for the new session: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). Omit to use the target box\'s own default — only set it if the user asked for a specific model.'),
   },
-  async ({ device_id, workdir, task, topic }) => {
+  async ({ device_id, workdir, task, topic, model }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}) }),
+        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}) }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
@@ -481,24 +487,57 @@ server.tool(
   }
 );
 
+// There is deliberately NO agent_chat_leave tool (2026-08-19). A room lives
+// for the life of the two sessions: agents kept closing rooms and opening new
+// ones for every exchange, which filled the user's chat list with dead
+// single-exchange rooms and lost the thread between two sessions that talk
+// repeatedly. agent_chat_mute below is the escape hatch instead. The
+// /agent-chat-leave route and chatLeave internals still exist — session
+// eviction uses them to close a dead session's rooms out.
+
 server.tool(
-  'agent_chat_leave',
-  'Leave an agent chat room. The room and its history remain visible to your user.',
+  'agent_chat_mute',
+  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both sessions). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
   {
-    room_id: z.string().describe('The room id to leave'),
+    room_id: z.string().describe('The agent chat room id to mute'),
+    reason: z.string().describe('Why you are muting it, in one line — shown to your user, who decides whether to unmute'),
+  },
+  async ({ room_id, reason }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-mute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, reason }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_mute failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Muted room ${room_id}. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_unmute',
+  'Unmute an agent chat room you previously muted: messages are delivered to you again. Nothing that arrived while it was muted is replayed — use agent_chat_read to catch up.',
+  {
+    room_id: z.string().describe('The agent chat room id to unmute'),
   },
   async ({ room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-leave`, {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-unmute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
-        return { content: [{ type: 'text', text: `agent_chat_leave failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+        return { content: [{ type: 'text', text: `agent_chat_unmute failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      return { content: [{ type: 'text', text: `Left room ${room_id}.` }] };
+      return { content: [{ type: 'text', text: `Unmuted room ${room_id}. ${data.note || ''}`.trim() }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
