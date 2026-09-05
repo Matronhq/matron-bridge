@@ -784,6 +784,26 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
       expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
     });
 
+    it('still dispatches as a picker tap when the session was respawned after teardown (pickerFrames evicted)', () => {
+      let live = null;
+      const deps = { ...sessionlessDeps(), findSessionByConvoId: () => live };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer.evictConvo('convo-1');       // reaper tore the session down
+      live = { alive: true, roomId: '!room' }; // something respawned it before the tap
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'sleep:confirm', picker: true });
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      // ...and it was consumed: a retry is an ordinary (non-picker) answer at
+      // most, never a second picker dispatch, and never a sessionless route.
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routePromptReply.mock.calls.filter(c => c[1]?.picker)).toHaveLength(1);
+      live = null;
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+    });
+
     it('without the dep, a sessionless sleep tap falls back to the unknown-convo notice', () => {
       const deps = makeDeps();
       const consumer = createJournalInputConsumer(deps);
