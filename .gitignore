@@ -6,6 +6,7 @@ node_modules
 !.env.example
 *.log
 .mcp-config-generated*.json
+mcp-config.local.json
 journal-cursor.json
 
 node_modules

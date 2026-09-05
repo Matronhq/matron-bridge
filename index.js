@@ -26,6 +26,8 @@ import {
   extractBypassFlag,
   extractMcpExtraFlags,
   knownMcpExtras,
+  mergeMcpConfigs,
+  parseDefaultExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
 import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
@@ -70,6 +72,7 @@ import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-rec
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { matronFilesDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -258,8 +261,32 @@ const INFLIGHT_FILE = path.join(os.homedir(), '.matron-bridge-inflight.json');
 // `share` is likewise opt-in: OFF unless SHOW_FILE_DEFAULT_ON=1 is set in the
 // bridge's environment (the operator launch path sets it so operator sessions
 // keep show_file), or a session passes `--share`.
-const RAW_MCP_CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
-const DEFAULT_MCP_EXTRAS = resolveDefaultExtras(process.env.SHOW_FILE_DEFAULT_ON);
+// A gitignored mcp-config.local.json overlays the committed config: extra
+// servers or whole `mcpExtras` groups for this machine only (e.g. circleci).
+// Edits need a bridge restart — the merge happens once, here.
+function loadLocalMcpOverlay() {
+  const p = path.join(__dirname, 'mcp-config.local.json');
+  if (!fs.existsSync(p)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch (e) {
+    console.warn(`[mcp-config] Ignoring malformed mcp-config.local.json: ${e.message}`);
+    return null;
+  }
+}
+const RAW_MCP_CONFIG = mergeMcpConfigs(
+  JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8')),
+  loadLocalMcpOverlay(),
+);
+// The flags /start, /resume, /restart and /workdir accept: one per mcpExtras
+// block in the merged config.
+const KNOWN_MCP_EXTRAS = knownMcpExtras(RAW_MCP_CONFIG);
+// Per-machine baseline of extras applied to every session: the names in
+// MCP_DEFAULT_EXTRAS (e.g. "circleci") plus share's own opt-in above.
+const DEFAULT_MCP_EXTRAS_RAW = effectiveExtras(
+  parseDefaultExtras(process.env.MCP_DEFAULT_EXTRAS),
+  resolveDefaultExtras(process.env.SHOW_FILE_DEFAULT_ON),
+);
 const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
 
 function mcpConfigPathFor(extras = []) {
@@ -282,12 +309,26 @@ function mcpConfigPathFor(extras = []) {
 // disk by the time any session spawns. Per-extras variants are generated
 // lazily on first use.
 mcpConfigPathFor([]);
-// Sanity check: make sure the bridge's known extras stay in sync with what
-// the config file declares.
-for (const ex of knownMcpExtras()) {
-  if (!RAW_MCP_CONFIG.mcpExtras?.[ex]) {
-    console.warn(`[mcp-config] Flag --${ex} is recognised but no matching mcpExtras block exists; sessions opting in will get no extra servers.`);
-  }
+// Drop (and warn about) any machine default that names an extra no config block
+// defines. buildMcpServers would silently ignore it at spawn time, so filtering
+// here keeps /start and /restart from advertising an extra that never loads.
+const DEFAULT_MCP_EXTRAS = DEFAULT_MCP_EXTRAS_RAW.filter((ex) => {
+  if (KNOWN_MCP_EXTRAS.includes(ex)) return true;
+  console.warn(`[mcp-config] MCP_DEFAULT_EXTRAS lists "${ex}" but no mcpExtras["${ex}"] block exists (in mcp-config.json or mcp-config.local.json); it will be ignored.`);
+  return false;
+});
+
+// Plugin MCP servers (context7, serena, …) load from this dir. Default: a
+// bridge-owned EMPTY dir so sessions are lean (no plugin MCPs) while ~/.claude
+// — creds, transcripts, --resume — stays untouched. Point BRIDGE_PLUGIN_CACHE_DIR
+// at the real cache (~/.claude/plugins) or a curated subset to re-enable plugins.
+const PLUGIN_CACHE_DIR = process.env.BRIDGE_PLUGIN_CACHE_DIR
+  ? expandHome(process.env.BRIDGE_PLUGIN_CACHE_DIR)
+  : path.join(os.homedir(), '.claude-matrix-bridge', 'empty-plugin-cache');
+try {
+  fs.mkdirSync(PLUGIN_CACHE_DIR, { recursive: true });
+} catch (e) {
+  console.warn(`[plugin-cache] Could not create ${PLUGIN_CACHE_DIR}: ${e.message}`);
 }
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
@@ -1595,6 +1636,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
+    '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify({
       permissions: {
@@ -1657,6 +1699,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
     // No MCP_TOOL_TIMEOUT default here. #254 briefly injected a 10-minute
     // backstop so a wedged MCP server couldn't hang a turn forever, but a
     // hard kill also cut off legitimately long calls (long builds, big test
@@ -2383,6 +2426,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
+    '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(settings),
   );
@@ -2402,6 +2446,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
     // No MCP_TOOL_TIMEOUT default, same reasoning as spawnEnv above:
     // warn, don't kill. Operator env passes through if set.
   };
@@ -5769,7 +5814,7 @@ function safeMediaFilename(name) {
 
 // Build the claude content blocks for an already-materialized (fetched from
 // the journal blob store) NON-audio media buffer: saves the bytes to the right
-// place (iv upload dir vs. session workdir) and produces the same save-path
+// place (iv upload dir vs. per-repo matron files dir) and produces the same save-path
 // text + inline image/document blocks the media path has always produced.
 // Called by the journal media path (journalOnMedia, whose bytes come from
 // journalPublisher.fetchMedia) so a file sent from Matron feels identical to
@@ -5814,18 +5859,19 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
   // SDK mode: lead with the caption so claude reads the user's words before
   // the "Image saved to …" bookkeeping and the image itself — the order a
   // person would say it in. Everything below appends to the same `blocks`
-  // array, i.e. the same single user turn.
+  // array, i.e. the same single user turn. Saves land OUTSIDE the workdir
+  // (in ~/matron-files/<repo>/) so received files never end up committed;
+  // the absolute save path in the text block is how claude finds them.
+  const saveDir = matronFilesDir(session.workdir);
   if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
-    // Save image to workdir
-    const imgPath = deduplicateFilename(session.workdir, workdirName);
+    const imgPath = deduplicateFilename(saveDir, workdirName);
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
-    // Save file to workdir
-    const savePath = deduplicateFilename(session.workdir, workdirName);
+    const savePath = deduplicateFilename(saveDir, workdirName);
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
@@ -5904,7 +5950,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(parts.slice(1));
-      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass);
+      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass, KNOWN_MCP_EXTRAS);
       const agentFlags = extractAgentFlag(afterMcp);
       if (agentFlags.error) {
         await sendReply(agentFlags.error);
@@ -5985,7 +6031,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Confirm in the origin room/convo. No matrix.to room link: Matron is
       // the only client now, and its new conversation appears on its own —
       // a Matrix room URL is just a dead link there.
-      const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
+      // Show what the session actually got: machine defaults plus its own flags.
+      const shownStartExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+      const extrasNote = shownStartExtras.length > 0 ? ` (extras: ${shownStartExtras.join(', ')})` : '';
       const permNote = permissionNote(session);
       const startModelNote = startModel ? ` on ${aliasLabel(startModel)}` : '';
       await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.`);
@@ -6028,7 +6076,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // value if the bridge was restarted in between.
       const { force: restartForced, rest: restartArgs } = extractForceFlag(parts.slice(1));
       const { bypass: restartBypass, rest: restartAfterBypass } = extractBypassFlag(restartArgs);
-      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartAfterBypass);
+      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartAfterBypass, KNOWN_MCP_EXTRAS);
       const restartAgentFlags = extractAgentFlag(restartAfterMcp);
       if (restartAgentFlags.error) {
         await sendReply(restartAgentFlags.error);
@@ -6098,8 +6146,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(roomId, restarted.claudeSessionId, restarted.workdir, restarted.originRoomId,
           { model: restartModelFlag.model });
       }
-      const extrasLine = effectiveRestartExtras.length > 0
-        ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
+      const shownRestartExtras = effectiveExtras(effectiveRestartExtras, DEFAULT_MCP_EXTRAS);
+      const extrasLine = shownRestartExtras.length > 0
+        ? `\nExtras: ${shownRestartExtras.join(', ')}`
         : '';
       const restartModelLine = restartModelFlag.model ? `\nModel: ${aliasLabel(restartModelFlag.model)}` : '';
       const restartPermNote = permissionNote(restarted);
@@ -6116,7 +6165,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const { bypass: resumeBypass, rest: resumeAfterBypass } = extractBypassFlag(parts.slice(1));
-      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(resumeAfterBypass);
+      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(resumeAfterBypass, KNOWN_MCP_EXTRAS);
       const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
       if (resumeAgentFlags.error) {
         await sendReply(resumeAgentFlags.error);
@@ -6437,7 +6486,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const { bypass: workdirBypass, rest: workdirAfterBypass } = extractBypassFlag(parts.slice(1));
-      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(workdirAfterBypass);
+      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(workdirAfterBypass, KNOWN_MCP_EXTRAS);
       const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
       if (workdirAgentFlags.error) {
         await sendReply(workdirAgentFlags.error);
@@ -7770,12 +7819,13 @@ const journalMediaRouter = createJournalMediaRouter({
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
-  // where the file itself would have been saved (iv upload dir / workdir).
+  // where the file itself would have been saved (iv upload dir / matron
+  // files dir).
   // Throws propagate to the router, which falls back to raw-file delivery.
   buildVideoBlocks: async (session, { buffer, mime, name, caption }) => {
     const safeName = safeMediaFilename(name || 'video');
     const stem = safeName.replace(/\.[^.]+$/, '') || 'video';
-    const baseDir = session.iv ? ivUploadDir(session.roomId) : session.workdir;
+    const baseDir = session.iv ? ivUploadDir(session.roomId) : matronFilesDir(session.workdir);
     const outDir = deduplicateFilename(baseDir, `${stem}-frames`);
     const result = await extractVideoFrames(buffer, mime, { outDir });
     console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s, audio=${result.hasAudio}) in ${outDir}`);
