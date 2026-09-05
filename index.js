@@ -2368,6 +2368,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    // Same MCP tool-call backstop as the print-mode spawnEnv: an interactive
+    // session's turn hangs on a wedged MCP server exactly the same way.
+    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT || '600000',
   };
   delete interactiveEnv.SHOW_FILE_TOKEN;
   if (showFileToken) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
