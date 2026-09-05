@@ -327,7 +327,7 @@ server.tool(
 
 server.tool(
   'agent_boxes',
-  "List the user's other agent boxes (machines) as spawn targets, with recent folders, current activity, and account usage limits. Use this when the user asks to run work on another machine or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
+  "List the user's agent boxes (machines) as spawn targets — including this one, marked \"this box\" — with recent folders, current activity, and account usage limits. Use this when the user asks to start a new session here or on another machine, or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
   {},
   async () => {
     try {
@@ -341,7 +341,7 @@ server.tool(
         return { content: [{ type: 'text', text: `agent_boxes failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       const boxes = data.boxes || [];
-      if (!boxes.length) return { content: [{ type: 'text', text: 'No other boxes found.' }] };
+      if (!boxes.length) return { content: [{ type: 'text', text: 'No boxes found.' }] };
       return { content: [{ type: 'text', text: boxes.map(formatBox).join('\n\n') }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
@@ -351,7 +351,7 @@ server.tool(
 
 server.tool(
   'agent_session_start',
-  "Ask the user's consent to start a new agent session on another of their boxes, seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
+  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
   {
     device_id: z.number().int().describe('Target box device id, from agent_boxes'),
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
