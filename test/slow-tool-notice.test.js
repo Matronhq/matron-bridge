@@ -44,7 +44,7 @@ function makeHarness({ thresholdMs = 1000, reminderMs = 3000, notify } = {}) {
 
 describe('resolveSlowToolNoticeMs', () => {
   it('defaults to 3 minutes, reminder to 10', () => {
-    expect(DEFAULT_SLOW_TOOL_NOTICE_MS).toBe(180_000);
+    expect(DEFAULT_SLOW_TOOL_NOTICE_MS).toBe(300_000);
     expect(DEFAULT_SLOW_TOOL_REMINDER_MS).toBe(600_000);
     expect(resolveSlowToolReminderMs(undefined)).toBe(DEFAULT_SLOW_TOOL_REMINDER_MS);
     expect(resolveSlowToolReminderMs('0')).toBe(0);
@@ -71,12 +71,14 @@ describe('isNoticeEligible', () => {
     expect(isNoticeEligible('ExitPlanMode')).toBe(false);
     expect(isNoticeEligible('mcp__ask-user__request_secret')).toBe(false);
   });
-  it('includes ordinary, MCP and subagent tools', () => {
+  it('excludes subagents, whose activity already streams into chat', () => {
+    expect(isNoticeEligible('Task')).toBe(false);
+    expect(isNoticeEligible('Agent')).toBe(false);
+  });
+  it('includes ordinary and MCP tools', () => {
     expect(isNoticeEligible('Bash')).toBe(true);
     expect(isNoticeEligible('mcp__Roblox_Studio__run_script_in_play_mode')).toBe(true);
     expect(isNoticeEligible('mcp__chrome-devtools__get_network_request')).toBe(true);
-    expect(isNoticeEligible('Task')).toBe(true);
-    expect(isNoticeEligible('Agent')).toBe(true);
   });
   it('rejects junk', () => {
     expect(isNoticeEligible('')).toBe(false);
