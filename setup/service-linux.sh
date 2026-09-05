@@ -13,9 +13,9 @@ echo "Node: $NODE_BIN"
 echo
 
 # Bridge service
-cat > /etc/systemd/system/claude-matrix-bridge.service << EOF
+cat > /etc/systemd/system/matron-bridge.service << EOF
 [Unit]
-Description=Claude Code Matrix Bridge
+Description=Matron Bridge
 After=network.target docker.service
 
 [Service]
@@ -34,9 +34,9 @@ WantedBy=multi-user.target
 EOF
 
 # Viewer service
-cat > /etc/systemd/system/claude-matrix-file-viewer.service << EOF
+cat > /etc/systemd/system/matron-bridge-viewer.service << EOF
 [Unit]
-Description=Code File Viewer for Matrix Bridge (signed URL file server)
+Description=Code File Viewer for Matron Bridge (signed URL file server)
 After=network.target
 
 [Service]
@@ -53,11 +53,11 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable claude-matrix-bridge claude-matrix-file-viewer
-systemctl restart claude-matrix-bridge claude-matrix-file-viewer
+systemctl enable matron-bridge matron-bridge-viewer
+systemctl restart matron-bridge matron-bridge-viewer
 
 echo
 echo "✅ Services installed and started:"
-systemctl status claude-matrix-bridge --no-pager -l | head -5
+systemctl status matron-bridge --no-pager -l | head -5
 echo "---"
-systemctl status claude-matrix-file-viewer --no-pager -l | head -5
+systemctl status matron-bridge-viewer --no-pager -l | head -5

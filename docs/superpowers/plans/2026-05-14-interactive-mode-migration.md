@@ -891,7 +891,7 @@ cat > hooks/stop-notify.sh <<'EOF'
 INPUT=$(cat)
 SID=$(echo "$INPUT" | jq -r '.session_id // empty')
 TX=$(echo "$INPUT" | jq -r '.transcript_path // empty')
-PORT="${MATRIX_BRIDGE_API_PORT:-9802}"
+PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 curl -s -X POST "http://127.0.0.1:${PORT}/turn-end" \
   -H 'Content-Type: application/json' \
   -d "{\"session_id\":\"$SID\",\"transcript_path\":\"$TX\"}" > /dev/null
@@ -932,7 +932,7 @@ fi
 SID=$(echo "$INPUT" | jq -r '.session_id // empty')
 TUID=$(echo "$INPUT" | jq -r '.tool_use_id // empty')
 PLAN=$(echo "$INPUT" | jq -r '.tool_input.plan // empty')
-PORT="${MATRIX_BRIDGE_API_PORT:-9802}"
+PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 RESP=$(curl -s --max-time 1800 -X POST "http://127.0.0.1:${PORT}/plan-decision" \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg plan "$PLAN" '{session_id:$sid,tool_use_id:$tuid,plan:$plan}')")
@@ -1408,7 +1408,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
       CLAUDECODE: '',
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
-      MATRIX_BRIDGE_API_PORT: String(API_PORT),
+      MATRON_BRIDGE_API_PORT: String(API_PORT),
       MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     },
   });
@@ -1678,8 +1678,8 @@ Do NOT restart the live bridge. Start a second instance pointing at a test Matri
 
 ```bash
 MATRON_INTERACTIVE_MODE=1 \
-MATRIX_BRIDGE_API_PORT=9803 \
-MATRIX_VIEWER_PORT=9804 \
+MATRON_BRIDGE_API_PORT=9803 \
+MATRON_VIEWER_PORT=9804 \
 MATRIX_USER_ID=@bridge-test:yearbooks.be \
 ACCESS_TOKEN=... \
 node index.js

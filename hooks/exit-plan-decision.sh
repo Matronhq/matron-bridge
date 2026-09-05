@@ -22,7 +22,7 @@ fi
 SID=$(echo "$INPUT" | jq -r '.session_id // empty')
 TUID=$(echo "$INPUT" | jq -r '.tool_use_id // empty')
 PLAN=$(echo "$INPUT" | jq -r '.tool_input.plan // empty')
-PORT="${MATRIX_BRIDGE_API_PORT:-9802}"
+PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 
 # --max-time 1800s = 30 min — generous window for the user to read & decide on
 # their phone. The bridge HTTP handler should hold the response with its own

@@ -1,5 +1,10 @@
-import { describe, it, expect } from 'vitest';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector } from '../lib/prompt-detector.js';
+import { describe, it, test, expect } from 'vitest';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue } from '../lib/prompt-detector.js';
+
+const __dir = path.dirname(fileURLToPath(import.meta.url));
 
 describe('stripAnsi', () => {
   it('removes color codes', () => {
@@ -7,6 +12,10 @@ describe('stripAnsi', () => {
   });
   it('removes cursor movements and modes', () => {
     expect(stripAnsi('\x1b[2J\x1b[H\x1b[?25lhello\x1b[?25h')).toBe('hello');
+  });
+  it('removes CSI sequences with intermediates or non-letter finals', () => {
+    expect(stripAnsi('\x1b[4 q1. Yes')).toBe('1. Yes');
+    expect(stripAnsi('\x1b[1~1. Yes')).toBe('1. Yes');
   });
   it('removes bare CR that has no LF after it (TUI overwrites)', () => {
     expect(stripAnsi('foo\rbar\r\nbaz')).toBe('foobar\nbaz');
@@ -32,6 +41,184 @@ describe('stripAnsi', () => {
     expect(stripAnsi('a\x1b[1Eb\x1b[1Ec')).toBe('a\nb\nc');
     // No digits = 1 line.
     expect(stripAnsi('a\x1b[Bb')).toBe('a\nb');
+  });
+});
+
+describe('stripAnsi — CHA (Cursor Horizontal Absolute) word-boundary fixtures', () => {
+  // These fixtures reproduce the bytes Claude's TUI emits when positioning text
+  // within a visual row using CSI CHA (\x1b[<n>G) instead of literal spaces.
+  // The old regex-chain stripAnsi deleted \x1b[nG with no replacement, collapsing
+  // all inter-word gaps to nothing. The new column-aware pass converts CHA to
+  // the correct number of padding spaces so classifyScreen sees readable text.
+
+  test('spec exact bytes: CHA-positioned option label reconstructs word-separated text', () => {
+    // From the spec/plan — the literal byte sequence for resume option 2.
+    // ^[[5G^[[38;5;246m2.^[[8G^[[39mResume^[[15Gfull^[[20Gsession^[[28Gas-is
+    // Without CHA→spaces this collapses to "2.Resumefullsessionas-is".
+    const specBytes =
+      '\x1b[5G\x1b[38;5;246m2.\x1b[8G\x1b[39mResume\x1b[15Gfull\x1b[20Gsession\x1b[28Gas-is';
+    const result = stripAnsi(specBytes);
+    expect(result).toContain('Resume full session as-is');
+  });
+
+  test('CHA forward-only: pads to target column when target > current col', () => {
+    // col starts at 1; CHA 5 → 4 spaces; 'Hello' → col 10; CHA 11 → 1 space; 'world'
+    expect(stripAnsi('\x1b[5GHello\x1b[11Gworld')).toBe('    Hello world');
+  });
+
+  test('CHA no-rewrite (A1): back-positioning does not erase previously emitted text', () => {
+    // col=1; 'Hello' → col 6; CHA 3 ≤ col 6 → only repositions, emits nothing.
+    // Output keeps 'Hello' intact, 'World' follows without gap.
+    const result = stripAnsi('Hello\x1b[3GWorld');
+    expect(result).toBe('HelloWorld');
+  });
+
+  test('CHA col cap: target clamped to COL_CAP (120), not beyond terminal width', () => {
+    // CHA 200 must clamp to 120; starting at col 1 → 119 spaces before 'End'.
+    const result = stripAnsi('\x1b[200GEnd');
+    expect(result).toBe(' '.repeat(119) + 'End');
+  });
+
+  test('CHA 0 clamps to 1: degenerate param treated as column 1', () => {
+    // n=0 should clamp to 1; starting at col=1 → target=col → no pad.
+    expect(stripAnsi('\x1b[0GHello')).toBe('Hello');
+  });
+
+  test('cursor-forward cap is MAX_FWD_SPACES (80), distinct from CHA cap (120)', () => {
+    // Cursor-forward 81 → capped at 80; CHA 121 → capped at 120 (not 80).
+    // The two caps are intentionally different constants.
+    expect(stripAnsi('\x1b[81Cy')).toBe(' '.repeat(80) + 'y');
+    // CHA 121 from col=1 → clamp to 120 → 119 spaces
+    expect(stripAnsi('\x1b[121GEnd')).toBe(' '.repeat(119) + 'End');
+  });
+
+  test('resume menu fixture: CHA-positioned option labels reconstruct with spaces', () => {
+    // Mirrors real PTY bytes for Claude's session-resume menu.
+    // The ❯ marker causes the numbered detector to accept the run.
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'What\x1b[6Gwould\x1b[12Gyou\x1b[16Glike\x1b[21Gto\x1b[24Gdo?',
+      '❯ 1.\x1b[5GResume\x1b[12Gfrom\x1b[17Gsummary',
+      '  2.\x1b[5GResume\x1b[12Gfull\x1b[17Gsession\x1b[25Gas-is',
+      '  3.\x1b[5GStart\x1b[11Gnew\x1b[15Gsession',
+    ].join('\n');
+    const stripped = stripAnsi(raw);
+    // Every word gap must be present (not collapsed).
+    expect(stripped).toContain('This session');
+    expect(stripped).toContain('14h 16m old');
+    expect(stripped).toContain('Resume full session as-is');
+    expect(stripped).toContain('Start new session');
+  });
+
+  test('resume menu fixture: classifyScreen returns correct kind/question/options', () => {
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'What\x1b[6Gwould\x1b[12Gyou\x1b[16Glike\x1b[21Gto\x1b[24Gdo?',
+      '❯ 1.\x1b[5GResume\x1b[12Gfrom\x1b[17Gsummary',
+      '  2.\x1b[5GResume\x1b[12Gfull\x1b[17Gsession\x1b[25Gas-is',
+      '  3.\x1b[5GStart\x1b[11Gnew\x1b[15Gsession',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('session is 14h 16m old');
+    expect(r.options).toHaveLength(3);
+    expect(r.options[1].label).toContain('Resume full session as-is');
+    expect(r.options[2].label).toContain('Start new session');
+  });
+
+  test('plan-mode confirmation fixture: CHA-positioned text reconstructs with spaces', () => {
+    // Mirrors the plan-mode confirm menu where the session-age question
+    // and option labels are positioned via CHA.
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'Claude\x1b[8Ghas\x1b[12Gwritten\x1b[20Gup\x1b[23Ga\x1b[25Gplan.',
+      'Would\x1b[7Gyou\x1b[11Glike\x1b[16Gto\x1b[19Gproceed?',
+      '❯ 1.\x1b[6GYes,\x1b[11Gand\x1b[15Gbypass\x1b[22Gpermissions',
+      '  2.\x1b[6GYes,\x1b[11Gmanually\x1b[20Gapprove\x1b[28Gedits',
+      '  3.\x1b[6GNo,\x1b[10Grefine\x1b[17Gwith\x1b[22GUltraplan',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const stripped = stripAnsi(raw);
+    expect(stripped).toContain('This session is 14h 16m old');
+    expect(stripped).toContain('Claude has written up a plan');
+    expect(stripped).toContain('Would you like to proceed');
+    expect(stripped).toContain('Yes, and bypass permissions');
+    expect(stripped).toContain('Tell Claude what to change');
+  });
+
+  test('plan-mode confirmation fixture: classifyScreen returns kind/question/options/freeTextIdx', () => {
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'Claude\x1b[8Ghas\x1b[12Gwritten\x1b[20Gup\x1b[23Ga\x1b[25Gplan.',
+      'Would\x1b[7Gyou\x1b[11Glike\x1b[16Gto\x1b[19Gproceed?',
+      '❯ 1.\x1b[6GYes,\x1b[11Gand\x1b[15Gbypass\x1b[22Gpermissions',
+      '  2.\x1b[6GYes,\x1b[11Gmanually\x1b[20Gapprove\x1b[28Gedits',
+      '  3.\x1b[6GNo,\x1b[10Grefine\x1b[17Gwith\x1b[22GUltraplan',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('This session is 14h 16m old');
+    expect(r.options).toHaveLength(4);
+    expect(r.options[0].label).toContain('Yes, and bypass permissions');
+    expect(r.options[1].label).toContain('Yes, manually approve edits');
+    expect(r.freeTextIdx).toBe(3);
+  });
+
+  test('effort-change confirmation fixture: classifyScreen surfaces it as a prompt', () => {
+    // Changing effort mid-conversation invalidates the prompt cache, so the
+    // TUI shows this confirmation before applying. The bridge relies on the
+    // detector catching it (same shape as the bypass-permissions menu) to
+    // surface it to Matrix — see lib/effort-command.js. Guard that here.
+    const raw = [
+      'Change\x1b[8Geffort\x1b[15Glevel?',
+      'This\x1b[6Gconversation\x1b[19Gis\x1b[22Gcached.\x1b[31GSwitching\x1b[41Gto\x1b[44Gultracode\x1b[54Gre-reads\x1b[63Ghistory.',
+      '❯ 1.\x1b[6GYes,\x1b[11Gswitch\x1b[18Gto\x1b[21Gultracode',
+      '  2.\x1b[6GNo,\x1b[10Ggo\x1b[13Gback',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('Change effort level?');
+    expect(r.options).toHaveLength(2);
+    expect(r.options[0].label).toContain('Yes, switch to ultracode');
+    expect(r.options[1].label).toContain('No, go back');
+  });
+
+  test('AskUserQuestion menu fixture: CHA-positioned labels reconstruct with spaces', () => {
+    // Mirrors an AskUserQuestion-style numbered menu where each option label
+    // is built with CHA moves between individual words.
+    const raw = [
+      'Which\x1b[7Gapproach\x1b[16Gdo\x1b[19Gyou\x1b[23Gprefer?',
+      '❯ 1.\x1b[6GBake\x1b[11Gshould\x1b[18Gmatch\x1b[24Geditor',
+      '  2.\x1b[6GEditor\x1b[13Gshould\x1b[20Gmatch\x1b[26Gbake',
+      '  3.\x1b[6GNot\x1b[10Gsure',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const stripped = stripAnsi(raw);
+    expect(stripped).toContain('Which approach do you prefer');
+    expect(stripped).toContain('Bake should match editor');
+    expect(stripped).toContain('Editor should match bake');
+  });
+
+  test('AskUserQuestion menu fixture: classifyScreen returns correct kind/question/options', () => {
+    const raw = [
+      'Which\x1b[7Gapproach\x1b[16Gdo\x1b[19Gyou\x1b[23Gprefer?',
+      '❯ 1.\x1b[6GBake\x1b[11Gshould\x1b[18Gmatch\x1b[24Geditor',
+      '  2.\x1b[6GEditor\x1b[13Gshould\x1b[20Gmatch\x1b[26Gbake',
+      '  3.\x1b[6GNot\x1b[10Gsure',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('Which approach do you prefer');
+    expect(r.options).toHaveLength(4);
+    expect(r.options[0].label).toContain('Bake should match editor');
+    expect(r.options[1].label).toContain('Editor should match bake');
+    expect(r.options[3].label).toContain('Tell Claude what to change');
   });
 });
 
@@ -84,6 +271,20 @@ describe('classifyScreen — numbered', () => {
     expect(r.options.map(o => o.label)).toEqual(['Foo', 'Bar']);
   });
 
+  it('detects menu options after cursor-shape or key-style CSI sequences', () => {
+    for (const csi of ['\x1b[4 q', '\x1b[1~']) {
+      const screen = stripAnsi([
+        'Pick one:',
+        `${csi}1. Yes`,
+        '2. No',
+      ].join('\n'));
+      const r = classifyScreen(screen);
+      expect(r).not.toBeNull();
+      expect(r.kind).toBe('numbered');
+      expect(r.options.map(o => o.label)).toEqual(['Yes', 'No']);
+    }
+  });
+
   it('returns null for a single numbered line (not enough to be a menu)', () => {
     const screen = 'Found 1) thing in the codebase';
     expect(classifyScreen(screen)).toBeNull();
@@ -120,14 +321,82 @@ describe('classifyScreen — arrow-menu', () => {
     expect(r.options.map(o => o.label)).toEqual(['Option A', 'Option B', 'Option C']);
   });
 
-  it('detects > selection marker', () => {
+  it('does NOT treat ASCII > as an arrow-menu marker (transcript user-message prefix)', () => {
+    // Claude's TUI renders past USER messages as `> hi` — a resume's
+    // full-screen repaint is full of these, and treating `>` as a selection
+    // marker turned chat history into phantom menus (the "hi / 1 agent type
+    // available" card in the /login flow). Real menus always use ❯/▶/►.
     const screen = [
       'Pick:',
       '> First',
       '  Second',
     ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('does NOT misread a resumed transcript (`> hi` + status line) as an arrow-menu', () => {
+    // Regression: the exact shape that surfaced a garbage prompt card during
+    // the /login flow — the tail of an assistant message, the user's own
+    // `> hi`, and claude's "1 agent type available" startup status line.
+    const screen = [
+      'run through it (or if anything misbehaves) and I\'ll',
+      'verify each step in the bridge logs.',
+      '',
+      '> hi',
+      '  1 agent type available',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('does NOT misread a folded-paste input box as an arrow-menu', () => {
+    // Claude Code folds a large pasted message into a placeholder widget.
+    // The ❯ marker + "[Pasted text #N +M lines]" must not be read as a menu,
+    // else any multi-line paste surfaces a phantom prompt + clears busy.
+    const screen = [
+      'Look at this in MC:',
+      '❯ [Pasted text #1 +9 lines]',
+      '  paste again to expand',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('still detects a real menu whose first option mentions "paste" elsewhere', () => {
+    // Guard must be specific to the fold widget, not the word "paste".
+    const screen = [
+      'How should I proceed?',
+      '❯ Paste the snippet into the file',
+      '  Skip it',
+    ].join('\n');
     const r = classifyScreen(screen);
     expect(r.kind).toBe('arrow-menu');
+    expect(r.options).toHaveLength(2);
+  });
+
+  it('still detects a real menu when a folded paste precedes it in the buffer', () => {
+    // The fold-widget marker must not block detection of a later real menu —
+    // the search skips paste-fold markers rather than rejecting at the first ❯.
+    const screen = [
+      '❯ [Pasted text #1 +9 lines]',
+      '  paste again to expand',
+      '',
+      'How should I proceed?',
+      '❯ Apply the change',
+      '  Cancel',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r.kind).toBe('arrow-menu');
+    expect(r.options.map(o => o.label)).toEqual(['Apply the change', 'Cancel']);
+    // The fold widget + hint must not leak into the surfaced question.
+    expect(r.question).toBe('How should I proceed?');
+    expect(r.question).not.toMatch(/Pasted text|paste again/i);
+  });
+
+  it('treats the widget + hint on a single line as a folded paste', () => {
+    const screen = [
+      'Look at this:',
+      '❯ [Pasted text #2 +14 lines] paste again to expand',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
   });
 });
 
@@ -138,8 +407,8 @@ describe('classifyScreen — numbered list inside prose', () => {
     const screen = [
       'Verification',
       '',
-      '1. cd ~/claude-matrix-bridge && git pull',
-      '2. sudo systemctl restart claude-matrix-bridge.service',
+      '1. cd ~/matron-bridge && git pull',
+      '2. sudo systemctl restart matron-bridge.service',
       '3. In Matrix, send !version',
     ].join('\n');
     expect(classifyScreen(screen)).toBeNull();
@@ -411,7 +680,7 @@ describe('classifyScreen — multiple numbered runs', () => {
     // failed its guard, and fell through to a bad arrow-menu match.
     const screen = [
       'Verification',
-      '1. cd ~/claude-matrix-bridge && git pull',
+      '1. cd ~/matron-bridge && git pull',
       '2. sudo systemctl restart',
       '3. send !version',
       '4. try /version',
@@ -687,6 +956,351 @@ describe('PromptDetector', () => {
     expect(events).toHaveLength(1);
     expect(events[0].kind).toBe('yes-no');
   });
+
+  it('emits unclassified-prompt (not prompt) for a menu it cannot classify', async () => {
+    const LONG = 'this is an intentionally very long option label that exceeds the ninety character menu guard so the classifier rejects it as wrapped prose';
+    const screen = [
+      'What would you like to do?',
+      `❯ 1. ${LONG}`,
+      `  2. ${LONG} (second)`,
+    ].join('\n');
+    // Precondition: this is exactly the gap — the classifier rejects it.
+    expect(classifyScreen(screen)).toBeNull();
+    const det = new PromptDetector({ idleMs: 40 });
+    const prompts = [], unclassified = [];
+    det.on('prompt', p => prompts.push(p));
+    det.on('unclassified-prompt', u => unclassified.push(u));
+    det.feed(screen);
+    await new Promise(r => setTimeout(r, 120));
+    expect(prompts).toHaveLength(0);
+    expect(unclassified).toHaveLength(1);
+    expect(unclassified[0].screen).toContain('What would you like to do?');
+  });
+
+  it('does not emit unclassified-prompt for a normal classifiable menu', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const prompts = [], unclassified = [];
+    det.on('prompt', p => prompts.push(p));
+    det.on('unclassified-prompt', u => unclassified.push(u));
+    det.feed('Continue? [y/N]');
+    await new Promise(r => setTimeout(r, 120));
+    expect(prompts).toHaveLength(1);
+    expect(unclassified).toHaveLength(0);
+  });
+
+  it('emits screen-update for the letter-spaced post-login "Press Enter to continue" screen', async () => {
+    // The TUI shimmer-animates this line with per-character escapes, which
+    // stripAnsi renders letter-spaced — the old word-spaced cue regex never
+    // matched it, so no screen-update fired and the user had to send !enter.
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Login successful.\n P r e s s   E n t e r   t o   c o n t i n u e …');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+    expect(updates[0].hasInputCue).toBe(true);
+  });
+
+  it('distinguishes the paste-code cue from the press-enter cue across renders', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Browser didn\'t open? Use the url below to sign in\nhttps://claude.ai/oauth?x=1\nPaste code here if prompted >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Login successful. Press Enter to continue…');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(2);
+  });
+
+  it('suppresses a re-render whose long URL was truncated mid-repaint', async () => {
+    // After the user pastes their OAuth code the wizard repaints; a partial
+    // capture can cut the URL's query tail, and a full-vs-truncated pair must
+    // not read as two different sign-in screens (duplicate card in chat).
+    const base = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code';
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed(`Claude needs you to sign in.\nOpen this URL: ${base}&state=abc123\nPaste code here >`);
+    await new Promise(r => setTimeout(r, 120));
+    det.feed(`Claude needs you to sign in.\nOpen this URL: ${base.slice(0, 100)}\nPaste code here >`);
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+  });
+
+  it('suppresses a wizard repaint whose cue phrase flapped within the oauth family', async () => {
+    // After the user pastes their code the wizard repaints: "Paste code
+    // here" can scroll away while "use the url below" remains. Both are the
+    // SAME sign-in screen — per-phrase cue tokens made the dedup signature
+    // flap and re-sent the card (live-test round 2).
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Browser didn\'t open? Use the url below to sign in\nhttps://claude.ai/oauth?x=1\nPaste code here if prompted >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Use the url below to sign in\nhttps://claude.ai/oauth?x=1');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+  });
+
+  it('still emits for a genuinely different URL under the same cue', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Open this URL: https://claude.ai/first\nPaste code here >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Open this URL: https://claude.ai/second\nPaste code here >');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(2);
+  });
+});
+
+describe('looksLikeUnclassifiedMenu', () => {
+  const LONG = 'a'.repeat(120);
+
+  it('flags a ❯ numbered menu the classifier rejected (overlong labels)', () => {
+    const screen = `What would you like to do?\n❯ 1. ${LONG}\n  2. ${LONG}`;
+    expect(classifyScreen(screen)).toBeNull();           // the gap
+    expect(looksLikeUnclassifiedMenu(screen)).toBe(true);
+  });
+
+  it('ignores a prose numbered list with no selection cursor', () => {
+    expect(looksLikeUnclassifiedMenu('Here are the steps:\n1. First do this\n2. Then do that')).toBe(false);
+  });
+
+  it('ignores a bare ❯ slash-command suggestion (no numbered/lettered option)', () => {
+    expect(looksLikeUnclassifiedMenu('❯ /compact\n⎿ summary line')).toBe(false);
+  });
+
+  it('ignores a folded-paste placeholder under the cursor', () => {
+    expect(looksLikeUnclassifiedMenu('❯ [Pasted text #1 +9 lines]')).toBe(false);
+  });
+
+  it('ignores plain output and empty input', () => {
+    expect(looksLikeUnclassifiedMenu('All done. Nothing to pick here.')).toBe(false);
+    expect(looksLikeUnclassifiedMenu('')).toBe(false);
+    expect(looksLikeUnclassifiedMenu(null)).toBe(false);
+  });
+});
+
+describe('queued-message widget (type-ahead) is not a prompt', () => {
+  // Claude Code renders messages typed while it is busy ("type-ahead") in a
+  // queued-message widget: one or more `❯ <text>` lines closed by a
+  // `❯ Press up to edit queued messages` footer. A queued message that happens
+  // to begin with "1." (here the user's reply "1. also to be clear …") is
+  // structurally identical to a numbered menu item, so the detector surfaced a
+  // phantom prompt while claude was mid-turn. The widget lines must be ignored.
+  const queuedScreen = [
+    '  ❯ 1. also to be clear the designs are not linked to a book',
+    '',
+    '❯ Press up to edit queued messages',
+    '────────────────────────────────────────────────────────────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl+t to hide tasks            ◉ xhigh · /effort',
+  ].join('\n');
+
+  it('looksLikeUnclassifiedMenu ignores a queued type-ahead message', () => {
+    expect(looksLikeUnclassifiedMenu(queuedScreen)).toBe(false);
+  });
+
+  it('classifyScreen does not surface multiple queued messages as a menu', () => {
+    // Two queued messages that read like a 1./2. menu would otherwise pass the
+    // numbered-run guard (selection marker present).
+    const twoQueued = [
+      '  ❯ 1. first thing the user typed ahead while claude was busy',
+      '  ❯ 2. second thing the user typed ahead while claude was busy',
+      '❯ Press up to edit queued messages',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n');
+    expect(classifyScreen(twoQueued)).toBeNull();
+  });
+
+  it('handles a queued widget whose footer renders as its own background-filled line', () => {
+    // Regression for the stripInputBox/stripQueuedWidget ordering hazard: when
+    // the widget footer arrives as a standalone background-filled row,
+    // stripInputBox (which drops bg-filled non-menu lines) must not delete it
+    // before stripQueuedWidget can anchor on it — otherwise the numbered queued
+    // line (kept by the numbered exception) trips the phantom menu again.
+    const bg = '\x1b[48;5;237m', fg = '\x1b[38;5;231m', rst = '\x1b[0m';
+    const raw = [
+      `${bg}${fg}❯ 1. also to be clear the designs are not linked to a book${rst}`,
+      `${bg}${fg}❯ Press up to edit queued messages${rst}`,
+    ].join('\n');
+    // Mirror the live _check pipeline: stripInputBox -> stripAnsi -> stripQueuedWidget.
+    const screen = stripQueuedWidget(stripAnsi(stripInputBox(raw)));
+    expect(looksLikeUnclassifiedMenu(screen)).toBe(false);
+  });
+
+  it('stripQueuedWidget blanks the footer and marker lines, tolerating spacer blanks', () => {
+    const screen = [
+      'keep this prose line',
+      '  ❯ a queued message',
+      '',
+      '❯ Press up to edit queued messages',
+    ].join('\n');
+    expect(stripQueuedWidget(screen).split('\n')).toEqual([
+      'keep this prose line',
+      '',
+      '',
+      '',
+    ]);
+  });
+
+  it('stripQueuedWidget leaves screens without the widget untouched and is idempotent', () => {
+    const plain = 'Which approach?\n❯ 1. Yes\n  2. No';
+    expect(stripQueuedWidget(plain)).toBe(plain);
+    const widget = '  ❯ typed ahead\n❯ Press up to edit queued messages';
+    const once = stripQueuedWidget(widget);
+    expect(stripQueuedWidget(once)).toBe(once);
+  });
+
+  it('still classifies a real menu that coexists with the queued widget', () => {
+    // The widget sits above an actual AskUserQuestion menu; blanking the widget
+    // must not eat the real menu below it.
+    const both = [
+      '  ❯ should we also bump the timeout?',
+      '❯ Press up to edit queued messages',
+      'Which approach should we take?',
+      '❯ 1. Refactor the parser',
+      '  2. Patch the regex',
+    ].join('\n');
+    const r = classifyScreen(both);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.label)).toEqual(['Refactor the parser', 'Patch the regex']);
+  });
+});
+
+describe('classifyScreen — option descriptions (AskUserQuestion-style)', () => {
+  const screen = [
+    'What would you like me to do?',
+    '1. Everything actionable',
+    '   All of the above plus the export fix and nav redirect.',
+    '2. Just the blockers',
+    '   Only the CI fix and styles storage.',
+    '3. Type something.',
+  ].join('\n');
+
+  it('captures each option header plus its indented description', () => {
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(3);
+    expect(r.options[0].label).toBe('Everything actionable');
+    expect(r.options[0].description).toContain('All of the above plus the export fix');
+    expect(r.options[1].label).toBe('Just the blockers');
+    expect(r.options[1].description).toContain('Only the CI fix and styles storage');
+    // Last option has no description line.
+    expect(r.options[2].label).toBe('Type something.');
+    expect(r.options[2].description).toBeUndefined();
+    // "Type something." is detected as the free-text slot.
+    expect(r.freeTextIdx).toBe(2);
+  });
+});
+
+describe('extractPreamble', () => {
+  // Real AskUserQuestion render captured from a live PTY session (stripped +
+  // blank-collapsed), saved as a fixture. The detector must recover the prose
+  // claude wrote above the menu, without the question/options/chrome.
+  const render = fs.readFileSync(path.join(__dir, 'fixtures', 'auq-preamble-render.txt'), 'utf-8');
+  const question = "Once I extract Claude's explanatory paragraph from the live screen and show it before the question, what should happen to the clean copy that still arrives from the transcript after you answer?";
+
+  it('recovers the prose above the menu from a real render', () => {
+    const { preamble, complete } = extractPreamble(render, { question });
+    expect(complete).toBe(true);
+    expect(preamble).toContain('controlled capture');
+    expect(preamble).toContain('live-demonstrates the bug');
+    // Must NOT include the question text or the option labels.
+    expect(preamble).not.toContain('what should happen to the clean copy');
+    expect(preamble).not.toContain('Suppress the duplicate');
+    expect(preamble).not.toContain('Keep it');
+  });
+
+  it('returns incomplete for input with no menu/question widget', () => {
+    expect(extractPreamble('just some plain output, nothing to pick', { question })).toEqual({ preamble: '', complete: false });
+    expect(extractPreamble('', { question })).toEqual({ preamble: '', complete: false });
+    expect(extractPreamble(render, null)).toEqual({ preamble: '', complete: false });
+  });
+
+  it('strips ANSI and collapses blank runs before extracting', () => {
+    const raw = [
+      '\x1b[2m●\x1b[0m Here is my reasoning about the choice.',
+      '', '', '', '',  // blank run (spinner artifact)
+      'What would you like?',
+      '1. Alpha',
+      '   does A',
+      '2. Beta',
+    ].join('\n');
+    const { preamble, complete } = extractPreamble(raw, { question: 'What would you like?' });
+    expect(complete).toBe(true);
+    expect(preamble).toContain('Here is my reasoning about the choice');
+    expect(preamble).not.toContain('Alpha');
+  });
+});
+
+describe('extractPreamble — noisy real capture (todo widget + spinner + queued msg)', () => {
+  // Real @compiled-scope AskUserQuestion render captured live. Between claude's
+  // prose and the menu the raw PTY buffer interleaves: a TodoWrite widget
+  // (repainted ~4×, some frames garbled by redraw), a spinner status line, and
+  // a *queued user message* echoed in scrollback. The greedy extractor swept
+  // all of that into the surfaced preamble; the tightened one must not.
+  const noisy = fs.readFileSync(path.join(__dir, 'fixtures', 'auq-preamble-noisy.txt'), 'utf-8');
+  const prompt = {
+    kind: 'numbered',
+    question: 'How far should the @compiled migration go in this work?',
+    options: [
+      { key: '1', label: 'New + components we replace' },
+      { key: '2', label: 'New components only' },
+      { key: '3', label: 'Migrate the whole editor now' },
+      { key: '4', label: 'Type something.' },
+    ],
+  };
+
+  it('recovers the real prose', () => {
+    const { preamble, complete } = extractPreamble(noisy, prompt);
+    expect(complete).toBe(true);
+    expect(preamble).toContain('Good news on feasibility');
+    expect(preamble).toContain('The only real decision is how much to migrate now');
+  });
+
+  it('drops the TodoWrite widget chrome', () => {
+    const { preamble } = extractPreamble(noisy, prompt);
+    expect(preamble).not.toMatch(/\d+\s+tasks?\s+\(\d+\s+done/i); // "7 tasks (2 done, …)"
+    expect(preamble).not.toContain('+2 completed');
+    // garbled todo items leaked through the old looksLikeProse filter
+    expect(preamble).not.toContain('opose 2-3 integrat');
+  });
+
+  it('drops the spinner status line', () => {
+    const { preamble } = extractPreamble(noisy, prompt);
+    expect(preamble).not.toContain('Asking clarifying questions');
+    expect(preamble).not.toMatch(/[↑↓]\s*[\d.]+k?\s+tokens/i); // "↓ 39.6k tokens"
+  });
+
+  it('drops the queued user message echoed in scrollback', () => {
+    const { preamble } = extractPreamble(noisy, prompt);
+    expect(preamble).not.toContain('should we bring the editor out of vite');
+  });
+});
+
+describe('preambleMatchesText', () => {
+  it('matches the same prose despite minor glyph glitches', () => {
+    const captured = 'I reviewed the batch and found eight issues across CI and the editor navigator';
+    const transcript = 'I reviewed the batch and found eight issues across CI and the editor navigator pipeline.';
+    expect(preambleMatchesText(captured, transcript)).toBe(true);
+  });
+  it('does not match unrelated text', () => {
+    expect(preambleMatchesText('the quick brown fox jumps over lazy dogs today', 'completely different sentence about weather and rain')).toBe(false);
+  });
+  it('returns false for empty or tiny inputs', () => {
+    expect(preambleMatchesText('', 'anything here at all')).toBe(false);
+    expect(preambleMatchesText('two words', 'two words')).toBe(false);
+  });
+  it('does not match a short preamble merely contained in a much longer message', () => {
+    const shortPreamble = 'fixing the editor navigator pipeline bug today now';
+    const longUnrelated = 'fixing the editor navigator pipeline bug today now ' +
+      'but also rewriting the entire authentication subsystem and migrating the database ' +
+      'plus refactoring the deployment scripts and updating every dependency across services';
+    expect(preambleMatchesText(shortPreamble, longUnrelated)).toBe(false);
+  });
 });
 
 describe('isIdleReadyScreen', () => {
@@ -737,6 +1351,33 @@ describe('isIdleReadyScreen', () => {
     expect(isIdleReadyScreen('⏵⏵bypasspermissionson·esctointerrupt')).toBe(false);
   });
 
+  it('returns true for the logged-out screen (parked /login must not wait for the hardcap)', () => {
+    // A `claude --resume` spawned while logged out never paints the normal
+    // idle footer — without the logged-out token, a parked /login only ran at
+    // the 120s hardcap while the user's retries bounced off "still resuming".
+    expect(isIdleReadyScreen('❯ \n──────\nNot logged in · Please run /login')).toBe(true);
+    expect(isIdleReadyScreen('❯ \n──────\nNot logged in · Run /login')).toBe(true);
+    // Letter-spaced render of the same state must also match.
+    expect(isIdleReadyScreen('N o t   l o g g e d   i n  ·  Run /login')).toBe(true);
+  });
+
+  it('is NOT ready for mere conversation text containing "not logged in"', () => {
+    // A resumed session repaints its old transcript into the tail; prose
+    // discussing login states must not release the resume hold. Only the
+    // exact status-footer form (with the · separator and /login command)
+    // counts.
+    expect(isIdleReadyScreen('● The deploy failed because you are not logged in to npm.\n✻ Loading…')).toBe(false);
+    expect(isIdleReadyScreen('● It said "Not logged in" and then continued.')).toBe(false);
+  });
+
+  it('is NOT ready when the logged-out footer sits above the bottom lines (stale scrollback)', () => {
+    const screen = [
+      'Not logged in · Please run /login',
+      'line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+
   it('is NOT ready while the resume-summary picker is showing', () => {
     // The picker shows "Enter to confirm · Esc to cancel" — NOT the idle
     // "bypass permissions" status line — so the resume hold must keep waiting
@@ -779,5 +1420,84 @@ describe('classifyScreen — resume-from-summary picker', () => {
       "Don't ask me again",
     ]);
     expect(r.question).toMatch(/recommend resuming from a summary/);
+  });
+});
+
+describe('loginSuccessNearAutoEnterCue', () => {
+  it('matches the real post-login success screen (success line just above the cue)', () => {
+    const screen = [
+      ' Login successful. Logged in as pat@example.com',
+      '',
+      ' Press Enter to continue…',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('matches when success and cue share a single line', () => {
+    expect(loginSuccessNearAutoEnterCue('Login successful. Press Enter to continue…')).toBe(true);
+  });
+
+  it('matches the letter-spaced shimmer rendering of the success screen', () => {
+    const screen = [
+      'L o g i n   s u c c e s s f u l .',
+      'P r e s s   E n t e r   t o   c o n t i n u e …',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('does NOT match stale success text in scrollback above an unrelated cue', () => {
+    // A resumed session repaints its old transcript into the tail. A previous
+    // login's success text sitting well above a later "Press Enter to
+    // dismiss" notice must not read as a fresh login success — a
+    // whole-screen match here is what triggered spurious auto-returns to
+    // print mode (Bugbot, PR #162).
+    const screen = [
+      '> earlier chat about how the login successful message looked',
+      'assistant: yes, it said "Logged in as pat@example.com"',
+      'some more transcript',
+      'and more transcript',
+      'yet more transcript',
+      'still more transcript',
+      'A new version of claude is available.',
+      'Press Enter to dismiss',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(false);
+  });
+
+  it('does NOT match a success screen with no press-Enter cue', () => {
+    expect(loginSuccessNearAutoEnterCue('Login successful. Logged in as pat@example.com')).toBe(false);
+  });
+
+  it('handles empty and cue-less input', () => {
+    expect(loginSuccessNearAutoEnterCue('')).toBe(false);
+    expect(loginSuccessNearAutoEnterCue('just some ordinary output')).toBe(false);
+  });
+});
+
+describe('loginSuccessNearAutoEnterCue (wrapped cue)', () => {
+  it('finds a press-Enter cue wrapped across two lines', () => {
+    // Narrow terminals can wrap the cue; the auto-Enter decision matches the
+    // whole compacted screen so it still fires — the success locator must
+    // agree or the flow never returns to print mode.
+    const screen = [
+      ' Login successful. Logged in as pat@example.com',
+      ' Press Enter',
+      ' to continue…',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('still rejects stale success text far above a wrapped cue', () => {
+    const screen = [
+      'transcript: the login successful message from before',
+      'more transcript',
+      'more transcript',
+      'more transcript',
+      'more transcript',
+      'A new version is available.',
+      'Press Enter',
+      'to dismiss',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(false);
   });
 });

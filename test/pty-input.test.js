@@ -13,6 +13,11 @@ describe('bracketedPaste', () => {
   it('preserves an empty string (caller may still want to submit)', () => {
     expect(bracketedPaste('')).toBe('\x1b[200~\x1b[201~');
   });
+
+  it('strips embedded paste-terminator sequences so content cannot escape the paste', () => {
+    expect(bracketedPaste('a\x1b[201~\rrm -rf /\r')).toBe('\x1b[200~a\rrm -rf /\r\x1b[201~');
+    expect(bracketedPaste('\x1b[201~\x1b[201~x')).toBe('\x1b[200~x\x1b[201~');
+  });
 });
 
 describe('keystroke', () => {

@@ -1,108 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildMcpServers,
+  effectiveExtras,
+  extractBypassFlag,
   extractMcpExtraFlags,
   knownMcpExtras,
   mergeMcpConfigs,
   parseDefaultExtras,
-  resolveExtras,
+  resolveDefaultExtras,
 } from '../lib/mcp-config.js';
 
-const KNOWN = ['browser', 'circleci'];
-
-describe('extractMcpExtraFlags', () => {
-  it('pulls a known --flag out of the token list', () => {
-    expect(extractMcpExtraFlags(['--browser', '/some/dir'], KNOWN))
-      .toEqual({ extras: ['browser'], rest: ['/some/dir'] });
-    expect(extractMcpExtraFlags(['/some/dir', '--circleci'], KNOWN))
-      .toEqual({ extras: ['circleci'], rest: ['/some/dir'] });
-  });
-
-  it('leaves unknown --flags as positional tokens', () => {
-    expect(extractMcpExtraFlags(['--browser', '--not-a-flag', '/dir'], KNOWN))
-      .toEqual({ extras: ['browser'], rest: ['--not-a-flag', '/dir'] });
-  });
-
-  it('returns empty extras when none requested', () => {
-    expect(extractMcpExtraFlags(['/dir'], KNOWN)).toEqual({ extras: [], rest: ['/dir'] });
-    expect(extractMcpExtraFlags([], KNOWN)).toEqual({ extras: [], rest: [] });
-  });
-
-  it('does not consume positional args that share Object.prototype names', () => {
-    expect(extractMcpExtraFlags(['constructor'], KNOWN)).toEqual({ extras: [], rest: ['constructor'] });
-    expect(extractMcpExtraFlags(['__proto__'], KNOWN)).toEqual({ extras: [], rest: ['__proto__'] });
-    expect(extractMcpExtraFlags(['--__proto__'], KNOWN)).toEqual({ extras: [], rest: ['--__proto__'] });
-    expect(extractMcpExtraFlags(['hasOwnProperty', '--browser'], KNOWN))
-      .toEqual({ extras: ['browser'], rest: ['hasOwnProperty'] });
-  });
-});
-
-describe('knownMcpExtras', () => {
-  it('returns the mcpExtras keys of the supplied config', () => {
-    const cfg = { mcpServers: {}, mcpExtras: { browser: {}, circleci: {} } };
-    expect(knownMcpExtras(cfg).sort()).toEqual(['browser', 'circleci']);
-  });
-  it('returns [] when there are no extras', () => {
-    expect(knownMcpExtras({ mcpServers: {} })).toEqual([]);
-    expect(knownMcpExtras(undefined)).toEqual([]);
-  });
-});
-
-describe('mergeMcpConfigs', () => {
-  const base = { mcpServers: { 'ask-user': { command: 'node' } }, mcpExtras: { browser: { 'chrome-devtools': {} } } };
-
-  it('returns base unchanged when overlay is null/undefined', () => {
-    expect(mergeMcpConfigs(base, null)).toEqual(base);
-    expect(mergeMcpConfigs(base, undefined)).toEqual(base);
-    expect(mergeMcpConfigs(base, null)).not.toBe(base);
-  });
-
-  it('merges overlay mcpExtras into base by key', () => {
-    const overlay = { mcpExtras: { circleci: { circleci: { command: 'node', args: ['/x/server.js'] } } } };
-    const out = mergeMcpConfigs(base, overlay);
-    expect(Object.keys(out.mcpExtras).sort()).toEqual(['browser', 'circleci']);
-    expect(out.mcpExtras.circleci.circleci.args).toEqual(['/x/server.js']);
-  });
-
-  it('merges overlay mcpServers too', () => {
-    const overlay = { mcpServers: { extra: { command: 'node' } } };
-    const out = mergeMcpConfigs(base, overlay);
-    expect(Object.keys(out.mcpServers).sort()).toEqual(['ask-user', 'extra']);
-  });
-
-  it('does not mutate base', () => {
-    const snap = JSON.parse(JSON.stringify(base));
-    mergeMcpConfigs(base, { mcpExtras: { circleci: {} } });
-    expect(base).toEqual(snap);
-  });
-});
-
-describe('parseDefaultExtras', () => {
-  it('splits a comma list and trims', () => {
-    expect(parseDefaultExtras('circleci, browser')).toEqual(['circleci', 'browser']);
-  });
-  it('returns [] for empty/undefined', () => {
-    expect(parseDefaultExtras('')).toEqual([]);
-    expect(parseDefaultExtras(undefined)).toEqual([]);
-    expect(parseDefaultExtras('  ')).toEqual([]);
-  });
-  it('drops empty segments', () => {
-    expect(parseDefaultExtras('circleci,,')).toEqual(['circleci']);
-  });
-});
-
-describe('resolveExtras', () => {
-  it('unions machine default with session extras, default first, deduped', () => {
-    expect(resolveExtras(['circleci'], ['browser'])).toEqual(['circleci', 'browser']);
-    expect(resolveExtras(['circleci'], ['circleci'])).toEqual(['circleci']);
-    expect(resolveExtras([], ['browser'])).toEqual(['browser']);
-    expect(resolveExtras(['circleci'], [])).toEqual(['circleci']);
-  });
-  it('tolerates missing args', () => {
-    expect(resolveExtras()).toEqual([]);
-    expect(resolveExtras(['circleci'])).toEqual(['circleci']);
-  });
-});
+// What index.js passes: the mcpExtras keys of the merged config.
+const KNOWN = ['browser', 'share'];
 
 const BASE = Object.freeze({
   mcpServers: {
@@ -113,6 +22,12 @@ const BASE = Object.freeze({
     },
   },
   mcpExtras: {
+    share: {
+      'show-file': {
+        command: 'node',
+        args: ['./show-file-mcp.js'],
+      },
+    },
     browser: {
       'chrome-devtools': {
         command: 'xvfb-run',
@@ -129,6 +44,126 @@ const BASE = Object.freeze({
       },
     },
   },
+});
+
+describe('extractMcpExtraFlags', () => {
+  it('pulls --browser out of the token list', () => {
+    expect(extractMcpExtraFlags(['--browser', '/some/dir'], KNOWN))
+      .toEqual({ extras: ['browser'], rest: ['/some/dir'] });
+    expect(extractMcpExtraFlags(['/some/dir', '--browser'], KNOWN))
+      .toEqual({ extras: ['browser'], rest: ['/some/dir'] });
+  });
+
+  it('leaves unknown flags alone', () => {
+    expect(extractMcpExtraFlags(['--browser', '--not-a-flag', '/dir'], KNOWN))
+      .toEqual({ extras: ['browser'], rest: ['--not-a-flag', '/dir'] });
+  });
+
+  it('accepts em-dash / en-dash auto-corrected forms of --browser', () => {
+    // Matrix/mobile clients auto-correct a leading "--" into "—" (em-dash),
+    // so the user's "--browser" arrives as "—browser".
+    expect(extractMcpExtraFlags(['—browser'], KNOWN))
+      .toEqual({ extras: ['browser'], rest: [] });
+    expect(extractMcpExtraFlags(['–browser', '/dir'], KNOWN))
+      .toEqual({ extras: ['browser'], rest: ['/dir'] });
+    // A unicode-dash token that isn't a known flag is preserved unchanged.
+    expect(extractMcpExtraFlags(['—notaflag'], KNOWN))
+      .toEqual({ extras: [], rest: ['—notaflag'] });
+  });
+
+  it('returns empty extras when none requested', () => {
+    expect(extractMcpExtraFlags(['/dir'], KNOWN)).toEqual({ extras: [], rest: ['/dir'] });
+    expect(extractMcpExtraFlags([], KNOWN)).toEqual({ extras: [], rest: [] });
+  });
+
+  it('exposes the recognised extras list for sanity checks', () => {
+    expect(knownMcpExtras(BASE)).toContain('browser');
+  });
+
+  // Regression: a plain-object lookup table would silently consume tokens
+  // that match Object.prototype member names ("constructor", "toString",
+  // "__proto__") because bracket access falls through the prototype chain
+  // and returns a truthy function. The Map-backed table avoids this.
+  it('does not consume positional args that share Object.prototype names', () => {
+    expect(extractMcpExtraFlags(['constructor'], KNOWN)).toEqual({ extras: [], rest: ['constructor'] });
+    expect(extractMcpExtraFlags(['toString'], KNOWN)).toEqual({ extras: [], rest: ['toString'] });
+    expect(extractMcpExtraFlags(['__proto__'], KNOWN)).toEqual({ extras: [], rest: ['__proto__'] });
+    expect(extractMcpExtraFlags(['hasOwnProperty', '--browser'], KNOWN))
+      .toEqual({ extras: ['browser'], rest: ['hasOwnProperty'] });
+  });
+});
+
+// The browser extra's real on-disk shape since the xvfb-run leak fix: the MCP
+// is wrapped in repo-relative ./hooks/xvfb-wrap.sh, which must be resolved to
+// an absolute path in the generated config — claude runs with the SESSION
+// workdir as cwd, not the bridge install dir, so a relative command would
+// ENOENT for every session outside the repo.
+const BASE_WRAP = Object.freeze({
+  mcpServers: {
+    'ask-user': {
+      command: 'node',
+      args: ['./ask-user.js'],
+    },
+  },
+  mcpExtras: {
+    browser: {
+      'chrome-devtools': {
+        command: './hooks/xvfb-wrap.sh',
+        args: [
+          'npx', '-y', 'chrome-devtools-mcp',
+          '--no-usage-statistics',
+          '--chromeArg=--no-sandbox',
+          '--chromeArg=--disable-setuid-sandbox',
+        ],
+      },
+    },
+  },
+});
+
+describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', () => {
+  it('resolves a ./-relative server command against the bridge install dir on Linux', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'linux',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('/opt/bridge/hooks/xvfb-wrap.sh');
+    // args are the real command line, untouched by resolution
+    expect(config.mcpServers['chrome-devtools'].args[0]).toBe('npx');
+  });
+
+  it('leaves the relative command as-is when no base dir is supplied', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'linux',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('./hooks/xvfb-wrap.sh');
+  });
+
+  it('does not touch non-relative commands', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE,
+      extras: ['browser'],
+      platform: 'linux',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('xvfb-run');
+  });
+
+  it('on macOS the resolved wrapper is unwrapped to the real command', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'darwin',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(config.mcpServers['chrome-devtools'].args).toEqual([
+      '-y', 'chrome-devtools-mcp', '--no-usage-statistics',
+    ]);
+  });
 });
 
 describe('buildMcpServers', () => {
@@ -153,6 +188,17 @@ describe('buildMcpServers', () => {
     expect(Object.keys(config.mcpServers).sort()).toEqual(['ask-user', 'chrome-devtools']);
     expect(config.mcpServers['chrome-devtools'].command).toBe('xvfb-run');
     expect(extras).toEqual(['browser']);
+  });
+
+  it('resolves the share extra entrypoint against the bridge install dir', () => {
+    const { config, extras } = buildMcpServers({
+      baseConfig: BASE,
+      extras: ['share'],
+      platform: 'linux',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['show-file'].args[0]).toBe('/opt/bridge/show-file-mcp.js');
+    expect(extras).toEqual(['share']);
   });
 
   it('silently drops unknown extras names rather than letting a typo enable nothing-then-everything', () => {
@@ -196,5 +242,127 @@ describe('buildMcpServers', () => {
   it('leaves args alone when no ask-user base dir is given', () => {
     const { config } = buildMcpServers({ baseConfig: BASE, platform: 'linux' });
     expect(config.mcpServers['ask-user'].args[0]).toBe('./ask-user.js');
+  });
+});
+
+describe('effectiveExtras', () => {
+  it('adds defaults to fresh and explicitly configured sessions without duplicates', () => {
+    expect(effectiveExtras([], ['share'])).toEqual(['share']);
+    expect(effectiveExtras(['browser'], ['share'])).toEqual(['browser', 'share']);
+    expect(effectiveExtras(['share', 'browser'], ['share'])).toEqual(['share', 'browser']);
+  });
+
+  it('does not mutate the resolved extras used for restart inheritance', () => {
+    const resolvedExtras = ['browser'];
+    effectiveExtras(resolvedExtras, ['share']);
+    expect(resolvedExtras).toEqual(['browser']);
+  });
+});
+
+describe('resolveDefaultExtras', () => {
+  it('disables share by default and enables it only with the opt-in flag', () => {
+    expect(resolveDefaultExtras(undefined)).toEqual([]);
+    expect(resolveDefaultExtras('0')).toEqual([]);
+    expect(resolveDefaultExtras('1')).toEqual(['share']);
+    expect(effectiveExtras([], resolveDefaultExtras('1'))).toEqual(['share']);
+  });
+
+  it('keeps an explicitly requested share extra even when the default is off', () => {
+    expect(effectiveExtras(['share'], resolveDefaultExtras(undefined))).toEqual(['share']);
+  });
+});
+
+describe('extractBypassFlag', () => {
+  it('extracts --bypass and preserves positional args', () => {
+    expect(extractBypassFlag(['--bypass', '/some/dir']))
+      .toEqual({ bypass: true, rest: ['/some/dir'] });
+    expect(extractBypassFlag(['/some/dir', '--bypass']))
+      .toEqual({ bypass: true, rest: ['/some/dir'] });
+  });
+
+  it('extracts --auto as explicit false (returns a bypassed session to auto mode)', () => {
+    expect(extractBypassFlag(['--auto'])).toEqual({ bypass: false, rest: [] });
+  });
+
+  it('returns null when neither flag is present', () => {
+    expect(extractBypassFlag(['/dir'])).toEqual({ bypass: null, rest: ['/dir'] });
+    expect(extractBypassFlag([])).toEqual({ bypass: null, rest: [] });
+  });
+
+  it('last flag wins when both appear', () => {
+    expect(extractBypassFlag(['--bypass', '--auto']).bypass).toBe(false);
+    expect(extractBypassFlag(['--auto', '--bypass']).bypass).toBe(true);
+  });
+
+  it('normalizes unicode dashes (mobile autocorrect)', () => {
+    expect(extractBypassFlag(['—bypass'])).toEqual({ bypass: true, rest: [] });
+    expect(extractBypassFlag(['–auto', '/dir'])).toEqual({ bypass: false, rest: ['/dir'] });
+    expect(extractBypassFlag(['—notaflag'])).toEqual({ bypass: null, rest: ['—notaflag'] });
+  });
+
+  it('composes with extractMcpExtraFlags (bypass first, then extras)', () => {
+    const { bypass, rest } = extractBypassFlag(['--bypass', '--browser', '/dir']);
+    expect(bypass).toBe(true);
+    expect(extractMcpExtraFlags(rest, KNOWN)).toEqual({ extras: ['browser'], rest: ['/dir'] });
+  });
+});
+
+describe('knownMcpExtras', () => {
+  it('returns the mcpExtras keys of the supplied (merged) config', () => {
+    const cfg = { mcpServers: {}, mcpExtras: { browser: {}, circleci: {} } };
+    expect(knownMcpExtras(cfg).sort()).toEqual(['browser', 'circleci']);
+  });
+  it('returns [] when there are no extras', () => {
+    expect(knownMcpExtras({ mcpServers: {} })).toEqual([]);
+    expect(knownMcpExtras(undefined)).toEqual([]);
+  });
+  it('makes an overlay-defined extra a recognised flag', () => {
+    const merged = mergeMcpConfigs(BASE, { mcpExtras: { circleci: { circleci: { command: 'node' } } } });
+    expect(extractMcpExtraFlags(['--circleci', '/dir'], knownMcpExtras(merged)))
+      .toEqual({ extras: ['circleci'], rest: ['/dir'] });
+    expect(extractMcpExtraFlags(['--__proto__'], knownMcpExtras(merged)))
+      .toEqual({ extras: [], rest: ['--__proto__'] });
+  });
+});
+
+describe('mergeMcpConfigs', () => {
+  const base = { mcpServers: { 'ask-user': { command: 'node' } }, mcpExtras: { browser: { 'chrome-devtools': {} } } };
+
+  it('returns base unchanged (but a fresh object) when overlay is null/undefined', () => {
+    expect(mergeMcpConfigs(base, null)).toEqual(base);
+    expect(mergeMcpConfigs(base, undefined)).toEqual(base);
+    expect(mergeMcpConfigs(base, null)).not.toBe(base);
+  });
+
+  it('merges overlay mcpExtras into base by key', () => {
+    const overlay = { mcpExtras: { circleci: { circleci: { command: 'node', args: ['/x/server.js'] } } } };
+    const out = mergeMcpConfigs(base, overlay);
+    expect(Object.keys(out.mcpExtras).sort()).toEqual(['browser', 'circleci']);
+    expect(out.mcpExtras.circleci.circleci.args).toEqual(['/x/server.js']);
+  });
+
+  it('merges overlay mcpServers too', () => {
+    const out = mergeMcpConfigs(base, { mcpServers: { extra: { command: 'node' } } });
+    expect(Object.keys(out.mcpServers).sort()).toEqual(['ask-user', 'extra']);
+  });
+
+  it('does not mutate base', () => {
+    const snap = JSON.parse(JSON.stringify(base));
+    mergeMcpConfigs(base, { mcpExtras: { circleci: {} } });
+    expect(base).toEqual(snap);
+  });
+});
+
+describe('parseDefaultExtras', () => {
+  it('splits a comma list and trims', () => {
+    expect(parseDefaultExtras('circleci, browser')).toEqual(['circleci', 'browser']);
+  });
+  it('returns [] for empty/undefined', () => {
+    expect(parseDefaultExtras('')).toEqual([]);
+    expect(parseDefaultExtras(undefined)).toEqual([]);
+    expect(parseDefaultExtras('  ')).toEqual([]);
+  });
+  it('drops empty segments', () => {
+    expect(parseDefaultExtras('circleci,,')).toEqual(['circleci']);
   });
 });

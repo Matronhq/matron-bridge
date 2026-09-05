@@ -1,6 +1,69 @@
 import { describe, it, expect } from 'vitest';
 import { macifyMcpServers } from '../lib/mcp-config-mac.js';
 
+describe('macifyMcpServers — xvfb-wrap.sh unwrapping', () => {
+  // The browser extra now wraps its MCP in hooks/xvfb-wrap.sh (the leak-proof
+  // xvfb-run replacement). On macOS there's no Xvfb at all, so the wrapper —
+  // whether still repo-relative or already resolved to an absolute path by
+  // buildMcpServers — must be unwrapped to the real command, exactly like
+  // the legacy xvfb-run entries.
+  it('unwraps a resolved absolute xvfb-wrap.sh path and strips Linux sandbox args', () => {
+    const input = {
+      mcpServers: {
+        'chrome-devtools': {
+          command: '/opt/bridge/hooks/xvfb-wrap.sh',
+          args: [
+            'npx', '-y', 'chrome-devtools-mcp',
+            '--no-usage-statistics',
+            '--chromeArg=--no-sandbox',
+            '--chromeArg=--disable-setuid-sandbox',
+            '--viewport=1920x1080',
+          ],
+        },
+      },
+    };
+    const out = macifyMcpServers(input);
+    expect(out.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(out.mcpServers['chrome-devtools'].args).toEqual([
+      '-y', 'chrome-devtools-mcp', '--no-usage-statistics', '--viewport=1920x1080',
+    ]);
+  });
+
+  it('unwraps a still-relative ./hooks/xvfb-wrap.sh command', () => {
+    const input = {
+      mcpServers: {
+        'chrome-devtools': {
+          command: './hooks/xvfb-wrap.sh',
+          args: ['npx', '-y', 'chrome-devtools-mcp'],
+        },
+      },
+    };
+    const out = macifyMcpServers(input);
+    expect(out.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(out.mcpServers['chrome-devtools'].args).toEqual(['-y', 'chrome-devtools-mcp']);
+  });
+
+  it('does not unwrap commands that merely contain the name (no false positives)', () => {
+    const input = {
+      mcpServers: {
+        other: { command: '/opt/tools/not-xvfb-wrap.sh.backup', args: ['a'] },
+      },
+    };
+    const out = macifyMcpServers(input);
+    expect(out.mcpServers.other).toEqual(input.mcpServers.other);
+  });
+
+  it('returns the server unchanged when xvfb-wrap.sh has no command to unwrap', () => {
+    const input = {
+      mcpServers: {
+        broken: { command: './hooks/xvfb-wrap.sh', args: [] },
+      },
+    };
+    const out = macifyMcpServers(input);
+    expect(out.mcpServers.broken).toEqual(input.mcpServers.broken);
+  });
+});
+
 describe('macifyMcpServers', () => {
   it('unwraps xvfb-run for puppeteer and strips Linux sandbox launch args', () => {
     const input = {

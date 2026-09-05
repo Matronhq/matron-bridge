@@ -796,7 +796,7 @@ env: {
   CLAUDECODE: '',
   CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
   BRIDGE_ROOM_ID: session.roomId,
-  MATRIX_BRIDGE_API_PORT: String(API_PORT),
+  MATRON_BRIDGE_API_PORT: String(API_PORT),
   MATRON_BASH_TEE_ENABLED: session.showBashOutput ? '1' : '0',
 },
 ```

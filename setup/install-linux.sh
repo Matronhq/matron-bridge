@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 SERVICE_USER="${SERVICE_USER:-$(whoami)}"
 
-echo "=== Claude Matrix Bridge - Install ==="
+echo "=== Matron Bridge - Install ==="
 echo "Repo: $REPO_DIR"
 echo "User: $SERVICE_USER"
 echo
@@ -21,12 +21,12 @@ if [ ! -f "$REPO_DIR/.env" ]; then
   cp "$REPO_DIR/.env.example" "$REPO_DIR/.env"
   HMAC=$(openssl rand -hex 32)
   sed -i "s/^HMAC_SECRET=$/HMAC_SECRET=$HMAC/" "$REPO_DIR/.env"
-  echo "⚠️  Edit .env to set MATRIX_ACCESS_TOKEN, ALLOWED_USER_IDS, etc."
+  echo "⚠️  Edit .env to set JOURNAL_WS_URL, JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, etc."
 else
   echo ".env already exists, skipping."
 fi
 
 echo
 echo "Done. Next steps:"
-echo "  1. Edit .env with your settings (MATRIX_ACCESS_TOKEN, ALLOWED_USER_IDS)"
+echo "  1. Edit .env with your settings (JOURNAL_WS_URL, JOURNAL_TOKEN_FILE/JOURNAL_TOKEN, ALLOWED_USER_IDS)"
 echo "  2. Run: sudo bash setup/service.sh"
