@@ -169,14 +169,15 @@ if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAU
 // Box-wide default Claude model for FRESH starts (New Chat picker with no
 // pick, /start without --model). A resumed room keeps the model it last ran
 // on. Claude-only: Codex takes its model from its own config. Unset means
-// Claude Code's own default; an unknown alias is dropped with a warning so a
-// typo here can't make every spawn fail on a bogus --model.
+// fable; an unknown alias falls back to fable with a warning so a typo here
+// can't make every spawn fail on a bogus --model.
+const FALLBACK_DEFAULT_MODEL = 'fable';
 const DEFAULT_MODEL = (() => {
   const raw = process.env.MATRON_DEFAULT_MODEL;
-  if (!raw || !raw.trim()) return null;
+  if (!raw || !raw.trim()) return FALLBACK_DEFAULT_MODEL;
   if (!isValidModelArg(raw)) {
-    console.warn(`[model] Unknown MATRON_DEFAULT_MODEL=${JSON.stringify(raw)}; using Claude Code's default. Try: ${VALID_ALIAS_HINT} (or a full claude-* name).`);
-    return null;
+    console.warn(`[model] Unknown MATRON_DEFAULT_MODEL=${JSON.stringify(raw)}; using ${FALLBACK_DEFAULT_MODEL}. Try: ${VALID_ALIAS_HINT} (or a full claude-* name).`);
+    return FALLBACK_DEFAULT_MODEL;
   }
   return normalizeModelArg(raw);
 })();
