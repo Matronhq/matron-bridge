@@ -100,4 +100,15 @@ describe('/sleep wiring', () => {
   it('lists /sleep in the command reference', () => {
     expect(src).toMatch(/'\/sleep'/);
   });
+
+  it('routes a verified sleep: tap whose session was reaped through the sessionless seam', () => {
+    // The idle reaper removes the session long before a walk-away user taps;
+    // the router hands such taps to routeSessionlessPickerTap, which must
+    // reach the same confirm/cancel handlers the live path uses.
+    const body = bodyOf('routeSessionlessPickerTap: (convoId', '\n  noticeUnknownConvo:');
+    expect(body).toContain('confirmSleepFromButton(null, sendReply)');
+    expect(body).toContain('cancelSleepFromButton(null, sendReply)');
+    expect(body, 'a confirm stops the machine: it needs the same replay guard as journalOnPromptReply')
+      .toContain('journalPublisher.flushCursor()');
+  });
 });

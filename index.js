@@ -8836,6 +8836,22 @@ const journalInputConsumer = createJournalInputConsumer({
   routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
+  // A verified /sleep card tap whose session the idle reaper already removed
+  // (lib/journal-input-router.js isSleepPickerTap). The card acts on the
+  // host, so it needs only a convo to answer into — no session, no resume.
+  routeSessionlessPickerTap: (convoId, { choice }) => {
+    // Same command-replay guard as journalOnPromptReply: a confirm stops the
+    // machine, so it must never replay out of the cursor's debounce window.
+    journalPublisher.flushCursor();
+    const sendReply = (text) => journalPublishNotice(convoId, text);
+    if (choice === 'sleep:confirm') {
+      confirmSleepFromButton(null, sendReply).catch((e) => {
+        try { console.warn(`[sleep] sessionless confirm failed: ${e?.message || e}`); } catch { /* logging must never throw */ }
+      });
+    } else if (choice === 'sleep:cancel') {
+      cancelSleepFromButton(null, sendReply);
+    }
+  },
   noticeUnknownConvo: (convoId, { type }) => {
     // A user: frame in an INACTIVE room convo (TTL lapse / left) falls
     // through the room carve-out to here — but this notice would be

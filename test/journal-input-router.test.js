@@ -693,6 +693,71 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
       expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-b', { type: 'prompt_reply', username: 'dan' });
     });
   });
+
+  // /sleep card taps outlive the session that published the card: the buttons
+  // act on the host, and the idle reaper removes the session (immediately for
+  // Codex, on process close for Claude) long before a walk-away user taps.
+  describe('sleep card: verified sleep taps route without a session', () => {
+    const sleepCard = (seq, convoId = 'convo-1') => baseFrame({
+      seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+      payload: {
+        question: 'Sleep this box now?',
+        options: [
+          { id: 'sleep-confirm', value: 'sleep:confirm' },
+          { id: 'sleep-cancel', value: 'sleep:cancel' },
+        ],
+      },
+    });
+    const sleepReply = (targetSeq, choice, convoId = 'convo-1') => baseFrame({
+      seq: 300, convo_id: convoId, type: 'prompt_reply',
+      payload: { target_seq: targetSeq, choice, text: null },
+    });
+    const sessionlessDeps = () => ({ ...makeDeps(), routeSessionlessPickerTap: vi.fn() });
+
+    it('a sleep:confirm tap on the card it targets, with no session, goes to routeSessionlessPickerTap', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledWith('convo-1', { target_seq: 20, choice: 'sleep:confirm' }, { username: 'dan' });
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+    });
+
+    it('a sleep:cancel tap routes the same way', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:cancel'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledWith('convo-1', { target_seq: 20, choice: 'sleep:cancel' }, { username: 'dan' });
+    });
+
+    it('a sleep: choice with no registered frame is NOT routed — unknown-convo notice as before', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+
+    it('a sleep: choice the targeted frame never offered is NOT routed', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:now'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalled();
+    });
+
+    it('without the dep, a sessionless sleep tap falls back to the unknown-convo notice', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+  });
 });
 
 // The wiring half of the auto-resume seam: index.js can't be imported
