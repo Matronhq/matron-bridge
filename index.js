@@ -1605,7 +1605,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   ];
   const printModel = options.model === null
     ? undefined
-    : resolveModel({ option: options.model, persisted: persistedMode?.model, fallback: DEFAULT_MODEL });
+    : resolveModel({ option: options.model, persisted: persistedMode?.model, fallback: DEFAULT_MODEL, resumed: identity.resumed });
   if (printModel) {
     args.push('--model', printModel);
   }
@@ -2335,7 +2335,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const sessionId = identity.sessionId;
   const model = options.model === null
     ? undefined
-    : resolveModel({ option: options.model, persisted: persistedForRoom?.model, fallback: DEFAULT_MODEL });
+    : resolveModel({ option: options.model, persisted: persistedForRoom?.model, fallback: DEFAULT_MODEL, resumed: identity.resumed });
 
   const settings = {
     hooks: {
