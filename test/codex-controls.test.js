@@ -9,6 +9,13 @@ function setup() {
   return { session, opts, run: text => handleCodexControl(session, text, opts) };
 }
 describe('Codex native controls', () => {
+  it('keeps an unanswered plan question actionable instead of superseding it with Build', () => {
+    const h = setup(); h.session.codex.planMode = true; h.session._codexHadAssistantMessage = true;
+    h.session.codexPrompts = { active: { kind: 'async-question' } };
+    offerCodexBuild(h.session);
+    expect(h.session.sendButtonMessage).not.toHaveBeenCalled();
+    expect(h.session._codexBuildValue).toBeUndefined();
+  });
   it('enters read-only plan mode, publishes Build, and only implements on explicit approval', async () => {
     const h = setup(); await h.run('/plan examine the bridge');
     expect(h.session.codex.planMode).toBe(true); expect(h.opts.send).toHaveBeenCalledWith('examine the bridge');

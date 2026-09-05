@@ -2120,6 +2120,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     notice: (s, message) => journalPublishNotice(journalConvoIdFor(s), message),
     publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
       payload.question, escapeHtml(payload.question), payload) ?? false,
+    submitAsyncAnswer: submitCodexAsyncAnswer,
     publishText: (s, message) => { s.responseBuffer += message; flushResponse(s); }, enabled: JOURNAL_ENABLED,
   });
 
@@ -4945,6 +4946,23 @@ function sendTextToSession(session, text, opts) {
   return sendToSession(session, [{ type: 'text', text }], opts);
 }
 
+function submitCodexAsyncAnswer(session, text) {
+  if (!session.alive || session._autoStopped) return false;
+  const entry = markJournalOrigin([{ type: 'text', text }]);
+  // Use the normal acknowledged steering / turn-start path so answers are
+  // retained on a delivery race and enter history only when dispatched.
+  // Never retry a previously uncertain send merely because an answer arrived.
+  if (session._codexUncertainSteer) {
+    (session.queuedMessages ||= []).push(entry);
+    (session.queueNotifications ||= []).push({});
+    journalPublishNotice(journalConvoIdFor(session), 'Your answer is queued with messages whose delivery is unconfirmed. Check the response before choosing Send or Cancel.');
+    return true;
+  }
+  // This answer is independent of existing queued messages and their cards.
+  const sent = flushQueue(session, [entry], { convoId: journalConvoIdFor(session), entries: [], notifications: [{}] });
+  return sent === true || sent === 'deferred' || session.queuedMessages?.includes(entry) === true;
+}
+
 // Begin holding outgoing messages for a freshly-resumed iv session and start
 // watching for the moment claude is idle-and-ready to receive them. Called
 // from the auto-resume branch right after the PTY is spawned. No-op for
@@ -5245,18 +5263,27 @@ function restoreQueuedBatch(session, queued) {
 
 function flushQueue(session, queued, releaseSnapshot = null) {
   const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
+  const restore = () => {
+    restoreQueuedBatch(session, queued);
+    // A separately submitted async answer has no queue card yet. Preserve the
+    // queue/notification alignment if it must join the queue for a retry.
+    if (snapshot.notifications) {
+      const current = session.queueNotifications || [];
+      session.queueNotifications = [...snapshot.notifications.filter(n => !current.includes(n)), ...current];
+    }
+  };
   // A parked restart must keep the queue for the replacement, including
   // native Codex steering; never send into a process about to be replaced.
   if (typeof session._deferredCommandText === 'string' && session._deferredCommandText.startsWith('!restart')) {
-    restoreQueuedBatch(session, queued);
+    restore();
     journalPublishNotice(journalConvoIdFor(session), '⏳ A restart is pending for this session — queued messages go to the restarted session instead.');
     return false;
   }
   session._codexUncertainSteer = false; // an explicit retry may release held input
   if (session.codex?.transport === 'app-server' && session.busy && !hasQueuedCompact(queued)) {
-    if (session._codexSteerPending) { restoreQueuedBatch(session, queued); return false; }
+    if (session._codexSteerPending) { restore(); return false; }
     const { blocks, mirrorText } = planQueueFlush(queued);
-    const notifications = (session.queueNotifications || []).slice(0, queued.length);
+    const notifications = snapshot.notifications || (session.queueNotifications || []).slice(0, queued.length);
     session._codexSteerPending = { queued };
     void session.codex.steer(blocks).then(sent => {
       session._codexSteerPending = false;
@@ -5268,7 +5295,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
         finalizeSentQueue(snapshot.convoId, snapshot.entries);
         session.queueNotifications = (session.queueNotifications || []).filter(n => !notifications.includes(n));
       } else {
-        restoreQueuedBatch(session, queued);
+        restore();
         session._codexUncertainSteer = session.codex.steerUncertain === true;
         journalPublishNotice(snapshot.convoId, session._codexUncertainSteer
           ? 'Codex did not confirm delivery. Your messages are retained, but will not resend automatically. Check the response before choosing Send or Cancel.'
@@ -5280,7 +5307,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     }).catch(() => {
       session._codexSteerPending = false;
       if (!session.alive) return;
-      restoreQueuedBatch(session, queued);
+      restore();
       session._codexUncertainSteer = true;
       journalPublishNotice(snapshot.convoId, 'Could not confirm Codex delivery. Messages retained; check before resending.');
     });
@@ -5291,7 +5318,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     // current process is alive; codex exec cannot. Preserve the detached
     // batch, interrupt the active child, and let finishCodexTurn dispatch it
     // after that child has exited and released the adapter's process slot.
-    restoreQueuedBatch(session, queued);
+    restore();
     session._codexInterrupted = true;
     if (session.codex?.interrupt('SIGINT')) return 'deferred';
     session._codexInterrupted = false;
@@ -5322,7 +5349,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
         : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
       return false;
     }
-    restoreQueuedBatch(session, queued);
+    restore();
     console.log(`[QUEUE] could not send queued message(s); kept ${queued.length} queued message(s) for retry (room ${session.roomId})`);
     return false;
   }
@@ -7765,9 +7792,10 @@ async function journalRouteTextToSession(session, body) {
   if (dispatchedCommand) return;
 
   if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
+    const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ text: trimmed });
-    if (answer) recordUserAnswer(session, answer, { mirrorToJournal: false });
-    else journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
+    if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    if (!answer) journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
     return;
   }
 
@@ -7972,8 +8000,9 @@ async function journalRouteTextToSession(session, body) {
 // no usable free text).
 function journalRoutePromptReply(session, { choice, text }) {
   if (session.codexPrompts?.active) {
+    const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ choice, text });
-    if (answer) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     return answer;
   }
   if (session._codexBuildValue && choice === session._codexBuildValue && !session.busy) {

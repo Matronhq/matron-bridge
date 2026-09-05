@@ -2,11 +2,11 @@
 
 **matron-bridge** runs beside the Claude Code and Codex CLIs on your dev box, spawns and manages agent sessions, and publishes them to a [matron-journal](https://github.com/Matronhq/matron-journal) server. The Matron apps — [Apple](https://github.com/Matronhq/matron-apple) (iPhone + Mac), [Android](https://github.com/Matronhq/matron-android), [desktop](https://github.com/Matronhq/matron-desktop), and [web](https://github.com/Matronhq/matron-web) — chat with those sessions from anywhere, with live streaming and a return path for user input. See [matron.chat](https://matron.chat) for the overview.
 
-Claude uses `--print` structured JSON streaming. Codex uses the stable programmatic `codex exec --json` interface, starting one process per turn and resuming the same Codex thread automatically.
+Claude uses `--print` structured JSON streaming. Codex uses a persistent `codex app-server` connection with native streaming, approval cards, and question buttons. Set `MATRON_CODEX_TRANSPORT=exec` to use the legacy one-process-per-turn backend.
 
 Use `/switch codex` or `/switch claude` inside an idle session to hand the same bridge conversation to the other agent. The bridge keeps separate native session IDs for Claude and Codex, resumes each one when you switch back, and prepends only the transcript messages that agent has not seen to your next real prompt. The Matron conversation ID stays stable, as do the shared working directory, files, and Git state. Provider-private reasoning and tool state are not transferable.
 
-Codex turns run with `approval_policy="never"` because there is no interactive terminal to approve escalations. The sandbox defaults to `workspace-write`; blocked operations fail closed and the bridge surfaces the error. Only use `CODEX_SANDBOX_MODE=danger-full-access` on a host you intentionally trust for unattended agent execution.
+Native Codex turns use on-request approvals shown as Matron cards. The sandbox defaults to `workspace-write`; blocked operations fail closed and the bridge surfaces the error. The legacy exec backend cannot answer approvals and uses `approval_policy="never"`.
 
 For the full operator reference, see [Using the Codex backend](docs/codex.md).
 

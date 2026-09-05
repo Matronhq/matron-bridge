@@ -28,6 +28,8 @@ The bridge:
 
 The installed Codex CLI remains responsible for model access, authentication, user/project configuration, `AGENTS.md`, skills, rules, MCP servers, and tool execution.
 
+Both blocking questions and `request_user_input_async` appear as Matron question cards with selectable options and free-text replies. Async questions stay available after normal turn completion until answered or expired; Codex can continue working meanwhile. Replies include the question text and use native steering during a turn or start a new turn afterward. Blocking permission requests take priority, and interruption, reconnection, or shutdown clears outstanding cards.
+
 ### Optional live view for Codex launched by a Claude session
 
 This wrapper-based view is separate from the native app-server backend above.

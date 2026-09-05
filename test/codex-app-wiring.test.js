@@ -12,6 +12,35 @@ function setup(extraOptions = {}) {
   return { codex, session, publisher, ...options };
 }
 describe('Codex journal publication', () => {
+  it('publishes completed async question messages as cards that survive normal turn completion', async () => {
+    const submitAsyncAnswer = vi.fn(() => true);
+    const h = setup({ submitAsyncAnswer });
+    const item = { id: 'question', type: 'agentMessage', text: '', delivery: 'async', questions: [
+      { title: 'What should we test?', options: ['Token usage', 'Model switching'] },
+    ] };
+    h.codex.emit('item', { method: 'item/started', item, turnId: 'turn' }); await settle();
+    expect(h.publishPrompt).not.toHaveBeenCalled();
+    h.codex.emit('item', { method: 'item/completed', item, turnId: 'turn' }); await settle();
+    expect(h.publishPrompt).toHaveBeenCalledWith(h.session, expect.objectContaining({
+      question: 'What should we test?', options: [expect.objectContaining({ label: 'Token usage' }), expect.objectContaining({ label: 'Model switching' })],
+    }));
+    expect(h.session._codexAwaitingAnswer).toBe(false);
+    h.session.busy = false; h.codex.emit('requests-cleared'); h.codex.emit('turn-exit', { code: 0 });
+    expect(h.session.codexPrompts.answer({ choice: h.session.codexPrompts.active.options[1].value })).toBe('Model switching');
+    expect(submitAsyncAnswer).toHaveBeenCalledWith(h.session, 'What should we test?\nModel switching');
+    expect(h.codex.client.respond).not.toHaveBeenCalled();
+  });
+  it('clears async cards on disconnect, interruption, or shutdown', () => {
+    for (const [event, data] of [['connection-reset'], ['turn-exit', { code: 1 }], ['closed']]) {
+      const h = setup();
+      h.codex.emit('item', { method: 'item/completed', turnId: 'turn', item: {
+        id: 'question', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Name?', options: null }],
+      } });
+      h.codex.emit(event, data);
+      expect(h.session.codexPrompts.active).toBeNull();
+      expect(h.codex.client.respond).not.toHaveBeenCalled();
+    }
+  });
   it('publishes cumulative text with stable item identity and redaction', () => {
     const h = setup();
     h.codex.emit('text-delta', { turnId: 'turn', itemId: 'msg', delta: 'Hello ' });
