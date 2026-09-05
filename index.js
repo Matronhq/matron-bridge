@@ -69,6 +69,7 @@ import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-rec
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { matronFilesDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -5768,7 +5769,7 @@ function safeMediaFilename(name) {
 
 // Build the claude content blocks for an already-materialized (fetched from
 // the journal blob store) NON-audio media buffer: saves the bytes to the right
-// place (iv upload dir vs. session workdir) and produces the same save-path
+// place (iv upload dir vs. per-repo matron files dir) and produces the same save-path
 // text + inline image/document blocks the media path has always produced.
 // Called by the journal media path (journalOnMedia, whose bytes come from
 // journalPublisher.fetchMedia) so a file sent from Matron feels identical to
@@ -5813,18 +5814,19 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
   // SDK mode: lead with the caption so claude reads the user's words before
   // the "Image saved to …" bookkeeping and the image itself — the order a
   // person would say it in. Everything below appends to the same `blocks`
-  // array, i.e. the same single user turn.
+  // array, i.e. the same single user turn. Saves land OUTSIDE the workdir
+  // (in ~/matron-files/<repo>/) so received files never end up committed;
+  // the absolute save path in the text block is how claude finds them.
+  const saveDir = matronFilesDir(session.workdir);
   if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
-    // Save image to workdir
-    const imgPath = deduplicateFilename(session.workdir, workdirName);
+    const imgPath = deduplicateFilename(saveDir, workdirName);
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
-    // Save file to workdir
-    const savePath = deduplicateFilename(session.workdir, workdirName);
+    const savePath = deduplicateFilename(saveDir, workdirName);
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
@@ -7741,12 +7743,13 @@ const journalMediaRouter = createJournalMediaRouter({
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
-  // where the file itself would have been saved (iv upload dir / workdir).
+  // where the file itself would have been saved (iv upload dir / matron
+  // files dir).
   // Throws propagate to the router, which falls back to raw-file delivery.
   buildVideoBlocks: async (session, { buffer, mime, name, caption }) => {
     const safeName = safeMediaFilename(name || 'video');
     const stem = safeName.replace(/\.[^.]+$/, '') || 'video';
-    const baseDir = session.iv ? ivUploadDir(session.roomId) : session.workdir;
+    const baseDir = session.iv ? ivUploadDir(session.roomId) : matronFilesDir(session.workdir);
     const outDir = deduplicateFilename(baseDir, `${stem}-frames`);
     const result = await extractVideoFrames(buffer, mime, { outDir });
     console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s, audio=${result.hasAudio}) in ${outDir}`);
