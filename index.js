@@ -153,12 +153,18 @@ import {
   resolveNativeSessionIdForPersistence,
   snapshotAgentState,
 } from './lib/agent-handoff.js';
-import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
+import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, normalizeCodexNetworkAccess } from './lib/codex-session.js';
+import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
+import { wireCodexAppSession } from './lib/codex-app-wiring.js';
+import { codexMcpConfig } from './lib/codex-mcp.js';
+import { handleCodexControl, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
+import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
+import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
-const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat bridge. Work autonomously within the configured sandbox; interactive approvals are unavailable.';
+const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work within the configured sandbox. Use native approval requests for actions requiring extra permission. Never post secrets in chat.';
 
 // --- Config ---
 
@@ -188,6 +194,10 @@ const DEFAULT_MODEL = (() => {
   return normalizeModelArg(raw);
 })();
 const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
+const CODEX_NETWORK_ACCESS = normalizeCodexNetworkAccess(process.env.CODEX_NETWORK_ACCESS);
+// Explicit rollback; never silently replay a failed app-server turn via exec.
+const CODEX_APP_SERVER = process.env.MATRON_CODEX_TRANSPORT !== 'exec';
+const codexThreadLists = new Map();
 // Box-wide default for print-mode Claude sessions: 'bypass' spawns with
 // --dangerously-skip-permissions, 'auto' with Claude Code's auto permission
 // mode + the Matron permission-card prompt tool. Bypass is the default —
@@ -1253,6 +1263,43 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 // turn every turn end into a spawn storm.
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
 const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
+const codexAccountReader = createCodexAccountReader();
+const codexTelemetryReader = new CodexTelemetryReader();
+
+async function refreshCodexMetadata(session, options) {
+  const metadata = await codexAccountReader.read(session.workdir, options);
+  if (!session.alive || sessions.get(session.roomId) !== session) return metadata;
+  if (session._codexMetadata === metadata) return metadata;
+  session._codexMetadata = metadata;
+  journalStatus(session);
+  return metadata;
+}
+
+async function refreshCodexTelemetry(session, { force = false } = {}) {
+  if (!session.claudeSessionId || !session.alive) return;
+  if (session._codexTelemetryInflight) {
+    if (!force) return session._codexTelemetryInflight;
+    // A turn may close during a poll. Read again after that poll finishes so
+    // a pre-completion snapshot cannot hide the final token counts.
+    await session._codexTelemetryInflight;
+    return refreshCodexTelemetry(session);
+  }
+  const threadId = session.claudeSessionId;
+  const revision = session._codexUsageRevision || 0;
+  session._codexTelemetryInflight = codexTelemetryReader.read(threadId).then(telemetry => {
+    if (!session.alive || sessions.get(session.roomId) !== session || session.claudeSessionId !== threadId) return;
+    if ((session._codexUsageRevision || 0) !== revision || session.codex?.usage) return;
+    if (telemetry.usage) session._codexNativeUsage = telemetry.usage;
+    if (telemetry.context) {
+      session._lastContextTokens = telemetry.context.tokens;
+      session._codexContextWindow = telemetry.context.window;
+    }
+    if (telemetry.model) session._codexObservedModel = telemetry.model;
+    if (telemetry.effort) session._codexObservedEffort = telemetry.effort;
+    journalStatus(session);
+  }).finally(() => { session._codexTelemetryInflight = null; });
+  return session._codexTelemetryInflight;
+}
 
 // Kick off a background limits refresh if the cache is stale. Returns the
 // in-flight promise (resolving true when the cache gained fresh lines) when
@@ -1314,30 +1361,21 @@ function journalStatus(session) {
   if (!convoId) return;
   // Host CPU/RAM vitals are host-global, not account- or agent-specific, so
   // they ride on every frame (Claude and Codex) at TOP LEVEL (status.vitals) —
-  // NOT in limits[], which clients render as Claude-account subscription
+  // NOT in limits[], which clients render as account subscription
   // meters. hostVitals() only READS the sampler cache (the 15s interval owns
   // sampling); it never samples here.
   const vitals = hostVitals();
   const isCodex = session.agent === AGENT_CODEX;
+  const codexOptions = isCodex ? codexSessionOptions(session) : null;
   const status = buildSessionStatus({
-    model: session.currentModel || session.initData?.model,
+    model: isCodex ? codexOptions.model : session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
-    // Account rate limits are Claude-account-specific; Codex frames carry none,
-    // keeping the Codex limits array empty (buildSessionStatus omits it).
-    limits: isCodex ? [] : (usageLimitsCache.lines || []),
-    // Composer argument offers for /model and /effort, session-scoped. Codex
-    // states EMPTY rather than staying silent: its model id is free text passed
-    // straight to `codex --model` (the bridge validates nothing and holds no id
-    // list) and effort isn't exposed for it at all — see the '!effort' handler.
-    // Silence would merge stickily, so a mid-session /switch claude→codex would
-    // leave Claude's offers standing on a session that refuses them.
-    modelOptions: isCodex ? [] : modelOptions(),
-    effortLevels: isCodex ? [] : effortOptions(),
-    // Optimistically tracked, never read back (lib/effort-tracker.js). Null for
-    // Codex (not applicable) and for a Claude session whose level is unknown;
-    // either way it publishes as an EXPLICIT null, so a sticky client clears a
-    // level this session no longer stands behind (e.g. after a restart).
-    effort: isCodex ? null : trackedEffort(session),
+    // Codex supplies its real window; an unknown window must not use Claude's fallback.
+    contextWindow: isCodex ? session._codexContextWindow || null : undefined,
+    limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || []),
+    modelOptions: isCodex ? codexOptions.modelOptions : modelOptions(),
+    effortLevels: isCodex ? codexOptions.effortLevels : effortOptions(),
+    effort: isCodex ? codexOptions.effort : trackedEffort(session),
     email: getAccountEmail(),
     // Absolute path for the client's header workdir segment: session.workdir
     // can be relative (it is passed through from the resume/start args), so
@@ -1346,10 +1384,11 @@ function journalStatus(session) {
     vitals,
   });
   // The shared account email cache is Claude-specific — strip it from Codex
-  // frames. (Rate limits are already excluded from the Codex limits array
-  // above; host vitals live at top-level status.vitals and stay on both.)
+  // frames. Codex supplies its own limits; host vitals stay on both.
   if (isCodex) {
     delete status.email;
+    // Explicitly clear a prior provider's limits, including on fetch failure.
+    status.limits = session._codexMetadata?.limits || [];
   }
   if (Object.keys(status).length === 0) return;
   // Stamp only when the frame actually left the bridge — a publish dropped
@@ -1374,6 +1413,11 @@ function journalStatus(session) {
 // frames while the journal socket is down.
 function journalSpawnStatus(session) {
   journalStatus(session);
+  if (session.agent === AGENT_CODEX) {
+    void refreshCodexMetadata(session);
+    void refreshCodexTelemetry(session);
+    return;
+  }
   const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
   if (refresh) {
     refresh.then((updated) => {
@@ -1987,10 +2031,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
 
 // --- Codex programmatic sessions ---
 //
-// Codex's stable non-interactive contract is one `codex exec --json` process
-// per turn. The CodexExecSession adapter retains the thread ID and starts a
-// fresh child for each message; this wrapper presents the same logical session
-// shape the rest of the bridge expects from Claude's long-lived process.
+// Native app-server is long-lived, with exec retained as an explicit rollback.
+// Both expose a logical turn lifecycle to the shared bridge session code.
 function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persisted = getPersistedSession(roomId);
@@ -1999,14 +2041,32 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   const model = options.model === null
     ? undefined
     : (options.model ?? persistedCodexState.model ?? undefined);
-  const codex = new CodexExecSession({
+  const mcpExtras = options.mcpExtras ?? persistedCodexState.mcpExtras ?? persisted?.mcpExtras ?? [];
+  const extras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (CODEX_APP_SERVER && extras.includes('share')) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
+  const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
+  const codex = new Adapter({
     cwd,
     threadId: resumeSessionId || null,
     model,
+    effort: persistedCodexState.effort || null,
     sandbox: CODEX_SANDBOX_MODE,
-    developerInstructions: CODEX_BRIDGE_PROMPT,
-    env: { ...process.env },
+    networkAccess: CODEX_NETWORK_ACCESS,
+    developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
+    env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
+    config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
+      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
   });
+  codex.planMode = CODEX_APP_SERVER && persisted?.codexPlanMode === true;
 
   const session = {
     agent: AGENT_CODEX,
@@ -2014,7 +2074,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     proc: null,
     roomId,
     workdir: cwd,
-    mcpExtras: [],
+    mcpExtras,
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -2022,7 +2084,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
-    showBashOutput: false,
+    showBashOutput: CODEX_APP_SERVER && persisted?.showBashOutput !== false,
     alive: true,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
@@ -2052,16 +2114,41 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     _codexLastError: null,
   };
 
+  if (CODEX_APP_SERVER) wireCodexAppSession(session, {
+    publisher: journalPublisher, convoIdFor: journalConvoIdFor, runningStore: subagentRunningStore,
+    stream: journalStream, activity: journalActivity, status: journalStatus,
+    notice: (s, message) => journalPublishNotice(journalConvoIdFor(s), message),
+    publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
+      payload.question, escapeHtml(payload.question), payload) ?? false,
+    publishText: (s, message) => { s.responseBuffer += message; flushResponse(s); }, enabled: JOURNAL_ENABLED,
+  });
+
   codex.on('spawn', ({ child, args }) => {
     session.proc = child;
     session._codexTurnFinished = false;
     session._codexLastError = null;
     session._codexCompletedUsage = null;
+    session._codexHadAssistantMessage = false;
+    clearInterval(session._codexTelemetryTimer);
+    session._codexTelemetryTimer = setInterval(() => {
+      void refreshCodexTelemetry(session);
+      void refreshCodexMetadata(session);
+    }, 5000);
+    session._codexTelemetryTimer.unref?.();
     debug(`Spawning codex with args: ${args.join(' ')}`);
     debug(`Working directory: ${cwd}`);
   });
   codex.on('event', event => {
-    debug('Codex event:', JSON.stringify(event));
+    if (session.codexSafeOutput) {
+      if (typeof event.message === 'string') event = { ...event, message: session.codexSafeOutput(event.message) };
+      if (typeof event.error?.message === 'string') event = { ...event, error: { ...event.error, message: session.codexSafeOutput(event.error.message) } };
+    }
+    if (session.codexSafeOutput && event.item) {
+      event = { ...event, item: { ...event.item,
+        ...(event.item.text != null ? { text: session.codexSafeOutput(event.item.text) } : {}),
+        ...(event.item.command != null ? { command: session.codexSafeOutput(event.item.command) } : {}) } };
+    }
+    debug('Codex event:', event.type);
     handleCodexEvent(session, event);
   });
   codex.on('parse-error', ({ line }) => debug('Failed to parse Codex JSON line:', line));
@@ -2069,7 +2156,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     session._codexLastError = error?.message || String(error);
   });
   codex.on('turn-exit', ({ code, signal, stderr, sawTurnCompleted }) => {
-    session.proc = null;
+    clearInterval(session._codexTelemetryTimer);
+    void refreshCodexTelemetry(session, { force: true });
+    if (session.alive) void refreshCodexMetadata(session);
+    session.proc = codex.transport === 'app-server' ? codex.child : null;
     if (session._codexTurnFinished) return;
     if (!session.alive) {
       // killSession normally performs this synchronously so a replacement
@@ -2094,6 +2184,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       return;
     }
     finishCodexTurn(session, { usage: session._codexCompletedUsage });
+    if (CODEX_APP_SERVER) void offerCodexBuild(session);
   });
 
   session.resetTimeout = () => {};
@@ -2122,6 +2213,8 @@ function codexToolIndicator(item) {
 }
 
 function handleCodexEvent(session, event) {
+  // A killed/replaced child can still drain stdout while shutting down.
+  if (!session.alive) return;
   // Progress touch for restart carry-on — the Codex-side counterpart of the
   // touch in handleClaudeEvent. Debounced and no-op without a marker.
   inflightMarker.touch(journalConvoIdFor(session));
@@ -2167,6 +2260,7 @@ function handleCodexEvent(session, event) {
           journalFlushForSession(session);
         }
       }
+      void refreshCodexTelemetry(session);
       break;
     }
 
@@ -2182,7 +2276,11 @@ function handleCodexEvent(session, event) {
     case 'item.completed': {
       const item = event.item || {};
       if (item.type === 'agent_message' && typeof item.text === 'string' && item.text.trim()) {
+        session._codexHadAssistantMessage = true;
         session.responseBuffer += (session.responseBuffer ? '\n\n' : '') + item.text;
+        // exec emits complete messages, including progress before tools run.
+        // Deliver each now; only turn-exit may release busy/queued input.
+        flushResponse(session);
       }
       if (codexToolIndicator(item) && session._journalActivityState === 'tool') {
         journalActivity(session, 'thinking');
@@ -2218,6 +2316,7 @@ function handleCodexEvent(session, event) {
 }
 
 function flushPendingSessionQueue(session) {
+  if (session._codexSteerPending || session._codexUncertainSteer) return false;
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queue = session.queuedMessages;
   const notifications = session.queueNotifications || [];
@@ -2301,6 +2400,9 @@ function finishCodexTurn(session, {
   session.turnCount++;
 
   if (usage) {
+    // Prefer the fresh native snapshot fetched on turn-exit. If that record
+    // is unavailable, expose the exec totals instead of an earlier snapshot.
+    if (!session.codex?.usage) session._codexNativeUsage = null;
     session.totalUsage.input_tokens += usage.input_tokens || 0;
     session.totalUsage.output_tokens += usage.output_tokens || 0;
     session.totalUsage.cache_read += usage.cached_input_tokens || 0;
@@ -2339,7 +2441,7 @@ function finishCodexTurn(session, {
     else if (session.sendCallback) session.sendCallback(message);
   }
 
-  if (!preserveQueue) {
+  if (!preserveQueue && !session._codexSteerPending && !session._codexUncertainSteer) {
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
     // the queue (and the roomId-keyed room-delivery inbox) carries into the
     // replacement session; see dispatchDeferredCommand. (killSession's
@@ -4680,6 +4782,11 @@ function flushResponse(session) {
 // false, unchanged from before.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
   if (!session.alive || session._autoStopped) return false;
+  const nativeCompact = session.codex?.transport === 'app-server' && contentBlocks.length === 1
+    && contentBlocks[0]?.type === 'text' && isCompactCommand(contentBlocks[0].text);
+  if (nativeCompact && contentBlocks[0].text.trim() !== '/compact') {
+    return reportSessionSendFailure(session, 'Native Codex compaction does not accept custom instructions. Use /compact by itself.');
+  }
 
   const historyText = contentBlocks
     .filter(block => block?.type === 'text' && typeof block.text === 'string')
@@ -4708,7 +4815,8 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   // Reject unsupported Codex inputs before changing activity state or
   // journaling them. A false return is important: callers gate chat history,
   // media mirroring, and first-message naming on actual dispatch.
-  if (session.agent === AGENT_CODEX && (!historyText || !contentBlocksToCodexPrompt(contentBlocks))) {
+  if (session.agent === AGENT_CODEX && (session.codex?.transport === 'app-server'
+    ? !codexInput(contentBlocks).length : (!historyText || !contentBlocksToCodexPrompt(contentBlocks)))) {
     return reportSessionSendFailure(
       session,
       'Codex programmatic mode needs a text prompt or a saved-file path.',
@@ -4758,14 +4866,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
     }
   }
 
-  const preparedHandoff = applyPendingAgentHandoff(session, contentBlocks);
+  const preparedHandoff = nativeCompact ? { blocks: contentBlocks, pending: null } : applyPendingAgentHandoff(session, contentBlocks);
   contentBlocks = preparedHandoff.blocks;
 
   if (session.agent === AGENT_CODEX) {
-    // codex exec accepts one text prompt per process. Media builders always
-    // include an absolute-path text annotation; binary/base64 blocks are
-    // intentionally omitted here because Codex can inspect the saved file.
-    const sent = session.codex?.send(contentBlocks) === true;
+    // Native input preserves images; the legacy adapter uses saved-file paths.
+    session._codexBuildValue = null;
+    const sent = (nativeCompact ? session.codex.compact() : session.codex?.send(contentBlocks)) === true;
     if (sent) {
       commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (!skipJournalMirror && journalText) {
@@ -5138,16 +5245,46 @@ function restoreQueuedBatch(session, queued) {
 
 function flushQueue(session, queued, releaseSnapshot = null) {
   const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
-  // A restart is parked for this session (a user's mid-turn /restart, or a
-  // self-restart waiting for the turn-end seam). The queue carries into the
-  // replacement — recreateSession copies queuedMessages — so draining it now
-  // would hand the batch to a process about to be torn down and leave the
-  // replacement starting idle. Keep the batch, exactly as a refused flush
-  // does below, and say why nothing went out.
+  // A parked restart must keep the queue for the replacement, including
+  // native Codex steering; never send into a process about to be replaced.
   if (typeof session._deferredCommandText === 'string' && session._deferredCommandText.startsWith('!restart')) {
     restoreQueuedBatch(session, queued);
     journalPublishNotice(journalConvoIdFor(session), '⏳ A restart is pending for this session — queued messages go to the restarted session instead.');
     return false;
+  }
+  session._codexUncertainSteer = false; // an explicit retry may release held input
+  if (session.codex?.transport === 'app-server' && session.busy && !hasQueuedCompact(queued)) {
+    if (session._codexSteerPending) { restoreQueuedBatch(session, queued); return false; }
+    const { blocks, mirrorText } = planQueueFlush(queued);
+    const notifications = (session.queueNotifications || []).slice(0, queued.length);
+    session._codexSteerPending = { queued };
+    void session.codex.steer(blocks).then(sent => {
+      session._codexSteerPending = false;
+      if (!session.alive || sessions.get(session.roomId) !== session) return;
+      if (sent) {
+        commitDispatchedUserTurn(session, blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n'), null);
+        if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
+        for (const entry of queued) for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+        finalizeSentQueue(snapshot.convoId, snapshot.entries);
+        session.queueNotifications = (session.queueNotifications || []).filter(n => !notifications.includes(n));
+      } else {
+        restoreQueuedBatch(session, queued);
+        session._codexUncertainSteer = session.codex.steerUncertain === true;
+        journalPublishNotice(snapshot.convoId, session._codexUncertainSteer
+          ? 'Codex did not confirm delivery. Your messages are retained, but will not resend automatically. Check the response before choosing Send or Cancel.'
+          : 'Codex could not steer this turn. Your messages are still queued for its end.');
+      }
+      if (!session.busy && !session._codexUncertainSteer) {
+        if (!dispatchDeferredCommand(session) && !flushPendingSessionQueue(session)) maybeFlushRoomDelivery(session);
+      }
+    }).catch(() => {
+      session._codexSteerPending = false;
+      if (!session.alive) return;
+      restoreQueuedBatch(session, queued);
+      session._codexUncertainSteer = true;
+      journalPublishNotice(snapshot.convoId, 'Could not confirm Codex delivery. Messages retained; check before resending.');
+    });
+    return 'deferred';
   }
   if (session.agent === AGENT_CODEX && session.busy) {
     // Claude's stream-json stdin can accept a forced follow-up while the
@@ -5962,7 +6099,31 @@ function fetchUsageLimitsText(cwd) {
 const CODEX_MODEL_FLAG_REFUSAL =
   '--model selects a Claude model alias and is Claude-only. Start Codex without --model, then use /model <model-id> in the new conversation (or /model default for your Codex config default).';
 
+function runCodexControl(session, text, reply) {
+  return handleCodexControl(session, text, {
+    beforeDispatch: () => journalPublisher.flushCursor(),
+    reply: reply || journalSessionCommandCtx(session).sendReply,
+    status: journalStatus,
+    persist: extra => persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, extra),
+    send: body => sendTextToSession(session, body, { skipJournalMirror: true }),
+  });
+}
+
+async function availableCodexThreads(workdir, { cached = false, roomId = '' } = {}) {
+  const key = `${roomId}:${workdir || '*'}`;
+  if (cached && codexThreadLists.has(key)) return codexThreadLists.get(key);
+  const persisted = listPersistedAgentSessions(AGENT_CODEX, workdir);
+  if (!CODEX_APP_SERVER) return persisted;
+  const merged = mergeCodexThreads(await listCodexThreads(workdir), persisted);
+  const items = workdir ? merged.slice(0, 15) : merged;
+  if (codexThreadLists.size >= 100) codexThreadLists.delete(codexThreadLists.keys().next().value);
+  codexThreadLists.set(key, items);
+  return items;
+}
+
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
+  const nativeSession = sessions.get(roomId);
+  if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
@@ -5982,7 +6143,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const startModelFlag = extractModelFlag(agentFlags.rest);
       const selectedAgent = resolveAgent({ option: agentFlags.agent, fallback: DEFAULT_AGENT });
-      if (selectedAgent === AGENT_CODEX && mcpExtras.length > 0) {
+      if (selectedAgent === AGENT_CODEX && !CODEX_APP_SERVER && mcpExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
         return;
       }
@@ -6119,7 +6280,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(restartModelFlag.error);
         return;
       }
-      if (existing.agent === AGENT_CODEX && restartFlagExtras.length > 0) {
+      if (existing.agent === AGENT_CODEX && !CODEX_APP_SERVER && restartFlagExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
         return;
       }
@@ -6288,11 +6449,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       if (selectedAgent === AGENT_CODEX) {
-        if (resumeExtras.length > 0) {
+        if (!CODEX_APP_SERVER && resumeExtras.length > 0) {
           await sendReply('--browser is a Claude-only session extra. Codex uses MCP servers from its own config.');
           return;
         }
-        const localEntries = listPersistedAgentSessions(AGENT_CODEX, resumeWorkdir);
+        let localEntries;
+        try { localEntries = await availableCodexThreads(isNaN(num) ? null : resumeWorkdir, { cached: !isNaN(num), roomId }); }
+        catch { localEntries = listPersistedAgentSessions(AGENT_CODEX, isNaN(num) ? null : resumeWorkdir); }
         if (!isNaN(num)) {
           if (num < 1 || num > localEntries.length) {
             await sendReply(`Codex session number not found: ${resumeArg}\nUse /sessions --codex to list bridge-owned Codex sessions.`);
@@ -6301,7 +6464,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           resumePersisted = localEntries[num - 1];
         } else {
           const resolution = matchSessionIdPrefix(
-            listPersistedAgentSessions(AGENT_CODEX),
+            localEntries,
             resumeArg,
           );
           if (resolution.ambiguous) {
@@ -6518,7 +6681,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const workdirModelFlag = extractModelFlag(workdirAgentFlags.rest);
       const selectedAgent = resolveAgent({ option: workdirAgentFlags.agent, fallback: DEFAULT_AGENT });
-      if (selectedAgent === AGENT_CODEX && workdirExtras.length > 0) {
+      if (selectedAgent === AGENT_CODEX && !CODEX_APP_SERVER && workdirExtras.length > 0) {
         await sendReply('--browser is a Claude-only session extra. Start Codex without --browser; Codex uses MCP servers from its own config.');
         return;
       }
@@ -6598,13 +6761,24 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session. Send !start to begin.');
         return;
       }
+      let codexDetails = '';
+      if (session.agent === AGENT_CODEX) {
+        await Promise.all([refreshCodexMetadata(session), refreshCodexTelemetry(session)]);
+        const options = codexSessionOptions(session);
+        const u = codexUsageFor(session);
+        codexDetails = `\nModel: ${options.model || 'config default'}\nEffort: ${options.effort || 'config default'}` +
+          `\nTokens: ${(u.input_tokens + u.output_tokens).toLocaleString()}`;
+        if (session._lastContextTokens != null && session._codexContextWindow) {
+          codexDetails += `\nContext: ${session._lastContextTokens.toLocaleString()} / ${session._codexContextWindow.toLocaleString()}`;
+        }
+      }
       const uptimeMs = Date.now() - session.startedAt;
       const shortId = session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '…' : '(pending)';
       const busyText = session.busy ? 'yes' : 'no';
 
       const plainStatus =
         `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
-        `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
+        `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}${codexDetails}`;
 
       const busyHtml = session.busy
         ? color('● busy', '#f0883e')
@@ -6619,7 +6793,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
         `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
         (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>`) +
-        `</table>`;
+        `</table>` + escapeHtml(codexDetails).replace(/\n/g, '<br/>');
 
       await sendHtml(plainStatus, htmlStatus);
       break;
@@ -6682,7 +6856,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       let items;
       if (selectedAgent === AGENT_CODEX) {
-        items = listPersistedAgentSessions(AGENT_CODEX, workdir).slice(0, 15);
+        try { items = (await availableCodexThreads(workdir, { roomId })).slice(0, 15); }
+        catch {
+          await sendReply('Could not list native Codex threads; showing bridge-recorded sessions only.');
+          items = listPersistedAgentSessions(AGENT_CODEX, workdir).slice(0, 15);
+          codexThreadLists.set(`${roomId}:${workdir}`, items);
+        }
       } else {
         const projectDir = projectDirFor(workdir);
         if (!(await pathExists(projectDir))) {
@@ -6936,7 +7115,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? `Current model: ${current}`
         : (session.agent === AGENT_CODEX ? 'Current model: Codex config default' : 'Current model: (appears after the first reply)');
       if (session.agent === AGENT_CODEX) {
-        await sendReply(`${currentLine}\n\nType /model <model-id> to set the model for future Codex turns, or /model default to return to your Codex config default.`);
+        const metadata = await refreshCodexMetadata(session);
+        const options = codexSessionOptions(session);
+        const plain = `Current model: ${options.model || 'Codex config default'}\n\n` +
+          options.modelOptions.map(o => `${o.label}: /model ${o.value}`).join('\n') +
+          (metadata.modelsError ? `\n\n${metadata.modelsError}\nYou can still type /model <model-id>.` : '');
+        if (session.sendButtonMessage) {
+          session.sendButtonMessage('Codex model', options.modelOptions.map((o, i) => ({
+            id: `codex-model-${i}`, label: o.label, value: `model:${o.value}`,
+          })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+        } else await sendReply(plain);
       } else if (session.iv) {
         // A live TUI means switching works. Prefer buttons, but fall back to a
         // typed-command hint when no button channel is wired (e.g. some
@@ -7110,7 +7298,19 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       if (session.agent === AGENT_CODEX) {
-        await sendReply('Codex effort switching is not exposed by this first programmatic integration. Set model_reasoning_effort in your Codex config if needed.');
+        await refreshCodexMetadata(session);
+        if (parts[1]) {
+          switchEffortAndTrack(session, parts[1], sendReply);
+        } else {
+          const options = codexSessionOptions(session);
+          const plain = `Codex effort: ${options.effort || 'config default'}\n\n` +
+            options.effortLevels.map(o => `/effort ${o.value}`).join('\n');
+          if (session.sendButtonMessage) {
+            session.sendButtonMessage('Codex effort', options.effortLevels.map((o, i) => ({
+              id: `codex-effort-${i}`, label: o.label, value: `effort:${o.value}`,
+            })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+          } else await sendReply(plain);
+        }
         break;
       }
       const arg = parts[1];
@@ -7167,6 +7367,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await refreshCodexTelemetry(session, { force: true });
+        const u = codexUsageFor(session);
+        const context = session._lastContextTokens != null && session._codexContextWindow
+          ? `\nContext: ${session._lastContextTokens.toLocaleString()} / ${session._codexContextWindow.toLocaleString()}` : '';
+        const plain = `Codex token usage (${session._codexNativeUsage ? 'native thread' : 'bridge-recorded turns'}):\n\n` +
+          `Input: ${u.input_tokens.toLocaleString()} (includes cached input)\n` +
+          `Cached input: ${u.cache_read.toLocaleString()}\n` +
+          `Output: ${u.output_tokens.toLocaleString()}\n` +
+          (u.reasoning_tokens != null ? `Reasoning: ${u.reasoning_tokens.toLocaleString()} (included in output)\n` : '') +
+          `Total: ${(u.input_tokens + u.output_tokens).toLocaleString()}\n` +
+          `Bridge turns: ${session.turnCount}${context}`;
+        await sendHtml(plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+        break;
+      }
       const u = session.totalUsage;
       const uCostClr = u.cost_usd < 0.5 ? '#3fb950' : u.cost_usd < 2 ? '#f0883e' : '#f85149';
       const plainUsage =
@@ -7197,8 +7412,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // This is a global query — no active session required.
       try {
         const active = sessions.get(roomId);
-        if (active?.agent === AGENT_CODEX) {
-          await sendReply('Codex subscription limits are not exposed by codex exec JSON output.');
+        if ((active?.agent || DEFAULT_AGENT) === AGENT_CODEX) {
+          const metadata = active
+            ? await refreshCodexMetadata(active, { force: true })
+            : await codexAccountReader.read(DEFAULT_WORKDIR, { force: true });
+          const fallback = metadata.limitsError || 'No Codex subscription limits were returned for this account. API-key accounts may not have subscription limits.';
+          const { plain, html } = formatLimits({ ok: metadata.limits.length > 0, lines: metadata.limits }, fallback);
+          await sendHtml(plain, html);
           break;
         }
         const cwd = active?.workdir || DEFAULT_WORKDIR;
@@ -7512,12 +7732,12 @@ function clearQueueNotifications(session) {
 async function journalRouteTextToSession(session, body) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
-
   // The user is back in the loop, so restart_session gets a fresh budget.
   // Deliberately NOT in sendToSession: the auto-continue message a
   // self-restart queues flows through there, so a session would refresh its
   // own budget every time and the cap would never bind.
   session._agentRestartCount = 0;
+  if (session.codex?.transport === 'app-server' && await runCodexControl(session, trimmed)) return;
 
   // Bridge-intercepted !/ commands run FIRST, before any prompt/menu
   // resolution below — exactly where Matrix's room.message handler checks
@@ -7543,6 +7763,13 @@ async function journalRouteTextToSession(session, body) {
     },
   });
   if (dispatchedCommand) return;
+
+  if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
+    const answer = session.codexPrompts.answer({ text: trimmed });
+    if (answer) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    else journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
+    return;
+  }
 
   if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
     session.pendingUnclassifiedPrompt = false;
@@ -7744,6 +7971,16 @@ async function journalRouteTextToSession(session, body) {
 // nothing could be resolved (no pending prompt, or an unmatched choice with
 // no usable free text).
 function journalRoutePromptReply(session, { choice, text }) {
+  if (session.codexPrompts?.active) {
+    const answer = session.codexPrompts.answer({ choice, text });
+    if (answer) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    return answer;
+  }
+  if (session._codexBuildValue && choice === session._codexBuildValue && !session.busy) {
+    session._codexBuildValue = null;
+    void runCodexControl(session, 'build');
+    return 'Build';
+  }
   // iv-mode: a structured, button-shaped pending prompt. promptButtons(p)
   // reproduces the exact `options` shape journaled for the `prompt` event
   // (see lib/prompt-buttons.js) — matching against it is matching against
@@ -10145,6 +10382,7 @@ function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.ag
   session._agentHistoryCursor = cursor;
   session.totalUsage = { ...session.totalUsage, ...state.totalUsage };
   session.turnCount = state.turnCount;
+  if (session.agent === AGENT_CODEX && session.codex) session.codex.effort = state.effort || null;
   session._pendingAgentHandoff = null;
   if (cursor < history.length) {
     session._pendingAgentHandoff = buildAgentHandoffPrompt({
@@ -10197,7 +10435,7 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
     // null is an explicit provider-local default and prevents createSession
     // from falling back to the outgoing provider's legacy top-level model.
     model: targetState.model,
-    mcpExtras: target === AGENT_CLAUDE ? targetState.mcpExtras : [],
+    mcpExtras: targetState.mcpExtras,
     journalConvoId: stableConvoId,
     ...(target === AGENT_CLAUDE
       ? { interactive: targetState.interactiveMode ?? INTERACTIVE_MODE }
@@ -10274,6 +10512,20 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
 // through here (the !effort command and the effort: picker button) — see
 // lib/effort-tracker.js for what turns a pending write into a published one.
 function switchEffortAndTrack(session, arg, send) {
+  if (session.agent === AGENT_CODEX) {
+    const level = String(arg || '').toLowerCase();
+    const options = codexSessionOptions(session);
+    if (!options.effortLevels.some(o => o.value === level)) {
+      send(`Unknown effort for this Codex model. Options: ${options.effortLevels.map(o => o.value).join(', ')}.`);
+      return false;
+    }
+    session.codex.effort = level === 'default' ? null : level;
+    session._codexObservedEffort = null;
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
+    journalStatus(session);
+    send(`Codex effort set to ${level}; it will apply on the next turn.`);
+    return true;
+  }
   const written = switchEffortInSession(session, arg, send);
   if (written) noteEffortWrite(session, arg);
   return written;
@@ -10297,6 +10549,11 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     const model = requested.toLowerCase() === 'default' ? null : requested;
     session.currentModel = model;
     session.codex.model = model;
+    session._codexObservedModel = null;
+    session._codexObservedEffort = null;
+    const efforts = codexSessionOptions(session).effortLevels;
+    if (session.codex.effort && !efforts.some(e => e.value === session.codex.effort)) session.codex.effort = null;
+    journalStatus(session);
     persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model });
     sendReply(model
       ? `Codex model set to ${model}; it will apply on the next turn.`
@@ -10444,6 +10701,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;
   next.queueNotifications = existing.queueNotifications;
+  next._codexUncertainSteer = existing._codexUncertainSteer;
   journalInputConsumer.queueRelease.carryForward(
     journalConvoIdFor(existing),
     journalConvoIdFor(next),
@@ -10569,6 +10827,12 @@ function clearPendingInterrupt(session) {
 
 function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}) {
   if (!session) return;
+  if (preserveQueue && session._codexSteerPending?.queued) {
+    restoreQueuedBatch(session, session._codexSteerPending.queued);
+    session._codexSteerPending = false;
+    session._codexUncertainSteer = true;
+    journalPublishNotice(journalConvoIdFor(session), 'Restart interrupted a send-now acknowledgement. Messages are retained but held; check the response before resending.');
+  }
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
   // stops it, but belt-and-braces. Also settles child convos (finishAll).
