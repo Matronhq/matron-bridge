@@ -139,6 +139,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `ALLOWED_USER_IDS` | Comma-separated allowlist of authorized user identities for this bridge (its sender label for journal-originated session commands) | `""` (any user) |
 | `DEFAULT_WORKDIR` | Default working directory for coding-agent sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `MATRON_DEFAULT_AGENT` | Default coding agent (`claude` or `codex`); override per command with `--claude` / `--codex` | `claude` |
+| `MATRON_DEFAULT_MODEL` | Claude model for fresh starts when none is picked (New Chat picker, `/start` without `--model`); an alias such as `fable`, `opus`, `sonnet` or a full `claude-*` name. The `default` alias resolves to this too. Resumed rooms keep their own model. Claude only; reported to the picker as `default_model`. | `fable` |
 | `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
 | `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
@@ -169,11 +170,12 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
 | `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
+| `!start --auto [workdir]` | Claude only: spawn with auto permission mode + Matron permission cards instead of the default `--dangerously-skip-permissions`. Also order-independent and accepted by `!resume`, `!workdir`, and `!restart`; pass `--bypass` instead to return to the default. See Permissions below. |
 | `!stop` | Stop the current session |
-| `!restart [--force] [--browser]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser` is Claude-only) |
-| `!resume [--claude\|--codex] <n\|id> [--browser]` | Resume a previous session (`--browser` is Claude-only) |
+| `!restart [--force] [--browser] [--bypass\|--auto]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser`/`--bypass`/`--auto` are Claude-only) |
+| `!resume [--claude\|--codex] <n\|id> [--browser] [--bypass\|--auto]` | Resume a previous session (`--browser`/`--bypass`/`--auto` are Claude-only) |
 | `!sessions [--claude\|--codex]` | List past sessions for an agent |
-| `!workdir [--claude\|--codex] <path> [--browser]` | Start an agent session in another working directory (`--browser` is Claude-only) |
+| `!workdir [--claude\|--codex] <path> [--browser] [--bypass\|--auto]` | Start an agent session in another working directory (`--browser`/`--bypass`/`--auto` are Claude-only) |
 | `!status` | Show session info (uptime, workdir, restarts) |
 | `!agent` | Show the current/default coding agent |
 | `!switch <claude\|codex>` | Hand the current conversation to the other agent (idle sessions only) |
@@ -194,6 +196,10 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 While the agent is busy, messages queue automatically; `!esc` cancels the current turn without killing the session, and sending `interrupt` force-interrupts.
 
 Any other message is forwarded directly to the selected agent. Claude Code slash commands (e.g. `/commit`, `/review-pr`) are passed through in Claude interactive mode; Codex programmatic sessions treat messages as normal task prompts. `/model` changes a model within the active provider; `/switch` hands the bridge conversation between Claude and Codex.
+
+### Permissions
+
+Print-mode Claude sessions run with `--dangerously-skip-permissions` by default. Opting a session in with `--auto` switches it to Claude Code's `auto` permission mode: routine work is auto-approved, dangerous actions are blocked, and the remaining prompts appear in Matron as Allow once / Always allow this tool (session) / Deny cards (an unanswered card denies itself after 5 minutes). `--bypass` returns a session to the default. Both flags persist across restarts until changed again, and `MATRON_PERMISSION_MODE=auto` flips the box-wide default so every session runs in auto mode unless started with `--bypass`. Interactive (`!mode interactive`) and Codex sessions don't route through this flow — they always run bypassed. Note: Haiku-class models don't support auto mode and fall back to Claude Code's `default` mode, which prompts more often; the bridge warns about this at spawn time.
 
 ## Matron journal transport
 
@@ -226,12 +232,15 @@ Bridge sessions on the same journal server can chat with each other. An agent ro
 Every session gets these MCP tools via `ask-user.js`:
 
 - `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
-- `agent_chat_start` — pick a target from the roster and invite its agent to a new room
+- `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
 - `agent_chat_accept` / `agent_chat_refuse` — answer an inbound chat request
-- `agent_chat_join` / `agent_chat_leave` — ask to join an existing room by id, or leave one
+- `agent_chat_join` — ask to join an existing room by id
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
+- `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
 
 Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
+
+A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
 
 ## How it works
 

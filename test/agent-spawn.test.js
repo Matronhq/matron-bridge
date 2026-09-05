@@ -129,6 +129,37 @@ describe('createAgentSpawnHandlers', () => {
       expect(sent).toHaveLength(0);
     });
 
+    // Wire contract: the optional `model` field the journal relays to the
+    // target bridge's RPC `start`. Field name is exactly `model`.
+    it('carries a valid model alias in the spawn_request frame, normalized', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ ...good, model: 'Opus[1M]' });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].model).toBe('opus[1m]');
+    });
+
+    it('a full claude-* model name is accepted', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ ...good, model: 'claude-opus-4-8' });
+      expect(sent[0].model).toBe('claude-opus-4-8');
+    });
+
+    it('omits the model key entirely when none was asked for', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart(good);
+      expect('model' in sent[0]).toBe(false);
+    });
+
+    it('rejects an unknown or non-string model before sending any frame, listing the aliases', async () => {
+      const { handlers, sent } = mk();
+      for (const model of ['gpt-5', 'opus sonnet', 42, {}]) {
+        const res = await handlers.sessionStart({ ...good, model });
+        expect(res.status).toBe(400);
+        expect(res.body.error).toMatch(/sonnet/);
+      }
+      expect(sent).toHaveLength(0);
+    });
+
     it('journal op error: conflict maps to 409 with detail; unknown ref returns false', async () => {
       const { handlers, sent } = mk();
       const p = handlers.sessionStart(good);
@@ -379,11 +410,12 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     // subprocess boot.
     expect(args).toMatch(/getActivity: \(\) => buildActivity\(\{ sessions, persisted: loadPersistedSessions\(\) \}\)/);
     expect(args).toMatch(/getLimits: \(\) => \{ refreshUsageLimits\(DEFAULT_WORKDIR\); return buildLimits\(usageLimitsCache\); \}/);
+    expect(args).toMatch(/getDisk: \(\) => buildDisk\(\{ path: DEFAULT_WORKDIR \}\)/);
     expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
     expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
     expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true \}\)/);
     expect(args).toMatch(/serverLabel: SERVER_LABEL,/);
-    expect(indexSrc).toMatch(/import \{ buildActivity, buildLimits \} from '\.\/lib\/spawn-capacity\.js';/);
+    expect(indexSrc).toMatch(/import \{ buildActivity, buildLimits, buildDisk \} from '\.\/lib\/spawn-capacity\.js';/);
   });
 
   it('mounts /agent-boxes and /agent-session-start on agentSpawnHandlers via the throw-isolating adapter, before the /secret regex', () => {
