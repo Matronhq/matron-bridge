@@ -56,6 +56,7 @@ import {
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
 import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton } from './lib/timer-command.js';
+import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
@@ -6756,6 +6757,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/limits — Show subscription usage limits (session & weekly)\n` +
         `/timer <duration|time> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel <id|all> cancels\n` +
         `/tools — List available tools\n` +
+        `/sleep — Stop this machine now, with a confirmation button (needs MATRON_SLEEP_COMMAND)\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
@@ -6800,6 +6802,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
           ['/timer &lt;duration|time&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
           ['/tools', 'List available tools'],
+          ['/sleep', 'Stop this machine now, with a confirmation button (needs <code>MATRON_SLEEP_COMMAND</code>)'],
           ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
@@ -7289,6 +7292,32 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const lines = active.map(t => `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
       await sendReply(`⏰ Timers for this conversation:\n${lines.join('\n')}\n\n/timer cancel <id|all> to cancel.`);
+      break;
+    }
+
+    case '!sleep': {
+      // Box-scoped, not session-scoped — but the confirmation card is a
+      // picker frame, and sendButtonMessage can only publish one into a
+      // convo that HAS a session (it returns null otherwise). So /sleep is
+      // offered from a session's convo; the control convo gets a pointer
+      // instead of a button that could never be tapped.
+      const { command, wakeHint } = sleepConfig();
+      if (!command) {
+        await sendReply(SLEEP_NOT_CONFIGURED);
+        break;
+      }
+      const session = sessions.get(roomId);
+      if (!session || !session.sendButtonMessage) {
+        await sendReply('Run /sleep from a session\'s convo — the confirmation card needs one.');
+        break;
+      }
+      // Every live session, not just this convo's: sleeping stops the whole
+      // machine, so a turn running in ANOTHER chat is just as interrupted.
+      let busyCount = 0;
+      for (const [, s] of sessions) if (s.alive && s.busy) busyCount++;
+      const card = sleepCardText({ wakeHint, busyCount });
+      await session.sendButtonMessage(
+        card, sleepButtons(), 'pick_one', card, escapeHtml(card));
       break;
     }
 
@@ -8011,7 +8040,8 @@ function journalOnPromptReply(session, answer, { username }) {
     // the router verified the choice against the offered values of a picker
     // frame this bridge published.
     const skipsAliveGate = typeof answer.choice === 'string'
-      && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:') || answer.choice.startsWith('resume:'));
+      && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:')
+        || answer.choice.startsWith('resume:') || answer.choice.startsWith('sleep:'));
     if (!session.alive && !skipsAliveGate) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
@@ -8025,6 +8055,8 @@ function journalOnPromptReply(session, answer, { username }) {
       sendTimerNow: sendTimerNowFromButton,
       answerPermission: answerPermissionFromButton,
       carryOnConvo,
+      confirmSleep: confirmSleepFromButton,
+      cancelSleep: cancelSleepFromButton,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
     });
@@ -8280,6 +8312,44 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
   if (!fired) {
     sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
   }
+}
+
+// A tap on the /sleep card's "Sleep now" button (value sleep:confirm). This
+// is the only bridge path that runs a command capable of killing the bridge
+// itself, so the two invariants live here rather than at the call site:
+//
+//   - the executed string is sleepConfig().command, read fresh from the
+//     environment. Chat text NEVER reaches it — the button carries the fixed
+//     value `sleep:confirm`, nothing user-authored;
+//   - performSleep gets the REAL journalPublisher.flush, because the whole
+//     point of its publish -> flush -> exec ordering is settling the goodbye
+//     before the host command tears this process down.
+//
+// Sessions are deliberately NOT killed here. A command that works makes
+// systemd stop this unit, and gracefulShutdown already kills every session and
+// flushes on the way out — so doing it up front buys nothing, and on a command
+// that FAILS (passworded sudo) it would leave a live bridge with every session
+// destroyed and a user who was just told the box was going away.
+async function confirmSleepFromButton(session, sendReply) {
+  const { command } = sleepConfig();
+  await performSleep({
+    command,
+    publish: async text => { await sendReply(text); },
+    flush: () => journalPublisher.flush({ timeoutMs: FLUSH_TIMEOUT_MS }),
+    // runSleepCommand owns the spawn and its two failure modes (an
+    // asynchronous 'error', which unhandled would take the bridge down with
+    // it, and an early non-zero exit). `sh -c` is safe precisely because `cmd`
+    // is deployer-set config, never chat input — see the invariant above.
+    exec: cmd => runSleepCommand(cmd, { spawn }),
+  });
+}
+
+// A tap on the same card's "Stay awake" button (value sleep:cancel). The
+// picker frame is single-use, so this just acknowledges — there is no pending
+// state to unwind, which is exactly why the card commits to nothing until a
+// button is pressed.
+function cancelSleepFromButton(session, sendReply) {
+  sendReply('Staying awake.');
 }
 
 // The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
@@ -8851,6 +8921,22 @@ const journalInputConsumer = createJournalInputConsumer({
   routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
+  // A verified /sleep card tap whose session the idle reaper already removed
+  // (lib/journal-input-router.js isSleepPickerTap). The card acts on the
+  // host, so it needs only a convo to answer into — no session, no resume.
+  routeSessionlessPickerTap: (convoId, { choice }) => {
+    // Same command-replay guard as journalOnPromptReply: a confirm stops the
+    // machine, so it must never replay out of the cursor's debounce window.
+    journalPublisher.flushCursor();
+    const sendReply = (text) => journalPublishNotice(convoId, text);
+    if (choice === 'sleep:confirm') {
+      confirmSleepFromButton(null, sendReply).catch((e) => {
+        try { console.warn(`[sleep] sessionless confirm failed: ${e?.message || e}`); } catch { /* logging must never throw */ }
+      });
+    } else if (choice === 'sleep:cancel') {
+      cancelSleepFromButton(null, sendReply);
+    }
+  },
   noticeUnknownConvo: (convoId, { type }) => {
     // A user: frame in an INACTIVE room convo (TTL lapse / left) falls
     // through the room carve-out to here — but this notice would be
