@@ -247,6 +247,25 @@ describe('createJournalMediaRouter — audio (voice note)', () => {
     expect(warnings.some(w => /transcription failed/.test(w))).toBe(true);
   });
 
+  // The generic notice sent the operator hunting through service logs for the
+  // real cause (`spawn ffmpeg ENOENT`), so an uninstalled box now says so and
+  // names the fix.
+  it('an uninstalled transcription stack notices the install gap, not a generic failure', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('x'), contentType: 'audio/ogg' })),
+      transcribe: vi.fn(async () => {
+        throw Object.assign(new Error('ffmpeg is not installed on this box (not found on PATH)'),
+          { code: 'TRANSCRIBE_UNAVAILABLE', dependency: 'ffmpeg' });
+      }),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg' }, ctx);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    const notice = deps.publishNotice.mock.calls[0][1];
+    expect(notice).toMatch(/isn't set up on this box/);
+    expect(notice).toMatch(/ffmpeg/);
+    expect(notice).toMatch(/install-whisper\.sh/);
+  });
+
   it('an empty transcript is dropped (no empty turn injected)', async () => {
     const { route, deps } = makeRouter({
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('x'), contentType: 'audio/ogg' })),
