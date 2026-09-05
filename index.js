@@ -105,7 +105,7 @@ import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
-import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs } from './lib/slow-tool-notice.js';
+import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -1624,13 +1624,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    // Claude Code waits on an MCP tool call FOREVER by default; a wedged MCP
-    // server (2026-08-27: Roblox Studio's long-poll channel after a plugin
-    // self-update) therefore hangs the whole turn with no visible cause.
-    // Back-stop at 10 min — generous on purpose, because the ask-user MCP
-    // tools legitimately block for minutes waiting on a human (secret forms,
-    // permission cards). Operator override via the bridge's own env wins.
-    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT || '600000',
+    // No MCP_TOOL_TIMEOUT default here. #254 briefly injected a 10-minute
+    // backstop so a wedged MCP server couldn't hang a turn forever, but a
+    // hard kill also cut off legitimately long calls (long builds, big test
+    // runs, patient subagents). The slow-tool notices below make a hung call
+    // visible instead and leave the cancel decision with the user. An
+    // operator who wants the hard cap can still set MCP_TOOL_TIMEOUT in the
+    // bridge's own env; it passes through via ...process.env.
   };
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
@@ -1750,6 +1750,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // creation); alive gates a timer surviving into a killed session.
   session.slowToolNotices = createSlowToolNotices({
     thresholdMs: resolveSlowToolNoticeMs(process.env.MATRON_SLOW_TOOL_NOTICE_MS),
+    reminderMs: resolveSlowToolReminderMs(process.env.MATRON_SLOW_TOOL_REMINDER_MS),
     notify: ({ toolName, elapsedMs, reminder }) => {
       if (!session.alive || typeof session.sendCallback !== 'function') return;
       session.sendCallback(renderSlowToolNotice({ toolName, elapsedMs, reminder }));
@@ -2368,9 +2369,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    // Same MCP tool-call backstop as the print-mode spawnEnv: an interactive
-    // session's turn hangs on a wedged MCP server exactly the same way.
-    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT || '600000',
+    // No MCP_TOOL_TIMEOUT default, same reasoning as spawnEnv above:
+    // warn, don't kill. Operator env passes through if set.
   };
   delete interactiveEnv.SHOW_FILE_TOKEN;
   if (showFileToken) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
