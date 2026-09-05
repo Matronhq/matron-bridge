@@ -56,4 +56,29 @@ describe('Codex journal publication', () => {
     expect(h.session._codexNativeUsage).toMatchObject({ input_tokens: 100, cache_read: 30, output_tokens: 20, cost_usd: 0 });
     expect(h.session._lastContextTokens).toBe(40); expect(h.session._codexUsageRevision).toBe(1);
   });
+  it('ends orphaned child views on reconnect and allows rediscovery', () => {
+    const h = setup(); h.codex.childThreads.add('child');
+    h.codex.emit('child-discovered', { id: 'child', item: {} });
+    h.codex.emit('turn-exit', { code: 0 });
+    h.codex.emit('connection-reset');
+    expect(h.publisher.upsertConvo).toHaveBeenLastCalledWith('convo:sub:codex-child', expect.objectContaining({
+      sessionState: 'done', sessionOutcome: 'interrupted',
+    }));
+    expect(h.codex.childThreads.has('child')).toBe(false);
+    expect(h.notice).toHaveBeenCalledWith(h.session, expect.stringContaining('reconnected'));
+    h.codex.emit('child-discovered', { id: 'child', item: {} });
+    expect(h.publisher.upsertConvo).toHaveBeenLastCalledWith('convo:sub:codex-child', expect.objectContaining({ sessionState: 'running' }));
+  });
+  it('prunes completed children so more than 64 lifetime children can be displayed', () => {
+    const h = setup();
+    for (let i = 0; i < 70; i++) {
+      const id = `child-${i}`; h.codex.childThreads.add(id);
+      h.codex.emit('child-discovered', { id, item: {} });
+      h.codex.emit('children-state', { agentsStates: { [id]: { status: 'completed' } } });
+      h.codex.emit('turn-exit', { code: 0 });
+      expect(h.codex.childThreads.has(id)).toBe(false);
+    }
+    expect(h.codex.rpc).toHaveBeenCalledTimes(70);
+    expect(h.publisher.upsertConvo).toHaveBeenLastCalledWith('convo:sub:codex-child-69', expect.objectContaining({ sessionOutcome: 'completed' }));
+  });
 });

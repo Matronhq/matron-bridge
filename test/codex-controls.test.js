@@ -53,4 +53,14 @@ describe('Codex bridge MCP injection', () => {
     const result = codexMcpConfig({ baseConfig, extras: ['share'], bridgeDir: '/bridge', roomId: 'room', apiPort: 9802 });
     expect(result.mcp_servers['show-file']).toBeUndefined();
   });
+  it('handles URL-based entries without injecting local credentials or crashing', () => {
+    const remoteConfig = { mcpServers: { 'ask-user': { url: 'https://example.test/ask' },
+      'show-file': { url: 'https://example.test/share' } } };
+    const options = { baseConfig: remoteConfig, bridgeDir: '/bridge', roomId: 'room', apiPort: 9802 };
+    const result = codexMcpConfig(options);
+    expect(result.mcp_servers['ask-user']).toMatchObject({ url: 'https://example.test/ask' });
+    expect(result.mcp_servers['ask-user'].env).toBeUndefined();
+    expect(result.mcp_servers['show-file']).toBeUndefined();
+    expect(JSON.stringify(codexMcpConfig({ ...options, showFileToken: 'local-secret' }))).not.toContain('local-secret');
+  });
 });

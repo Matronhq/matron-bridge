@@ -266,7 +266,7 @@ Codex can inspect the saved file with its normal local tools when the sandbox pe
 | `/cost` | Monetary cost where reported | No invented monetary cost |
 | `/limits` | Claude subscription limits | Account quota windows and reset times through app server |
 
-Native subagent text is shown in linked child conversations with terminal outcomes and restart recovery. Arbitrary MCP schemas, secret-bearing native question forms, native TUI-only commands, and custom compaction instructions are not emulated. Secrets use the shared secure-input MCP flow; unsupported forms receive a visible refusal. `--model` on start/resume remains Claude-specific; Codex selects models using `/model`.
+Native subagent text is shown in linked child conversations with terminal outcomes and restart recovery. Closing/replacing the native connection marks unfinished child views interrupted; later collaboration events can rediscover those threads. The 64-child view limit applies to active children, with completed records pruned between turns. Arbitrary MCP schemas, secret-bearing native question forms, native TUI-only commands, and custom compaction instructions are not emulated. Secrets use the shared secure-input MCP flow; unsupported forms receive a visible refusal. `--model` on start/resume remains Claude-specific; Codex selects models using `/model`.
 
 ## Troubleshooting
 

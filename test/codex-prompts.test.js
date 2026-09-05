@@ -21,10 +21,25 @@ describe('native Codex approval and question cards', () => {
   it('serializes requests and rejects an old button on a newer card', async () => {
     const h = setup(); h.queue.add(approval(1)); h.queue.add(approval(2)); await settle();
     const old = h.queue.active.options[0].value;
+    const oldId = h.queue.active.options[0].id;
     h.choose(2); await settle();
     expect(h.queue.answer({ choice: old })).toBeNull();
+    expect(h.queue.answer({ choice: oldId })).toBeNull();
+    expect(h.queue.answer({ choice: oldId, text: 'Allow once' })).toBeNull();
+    expect(h.queue.answer({ choice: 'prompt-opt-0' })).toBeNull();
     h.choose(1);
     expect(h.respond.mock.calls).toEqual([[1, { decision: 'decline' }], [2, { decision: 'acceptForSession' }]]);
+  });
+  it('binds option IDs to individual questions and accepts only the current ID', async () => {
+    const h = setup(); h.queue.add({ id: 1, method: 'item/tool/requestUserInput', params: { questions: [
+      { id: 'first', question: 'First?', options: [{ label: 'Yes' }] },
+      { id: 'second', question: 'Second?', options: [{ label: 'Yes' }] },
+    ] } }); await settle();
+    const oldId = h.queue.active.options[0].id;
+    expect(h.queue.answer({ choice: oldId })).toBe('Yes');
+    expect(h.queue.answer({ choice: oldId })).toBeNull();
+    expect(h.queue.answer({ choice: h.queue.active.options[0].id })).toBe('Yes');
+    expect(h.respond).toHaveBeenCalledTimes(1);
   });
   it('denies permissions in plan mode and scopes approved permissions', () => {
     const h = setup(); const request = approval(1, 'item/permissions/requestApproval');

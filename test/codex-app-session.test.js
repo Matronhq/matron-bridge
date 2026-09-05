@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { CodexAppServerSession, codexInput } from '../lib/codex-app-session.js';
+import { CodexAppServerSession, codexInput, codexPlanConfig } from '../lib/codex-app-session.js';
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 class FakeClient extends EventEmitter {
@@ -168,6 +168,37 @@ describe('native Codex session lifecycle', () => {
     expect(h.session.busy).toBe(false);
     expect(h.exits).toHaveLength(1);
     expect(h.clients).toHaveLength(1);
+  });
+
+  it('ignores stale nested turn IDs both during startup and during an active turn', async () => {
+    const h = setup(); h.send(); await settle(); h.complete();
+    h.send();
+    h.clients[0].notify('turn/started', { threadId: 'thread-1', turn: { id: 'turn-1' } });
+    h.clients[0].notify('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } });
+    expect(h.session.busy).toBe(true);
+    await settle(); expect(h.session.turnId).toBe('turn-2');
+    h.clients[0].notify('turn/started', { threadId: 'thread-1', turn: { id: 'unknown-stale-turn' } });
+    expect(h.session.turnId).toBe('turn-2');
+    h.complete(); expect(h.exits).toHaveLength(2); expect(h.session.busy).toBe(false);
+    h.session.kill();
+  });
+
+  it('announces connection replacement and disconnect so child views can terminate', async () => {
+    const h = setup(); const reset = vi.fn(); h.session.on('connection-reset', reset);
+    h.send(); await settle(); h.complete();
+    h.session.effort = 'high'; h.send(); await settle();
+    expect(reset).toHaveBeenCalledTimes(1);
+    h.clients[1].closed = true; h.clients[1].emit('disconnect', new Error('lost'));
+    expect(reset).toHaveBeenCalledTimes(2); h.session.kill();
+  });
+
+  it('denies every per-origin browser capability in Plan mode', () => {
+    const result = codexPlanConfig({}, { browser_use: { origins: { 'https://example.test': {
+      access: 'allow', uploads: 'allow', downloads: 'allow', full_cdp_access: 'allow',
+    } } } });
+    expect(result.browser_use.origins['https://example.test']).toEqual({
+      access: 'deny', uploads: 'deny', downloads: 'deny', full_cdp_access: 'deny',
+    });
   });
 
   it('compacts natively without starting an ordinary prompt', async () => {
