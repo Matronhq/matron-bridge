@@ -750,6 +750,40 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
       expect(deps.noticeUnknownConvo).toHaveBeenCalled();
     });
 
+    it('still routes after evictConvo (session teardown), which is exactly when a walk-away tap arrives', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer.evictConvo('convo-1');
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledWith('convo-1', { target_seq: 20, choice: 'sleep:confirm' }, { username: 'dan' });
+      expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+    });
+
+    it('is single-use: a second tap (double-tap, client retry) does not run the host command again', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledTimes(1);
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
+    });
+
+    it('a tap answered while the session was live consumes the frame for the sessionless path too', () => {
+      let live = { alive: true, roomId: '!room' };
+      const deps = { ...sessionlessDeps(), findSessionByConvoId: () => live };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:cancel'));
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'sleep:cancel', picker: true });
+      live = null;
+      consumer(sleepReply(20, 'sleep:cancel'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
+    });
+
     it('without the dep, a sessionless sleep tap falls back to the unknown-convo notice', () => {
       const deps = makeDeps();
       const consumer = createJournalInputConsumer(deps);
