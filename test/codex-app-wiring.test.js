@@ -2,12 +2,12 @@ import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import { wireCodexAppSession } from '../lib/codex-app-wiring.js';
 const settle = () => new Promise(resolve => setImmediate(resolve));
-function setup() {
+function setup(extraOptions = {}) {
   const codex = Object.assign(new EventEmitter(), { threadId: 'parent', turnId: 'turn', childThreads: new Set(), rpc: vi.fn(async () => ({})), client: { respond: vi.fn(() => true), rejectRequest: vi.fn() } });
   const session = { codex, workdir: '/missing-test-workdir', alive: true, busy: true, showBashOutput: true };
   const publisher = Object.fromEntries(['streamAppend', 'stream', 'endStream', 'upsertConvo', 'publishText', 'finalizeToolOutput'].map(n => [n, vi.fn(() => true)]));
   publisher.uploadMedia = vi.fn(async () => ({ media_id: 'blob-1' }));
-  const options = { publisher, convoIdFor: () => 'convo', stream: vi.fn(), activity: vi.fn(), status: vi.fn(), notice: vi.fn(), publishPrompt: vi.fn(() => true), publishText: vi.fn() };
+  const options = { publisher, convoIdFor: () => 'convo', stream: vi.fn(), activity: vi.fn(), status: vi.fn(), notice: vi.fn(), publishPrompt: vi.fn(() => true), publishText: vi.fn(), ...extraOptions };
   wireCodexAppSession(session, options);
   return { codex, session, publisher, ...options };
 }
@@ -80,5 +80,14 @@ describe('Codex journal publication', () => {
     }
     expect(h.codex.rpc).toHaveBeenCalledTimes(70);
     expect(h.publisher.upsertConvo).toHaveBeenLastCalledWith('convo:sub:codex-child-69', expect.objectContaining({ sessionOutcome: 'completed' }));
+  });
+  it('allows child discovery to retry after recovery-state persistence fails', () => {
+    const runningStore = { add: vi.fn().mockReturnValueOnce(false).mockReturnValue(true) };
+    const h = setup({ runningStore }); h.codex.childThreads.add('child');
+    h.codex.emit('child-discovered', { id: 'child', item: {} });
+    expect(h.codex.childThreads.has('child')).toBe(false);
+    expect(h.publisher.upsertConvo).not.toHaveBeenCalled();
+    h.codex.childThreads.add('child'); h.codex.emit('child-discovered', { id: 'child', item: {} });
+    expect(h.publisher.upsertConvo).toHaveBeenCalledWith('convo:sub:codex-child', expect.objectContaining({ sessionState: 'running' }));
   });
 });

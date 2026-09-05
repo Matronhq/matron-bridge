@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { handleCodexControl, listCodexThreads, mergeCodexThreads, offerCodexBuild } from '../lib/codex-controls.js';
 import { codexMcpConfig } from '../lib/codex-mcp.js';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 function setup() {
   const session = { alive: true, busy: false, codex: { transport: 'app-server', threadId: 'thread', planMode: false, ensureThread: vi.fn(async () => {}), rpc: vi.fn(async () => ({})) }, sendButtonMessage: vi.fn(() => true) };
   const opts = { reply: vi.fn(), send: vi.fn(() => true), persist: vi.fn(), beforeDispatch: vi.fn() };
@@ -21,6 +23,27 @@ describe('Codex native controls', () => {
     const h = setup(); h.session.busy = true;
     expect(await h.run('/plan')).toBe(true); expect(h.session.codex.planMode).toBe(false);
     expect(await h.run('hello')).toBe(false); expect(h.opts.send).not.toHaveBeenCalled();
+  });
+  it('does not treat prose beginning with build as permission to leave Plan mode', async () => {
+    const h = setup(); h.session.codex.planMode = true;
+    expect(await h.run('build the auth flow')).toBe(false);
+    expect(h.session.codex.planMode).toBe(true);
+    expect(h.opts.send).not.toHaveBeenCalled();
+    expect(h.opts.beforeDispatch).not.toHaveBeenCalled();
+  });
+  it('uses the same bounded resume list on first lookup and cached lookup', async () => {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    const start = source.indexOf('async function availableCodexThreads(');
+    const context = vm.createContext({ codexThreadLists: new Map(), AGENT_CODEX: 'codex', CODEX_APP_SERVER: true,
+      listPersistedAgentSessions: () => [], mergeCodexThreads,
+      listCodexThreads: vi.fn(async () => Array.from({ length: 20 }, (_, i) => ({ sessionId: `thread-${i}`, modified: 20 - i }))),
+    });
+    vm.runInContext(source.slice(start, source.indexOf('\n}\n', start) + 2), context);
+    const first = await context.availableCodexThreads('/workspace', { cached: true, roomId: 'room' });
+    const cached = await context.availableCodexThreads('/workspace', { cached: true, roomId: 'room' });
+    expect(first).toHaveLength(15); expect(cached).toEqual(first);
+    expect(context.listCodexThreads).toHaveBeenCalledTimes(1);
+    expect(await context.availableCodexThreads(null)).toHaveLength(20);
   });
   it('uses device login, cancel, and account logout rather than model prompts', async () => {
     const h = setup(); h.session.codex.rpc.mockResolvedValue({ verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD', loginId: 'login' });

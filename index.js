@@ -6114,9 +6114,10 @@ async function availableCodexThreads(workdir, { cached = false, roomId = '' } = 
   if (cached && codexThreadLists.has(key)) return codexThreadLists.get(key);
   const persisted = listPersistedAgentSessions(AGENT_CODEX, workdir);
   if (!CODEX_APP_SERVER) return persisted;
-  const items = mergeCodexThreads(await listCodexThreads(workdir), persisted);
+  const merged = mergeCodexThreads(await listCodexThreads(workdir), persisted);
+  const items = workdir ? merged.slice(0, 15) : merged;
   if (codexThreadLists.size >= 100) codexThreadLists.delete(codexThreadLists.keys().next().value);
-  codexThreadLists.set(key, workdir ? items.slice(0, 15) : items);
+  codexThreadLists.set(key, items);
   return items;
 }
 
