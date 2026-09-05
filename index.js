@@ -504,11 +504,15 @@ if (JOURNAL_ENABLED) {
   // times a day, and a fresh message here on every boot bumps the control
   // convo to the top of the chat list each time. `help` prints the same text.
   if (shouldAnnounceOnline(ANNOUNCE_MARKER_FILE, JOURNAL_CONTROL_CONVO_ID)) {
-    journalPublisher.publishText(JOURNAL_CONTROL_CONVO_ID, {
+    // publishText reports whether the frame was accepted onto the outgoing
+    // queue (evicted-on-overflow → false), not delivery. Only an accepted
+    // publish records the marker: a refused one would otherwise silence
+    // every later boot for a message nobody ever received.
+    const accepted = journalPublisher.publishText(JOURNAL_CONTROL_CONVO_ID, {
       body: 'Bridge online. Commands: "new [directory]" — start a session; "list" — active sessions; "help" — this text.',
       from: 'assistant',
     });
-    recordOnlineAnnounced(ANNOUNCE_MARKER_FILE, JOURNAL_CONTROL_CONVO_ID);
+    if (accepted) recordOnlineAnnounced(ANNOUNCE_MARKER_FILE, JOURNAL_CONTROL_CONVO_ID);
   }
 }
 

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from '../lib/announce-once.js';
 
 // In-memory fs fake (same shape as test/atomic-write.test.js) — covers the
@@ -70,5 +71,26 @@ describe('announce-once', () => {
     const marker = JSON.parse(fs.files[MARKER]);
     expect(marker.convoId).toBe(CONVO);
     expect(typeof marker.announcedAt).toBe('string');
+  });
+});
+
+// index.js cannot be imported (it boots a bridge), so the wiring is pinned by
+// source inspection, as the other *-wiring tests do.
+describe('index.js boot announcement wiring', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const start = src.indexOf('shouldAnnounceOnline(ANNOUNCE_MARKER_FILE');
+  const block = src.slice(start, src.indexOf('\n  }\n', start));
+
+  it('gates the announcement on the marker', () => {
+    expect(start).toBeGreaterThan(-1);
+  });
+
+  it('records the marker only when the publish was accepted, so a refused one is retried next boot', () => {
+    // publishText returns enqueue acceptance (false when the frame was
+    // evicted). Recording unconditionally would silence every later boot
+    // for a message that never left the bridge.
+    expect(block).toMatch(/const accepted = journalPublisher\.publishText\(/);
+    expect(block).toMatch(/if \(accepted\) recordOnlineAnnounced\(/);
+    expect(block.match(/recordOnlineAnnounced\(/g)).toHaveLength(1);
   });
 });
