@@ -17,7 +17,10 @@ npm install
 
 # First-run configuration: guided wizard on a terminal, template fallback otherwise
 if [ ! -f "$REPO_DIR/.env" ]; then
-  if [ -t 0 ]; then
+  # Both stdin AND stdout must be a terminal: the wizard refuses otherwise
+  # (readline only masks the hidden token in terminal mode), and under set -e
+  # that refusal would skip the template fallback and leave no .env at all.
+  if [ -t 0 ] && [ -t 1 ]; then
     node "$SCRIPT_DIR/wizard.mjs"
   else
     echo "Creating .env from .env.example (no terminal for the setup wizard)..."
