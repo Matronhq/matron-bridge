@@ -9268,11 +9268,22 @@ const selfRestartHandler = createSelfRestartHandler({
   // the session told itself to do.
   queueContinuation: (session, text) => {
     const entry = [{ type: 'text', text }];
+    // Lockstep with queueNotifications (PR #104): cancel and send_one address
+    // the queue by notification index, so an entry with no slot of its own
+    // would shift every later tile onto the wrong message. A bridge-composed
+    // continuation has no card, so it gets a placeholder slot — no item id,
+    // no event id — which the positional paths already treat as an untracked
+    // tile (nothing to edit, nothing to release).
+    const notification = { id: null, eventId: null, plain: text.slice(0, 80) };
     if (!session.queuedMessages) session.queuedMessages = [];
+    if (!session.queueNotifications) session.queueNotifications = [];
     session.queuedMessages.push(entry);
+    session.queueNotifications.push(notification);
     return () => {
       const i = session.queuedMessages?.indexOf(entry) ?? -1;
       if (i >= 0) session.queuedMessages.splice(i, 1);
+      const j = session.queueNotifications?.indexOf(notification) ?? -1;
+      if (j >= 0) session.queueNotifications.splice(j, 1);
     };
   },
   // The same stash a user's mid-turn /restart parks on, replayed by

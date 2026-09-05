@@ -66,6 +66,14 @@ describe('index.js self-restart dependency wiring', () => {
     expect(body).toMatch(/type: 'text'/);
   });
 
+  it('keeps queuedMessages and queueNotifications in lockstep (placeholder slot, undone together)', () => {
+    // cancel / send_one address the queue by notification index; an entry
+    // with no slot would land later tiles on the wrong message.
+    expect(body).toMatch(/session\.queueNotifications\.push\(notification\)/);
+    expect(body).toMatch(/id: null, eventId: null/);
+    expect(body).toMatch(/session\.queueNotifications\.splice\(j, 1\)/);
+  });
+
   it('does NOT mark the continuation journal-origin, so it mirrors exactly once', () => {
     // markJournalOrigin means "the journal already has this row, skip the
     // mirror" (lib/queue-flush.js). This text is bridge-generated, so
