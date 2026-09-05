@@ -148,6 +148,8 @@ import {
   snapshotAgentState,
 } from './lib/agent-handoff.js';
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox } from './lib/codex-session.js';
+import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
+import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
@@ -1178,6 +1180,41 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 // turn every turn end into a spawn storm.
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
 const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
+const codexAccountReader = createCodexAccountReader();
+const codexTelemetryReader = new CodexTelemetryReader();
+
+async function refreshCodexMetadata(session, options) {
+  const metadata = await codexAccountReader.read(session.workdir, options);
+  if (!session.alive || sessions.get(session.roomId) !== session) return metadata;
+  if (session._codexMetadata === metadata) return metadata;
+  session._codexMetadata = metadata;
+  journalStatus(session);
+  return metadata;
+}
+
+async function refreshCodexTelemetry(session, { force = false } = {}) {
+  if (!session.claudeSessionId || !session.alive) return;
+  if (session._codexTelemetryInflight) {
+    if (!force) return session._codexTelemetryInflight;
+    // A turn may close during a poll. Read again after that poll finishes so
+    // a pre-completion snapshot cannot hide the final token counts.
+    await session._codexTelemetryInflight;
+    return refreshCodexTelemetry(session);
+  }
+  const threadId = session.claudeSessionId;
+  session._codexTelemetryInflight = codexTelemetryReader.read(threadId).then(telemetry => {
+    if (!session.alive || sessions.get(session.roomId) !== session || session.claudeSessionId !== threadId) return;
+    if (telemetry.usage) session._codexNativeUsage = telemetry.usage;
+    if (telemetry.context) {
+      session._lastContextTokens = telemetry.context.tokens;
+      session._codexContextWindow = telemetry.context.window;
+    }
+    if (telemetry.model) session._codexObservedModel = telemetry.model;
+    if (telemetry.effort) session._codexObservedEffort = telemetry.effort;
+    journalStatus(session);
+  }).finally(() => { session._codexTelemetryInflight = null; });
+  return session._codexTelemetryInflight;
+}
 
 // Kick off a background limits refresh if the cache is stale. Returns the
 // in-flight promise (resolving true when the cache gained fresh lines) when
@@ -1239,30 +1276,21 @@ function journalStatus(session) {
   if (!convoId) return;
   // Host CPU/RAM vitals are host-global, not account- or agent-specific, so
   // they ride on every frame (Claude and Codex) at TOP LEVEL (status.vitals) —
-  // NOT in limits[], which clients render as Claude-account subscription
+  // NOT in limits[], which clients render as account subscription
   // meters. hostVitals() only READS the sampler cache (the 15s interval owns
   // sampling); it never samples here.
   const vitals = hostVitals();
   const isCodex = session.agent === AGENT_CODEX;
+  const codexOptions = isCodex ? codexSessionOptions(session) : null;
   const status = buildSessionStatus({
-    model: session.currentModel || session.initData?.model,
+    model: isCodex ? codexOptions.model : session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
-    // Account rate limits are Claude-account-specific; Codex frames carry none,
-    // keeping the Codex limits array empty (buildSessionStatus omits it).
-    limits: isCodex ? [] : (usageLimitsCache.lines || []),
-    // Composer argument offers for /model and /effort, session-scoped. Codex
-    // states EMPTY rather than staying silent: its model id is free text passed
-    // straight to `codex --model` (the bridge validates nothing and holds no id
-    // list) and effort isn't exposed for it at all — see the '!effort' handler.
-    // Silence would merge stickily, so a mid-session /switch claude→codex would
-    // leave Claude's offers standing on a session that refuses them.
-    modelOptions: isCodex ? [] : modelOptions(),
-    effortLevels: isCodex ? [] : effortOptions(),
-    // Optimistically tracked, never read back (lib/effort-tracker.js). Null for
-    // Codex (not applicable) and for a Claude session whose level is unknown;
-    // either way it publishes as an EXPLICIT null, so a sticky client clears a
-    // level this session no longer stands behind (e.g. after a restart).
-    effort: isCodex ? null : trackedEffort(session),
+    // Codex supplies its real window; an unknown window must not use Claude's fallback.
+    contextWindow: isCodex ? session._codexContextWindow || null : undefined,
+    limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || []),
+    modelOptions: isCodex ? codexOptions.modelOptions : modelOptions(),
+    effortLevels: isCodex ? codexOptions.effortLevels : effortOptions(),
+    effort: isCodex ? codexOptions.effort : trackedEffort(session),
     email: getAccountEmail(),
     // Absolute path for the client's header workdir segment: session.workdir
     // can be relative (it is passed through from the resume/start args), so
@@ -1271,10 +1299,11 @@ function journalStatus(session) {
     vitals,
   });
   // The shared account email cache is Claude-specific — strip it from Codex
-  // frames. (Rate limits are already excluded from the Codex limits array
-  // above; host vitals live at top-level status.vitals and stay on both.)
+  // frames. Codex supplies its own limits; host vitals stay on both.
   if (isCodex) {
     delete status.email;
+    // Explicitly clear a prior provider's limits, including on fetch failure.
+    status.limits = session._codexMetadata?.limits || [];
   }
   if (Object.keys(status).length === 0) return;
   // Stamp only when the frame actually left the bridge — a publish dropped
@@ -1299,6 +1328,11 @@ function journalStatus(session) {
 // frames while the journal socket is down.
 function journalSpawnStatus(session) {
   journalStatus(session);
+  if (session.agent === AGENT_CODEX) {
+    void refreshCodexMetadata(session);
+    void refreshCodexTelemetry(session);
+    return;
+  }
   const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
   if (refresh) {
     refresh.then((updated) => {
@@ -1921,6 +1955,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     cwd,
     threadId: resumeSessionId || null,
     model,
+    effort: persistedCodexState.effort || null,
     sandbox: CODEX_SANDBOX_MODE,
     developerInstructions: CODEX_BRIDGE_PROMPT,
     env: { ...process.env },
@@ -1975,6 +2010,12 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     session._codexTurnFinished = false;
     session._codexLastError = null;
     session._codexCompletedUsage = null;
+    clearInterval(session._codexTelemetryTimer);
+    session._codexTelemetryTimer = setInterval(() => {
+      void refreshCodexTelemetry(session);
+      void refreshCodexMetadata(session);
+    }, 5000);
+    session._codexTelemetryTimer.unref?.();
     debug(`Spawning codex with args: ${args.join(' ')}`);
     debug(`Working directory: ${cwd}`);
   });
@@ -1987,6 +2028,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     session._codexLastError = error?.message || String(error);
   });
   codex.on('turn-exit', ({ code, signal, stderr, sawTurnCompleted }) => {
+    clearInterval(session._codexTelemetryTimer);
+    void refreshCodexTelemetry(session, { force: true });
+    if (session.alive) void refreshCodexMetadata(session);
     session.proc = null;
     if (session._codexTurnFinished) return;
     if (!session.alive) {
@@ -2087,6 +2131,7 @@ function handleCodexEvent(session, event) {
           journalFlushForSession(session);
         }
       }
+      void refreshCodexTelemetry(session);
       break;
     }
 
@@ -2220,6 +2265,9 @@ function finishCodexTurn(session, {
   session.turnCount++;
 
   if (usage) {
+    // Prefer the fresh native snapshot fetched on turn-exit. If that record
+    // is unavailable, expose the exec totals instead of an earlier snapshot.
+    session._codexNativeUsage = null;
     session.totalUsage.input_tokens += usage.input_tokens || 0;
     session.totalUsage.output_tokens += usage.output_tokens || 0;
     session.totalUsage.cache_read += usage.cached_input_tokens || 0;
@@ -6497,13 +6545,24 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session. Send !start to begin.');
         return;
       }
+      let codexDetails = '';
+      if (session.agent === AGENT_CODEX) {
+        await Promise.all([refreshCodexMetadata(session), refreshCodexTelemetry(session)]);
+        const options = codexSessionOptions(session);
+        const u = codexUsageFor(session);
+        codexDetails = `\nModel: ${options.model || 'config default'}\nEffort: ${options.effort || 'config default'}` +
+          `\nTokens: ${(u.input_tokens + u.output_tokens).toLocaleString()}`;
+        if (session._lastContextTokens != null && session._codexContextWindow) {
+          codexDetails += `\nContext: ${session._lastContextTokens.toLocaleString()} / ${session._codexContextWindow.toLocaleString()}`;
+        }
+      }
       const uptimeMs = Date.now() - session.startedAt;
       const shortId = session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '…' : '(pending)';
       const busyText = session.busy ? 'yes' : 'no';
 
       const plainStatus =
         `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
-        `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
+        `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}${codexDetails}`;
 
       const busyHtml = session.busy
         ? color('● busy', '#f0883e')
@@ -6518,7 +6577,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
         `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
         (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>`) +
-        `</table>`;
+        `</table>` + escapeHtml(codexDetails).replace(/\n/g, '<br/>');
 
       await sendHtml(plainStatus, htmlStatus);
       break;
@@ -6833,7 +6892,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? `Current model: ${current}`
         : (session.agent === AGENT_CODEX ? 'Current model: Codex config default' : 'Current model: (appears after the first reply)');
       if (session.agent === AGENT_CODEX) {
-        await sendReply(`${currentLine}\n\nType /model <model-id> to set the model for future Codex turns, or /model default to return to your Codex config default.`);
+        const metadata = await refreshCodexMetadata(session);
+        const options = codexSessionOptions(session);
+        const plain = `Current model: ${options.model || 'Codex config default'}\n\n` +
+          options.modelOptions.map(o => `${o.label}: /model ${o.value}`).join('\n') +
+          (metadata.modelsError ? `\n\n${metadata.modelsError}\nYou can still type /model <model-id>.` : '');
+        if (session.sendButtonMessage) {
+          session.sendButtonMessage('Codex model', options.modelOptions.map((o, i) => ({
+            id: `codex-model-${i}`, label: o.label, value: `model:${o.value}`,
+          })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+        } else await sendReply(plain);
       } else if (session.iv) {
         // A live TUI means switching works. Prefer buttons, but fall back to a
         // typed-command hint when no button channel is wired (e.g. some
@@ -7007,7 +7075,19 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       if (session.agent === AGENT_CODEX) {
-        await sendReply('Codex effort switching is not exposed by this first programmatic integration. Set model_reasoning_effort in your Codex config if needed.');
+        await refreshCodexMetadata(session);
+        if (parts[1]) {
+          switchEffortAndTrack(session, parts[1], sendReply);
+        } else {
+          const options = codexSessionOptions(session);
+          const plain = `Codex effort: ${options.effort || 'config default'}\n\n` +
+            options.effortLevels.map(o => `/effort ${o.value}`).join('\n');
+          if (session.sendButtonMessage) {
+            session.sendButtonMessage('Codex effort', options.effortLevels.map((o, i) => ({
+              id: `codex-effort-${i}`, label: o.label, value: `effort:${o.value}`,
+            })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+          } else await sendReply(plain);
+        }
         break;
       }
       const arg = parts[1];
@@ -7064,6 +7144,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No active session.');
         break;
       }
+      if (session.agent === AGENT_CODEX) {
+        await refreshCodexTelemetry(session, { force: true });
+        const u = codexUsageFor(session);
+        const context = session._lastContextTokens != null && session._codexContextWindow
+          ? `\nContext: ${session._lastContextTokens.toLocaleString()} / ${session._codexContextWindow.toLocaleString()}` : '';
+        const plain = `Codex token usage (${session._codexNativeUsage ? 'native thread' : 'bridge-recorded turns'}):\n\n` +
+          `Input: ${u.input_tokens.toLocaleString()} (includes cached input)\n` +
+          `Cached input: ${u.cache_read.toLocaleString()}\n` +
+          `Output: ${u.output_tokens.toLocaleString()}\n` +
+          (u.reasoning_tokens != null ? `Reasoning: ${u.reasoning_tokens.toLocaleString()} (included in output)\n` : '') +
+          `Total: ${(u.input_tokens + u.output_tokens).toLocaleString()}\n` +
+          `Bridge turns: ${session.turnCount}${context}`;
+        await sendHtml(plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+        break;
+      }
       const u = session.totalUsage;
       const uCostClr = u.cost_usd < 0.5 ? '#3fb950' : u.cost_usd < 2 ? '#f0883e' : '#f85149';
       const plainUsage =
@@ -7094,8 +7189,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // This is a global query — no active session required.
       try {
         const active = sessions.get(roomId);
-        if (active?.agent === AGENT_CODEX) {
-          await sendReply('Codex subscription limits are not exposed by codex exec JSON output.');
+        if ((active?.agent || DEFAULT_AGENT) === AGENT_CODEX) {
+          const metadata = active
+            ? await refreshCodexMetadata(active, { force: true })
+            : await codexAccountReader.read(DEFAULT_WORKDIR, { force: true });
+          const fallback = metadata.limitsError || 'No Codex subscription limits were returned for this account. API-key accounts may not have subscription limits.';
+          const { plain, html } = formatLimits({ ok: metadata.limits.length > 0, lines: metadata.limits }, fallback);
+          await sendHtml(plain, html);
           break;
         }
         const cwd = active?.workdir || DEFAULT_WORKDIR;
@@ -9895,6 +9995,7 @@ function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.ag
   session._agentHistoryCursor = cursor;
   session.totalUsage = { ...session.totalUsage, ...state.totalUsage };
   session.turnCount = state.turnCount;
+  if (session.agent === AGENT_CODEX && session.codex) session.codex.effort = state.effort || null;
   session._pendingAgentHandoff = null;
   if (cursor < history.length) {
     session._pendingAgentHandoff = buildAgentHandoffPrompt({
@@ -10024,6 +10125,20 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
 // through here (the !effort command and the effort: picker button) — see
 // lib/effort-tracker.js for what turns a pending write into a published one.
 function switchEffortAndTrack(session, arg, send) {
+  if (session.agent === AGENT_CODEX) {
+    const level = String(arg || '').toLowerCase();
+    const options = codexSessionOptions(session);
+    if (!options.effortLevels.some(o => o.value === level)) {
+      send(`Unknown effort for this Codex model. Options: ${options.effortLevels.map(o => o.value).join(', ')}.`);
+      return false;
+    }
+    session.codex.effort = level === 'default' ? null : level;
+    session._codexObservedEffort = null;
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
+    journalStatus(session);
+    send(`Codex effort set to ${level}; it will apply on the next turn.`);
+    return true;
+  }
   const written = switchEffortInSession(session, arg, send);
   if (written) noteEffortWrite(session, arg);
   return written;
@@ -10047,6 +10162,11 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     const model = requested.toLowerCase() === 'default' ? null : requested;
     session.currentModel = model;
     session.codex.model = model;
+    session._codexObservedModel = null;
+    session._codexObservedEffort = null;
+    const efforts = codexSessionOptions(session).effortLevels;
+    if (session.codex.effort && !efforts.some(e => e.value === session.codex.effort)) session.codex.effort = null;
+    journalStatus(session);
     persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model });
     sendReply(model
       ? `Codex model set to ${model}; it will apply on the next turn.`

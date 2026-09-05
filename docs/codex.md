@@ -1,8 +1,10 @@
 # Using the Codex backend
 
-matron-bridge supports Codex through the Codex CLI's non-interactive JSONL interface. This integration is programmatic only: it does not embed or scrape the interactive Codex terminal UI.
+matron-bridge runs Codex turns through the CLI's non-interactive JSONL interface, queries account/model metadata through its stdio app server, and reads optional local rollout telemetry for context and native-thread token totals. It does not embed or scrape the interactive Codex terminal UI.
 
 Useful upstream references:
+
+- [App server: model discovery and account limits](https://learn.chatgpt.com/docs/app-server)
 
 - [Codex CLI](https://developers.openai.com/codex/cli/)
 - [Authentication](https://developers.openai.com/codex/auth/)
@@ -178,14 +180,31 @@ During a session:
 ```text
 /agent                 Show the active provider
 /status                Show the working directory, native session ID, and usage
+/model                 List available models with selection buttons
 /model <model-id>      Override the Codex model for future turns
 /model default         Return to the Codex configuration default
+/effort                List reasoning levels supported by the selected model
+/effort <level>        Set reasoning effort for future turns
+/effort default        Return to the Codex configuration default
 /usage                 Show cumulative token counts
+/limits                Fetch account quota usage and reset times
 /working               Toggle tool-activity messages
 !esc                    Interrupt the active Codex child without ending the conversation
 ```
 
 Messages sent while Codex is running are queued and delivered after the turn completes. The bare busy-queue commands `send`, `interrupt`, and `cancel` keep their normal bridge meanings; use `!esc` when the intention is specifically to stop the active Codex turn.
+
+## Models, effort, and usage
+
+`/model` discovers picker-visible models through `model/list`, including pagination. The bridge reads effective project configuration for the selected working directory; model and effort overrides stay local to the conversation and survive provider switches and restarts. `/model default` and `/effort default` remove the corresponding override. An explicit model ID remains usable if discovery is unavailable.
+
+`/limits` queries `account/rateLimits/read`. Each quota bucket keeps its own reported duration, percentage and reset timestamp; a primary window is not assumed to be five hours. The header refreshes metadata at session start, while a turn is running, and after turn completion, using a one-minute cache per working directory. `/limits` forces a refresh. Account queries do not start model turns. API-key accounts or older CLIs may return no subscription data; the command explains this and other Codex functionality remains available.
+
+`/usage` prefers absolute totals from the matching native thread's local rollout, so it includes earlier resumed turns and does not double-count repeated telemetry records. Cached input is included in input; reasoning tokens are included in output. Total tokens are input plus output. If native telemetry is unavailable, the command labels its fallback as bridge-recorded turns.
+
+The context header uses the latest request's input tokens and the context window reported by Codex, not cumulative tokens or Claude's window size. The bridge reads a bounded tail of the matching thread file every five seconds during execution and on demand. This rollout format is an optional, internal CLI interface: if files or fields are unavailable, execution and turn-end usage still work, and no context window is invented. Files are read from `CODEX_HOME` (default `~/.codex`), including archived sessions. The bridge does not publish transcript contents as telemetry.
+
+The app server must be able to initialize Codex's runtime state under the bridge service account. If account discovery is unavailable, check `codex app-server --help`, the service account's login, and its access to Codex's state directory. Neither account queries nor native telemetry estimate monetary cost.
 
 ## Switch providers in one conversation
 
@@ -225,14 +244,15 @@ Codex can inspect the saved file with its normal local tools when the sandbox pe
 | Bridge mode | Print or interactive PTY | Programmatic `codex exec --json` only |
 | Native lifecycle | Long-lived CLI process | One child process per turn; native thread resumed between turns |
 | `/mode` | Can switch print/interactive | Reports programmatic mode; interactive Codex is not implemented |
-| `/effort` | Bridge command where supported | Configure `model_reasoning_effort` in Codex config |
+| `/model` | Claude model aliases | Discovered Codex models, buttons, and config-default reset |
+| `/effort` | Bridge command where supported | Model-specific reasoning levels; persisted for future turns |
 | `--browser` bridge extra | Supported for Claude sessions | Not supported; configure Codex MCP servers locally |
-| Permission mode | Print-mode sessions default to `auto` (rare prompts arrive as cards in Matron); `--bypass`/`--auto` toggle it | Always runs with the equivalent of `--dangerously-skip-permissions`; no permission-mode flag |
+| Permission mode | Print-mode sessions default to `auto` (rare prompts arrive as cards in Matron); `--bypass`/`--auto` toggle it | Configured sandbox with `approval_policy="never"`; blocked operations fail |
 | `/mcp` | Live/configured status where available | Uses local Codex config; live status is not present in JSONL events |
 | `/tools` | Lists tools when the CLI exposes them | No authoritative inventory in JSONL; tools come from Codex, skills, sandbox, and MCP config |
-| `/usage` | Tokens and bridge-reported cost | Token counts only |
+| `/usage` | Tokens and bridge-reported cost | Native-thread token totals and actual context window; bridge totals as fallback |
 | `/cost` | Monetary cost where reported | Turn count only; `codex exec` does not report monetary cost |
-| `/limits` | Claude subscription limits | Not exposed by `codex exec` JSONL |
+| `/limits` | Claude subscription limits | Account quota windows and reset times through app server |
 
 ## Troubleshooting
 
