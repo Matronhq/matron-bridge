@@ -210,6 +210,8 @@ During a session:
 
 Messages sent while Codex is running are queued. Send-now uses native `turn/steer` with the expected turn ID, keeping the turn alive. Definite rejection retains input for the turn's end; a lost acknowledgement retains input but disables automatic resend to avoid duplicate actions. Inspect the response before explicitly sending or cancelling those messages. Use `!esc` to stop the active turn. Compaction runs separately and cannot be steered into another turn.
 
+Manual `/compact` and automatic context compaction show a “Compacting context” notice when Codex starts summarizing, followed by “Context compacted” when it finishes. Manual compaction confirms only after its turn succeeds; automatic compaction leaves the running task and queued messages in place.
+
 ## Models, effort, and usage
 
 `/model` discovers picker-visible models through `model/list`, including pagination. The bridge reads effective project configuration for the selected working directory; model and effort overrides stay local to the conversation and survive provider switches and restarts. `/model default` and `/effort default` remove the corresponding override. An explicit model ID remains usable if discovery is unavailable.
