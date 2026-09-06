@@ -212,6 +212,50 @@ describe('recent_folders', () => {
     }
   });
 
+  // agent_options feeds the New Chat Claude/Codex switch. Claude is always
+  // on offer (it is what the bridge is); Codex only when the box can spawn
+  // it — a picker that offers an agent which answers ENOENT helps no one.
+  describe('agent_options', () => {
+    it('lists Claude alone when the box has no codex binary', () => {
+      const { handler, responses } = harness({ codexAvailable: () => false });
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].result.agent_options).toEqual([{ value: 'claude', label: 'Claude Code' }]);
+    });
+
+    it('adds Codex when the box can spawn it', () => {
+      const { handler, responses } = harness({ codexAvailable: () => true });
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].result.agent_options).toEqual([
+        { value: 'claude', label: 'Claude Code' },
+        { value: 'codex', label: 'Codex' },
+      ]);
+    });
+
+    it('treats an unwired or throwing availability check as no Codex', () => {
+      for (const codexAvailable of [undefined, () => { throw new Error('boom'); }]) {
+        const { handler, responses } = harness({ codexAvailable });
+        handler(REQ('recent_folders', {}));
+        expect(responses[0].result.agent_options.map((o) => o.value)).toEqual(['claude']);
+      }
+    });
+
+    it('reports default_agent as the box default the picker should open on', () => {
+      for (const [defaultAgent, expected] of [['claude', 'claude'], ['codex', 'codex'], ['CODEX', 'codex']]) {
+        const { handler, responses } = harness({ defaultAgent, codexAvailable: () => true });
+        handler(REQ('recent_folders', {}));
+        expect(responses[0].result.default_agent).toBe(expected);
+      }
+    });
+
+    it('omits default_agent when the box default is unwired or junk', () => {
+      for (const defaultAgent of [undefined, null, 'nonsense']) {
+        const { handler, responses } = harness({ defaultAgent });
+        handler(REQ('recent_folders', {}));
+        expect('default_agent' in responses[0].result).toBe(false);
+      }
+    });
+  });
+
   it('attaches the account block when an email is known', () => {
     const { handler, responses } = harness({ getAccountEmail: () => 'pat@yearbook.com' });
     handler(REQ('recent_folders', {}));
@@ -509,6 +553,88 @@ describe('start', () => {
         expect('model' in calls[0]).toBe(false);
       }
     });
+  });
+});
+
+describe('start agent param', () => {
+  const spawning = (calls) => ({ startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; } });
+
+  it('passes an explicit agent through to startSession, normalized', () => {
+    for (const [agent, expected] of [['codex', 'codex'], ['Codex', 'codex'], ['claude', 'claude']]) {
+      const calls = [];
+      const { handler, responses } = harness({ ...spawning(calls), codexAvailable: () => true });
+      handler(REQ('start', { workdir: '~/yearbook-app', agent }));
+      expect(responses[0].ok).toBe(true);
+      expect(calls).toEqual([{ workdir: '/home/dan/yearbook-app', mcpExtras: [], agent: expected }]);
+    }
+  });
+
+  it('an omitted, null, or empty agent leaves the key off entirely — the box default applies', () => {
+    for (const params of [{}, { agent: null }, { agent: '' }]) {
+      const calls = [];
+      const { handler, responses } = harness(spawning(calls));
+      handler(REQ('start', params));
+      expect(responses[0].ok).toBe(true);
+      expect('agent' in calls[0]).toBe(false);
+    }
+  });
+
+  it('bad_agent on an unknown or non-string agent, spawning nothing', () => {
+    for (const agent of ['gemini', 42, {}]) {
+      const calls = [];
+      const { handler, responses } = harness(spawning(calls));
+      handler(REQ('start', { agent }));
+      expect(calls).toEqual([]);
+      expect(responses[0].ok).toBe(false);
+      expect(responses[0].error.code).toBe('bad_agent');
+    }
+  });
+
+  it('bad_agent when Codex is asked for on a box that cannot spawn it', () => {
+    const calls = [];
+    const { handler, responses } = harness({ ...spawning(calls), codexAvailable: () => false });
+    handler(REQ('start', { agent: 'codex' }));
+    expect(calls).toEqual([]);
+    expect(responses[0].error.code).toBe('bad_agent');
+    expect(responses[0].error.detail).toMatch(/codex/i);
+  });
+
+  // The model gate keys on the agent the session WILL run as, not the box
+  // default: an explicit Claude pick on a codex-default box may carry a
+  // model, and an explicit Codex pick on a claude-default box may not.
+  it('accepts a model with an explicit claude agent on a codex-default box', () => {
+    const calls = [];
+    const { handler, responses } = harness({ ...spawning(calls), defaultAgent: 'codex', codexAvailable: () => true });
+    handler(REQ('start', { agent: 'claude', model: 'opus' }));
+    expect(responses[0].ok).toBe(true);
+    expect(calls[0]).toEqual({ workdir: '/home/dan', mcpExtras: [], model: 'opus', agent: 'claude' });
+  });
+
+  it('bad_model when a model rides along with an explicit codex agent', () => {
+    const calls = [];
+    const { handler, responses } = harness({ ...spawning(calls), codexAvailable: () => true });
+    handler(REQ('start', { agent: 'codex', model: 'opus' }));
+    expect(calls).toEqual([]);
+    expect(responses[0].error.code).toBe('bad_model');
+    expect(responses[0].error.detail).toMatch(/codex/i);
+  });
+
+  // Mirrors the !start refusal: browser tools are a Claude MCP extra, and a
+  // Codex session on the legacy exec transport has nowhere to load them.
+  it('refuses browser with codex on the legacy exec transport, allows it on app-server', () => {
+    const refused = [];
+    const { handler, responses } = harness({ ...spawning(refused), codexAvailable: () => true, codexAppServer: false });
+    handler(REQ('start', { agent: 'codex', browser: true }));
+    expect(refused).toEqual([]);
+    expect(responses[0].ok).toBe(false);
+    expect(responses[0].error.code).toBe('bad_request');
+    expect(responses[0].error.detail).toMatch(/browser/i);
+
+    const allowed = [];
+    const h2 = harness({ ...spawning(allowed), codexAvailable: () => true, codexAppServer: true });
+    h2.handler(REQ('start', { agent: 'codex', browser: true }));
+    expect(h2.responses[0].ok).toBe(true);
+    expect(allowed[0].mcpExtras).toEqual(['browser']);
   });
 });
 
