@@ -182,6 +182,8 @@ Both `/` and `!` prefixes work for bridge commands.
 /resume --codex <thread-id-or-unique-prefix>
 ```
 
+From the Matron apps, the New Chat panel shows a Claude / Codex switch on the folder step for any box whose bridge can spawn `codex` (a real binary on the bridge's `PATH`, or `MATRON_CODEX_REAL_BIN`). The switch opens on the box's `MATRON_DEFAULT_AGENT` and hides where only Claude is available. Under the hood the bridge's `recent_folders` reply carries `agent_options` and `default_agent`, and the `start` RPC accepts `agent: "claude" | "codex"`; a Claude model pick is refused for a Codex start (`bad_model`), and a Codex pick on a box without the binary answers `bad_agent`.
+
 `/sessions --codex` lists recent native CLI, desktop/IDE, exec, and app-server threads alongside bridge-owned threads for the current directory. A numeric `/resume` selection uses the last displayed list, so it does not shift when a thread updates. Native prefixes must identify one listed thread; ambiguity is rejected. Listing is bounded to 150 recent native threads, excludes archived threads and subagents, and falls back visibly to bridge records if the CLI is unavailable.
 
 During a session:

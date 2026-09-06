@@ -64,7 +64,7 @@ import { SubagentWatcher } from './lib/subagent-watcher.js';
 import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
-import { launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
+import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
@@ -814,20 +814,39 @@ const subagentRunningStore = createSubagentRunningStore({ log: console });
 // origin-room replies — an RPC start has no origin chat room. Returns the
 // session; the RPC handler answers with its claudeSessionId (the journal
 // convo id — NOT the room key, which is bridge-internal).
-function journalStartSessionForRpc({ workdir, mcpExtras, model = null }) {
+function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = null }) {
   const sessionRoomId = newSessionConvoId();
   const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
   const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
   const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
     sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+  // `agent` is the New Chat switch's pick (validated by the RPC handler);
+  // absent means createSession's resolveAgent falls to the box default,
+  // exactly as before the switch existed. persistSession's live snapshot
+  // carries session.agent, so nothing extra to persist for it here.
   const session = createSession(sessionRoomId, workdir, undefined, {
     mcpExtras,
     ...(model ? { model } : {}),
+    ...(agent ? { agent } : {}),
   });
   session.originRoomId = null;
   session.sendCallback = sessionSendReply;
   session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
+  // A fresh Codex session learns its native thread id from the stream, so
+  // unlike Claude (which pre-assigns its id at spawn) it has no journal
+  // convo id yet — and the RPC handler must answer one synchronously or
+  // tear the session down as unsupported_mode. Mint the STABLE id here, the
+  // way /switch does (stableConvoId): the thread id lands later as
+  // claudeSessionId only, thread.started leaves an existing journalConvoId
+  // alone and persists it. Flushing now turns the buffered title seed into
+  // a real convo server-side before the app navigates to it, and re-seeds
+  // the header status the spawn skipped for want of an id.
+  if (session.agent === AGENT_CODEX && !session.journalConvoId) {
+    session.journalConvoId = newSessionConvoId();
+    journalFlushForSession(session);
+    journalSpawnStatus(session);
+  }
   // Same rules as !start: the requested model is the session's model from the
   // first turn, and it must be set before persisting (the live snapshot reads
   // currentModel). claudeSessionId is known immediately (pre-assigned at
@@ -866,6 +885,12 @@ const journalRpcHandler = createRpcRequestHandler({
   // what a no-pick start will actually run on (the spawn applies it via
   // resolveModel's fallback, so this is a label, not a second code path).
   defaultModel: DEFAULT_MODEL,
+  // The New Chat Claude/Codex switch: Codex is offered (and an explicit
+  // `agent: 'codex'` start accepted) only when this box can spawn it. Read
+  // per request — a handful of realpath calls — so installing codex later
+  // shows up without a bridge restart.
+  codexAvailable: () => detectCodexBinary(),
+  codexAppServer: CODEX_APP_SERVER,
   expandHome,
   // Capacity thunks (2026-08-10 capacity spec): answered from cache, never
   // blocking a reply on a subprocess. getLimits kicks a background refresh

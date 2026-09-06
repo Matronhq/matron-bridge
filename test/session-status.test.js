@@ -648,9 +648,10 @@ describe('index.js header-liveness wiring', () => {
   });
 
   it('all three spawn branches seed the header via journalSpawnStatus', () => {
-    // Definition + print + iv + codex call sites.
+    // Definition + print + iv + codex call sites, plus the RPC-start re-seed
+    // for a Codex session whose convo id is minted after the spawn.
     const calls = src.match(/journalSpawnStatus\(/g) || [];
-    expect(calls.length).toBe(4);
+    expect(calls.length).toBe(5);
     // The helper publishes now and repaints when the limits refresh lands.
     const start = src.indexOf('function journalSpawnStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
