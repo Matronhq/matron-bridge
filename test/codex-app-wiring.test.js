@@ -12,6 +12,67 @@ function setup(extraOptions = {}) {
   return { codex, session, publisher, ...options };
 }
 describe('Codex journal publication', () => {
+  it('announces manual compaction and confirms once only after a successful turn exit', () => {
+    const h = setup(); h.codex.operation = { kind: 'compact' };
+    const item = { id: 'compact', type: 'contextCompaction' };
+    const started = { method: 'item/started', item, turnId: 'turn' };
+    const completed = { ...started, method: 'item/completed' };
+    h.codex.emit('item', started); h.codex.emit('item', started);
+    expect(h.notice.mock.calls.map(c => c[1])).toEqual(['🗜️ Compacting context — summarizing conversation history…']);
+    expect(h.activity).toHaveBeenLastCalledWith(h.session, 'thinking', 'Compacting context');
+    h.codex.emit('item', completed); h.codex.emit('item', completed); h.codex.emit('item', started);
+    expect(h.notice).toHaveBeenCalledTimes(1);
+    h.codex.operation = null; // the adapter clears this before emitting turn-exit
+    h.codex.emit('turn-exit', { code: 0 }); h.codex.emit('turn-exit', { code: 0 });
+    expect(h.notice.mock.calls.map(c => c[1])).toEqual([
+      '🗜️ Compacting context — summarizing conversation history…',
+      '✅ Context compacted — conversation history summarized.',
+    ]);
+    expect(h.publishText).not.toHaveBeenCalled();
+  });
+  it('announces automatic compaction without ending the running task or changing queued input', () => {
+    const h = setup(); h.codex.operation = { kind: 'turn' };
+    const queue = [[{ type: 'text', text: 'Follow up' }]]; h.session.queuedMessages = queue;
+    const item = { id: 'auto', type: 'contextCompaction' };
+    h.codex.emit('item', { method: 'item/started', item, turnId: 'turn' });
+    h.codex.emit('item', { method: 'item/completed', item, turnId: 'turn' });
+    expect(h.notice).toHaveBeenLastCalledWith(h.session, '✅ Context compacted — conversation history summarized.');
+    expect(h.session.busy).toBe(true);
+    expect(h.session.queuedMessages).toEqual([[{ type: 'text', text: 'Follow up' }]]);
+    expect(h.activity).toHaveBeenLastCalledWith(h.session, 'thinking');
+    h.codex.emit('turn-exit', { code: 0 }); expect(h.notice).toHaveBeenCalledTimes(2);
+  });
+  it.each([1, 130])('does not confirm failed or interrupted manual compaction (exit %i)', code => {
+    const h = setup(); h.codex.operation = { kind: 'compact' };
+    const item = { id: 'compact', type: 'contextCompaction' };
+    h.codex.emit('item', { method: 'item/started', item });
+    h.codex.emit('item', { method: 'item/completed', item });
+    h.codex.emit('turn-exit', { code });
+    h.codex.emit('turn-exit', { code: 0 });
+    expect(h.notice).toHaveBeenCalledTimes(1);
+  });
+  it('resets compaction notices on reconnect and allows subsequent compactions', () => {
+    const h = setup(); h.codex.operation = { kind: 'compact' };
+    const item = { id: 'compact', type: 'contextCompaction' };
+    h.codex.emit('item', { method: 'item/started', item });
+    h.codex.emit('item', { method: 'item/completed', item });
+    h.codex.emit('connection-reset');
+    h.codex.emit('turn-exit', { code: 0 });
+    expect(h.notice).toHaveBeenCalledTimes(1);
+    h.codex.emit('item', { method: 'item/started', item });
+    h.codex.emit('item', { method: 'item/completed', item });
+    h.codex.emit('turn-exit', { code: 0 });
+    expect(h.notice).toHaveBeenCalledTimes(3);
+  });
+  it('keeps child and stopped-session compaction out of the parent chat', () => {
+    const h = setup(); const item = { id: 'compact', type: 'contextCompaction' };
+    h.codex.emit('child-event', { method: 'item/started', params: { threadId: 'child', item } });
+    h.session.alive = false;
+    h.codex.emit('item', { method: 'item/started', item });
+    h.codex.emit('item', { method: 'item/completed', item });
+    h.codex.emit('turn-exit', { code: 0 });
+    expect(h.notice).not.toHaveBeenCalled();
+  });
   it('publishes completed async question messages as cards that survive normal turn completion', async () => {
     const submitAsyncAnswer = vi.fn(() => true);
     const h = setup({ submitAsyncAnswer });
