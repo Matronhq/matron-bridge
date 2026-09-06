@@ -842,7 +842,8 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   // alone and persists it. Flushing now turns the buffered title seed into
   // a real convo server-side before the app navigates to it, and re-seeds
   // the header status the spawn skipped for want of an id.
-  if (session.agent === AGENT_CODEX && !session.journalConvoId) {
+  const mintedConvoId = session.agent === AGENT_CODEX && !session.journalConvoId;
+  if (mintedConvoId) {
     session.journalConvoId = newSessionConvoId();
     journalFlushForSession(session);
     journalSpawnStatus(session);
@@ -855,7 +856,13 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   // explicit `extra` — persistSession auto-carries mcpExtras but deliberately
   // not model.
   if (model) session.currentModel = model;
-  if ((mcpExtras.length > 0 || model) && session.claudeSessionId) {
+  // A minted Codex convo id is persisted NOW too (Bugbot, PR #263):
+  // journalResumeConvo matches on the persisted journalConvoId/sessionId,
+  // both otherwise unset until thread.started, so an idle reap or bridge
+  // restart in that window would orphan the chat the app just opened. The
+  // live snapshot carries journalConvoId; the native id is still null and
+  // persistSession keeps it null rather than inventing one.
+  if ((mcpExtras.length > 0 || model || mintedConvoId) && (session.claudeSessionId || mintedConvoId)) {
     persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null,
       model ? { model } : undefined);
   }

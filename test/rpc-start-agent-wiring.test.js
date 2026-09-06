@@ -41,6 +41,16 @@ describe('New Chat agent switch wiring (source inspection)', () => {
     expect(src).toMatch(/journalConvoId = newSessionConvoId\(\)[\s\S]*?journalFlushForSession\(session\)/);
   });
 
+  // Bugbot (PR #263): the minted id must ALSO be persisted at once —
+  // journalResumeConvo matches on the persisted journalConvoId/sessionId,
+  // both unset until thread.started, so an idle reap or bridge restart in
+  // that window would orphan the chat the app just opened.
+  it('persists the minted Codex convo id immediately, not only at thread.started', () => {
+    const src = rpcStart();
+    expect(src).toMatch(/const mintedConvoId = session\.agent === AGENT_CODEX && !session\.journalConvoId/);
+    expect(src).toMatch(/\(mcpExtras\.length > 0 \|\| model \|\| mintedConvoId\) && \(session\.claudeSessionId \|\| mintedConvoId\)/);
+  });
+
   it('hands the handler a live Codex-availability check and the transport flag', () => {
     const src = handlerWiring();
     expect(src).toMatch(/codexAvailable: \(\) => detectCodexBinary\(\)/);
