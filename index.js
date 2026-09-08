@@ -8314,11 +8314,12 @@ async function journalMakeTaskFromQueue(session, { text, username }) {
   const trimmed = spoken.trim();
   if (!trimmed) return { ok: false, error: 'nothing to file' };
   // First line titles it, the rest is the body — the same shape item_add uses
-  // and the same shape the app's own filing flow produces.
+  // and the same shape the app's own filing flow produces. `trimmed` is
+  // non-empty and starts with a non-space character, so the first line is
+  // always a usable title; the empty case is the guard above, not here.
   const nl = trimmed.indexOf('\n');
   const title = (nl < 0 ? trimmed : trimmed.slice(0, nl)).trim().slice(0, 200);
   const body = nl < 0 ? '' : trimmed.slice(nl + 1).trim();
-  if (!title) return { ok: false, error: 'nothing to file' };
 
   const res = await itemsClient.create({
     kind: 'task',

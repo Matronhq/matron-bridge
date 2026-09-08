@@ -2154,6 +2154,11 @@ describe('make_task', () => {
     const payload = withAction.mock.calls[0][5];
     expect(payload.actions.map((a) => a.id)).toEqual(['send', 'make_task', 'cancel']);
     expect(payload.actions[1]).toEqual({ id: 'make_task', label: '📌 Make task', intent: 'neutral' });
+    // The question has to account for every button on the card, and each "it"
+    // has to have exactly one referent.
+    expect(payload.question).toBe(
+      'Send this queued message now, or cancel it? You can also file this message as a task instead.',
+    );
     // The compatibility option list is derived from `actions`, so an older
     // client's free-text-shaped reply routes as the same wire action.
     expect(payload.options.map((o) => o.value)).toEqual(['send', 'make_task', 'cancel']);
@@ -2214,6 +2219,29 @@ describe('make_task', () => {
     expect(deps.flushQueue).not.toHaveBeenCalled();
   });
 
+  // The item is filed; only the queued copy's fate is uncertain, and the two
+  // ways it can go (a turn-end flush already sent it; the durable release
+  // fail-closed) are indistinguishable from here.
+  it('says the task was filed even when the queued copy could not be withdrawn', async () => {
+    const session = twoQueuedSession();
+    const notify = vi.fn();
+    resolveQueueReleaseTap('make_task', session, {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease: { dropItem: vi.fn() },
+      // Write-ahead fail-close: the release never happens, so the message stays.
+      emitRelease: vi.fn(() => false),
+      notify,
+      makeTask: vi.fn(async () => ({ ok: true, num: 7, id: 'it_7' })),
+    });
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(
+      '📌 Filed as task #7, but the queued message was already sent or could not be withdrawn.',
+    ));
+    expect(session.queuedMessages).toHaveLength(2);
+  });
+
   it('leaves the message queued and says so when the journal refuses the item', async () => {
     const session = twoQueuedSession();
     const notify = vi.fn();
@@ -2260,33 +2288,119 @@ describe('make_task', () => {
     expect(session.queuedMessages).toHaveLength(2);
   });
 
-  it('is a silent no-op on a media entry or a stale card, and unhandled without the seam', async () => {
-    const media = twoQueuedSession([{ type: 'image', source: {} }]);
+  it('files nothing on a media entry or a stale card, and SAYS so; unhandled without the seam', async () => {
     const makeTask = vi.fn(async () => ({ ok: true, num: 9, id: 'it_9' }));
-    const notify = vi.fn();
+
+    // A card is durable and the queue is shared, so a media entry can be under
+    // a card that offered the action. Nothing to file — and saying nothing
+    // would look exactly like a successful filing.
+    const media = twoQueuedSession([{ type: 'image', source: {} }]);
+    const mediaNotify = vi.fn();
     expect(resolveQueueReleaseTap('make_task', media, {
       ...matrixDeps(), entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] }, convoId: 'c1',
-      queueRelease: { dropItem: vi.fn() }, emitRelease: vi.fn(), notify, makeTask,
+      queueRelease: { dropItem: vi.fn() }, emitRelease: vi.fn(), notify: mediaNotify, makeTask,
     })).toBe(true);
     expect(makeTask).not.toHaveBeenCalled();
     expect(media.queuedMessages).toHaveLength(2);
+    expect(mediaNotify).toHaveBeenCalledWith("That queued message isn't text, so there's nothing to put in a task.");
 
     // The tapped message already flushed or was cancelled elsewhere.
     const stale = twoQueuedSession();
+    const staleNotify = vi.fn();
     expect(resolveQueueReleaseTap('make_task', stale, {
       ...matrixDeps(), entry: { prompt_id: 'pr_9', itemIds: ['pr_9::0'] }, convoId: 'c1',
-      queueRelease: { dropItem: vi.fn() }, emitRelease: vi.fn(), notify, makeTask,
+      queueRelease: { dropItem: vi.fn() }, emitRelease: vi.fn(), notify: staleNotify, makeTask,
     })).toBe(true);
     expect(makeTask).not.toHaveBeenCalled();
     expect(stale.queuedMessages).toHaveLength(2);
+    expect(staleNotify).toHaveBeenCalledWith('That queued message is no longer here — nothing was filed.');
 
     // A caller that never wired the seam cannot honour the action: report it
     // unhandled rather than silently swallowing the tap.
+    const unwiredNotify = vi.fn();
     expect(resolveQueueReleaseTap('make_task', twoQueuedSession(), {
       ...matrixDeps(), entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] }, convoId: 'c1',
+      notify: unwiredNotify,
     })).toBe(false);
     await Promise.resolve();
-    expect(notify).not.toHaveBeenCalled();
+    expect(unwiredNotify).not.toHaveBeenCalled();
+  });
+
+  // #1 (review): the tap is acknowledged synchronously and the card stays on
+  // screen until the POST resolves, so an impatient double tap must not file
+  // two tasks — and must not produce a second release whose failure would tell
+  // the user, falsely, that the message is still going out.
+  it('ignores a second tap while the first is still filing', async () => {
+    const session = twoQueuedSession();
+    let resolveFirst;
+    const makeTask = vi.fn(() => new Promise((resolve) => { resolveFirst = resolve; }));
+    const notify = vi.fn();
+    const { emitRelease, emitted } = durableRelease();
+    const queueRelease = { dropItem: vi.fn() };
+    const deps = {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease,
+      emitRelease,
+      notify,
+      makeTask,
+    };
+
+    expect(resolveQueueReleaseTap('make_task', session, deps)).toBe(true);
+    await Promise.resolve();
+    // Second tap, first POST still in flight: handled, but nothing new starts.
+    expect(resolveQueueReleaseTap('make_task', session, deps)).toBe(true);
+    expect(makeTask).toHaveBeenCalledTimes(1);
+
+    resolveFirst({ ok: true, num: 7, id: 'it_7' });
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(notify).toHaveBeenCalledWith('📌 Filed as task #7. The agent will be told when this turn ends.');
+    expect(emitted).toHaveLength(1);
+    expect(queueRelease.dropItem).toHaveBeenCalledTimes(1);
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
+
+    // The guard is released once the filing settles: the entry is gone now, so
+    // a later tap is the stale path, not a silently swallowed one.
+    await vi.waitFor(() => expect(session._makeTaskInFlight.size).toBe(0));
+    notify.mockClear();
+    resolveQueueReleaseTap('make_task', session, deps);
+    expect(notify).toHaveBeenCalledWith('That queued message is no longer here — nothing was filed.');
+    expect(makeTask).toHaveBeenCalledTimes(1);
+  });
+
+  // #5 (review): makeTask is the seam that queues the agent's heads-up, so by
+  // the time it resolves the queue has grown UNDER the tapped index. The
+  // release must still splice the tapped message and keep both arrays aligned.
+  it('splices the tapped entry even when filing appended a heads-up to the queue', async () => {
+    const session = twoQueuedSession();
+    const notify = vi.fn();
+    const { emitRelease } = durableRelease();
+    const queueRelease = { dropItem: vi.fn() };
+    const makeTask = vi.fn(async (s) => {
+      // What index.js's journalQueueMedia does: push the entry, then let
+      // notifyQueuedMessage reserve its lockstep notification slot.
+      s.queuedMessages.push([{ type: 'text', text: '📌 #7 filed' }]);
+      s.queueNotifications.push({ eventId: null, plain: '📨 Queued (3): 📌 #7 filed', id: 'pr_3::0' });
+      return { ok: true, num: 7, id: 'it_7' };
+    });
+
+    resolveQueueReleaseTap('make_task', session, {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease,
+      emitRelease,
+      notify,
+      makeTask,
+    });
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(expect.stringContaining('Filed as task #7')));
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: 'second' }],
+      [{ type: 'text', text: '📌 #7 filed' }],
+    ]);
+    expect(session.queueNotifications.map((n) => n.id)).toEqual(['pr_2::0', 'pr_3::0']);
   });
 
   it('only a non-empty all-text entry counts as filable', () => {
