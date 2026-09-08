@@ -4,7 +4,9 @@ import { spawn } from 'child_process';
 import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
-import { createSendAttachmentHandler } from './lib/send-attachment.js';
+import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
+import { createItemsClient } from './lib/items-client.js';
+import { createItemsHandlers } from './lib/items-tools.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -99,7 +101,7 @@ import {
   shareAgentMedia,
 } from './lib/show-file.js';
 import { processShowFile } from './lib/show-file-handler.js';
-import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
+import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
@@ -451,6 +453,18 @@ function resolveJournalToken() {
   return (process.env.JOURNAL_TOKEN || '').trim();
 }
 const _journalToken = resolveJournalToken();
+// Task & decision tracker (spec 2026-09-08). One client for the item_* tools,
+// the queued-card "Make task" tap, and the inbound item-turn router — HTTP
+// against the same host the media routes use, with the same bearer token.
+// Built here rather than next to the handlers so the later wirings can share
+// it; JOURNAL_ENABLED is not declared yet, hence the inline equivalent. With
+// no journal configured the base URL is empty and every call resolves status
+// 0, which the handlers turn into a 502 "journal unreachable" — a tool that
+// says so beats one that throws.
+const itemsClient = createItemsClient({
+  baseUrl: JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '',
+  token: _journalToken,
+});
 // Return path (Matron -> bridge input, this PR): where the inbound cursor is
 // persisted (survives a bridge restart — see lib/journal-publisher.js) and
 // the stable conversation Matron sends session-start/list/help commands
@@ -9597,6 +9611,18 @@ const agentChatHandlers = createAgentChatHandlers({
   log: console,
 });
 
+// The seven item_* tools (lib/items-tools.js), mounted below as loopback
+// routes in the same pattern. Attachments go through the SAME resolve +
+// guard + upload path as send_attachment — a tool argument is an untrusted
+// path either way, so the workdir containment and sensitive-file gate must
+// not be re-implemented here.
+const itemsHandlers = createItemsHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: itemsClient,
+  uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+});
+
 // Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
 // agent_boxes / agent_session_start MCP tools and the kind:'spawn' outcome
 // frames. Constructed exactly once, here — the factory starts an unref'd
@@ -10026,6 +10052,17 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/restart-session') {
         await respondAgentChatRoute(res, data, selfRestartHandler,
           (status, b) => debug(`restart-session ${status} ${b.parked ? 'parked' : ''} ${b.error || ''}`));
+        return;
+      }
+
+      // The seven item_* tool routes. One matcher rather than seven blocks:
+      // the handler names ARE the path segments, and the anchored alternation
+      // is the allowlist (no dynamic property lookup from raw input).
+      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder)$/);
+      if (itemsRoute) {
+        const name = itemsRoute[1];
+        await respondAgentChatRoute(res, data, itemsHandlers[name],
+          (status, b) => debug(`items/${name} ${status} ${b.error || (b.item ? `#${b.item.num ?? '?'}` : `${(b.items || []).length} items`)}`));
         return;
       }
 

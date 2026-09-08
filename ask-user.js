@@ -7,6 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
+import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -607,6 +608,112 @@ server.tool(
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
   }
+);
+
+// --- Task & decision tracker (spec 2026-09-08) ---
+//
+// The seven item_* tools share one shape: POST the args to the loopback
+// route, render `data.error` / `HTTP <status>` on failure, and a compact
+// English line on success (the rendering lives in lib/items-format.js so it
+// is testable without a journal). Never isError: a tool result that reads as
+// a sentence keeps the model working instead of retrying blindly.
+async function callItems(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/items/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `item_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'item_create',
+  "File an item in the user's task & decision tracker — a panel beside the chat, so it survives this session and the user can answer in their own time. Use kind 'question' for EACH decision you need from the user instead of listing questions in prose: the user answers in that item's own thread and their reply reaches you as a 📌 turn, so do not block waiting for it. Use 'decision' to record a choice you made yourself (what and why, in body) and 'task' for work to do later. Markdown body; attach screenshots or files by local path (uploaded and shown inline).",
+  {
+    kind: z.enum(['task', 'question', 'decision']),
+    title: z.string().describe('One line, ≤200 chars'),
+    body: z.string().optional().describe('Markdown. For a question: the options and your recommendation. For a decision: what and why.'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory'),
+    labels: z.array(z.string()).optional(),
+    links: z.array(z.object({ url: z.string(), title: z.string().optional() })).optional().describe('e.g. a GitHub issue or PR'),
+    awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, task→agent, decision→nobody'),
+    position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
+    supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
+  },
+  async (args) => callItems('create', args, (d) => itemLine(d.item)),
+);
+
+server.tool(
+  'item_list',
+  "List tracker items. By default: THIS conversation's open items, in list order. scope 'all' widens to every conversation of this user (other agents' items too). Worth checking at the start of a session, and before asking the user anything — the answer may already be filed.",
+  {
+    scope: z.enum(['convo', 'all']).default('convo').describe("Only this conversation's items unless set to 'all'"),
+    kind: z.enum(['task', 'question', 'decision']).optional(),
+    state: z.enum(['open', 'closed', 'any']).default('open').describe("'any' includes closed items"),
+    awaiting: z.enum(['user', 'agent']).optional().describe("'user' = blocked on the user; 'agent' = yours to act on"),
+    label: z.string().optional(),
+    since: z.number().int().optional().describe('Only items updated at/after this ms timestamp — cheap polling'),
+    limit: z.number().int().min(1).max(500).optional(),
+  },
+  async (args) => callItems('list', args, formatItemList),
+);
+
+server.tool(
+  'item_get',
+  "Read one item in full: its body and its whole comment thread — the user's answers, attachments, voice-note transcripts and status changes.",
+  { id: z.string().describe("Item id ('it_…') or '#12'") },
+  async (args) => callItems('get', args, formatItemDetail),
+);
+
+server.tool(
+  'item_comment',
+  "Add a comment to an item (text and/or attachments by local path) — progress, findings, or a follow-up question in the same thread. Optionally set `awaiting` to hand the item to the user ('user'), take it back ('agent'), or clear it (null). Prefer `item_close` when the item is actually resolved.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    body: z.string().optional().describe('Markdown'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory'),
+    awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
+  },
+  async (args) => callItems('comment', args, (d) => formatCommentAck(d, args.awaiting)),
+);
+
+server.tool(
+  'item_close',
+  "Close an item with a resolution: 'answered' (a question you have acted on), 'done' or 'cancelled' (task), 'decided' or 'reversed' (decision). Optional closing comment — say what happened.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    resolution: z.enum(['done', 'answered', 'decided', 'reversed', 'cancelled']),
+    comment: z.string().optional().describe('Closing note, added to the thread'),
+  },
+  async (args) => callItems('close', args, (d) => itemLine(d.item)),
+);
+
+server.tool(
+  'item_reopen',
+  'Reopen a closed item, with an optional comment explaining why it is back.',
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    comment: z.string().optional(),
+  },
+  async (args) => callItems('reopen', args, (d) => itemLine(d.item)),
+);
+
+server.tool(
+  'item_reorder',
+  'Move an item in the ordered list: to the top or bottom, or after/before another item. Exactly one of position, after or before.',
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    position: z.enum(['top', 'bottom']).optional(),
+    after: z.string().optional().describe('Item id to place this one after'),
+    before: z.string().optional().describe('Item id to place this one before'),
+  },
+  async (args) => callItems('reorder', args, (d) => itemLine(d.item)),
 );
 
 const transport = new StdioServerTransport();
