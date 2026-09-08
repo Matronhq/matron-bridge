@@ -74,11 +74,8 @@ describe('createItemsClient', () => {
   });
 
   it('handles non-JSON response bodies gracefully', async () => {
-    const { fetchImpl: fetch204 } = fakeFetch(() => ({
-      status: 204,
-      body: undefined, // json() will fail for 204 No Content
-    }));
-    // Override to throw on json()
+    // A real 204 has no body, so json() rejects — the shared fakeFetch helper
+    // can't express that, hence the hand-rolled stubs here.
     const mockFetch204 = vi.fn(async () => ({
       ok: true,
       status: 204,
