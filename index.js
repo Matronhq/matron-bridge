@@ -124,6 +124,7 @@ import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
+import { createItemTurnRouter } from './lib/items-turn.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
@@ -8267,6 +8268,42 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
   }
 }
 
+// A user-authored tracker marker (item comment / filed task / close / reopen)
+// -> one synthetic 📌 user turn. Thin wiring around lib/items-turn.js, sharing
+// every seam the media path already uses: the same blob fetch, the same
+// whisper transcription, the same busy queue. Nothing here re-mirrors into the
+// journal — the marker IS the durable record, so injecting passes
+// skipJournalMirror and the queued entry passes mirrorToJournal:false; a
+// mirror would show the user their own reply back as a second message.
+const itemTurnRouter = createItemTurnRouter({
+  fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
+  transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
+  queueText: (session, { text, preview }) => journalQueueMedia(session, {
+    blocks: [{ type: 'text', text }],
+    mirrorToJournal: false,
+    preview,
+    fullText: text,
+  }),
+  publishNotice: journalPublishNotice,
+  // The journal strips any client-supplied transcript, so a voice note on an
+  // item arrives with transcript:null and only the bridge can fill it in.
+  setTranscript: (id, commentId, body) => itemsClient.setTranscript(id, commentId, body),
+  getItem: (id) => itemsClient.get(id),
+  log: console,
+});
+
+function journalOnItem(session, item, ctx) {
+  // Same reasoning as journalOnMedia: answering the agent's question is the
+  // user back in the loop, so it refreshes the self-restart budget.
+  session._agentRestartCount = 0;
+  // Fire-and-forget, matching routeMediaToSession's contract — the route
+  // swallows its own failures, so this catch is belt-and-braces.
+  itemTurnRouter(session, item, ctx).catch((e) => {
+    try { console.warn(`[items-turn] ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+  });
+}
+
 function journalOnMedia(session, media, ctx) {
   // A voice note or a photo is the user back in the loop just as much as
   // typed text is, so it refreshes the self-restart budget too (text resets
@@ -9231,6 +9268,7 @@ const journalInputConsumer = createJournalInputConsumer({
   findSessionByConvoId: findSessionByClaudeSessionId,
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
+  routeItemToSession: journalOnItem,
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
   // A verified /sleep card tap whose session the idle reaper already removed

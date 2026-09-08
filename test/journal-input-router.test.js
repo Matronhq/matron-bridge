@@ -93,6 +93,43 @@ describe('createJournalInputConsumer', () => {
     };
   }
 
+  it('routes a user item marker to routeItemToSession when the seam is wired, and ignores it otherwise', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn() });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', seq: 7, payload }));
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    const [session, item, ctx] = deps.routeItemToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(item).toEqual({ payload, seq: 7 });
+    expect(ctx).toEqual({ username: 'dan' });
+    // agent-authored marker (the bridge's own API write echo): dropped
+    consumer(baseFrame({ type: 'item', sender: 'agent:dev-2', payload }));
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    // unwired seam: pass-through, and nothing else in the pipeline reacts
+    const bareDeps = makeDeps();
+    const bare = createJournalInputConsumer(bareDeps);
+    bare(baseFrame({ type: 'item', payload }));
+    expect(bareDeps.findSessionByConvoId).not.toHaveBeenCalled();
+    expect(bareDeps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('an item marker for a dead session notices instead of routing', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn(), findSessionByConvoId: vi.fn(() => null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', payload }));
+    expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
+  });
+
+  it('a routeItemToSession that throws never breaks the consumer', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn(() => { throw new Error('boom'); }) });
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(baseFrame({ type: 'item', payload }))).not.toThrow();
+  });
+
   it('ignores frames whose sender is not user:* (agent echoes — the loop-prevention filter)', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
