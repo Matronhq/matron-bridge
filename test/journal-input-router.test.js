@@ -114,7 +114,49 @@ describe('createJournalInputConsumer', () => {
     expect(bareDeps.routeTextToSession).not.toHaveBeenCalled();
   });
 
-  it('an item marker for a dead session notices instead of routing', () => {
+  it('an item marker wakes a reaped session, exactly as text does', () => {
+    // Spec: a reply "wakes the box if asleep". Answering the agent's question
+    // hours later — after the idle reaper took the session — is the case the
+    // tracker exists for, so the marker must auto-resume and then route into
+    // the resumed session, not hit the unknown-convo notice.
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const resumed = { claudeSessionId: 'convo-1', resumed: true };
+    const deps = makeDeps({
+      routeItemToSession: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      resumeSessionForConvo: vi.fn(() => resumed),
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', payload }));
+    expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'dan' });
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeItemToSession.mock.calls[0][0]).toBe(resumed);
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('a reordered item marker never wakes a reaped session', () => {
+    // Backlog housekeeping produces no turn (lib/items-turn.js isTurnWorthy),
+    // so respawning a whole agent session for it would be pure cost. Same for
+    // a field edit and a malformed marker.
+    const deps = makeDeps({
+      routeItemToSession: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      resumeSessionForConvo: vi.fn(() => ({ claudeSessionId: 'convo-1' })),
+    });
+    const consumer = createJournalInputConsumer(deps);
+    for (const payload of [
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'reordered', by: 'user', awaiting: null, resolution: null },
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'updated', by: 'user', awaiting: null, resolution: null },
+      { action: 'commented' },
+    ]) {
+      consumer(baseFrame({ type: 'item', payload }));
+    }
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(3);
+  });
+
+  it('an item marker for a dead session on a bridge with no resume seam notices instead of routing', () => {
     const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
     const deps = makeDeps({ routeItemToSession: vi.fn(), findSessionByConvoId: vi.fn(() => null) });
     const consumer = createJournalInputConsumer(deps);

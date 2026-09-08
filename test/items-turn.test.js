@@ -36,6 +36,14 @@ describe('formatItemTurn', () => {
     expect(formatItemTurn({ action: 'commented' }, { username: 'dan' })).toBeNull();
     expect(formatItemTurn(null, { username: 'dan' })).toBeNull();
   });
+  it('falls back to the neutral word for an unknown kind', () => {
+    // A newer journal may mint a kind this build has never heard of; the turn
+    // must still read as English rather than "filed a new undefined".
+    const t = formatItemTurn({ ...base, kind: 'epic', action: 'created' }, { username: 'dan', body: 'do it' });
+    expect(t).toBe('📌 dan filed a new item #12 "Which auth library?":\ndo it\n(item, now awaiting: agent. item_get it_1 for the full thread; item_close when acted on.)');
+    expect(formatItemTurn({ ...base, kind: undefined, action: 'commented', comment: { id: 'c', body: 'x', attachments: [] } }, { username: 'dan' }))
+      .toContain('(item, now awaiting: agent.');
+  });
   it('falls back to a generic author and a null awaiting', () => {
     const t = formatItemTurn({ ...base, action: 'commented', awaiting: null, comment: { id: 'c', body: 'x', attachments: [] } }, {});
     expect(t).toContain('— the user replied:');
@@ -126,6 +134,69 @@ describe('createItemTurnRouter', () => {
 
   it('an undeliverable turn publishes a notice', async () => {
     const { deps, route } = fixture({ injectBlocks: vi.fn(() => false) });
+    await route({ busy: false, journalConvoId: 'c1' }, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'x', attachments: [] } } }, { username: 'dan' });
+    expect(deps.publishNotice).toHaveBeenCalledWith('c1', expect.stringContaining("Couldn't deliver"));
+  });
+
+  it('reads session.busy AFTER the awaits, so a turn that starts mid-transcribe queues', async () => {
+    // The mirror image of journal-media's shouldQueue: busy is a live property,
+    // and a slow whisper run can straddle the start of a turn.
+    const session = { busy: false, claudeSessionId: 'c1' };
+    const { deps, route } = fixture({ transcribe: vi.fn(async () => { session.busy = true; return 'spoken words'; }) });
+    await route(session, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: '', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 1, transcript: null }] } } }, { username: 'dan' });
+    expect(deps.queueText).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+  });
+
+  it('never mutates the marker payload it was handed', async () => {
+    const { route } = fixture();
+    const payload = { ...base, action: 'commented', comment: { id: 'ic', body: '', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 1, transcript: null }] } };
+    const before = JSON.parse(JSON.stringify(payload));
+    await route({ busy: false, claudeSessionId: 'c1' }, { payload }, { username: 'dan' });
+    expect(payload).toEqual(before);
+    expect(payload.comment.attachments[0].transcript).toBeNull();
+  });
+
+  it('delivers markers for one convo in marker order even when the first is slow', async () => {
+    // A voice note takes seconds to transcribe; a text reply sent right after
+    // it must not overtake it into the session (per-convo promise chain).
+    let releaseFirst;
+    const gate = new Promise((r) => { releaseFirst = r; });
+    const { deps, route } = fixture({ transcribe: vi.fn(async () => { await gate; return 'slow words'; }) });
+    const session = { busy: false, claudeSessionId: 'c1' };
+    const first = route(session, { payload: { ...base, num: 1, title: 'first', action: 'commented', comment: { id: 'ic1', body: '', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 1, transcript: null }] } } }, { username: 'dan' });
+    const second = route(session, { payload: { ...base, num: 2, title: 'second', action: 'commented', comment: { id: 'ic2', body: 'typed reply', attachments: [] } } }, { username: 'dan' });
+    // The fast second marker has had every chance to run ahead.
+    await new Promise((r) => setTimeout(r, 5));
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(2);
+    expect(deps.injectBlocks.mock.calls[0][1][0].text).toContain('slow words');
+    expect(deps.injectBlocks.mock.calls[1][1][0].text).toContain('typed reply');
+  });
+
+  it('a different convo is not held up behind a slow one', async () => {
+    let releaseFirst;
+    const gate = new Promise((r) => { releaseFirst = r; });
+    const { deps, route } = fixture({ transcribe: vi.fn(async () => { await gate; return 'slow words'; }) });
+    const slow = route({ busy: false, claudeSessionId: 'c1' }, { payload: { ...base, action: 'commented', comment: { id: 'ic1', body: '', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 1, transcript: null }] } } }, { username: 'dan' });
+    await route({ busy: false, claudeSessionId: 'c2' }, { payload: { ...base, action: 'commented', comment: { id: 'ic2', body: 'other convo', attachments: [] } } }, { username: 'dan' });
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    releaseFirst();
+    await slow;
+  });
+
+  it('skips the transcript write-back when the comment has no id', async () => {
+    const { deps, route } = fixture();
+    await route({ busy: false }, { payload: { ...base, action: 'commented', comment: { body: '', attachments: [{ blob_ref: 'b1', mime: 'audio/mp4', name: 'v.m4a', size: 1, transcript: null }] } } }, { username: 'dan' });
+    expect(deps.setTranscript).not.toHaveBeenCalled();
+    // The transcript still reaches the agent — it just isn't persisted.
+    expect(deps.injectBlocks.mock.calls[0][1][0].text).toContain('transcript: spoken words');
+  });
+
+  it('publishes the undeliverable notice when the route itself throws', async () => {
+    const { deps, route } = fixture({ injectBlocks: vi.fn(() => { throw new Error('session exploded'); }) });
     await route({ busy: false, journalConvoId: 'c1' }, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'x', attachments: [] } } }, { username: 'dan' });
     expect(deps.publishNotice).toHaveBeenCalledWith('c1', expect.stringContaining("Couldn't deliver"));
   });
