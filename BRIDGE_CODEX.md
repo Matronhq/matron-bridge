@@ -38,3 +38,31 @@ If browser tools are needed but unavailable, ask the user to run `/restart --bro
 ## Journal history
 
 - To find something the user said in a past session on any of their boxes, query the journal's search API rather than grepping local transcripts: `GET <https base of JOURNAL_WS_URL, /ws stripped>/search?q=<url-encoded terms>&limit=50` with `Authorization: Bearer <agent token>` (the contents of `JOURNAL_TOKEN_FILE`, or `JOURNAL_TOKEN` when the file variable is unset). Never print or paste the token — your commands and output are mirrored into the journal — read it inside the request (`-H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"`) and never use `curl -v`/`--trace`. Read context around a hit with `GET /convo/:id/messages?around_seq=<seq>` (works across boxes, prose only). `GET /help` on the same base URL returns the full API digest; the spec is `docs/protocol.md` in matron-journal.
+
+## Tasks & decisions (`/items` HTTP API)
+
+The user has a task & decision tracker beside the chat — a persistent, shared list, not another chat message. There is no MCP tool for it in this session; call the journal's `/items` routes directly, same base URL and token discipline as journal search above (`Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")`, read inside the request, never printed, no `-v`/`--trace`). Below, `$BASE` is that same https base (`JOURNAL_WS_URL` with `wss://` → `https://`, trailing `/ws` stripped).
+
+- `GET $BASE/items?convo=<id>&state=open` — list items for one conversation. Add `kind=task|question|decision`, `awaiting=user|agent`, `label=<name>`, or `state=closed|any` to narrow. Omit `convo` to list across every conversation of this user instead — there is no "current conversation" default here (see below).
+- `POST $BASE/items` — file one: `{"kind":"question"|"decision"|"task","title":"...","body":"...","convo_id":"<id>"}` (optional `labels`, `links`, `awaiting`, `position`, `supersedes`). `convo_id` is required — the journal does not fill it in for an HTTP caller the way the MCP tools do for a Claude Code session.
+- `POST $BASE/items/:id/comments` — `{"body":"..."}`, optionally `"awaiting":"user"|"agent"|null` to hand the item over, take it back, or clear it.
+- `POST $BASE/items/:id/close` — `{"resolution":"done"|"answered"|"decided"|"reversed"|"cancelled","comment":"..."}`. `POST $BASE/items/:id/reopen` with an optional `{"comment":"..."}` undoes it.
+- Give every `POST` an `Idempotency-Key` header (any string unique to that intent, e.g. `$(uuidgen)`) so a retried request can't file or comment twice.
+
+**Your own `convo_id`:** the questions and decisions you file need to land on this conversation. If you don't already have it, search for something distinctive you just said and read `convo_id` off the hit — `GET $BASE/search?q=<a phrase from this turn>&limit=1`. If that fails too, list or comment across every conversation of this user instead of guessing an id (omit `convo` on `GET /items`).
+
+```bash
+BASE=<https base, as above>
+CONVO_ID=<this conversation's id — see above>
+
+curl -sS -X POST "$BASE/items" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"kind\":\"question\",\"title\":\"Which auth flow?\",\"body\":\"OAuth vs API key — recommend OAuth.\",\"convo_id\":\"$CONVO_ID\"}"
+
+curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"
+```
+
+If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
