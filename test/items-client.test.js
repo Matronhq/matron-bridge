@@ -72,4 +72,51 @@ describe('createItemsClient', () => {
     const none = createItemsClient({ baseUrl: '', token: 'tok', fetchImpl });
     expect(await none.list({})).toEqual({ status: 0, data: { error: 'journal unreachable' } });
   });
+
+  it('handles non-JSON response bodies gracefully', async () => {
+    const { fetchImpl: fetch204 } = fakeFetch(() => ({
+      status: 204,
+      body: undefined, // json() will fail for 204 No Content
+    }));
+    // Override to throw on json()
+    const mockFetch204 = vi.fn(async () => ({
+      ok: true,
+      status: 204,
+      json: async () => { throw new Error('No content'); },
+    }));
+    const c204 = createItemsClient({ baseUrl: 'https://j', token: 'tok', fetchImpl: mockFetch204 });
+    expect(await c204.list({})).toEqual({ status: 204, data: {} });
+
+    const mockFetch502 = vi.fn(async () => ({
+      ok: false,
+      status: 502,
+      json: async () => { throw new Error('Not JSON'); },
+    }));
+    const c502 = createItemsClient({ baseUrl: 'https://j', token: 'tok', fetchImpl: mockFetch502 });
+    expect(await c502.get('it_1')).toEqual({ status: 502, data: { error: 'HTTP 502' } });
+  });
+
+  it('aborts and returns status 0 on timeout', async () => {
+    let capturedSignal = null;
+    const mockFetch = vi.fn(async (url, init) => {
+      capturedSignal = init.signal;
+      // Return a promise that rejects when the signal aborts
+      return new Promise((resolve, reject) => {
+        if (capturedSignal.aborted) {
+          reject(new Error('AbortError'));
+        }
+        capturedSignal.addEventListener('abort', () => {
+          reject(new Error('AbortError'));
+        });
+        // Otherwise never resolve
+      });
+    });
+    const c = createItemsClient({ baseUrl: 'https://j', token: 'tok', fetchImpl: mockFetch, timeoutMs: 20 });
+    const start = Date.now();
+    const result = await c.list({});
+    const elapsed = Date.now() - start;
+    expect(result).toEqual({ status: 0, data: { error: 'journal unreachable' } });
+    expect(elapsed).toBeLessThan(200); // Should resolve quickly (within ~20ms timeout + overhead)
+    expect(capturedSignal.aborted).toBe(true); // Signal should have been aborted
+  });
 });
