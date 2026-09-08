@@ -134,10 +134,14 @@ describe('createJournalInputConsumer', () => {
     expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
   });
 
-  it('a reordered item marker never wakes a reaped session', () => {
+  it('a marker that can never become a turn is dropped outright — no wake, no route, no notice', () => {
     // Backlog housekeeping produces no turn (lib/items-turn.js isTurnWorthy),
     // so respawning a whole agent session for it would be pure cost. Same for
-    // a field edit and a malformed marker.
+    // a field edit, an unknown action and a malformed marker. And because it
+    // is not input at all, a sessionless convo must stay SILENT: publishing
+    // the unknown-convo notice would answer a backlog drag on an idle box
+    // with "no active session" — a complaint about something the user never
+    // asked the agent to do.
     const deps = makeDeps({
       routeItemToSession: vi.fn(),
       findSessionByConvoId: vi.fn(() => null),
@@ -147,13 +151,14 @@ describe('createJournalInputConsumer', () => {
     for (const payload of [
       { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'reordered', by: 'user', awaiting: null, resolution: null },
       { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'updated', by: 'user', awaiting: null, resolution: null },
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'archived', by: 'user', awaiting: null, resolution: null },
       { action: 'commented' },
     ]) {
       consumer(baseFrame({ type: 'item', payload }));
     }
     expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
     expect(deps.routeItemToSession).not.toHaveBeenCalled();
-    expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(3);
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
   });
 
   it('an item marker for a dead session on a bridge with no resume seam notices instead of routing', () => {

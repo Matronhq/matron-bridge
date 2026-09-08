@@ -127,10 +127,12 @@ describe('formatCommentAck', () => {
   it('reports the failure instead of claiming an awaiting change that did not happen', () => {
     expect(formatCommentAck({ item: open, awaiting_error: 'journal unreachable' }, 'user'))
       .toBe('Comment added to #12 "Which auth library?" — but awaiting update failed: journal unreachable');
-    // The key being present at all means the PATCH failed — a missing message
-    // must not read as success.
-    expect(formatCommentAck({ item: open, awaiting_error: undefined }, 'agent'))
-      .toBe('Comment added to #12 "Which auth library?" — but awaiting update failed: unknown error');
+    // The key being present at all means the PATCH failed. When the journal
+    // answered without an error string, lib/items-tools.js substitutes the
+    // status (never undefined) — report that verbatim rather than swallowing
+    // it into a success line.
+    expect(formatCommentAck({ item: open, awaiting_error: 'HTTP 202' }, 'agent'))
+      .toBe('Comment added to #12 "Which auth library?" — but awaiting update failed: HTTP 202');
   });
 
   it('falls back gracefully when the journal answered without an item', () => {

@@ -67,6 +67,47 @@ describe('items handlers', () => {
     expect((await h.list({ roomId: '!r:s', scope: 'mine' })).status).toBe(400);
   });
 
+  it('list: since sorts by recency, otherwise by the backlog rank', async () => {
+    // `rank` is the order the user dragged the backlog into — the answer to
+    // "what next". `since` asks a different question ("what changed while I
+    // was away"), which rank would answer oldest-untouched-first.
+    const { h, client } = fixture();
+    await h.list({ roomId: '!r:s', since: 1725800000000 });
+    expect(client.list.mock.calls[0][0]).toMatchObject({ since: 1725800000000, sort: 'updated' });
+    await h.list({ roomId: '!r:s' });
+    expect(client.list.mock.calls[1][0].sort).toBe('rank');
+  });
+
+  it('list: rejects an over-long or non-string label with a 400 naming the field', async () => {
+    const { h, client } = fixture();
+    const r = await h.list({ roomId: '!r:s', label: 'x'.repeat(41) });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/label/);
+    expect((await h.list({ roomId: '!r:s', label: 7 })).status).toBe(400);
+    expect(client.list).not.toHaveBeenCalled();
+    expect((await h.list({ roomId: '!r:s', label: 'x'.repeat(40) })).status).toBe(200);
+  });
+
+  it('list / create: a 404 means the journal has no /items routes, and says which upgrade is missing', async () => {
+    // Neither route has an item id in its path, so a 404 cannot be "no such
+    // item" — a bare "not found" would read to the model as an empty backlog.
+    const { h } = fixture({
+      list: vi.fn(async () => ({ status: 404, data: { error: 'Not Found' } })),
+      create: vi.fn(async () => ({ status: 404, data: { error: 'Not Found' } })),
+    });
+    for (const r of [
+      await h.list({ roomId: '!r:s' }),
+      await h.create({ roomId: '!r:s', kind: 'task', title: 'T' }),
+    ]) {
+      expect(r.status).toBe(404);
+      expect(r.body.error).toMatch(/does not have the \/items routes yet/);
+      expect(r.body.error).toMatch(/matron-journal PR #73/);
+    }
+    // An item-addressed 404 still means "no such item" — untouched.
+    const { h: h2 } = fixture({ get: vi.fn(async () => ({ status: 404, data: { error: 'no such item' } })) });
+    expect((await h2.get({ roomId: '!r:s', id: 'it_9' })).body.error).toBe('no such item');
+  });
+
   it('list: passes through cursor', async () => {
     const { h, client } = fixture();
     await h.list({ roomId: '!r:s', cursor: 'cur_1', limit: 10 });
@@ -131,6 +172,22 @@ describe('items handlers', () => {
     expect(r.status).toBe(201);
     expect(r.body.comment.id).toBe('ic_1');
     expect(r.body.awaiting_error).toBe('conflict');
+  });
+
+  it('comment: awaiting_error is never undefined, whatever the journal answered', async () => {
+    // formatCommentAck reports the key's PRESENCE as a failure, so an
+    // error-less body must still name what went wrong.
+    const { h } = fixture({ update: vi.fn(async () => ({ status: 500, data: {} })) });
+    expect((await h.comment({ roomId: '!r:s', id: 'it_1', body: 'ok', awaiting: 'user' })).body.awaiting_error)
+      .toBe('HTTP 500');
+    // A 2xx this handler does not accept as success is still a failure — and
+    // still names itself rather than reading as "unknown error".
+    const { h: h2 } = fixture({ update: vi.fn(async () => ({ status: 202, data: {} })) });
+    expect((await h2.comment({ roomId: '!r:s', id: 'it_1', body: 'ok', awaiting: 'user' })).body.awaiting_error)
+      .toBe('HTTP 202');
+    const { h: h3 } = fixture({ update: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
+    expect((await h3.comment({ roomId: '!r:s', id: 'it_1', body: 'ok', awaiting: 'user' })).body.awaiting_error)
+      .toBe('journal unreachable');
   });
 
   it('comment: does not call update when awaiting is not provided', async () => {

@@ -2531,14 +2531,15 @@ describe("journalMakeTaskFromQueue (index.js)", () => {
     await expect(refused({}, { text: 'hi', username: 'dan' }))
       .resolves.toEqual({ ok: false, error: 'HTTP 400' });
 
-    // Only a 201 is a creation. Anything else with an item body is some other
-    // route's answer (or a proxy's), not proof that this task exists.
+    // 201 and 200 are the two creations (see below); anything else with an
+    // item body is some other route's answer (or a proxy's), not proof that
+    // this task exists.
     const wrongStatus = loadMakeTask({
-      itemsClient: { create: async () => ({ ...created(), status: 200 }) },
+      itemsClient: { create: async () => ({ ...created(), status: 202 }) },
       journalQueueMedia,
     });
     await expect(wrongStatus({}, { text: 'hi', username: 'dan' }))
-      .resolves.toEqual({ ok: false, error: 'HTTP 200' });
+      .resolves.toEqual({ ok: false, error: 'HTTP 202' });
 
     // 201 with an unusable body is a failure too — a heads-up naming item
     // #undefined is worse than saying it didn't file.
@@ -2549,6 +2550,21 @@ describe("journalMakeTaskFromQueue (index.js)", () => {
     expect((await garbled({}, { text: 'hi', username: 'dan' })).ok).toBe(false);
 
     expect(journalQueueMedia).not.toHaveBeenCalled();
+  });
+
+  it('treats a 200 as the creation it is — the journal replaying an item this call already filed', async () => {
+    // An idempotent duplicate (or a POST whose response we lost and retried)
+    // answers 200 with the real item body. Calling that a failure would tell
+    // the user nothing was filed while the task sits in their backlog.
+    const journalQueueMedia = vi.fn(async () => {});
+    const makeTask = loadMakeTask({
+      itemsClient: { create: async () => ({ ...created(), status: 200 }) },
+      journalQueueMedia,
+    });
+
+    await expect(makeTask({}, { text: 'Refactor the auth module', username: 'dan' }))
+      .resolves.toEqual({ ok: true, num: 7, id: 'it_7' });
+    expect(journalQueueMedia).toHaveBeenCalledTimes(1);
   });
 
   it('refuses an empty message without calling the journal', async () => {

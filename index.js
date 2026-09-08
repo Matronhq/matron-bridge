@@ -8330,7 +8330,14 @@ async function journalMakeTaskFromQueue(session, { text, username }) {
     on_behalf_of: 'user',
   });
   const item = res?.data?.item;
-  if (res?.status !== 201 || !item || typeof item.id !== 'string' || !Number.isInteger(item.num)) {
+  // 201 is the creation. 200 is the journal replaying an item this same call
+  // already created (an idempotent retry, or a POST whose response we lost) —
+  // the task exists and its item body is the real one, so treating it as a
+  // failure would tell the user nothing was filed while a task sat in their
+  // backlog. Any other status with an item body is some other route's answer
+  // (or a proxy's), not proof that this task exists.
+  const created = res?.status === 201 || res?.status === 200;
+  if (!created || !item || typeof item.id !== 'string' || !Number.isInteger(item.num)) {
     return { ok: false, error: res?.data?.error || `HTTP ${res?.status ?? 0}` };
   }
 
