@@ -673,7 +673,7 @@ server.tool(
 
 server.tool(
   'item_comment',
-  "Add a comment to an item (text and/or attachments by local path) — progress, findings, or a follow-up question in the same thread. Optionally set `awaiting` to hand the item to the user ('user'), take it back ('agent'), or clear it (null). Prefer `item_close` when the item is actually resolved.",
+  "Add a comment to an item (text and/or attachments by local path) — progress, findings, or a follow-up question in the same thread. The item is the full record of that piece of work: put follow-up screenshots, images and files in `attachments` here, not in the chat with a note that they are in the conversation. Optionally set `awaiting` to hand the item to the user ('user'), take it back ('agent'), or clear it (null). Prefer `item_close` when the item is actually resolved.",
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     body: z.string().optional().describe('Markdown'),
