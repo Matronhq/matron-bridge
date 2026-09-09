@@ -50,6 +50,7 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 - A user's comment on any item — including a closed one — reopens it and hands it back to you as a `📌` turn. Voice-note attachments arrive transcribed. If you're mid-turn, it's queued and delivered on your next one.
 - Run `item_list` at the start of a session and before asking the user anything — the answer may already be filed. It defaults to this conversation's open items; pass `scope: "all"` to see every item across the user's conversations (useful picking up work from another session), or `state: "any"`/`kind`/`awaiting`/`label` to narrow further.
 - Items are shared by every session of this user. Don't file a duplicate of one `item_list` already shows — `item_comment` on it instead. Keep titles short and specific; put the reasoning in `body`.
+- **An item is the whole history of that piece of work, images included.** Follow-up screenshots, renders and files go in the comment's `attachments` (local paths, same as `item_create`), never "the image is in the conversation" — the user reads the item's thread, not the chat, to see how it went.
 - Refer to items by number (`#12`) in chat rather than pasting their contents back in — this is where "let's put it in a GitHub issue" instincts should go instead; use `links` on an item when an issue or PR already exists alongside it.
 
 ## Searching the journal
