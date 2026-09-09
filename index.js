@@ -1792,6 +1792,17 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // !restart to take effect.
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
+    // Load every MCP tool up front instead of letting Claude Code defer
+    // them behind ToolSearch. With deferral on, the item_* tools (and the
+    // rest of ask-user) reach the model only as names in a reminder, and a
+    // tool that needs a schema lookup before its first call is a tool the
+    // model reaches for last: a fleet survey on 2026-09-09 found not one
+    // item_* call on any box other than the one whose sessions were
+    // steered to them by hand, while questions went out as prose. The
+    // cost is a larger (cached) tool prefix per request. Values: `false`
+    // loads everything; `auto:N` defers past N% of context; operators can
+    // still set it in the bridge's own env, which wins here.
+    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     // No MCP_TOOL_TIMEOUT default here. #254 briefly injected a 10-minute
     // backstop so a wedged MCP server couldn't hang a turn forever, but a
     // hard kill also cut off legitimately long calls (long builds, big test
@@ -2604,6 +2615,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Same up-front MCP tool loading as spawnEnv above.
+    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
     // No MCP_TOOL_TIMEOUT default, same reasoning as spawnEnv above:
