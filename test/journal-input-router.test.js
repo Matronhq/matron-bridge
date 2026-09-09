@@ -219,6 +219,36 @@ describe('createJournalInputConsumer', () => {
     expect(warnings.length).toBeGreaterThan(0);
   });
 
+  it('ignores a flagged fallback text (journal mirror of an item marker) for a live session — no route, no warn', () => {
+    // Spec: docs/superpowers/specs/2026-09-08-task-decision-tracker-design.md
+    // "Old-client fallback" — the journal mirrors an item marker as a plain
+    // `text` event for pre-tracker clients. The marker path already
+    // delivered the turn, so this frame must be silence: no routeTextToSession
+    // call, and (being an ordinary, expected frame, not an anomaly) no warn.
+    const deps = makeDeps();
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      payload: { body: '📌 Task #1 "x" — dan commented:\nhi', fallback_for: 'item', item_id: 'it_1', num: 1, action: 'commented' },
+    }));
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(warnings.length).toBe(0);
+  });
+
+  it('routes the same text frame as usual when it carries no fallback_for flag', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      payload: { body: '📌 Task #1 "x" — dan commented:\nhi', item_id: 'it_1', num: 1, action: 'commented' },
+    }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    const [session, body, ctx] = deps.routeTextToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(body).toBe('📌 Task #1 "x" — dan commented:\nhi');
+    expect(ctx).toEqual({ username: 'dan' });
+  });
+
   it('routes a prompt_reply event for a known session to routePromptReply with target_seq/choice/text', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
