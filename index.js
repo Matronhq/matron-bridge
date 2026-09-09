@@ -1800,8 +1800,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // item_* call on any box other than the one whose sessions were
     // steered to them by hand, while questions went out as prose. The
     // cost is a larger (cached) tool prefix per request. Values: `false`
-    // loads everything; `auto:N` defers past N% of context; operators can
-    // still set it in the bridge's own env, which wins here.
+    // loads everything; `auto:N` defers past N% of context. Operators can
+    // set it in the bridge's `.env` like any other setting (dotenv loads
+    // that with `override: true` at startup, so `.env` beats the service
+    // environment — the same rule as for every other bridge setting), and
+    // whatever `process.env` holds by now wins over the default.
     ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     // No MCP_TOOL_TIMEOUT default here. #254 briefly injected a 10-minute
     // backstop so a wedged MCP server couldn't hang a turn forever, but a
