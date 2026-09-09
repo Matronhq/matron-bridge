@@ -4,7 +4,9 @@ import { spawn } from 'child_process';
 import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
-import { createSendAttachmentHandler } from './lib/send-attachment.js';
+import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
+import { createItemsClient } from './lib/items-client.js';
+import { createItemsHandlers } from './lib/items-tools.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -99,7 +101,7 @@ import {
   shareAgentMedia,
 } from './lib/show-file.js';
 import { processShowFile } from './lib/show-file-handler.js';
-import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
+import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
@@ -108,7 +110,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
-import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, dispatchBusyQueueMagicWord, isTextOnlyQueueEntry, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
@@ -121,7 +123,8 @@ import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/ro
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
-import { createJournalMediaRouter } from './lib/journal-media.js';
+import { createJournalMediaRouter, VOICE_NOTE_PREFIX } from './lib/journal-media.js';
+import { createItemTurnRouter, formatItemTurn } from './lib/items-turn.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
@@ -451,6 +454,18 @@ function resolveJournalToken() {
   return (process.env.JOURNAL_TOKEN || '').trim();
 }
 const _journalToken = resolveJournalToken();
+// Task & decision tracker (spec 2026-09-08). One client for the item_* tools,
+// the queued-card "Make task" tap, and the inbound item-turn router — HTTP
+// against the same host the media routes use, with the same bearer token.
+// Built here rather than next to the handlers so the later wirings can share
+// it; JOURNAL_ENABLED is not declared yet, hence the inline equivalent. With
+// no journal configured the base URL is empty and every call resolves status
+// 0, which the handlers turn into a 502 "journal unreachable" — a tool that
+// says so beats one that throws.
+const itemsClient = createItemsClient({
+  baseUrl: JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '',
+  token: _journalToken,
+});
 // Return path (Matron -> bridge input, this PR): where the inbound cursor is
 // persisted (survives a bridge restart — see lib/journal-publisher.js) and
 // the stable conversation Matron sends session-start/list/help commands
@@ -8014,6 +8029,11 @@ async function journalRouteTextToSession(session, body) {
       // sends the whole queue — so "send just this one" would silently mean
       // "send all". Withhold the action rather than offer one that lies.
       allowSendOne: session.agent !== AGENT_CODEX,
+      // This IS the user's own typed text, which is exactly what "📌 Make
+      // task" files. Unconditional: a /compact queued behind a turn is odd
+      // to file but harmless, and gating on it would make the card's actions
+      // depend on the message's content, which nothing else here does.
+      allowMakeTask: true,
     });
     return;
   }
@@ -8204,7 +8224,16 @@ const journalMediaRouter = createJournalMediaRouter({
   },
   injectText: (session, text) => sendTextToSession(session, text),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
-  queueMedia: (session, entry) => journalQueueMedia(session, entry),
+  // mirrorToJournal is what distinguishes the ONE text-shaped media entry (a
+  // voice note's transcript, which flushQueue mirrors like a typed message)
+  // from the saved file / image / video-frame entries, whose own journal event
+  // already exists. That transcript is the user's words, so it may be filed as
+  // a task; the rest have no sentence to file. The text-block re-check keeps
+  // this honest if a future mirrored entry is not text.
+  queueMedia: (session, entry) => journalQueueMedia(session, {
+    ...entry,
+    allowMakeTask: entry.mirrorToJournal === true && isTextOnlyQueueEntry(entry.blocks),
+  }),
   echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
   escapeHtml,
@@ -8228,7 +8257,7 @@ const journalMediaRouter = createJournalMediaRouter({
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, allowMakeTask = false }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = [...blocks];
   if (!mirrorToJournal) markJournalOrigin(entry);
@@ -8247,10 +8276,132 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       fullText,
       // Same capability gate as the text path above.
       allowSendOne: session.agent !== AGENT_CODEX,
+      // Off unless the caller says otherwise: most entries through here are
+      // media (a saved file, an image, extracted video frames) or a synthetic
+      // turn the bridge wrote itself, and neither is a sentence the user asked
+      // to keep. The voice-note transcript is the exception — see queueMedia.
+      allowMakeTask,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
   }
+}
+
+// The queued card's "📌 Make task" tap: file the queued message in the tracker
+// instead of sending it (items tracker, spec 2026-09-08). lib/busy-queue.js owns
+// the queue side (which entry, when to release it, what to say); this is only
+// the journal half.
+//
+// Two things the tracker's own plumbing cannot do for us:
+//   * The journal stamps a `created` marker for the item, but our own agent
+//     identity is its sender, so the input router's `user:` filter drops it —
+//     correctly, or every item_* tool write would echo back in as a turn. The
+//     agent would otherwise never learn the task exists. So the heads-up is
+//     queued HERE, as the same formatItemTurn text a user-filed marker would
+//     have produced, riding the same busy queue as everything else.
+//   * That queued heads-up must not itself offer "📌 Make task"
+//     (mirrorToJournal:false → allowMakeTask stays off): it is the bridge's own
+//     prose about an item that already exists, not something to file again.
+//
+// Never idempotency-keyed: a tap is one deliberate act by one person, and a
+// retry of it means "file another one".
+async function journalMakeTaskFromQueue(session, { text, username }) {
+  // A voice note reaches the agent as "[Voice note transcription]: …"; the
+  // label is transport packaging, not part of what the user said, and it would
+  // otherwise be the entire task title on a short note.
+  const raw = typeof text === 'string' ? text : '';
+  const spoken = raw.startsWith(VOICE_NOTE_PREFIX) ? raw.slice(VOICE_NOTE_PREFIX.length) : raw;
+  const trimmed = spoken.trim();
+  if (!trimmed) return { ok: false, error: 'nothing to file' };
+  // First line titles it, the rest is the body — the same shape item_add uses
+  // and the same shape the app's own filing flow produces. `trimmed` is
+  // non-empty and starts with a non-space character, so the first line is
+  // always a usable title; the empty case is the guard above, not here.
+  const nl = trimmed.indexOf('\n');
+  const title = (nl < 0 ? trimmed : trimmed.slice(0, nl)).trim().slice(0, 200);
+  const body = nl < 0 ? '' : trimmed.slice(nl + 1).trim();
+
+  const res = await itemsClient.create({
+    kind: 'task',
+    title,
+    body,
+    convo_id: journalConvoIdFor(session),
+    // The user tapped this; the item is theirs, not the agent's.
+    on_behalf_of: 'user',
+  });
+  const item = res?.data?.item;
+  // 201 is the creation. 200 is the journal replaying an item this same call
+  // already created (an idempotent retry, or a POST whose response we lost) —
+  // the task exists and its item body is the real one, so treating it as a
+  // failure would tell the user nothing was filed while a task sat in their
+  // backlog. Any other status with an item body is some other route's answer
+  // (or a proxy's), not proof that this task exists.
+  const created = res?.status === 201 || res?.status === 200;
+  if (!created || !item || typeof item.id !== 'string' || !Number.isInteger(item.num)) {
+    return { ok: false, error: res?.data?.error || `HTTP ${res?.status ?? 0}` };
+  }
+
+  const turn = formatItemTurn({
+    item_id: item.id,
+    num: item.num,
+    kind: 'task',
+    title: typeof item.title === 'string' ? item.title : title,
+    action: 'created',
+    by: 'user',
+    awaiting: item.awaiting ?? 'agent',
+    resolution: null,
+  }, { username: username || 'the user', body });
+  if (turn) {
+    // Best effort: the item IS filed, and saying otherwise because the tile
+    // failed to post would be a lie. The agent still finds it via item_list.
+    try {
+      await journalQueueMedia(session, {
+        blocks: [{ type: 'text', text: turn }],
+        mirrorToJournal: false,
+        preview: `📌 #${item.num} filed`,
+        fullText: turn,
+      });
+    } catch (e) {
+      console.warn(`[items] queued the task heads-up failed for #${item.num}: ${e?.message ?? e}`);
+    }
+  }
+  return { ok: true, num: item.num, id: item.id };
+}
+
+// A user-authored tracker marker (item comment / filed task / close / reopen)
+// -> one synthetic 📌 user turn. Thin wiring around lib/items-turn.js, sharing
+// every seam the media path already uses: the same blob fetch, the same
+// whisper transcription, the same busy queue. Nothing here re-mirrors into the
+// journal — the marker IS the durable record, so injecting passes
+// skipJournalMirror and the queued entry passes mirrorToJournal:false; a
+// mirror would show the user their own reply back as a second message.
+const itemTurnRouter = createItemTurnRouter({
+  fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
+  transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
+  queueText: (session, { text, preview }) => journalQueueMedia(session, {
+    blocks: [{ type: 'text', text }],
+    mirrorToJournal: false,
+    preview,
+    fullText: text,
+  }),
+  publishNotice: journalPublishNotice,
+  // The journal strips any client-supplied transcript, so a voice note on an
+  // item arrives with transcript:null and only the bridge can fill it in.
+  setTranscript: (id, commentId, body) => itemsClient.setTranscript(id, commentId, body),
+  getItem: (id) => itemsClient.get(id),
+  log: console,
+});
+
+function journalOnItem(session, item, ctx) {
+  // Same reasoning as journalOnMedia: answering the agent's question is the
+  // user back in the loop, so it refreshes the self-restart budget.
+  session._agentRestartCount = 0;
+  // Fire-and-forget, matching routeMediaToSession's contract — the route
+  // swallows its own failures, so this catch is belt-and-braces.
+  itemTurnRouter(session, item, ctx).catch((e) => {
+    try { console.warn(`[items-turn] ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+  });
 }
 
 function journalOnMedia(session, media, ctx) {
@@ -8297,6 +8448,10 @@ function journalOnPromptReply(session, answer, { username }) {
       // un-actioned.
       notify: (message) => journalPublishNotice(convoId, message),
       formatQueueSummary,
+      // "📌 Make task": file the queued message in the tracker instead of
+      // sending it. `username` is the tapping user, which the heads-up turn
+      // names — the bridge has no other handle on who tapped.
+      makeTask: (taskSession, { text }) => journalMakeTaskFromQueue(taskSession, { text, username }),
     });
     return;
   }
@@ -9217,6 +9372,7 @@ const journalInputConsumer = createJournalInputConsumer({
   findSessionByConvoId: findSessionByClaudeSessionId,
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
+  routeItemToSession: journalOnItem,
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
   // A verified /sleep card tap whose session the idle reaper already removed
@@ -9595,6 +9751,18 @@ const agentChatHandlers = createAgentChatHandlers({
   // be injected wholesale at the next turn-end seam.
   dropPendingRoomMessages: (sessionKey, roomId) => roomDelivery.dropRoom(sessionKey, roomId),
   log: console,
+});
+
+// The seven item_* tools (lib/items-tools.js), mounted below as loopback
+// routes in the same pattern. Attachments go through the SAME resolve +
+// guard + upload path as send_attachment — a tool argument is an untrusted
+// path either way, so the workdir containment and sensitive-file gate must
+// not be re-implemented here.
+const itemsHandlers = createItemsHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: itemsClient,
+  uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
 });
 
 // Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
@@ -10026,6 +10194,17 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/restart-session') {
         await respondAgentChatRoute(res, data, selfRestartHandler,
           (status, b) => debug(`restart-session ${status} ${b.parked ? 'parked' : ''} ${b.error || ''}`));
+        return;
+      }
+
+      // The seven item_* tool routes. One matcher rather than seven blocks:
+      // the handler names ARE the path segments, and the anchored alternation
+      // is the allowlist (no dynamic property lookup from raw input).
+      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder)$/);
+      if (itemsRoute) {
+        const name = itemsRoute[1];
+        await respondAgentChatRoute(res, data, itemsHandlers[name],
+          (status, b) => debug(`items/${name} ${status} ${b.error || (b.item ? `#${b.item.num ?? '?'}` : `${(b.items || []).length} items`)}`));
         return;
       }
 

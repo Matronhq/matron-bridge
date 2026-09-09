@@ -5,10 +5,13 @@ import {
   cancelQueuedItem,
   dispatchBusyQueueMagicWord,
   handleBusyQueueMagicWord,
+  isTextOnlyQueueEntry,
   notifyQueuedMessage,
   resolveQueueReleaseTap,
 } from '../lib/busy-queue.js';
 import { compactBatchSize } from '../lib/compact-priority.js';
+// The real renderer, so the heads-up assertions read the text the agent gets.
+import { formatItemTurn as realFormatItemTurn } from '../lib/items-turn.js';
 
 // Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
 // send/interrupt/!interrupt (flush now) and cancel (pop last) handling is
@@ -2110,5 +2113,478 @@ describe('index.js /cancel-queued endpoint — release registry wiring (source i
     expect(body).toMatch(/queueRelease\.listLive\(convoId\)/);
     expect(body).toMatch(/cancelQueuedItem\(session, \{/);
     expect(body).toMatch(/\bemitRelease\b/);
+  });
+});
+
+// "📌 Make task" (items tracker, spec 2026-09-08): the queued card's third
+// action files the tapped message in the tracker instead of sending it. The
+// action is opt-in per call site (allowMakeTask) because it only makes sense
+// for a message that IS text — a queued image or saved file has nothing to put
+// in a task title, and a card must never offer an action it cannot honour.
+describe('make_task', () => {
+  // A durable emitRelease stand-in: runs the write-ahead thunk and reports the
+  // put as persisted, exactly like the real one on a healthy disk.
+  function durableRelease() {
+    const emitted = [];
+    const emitRelease = vi.fn((convoId, fields, { mutate } = {}) => {
+      mutate?.();
+      emitted.push({ convoId, ...fields });
+      return true;
+    });
+    return { emitRelease, emitted };
+  }
+
+  function twoQueuedSession(first = [{ type: 'text', text: 'Refactor the auth module\nkeep the public API' }]) {
+    return makeSession({
+      queuedMessages: [first, [{ type: 'text', text: 'second' }]],
+      queueNotifications: [
+        { eventId: null, plain: 'p1', id: 'pr_1::0' },
+        { eventId: null, plain: 'p2', id: 'pr_2::0' },
+      ],
+    });
+  }
+
+  it('the card offers 📌 Make task only when the call site allows it', async () => {
+    const session = makeSession({ queuedMessages: [], queueNotifications: [] });
+    const withAction = vi.fn(async () => '$ev');
+    session.sendButtonMessage = withAction;
+    await notifyQueuedMessage(session, 'hello', {
+      ...matrixDeps(), queueRelease: { noteQueued: vi.fn() }, convoId: 'c1', allowMakeTask: true,
+    });
+    const payload = withAction.mock.calls[0][5];
+    expect(payload.actions.map((a) => a.id)).toEqual(['send', 'make_task', 'cancel']);
+    expect(payload.actions[1]).toEqual({ id: 'make_task', label: '📌 Make task', intent: 'neutral' });
+    // The question has to account for every button on the card, and each "it"
+    // has to have exactly one referent.
+    expect(payload.question).toBe(
+      'Send this queued message now, or cancel it? You can also file this message as a task instead.',
+    );
+    // The compatibility option list is derived from `actions`, so an older
+    // client's free-text-shaped reply routes as the same wire action.
+    expect(payload.options.map((o) => o.value)).toEqual(['send', 'make_task', 'cancel']);
+
+    const without = vi.fn(async () => '$ev');
+    const session2 = makeSession({ queuedMessages: [], queueNotifications: [] });
+    session2.sendButtonMessage = without;
+    await notifyQueuedMessage(session2, 'hello', {
+      ...matrixDeps(), queueRelease: { noteQueued: vi.fn() }, convoId: 'c1',
+    });
+    expect(without.mock.calls[0][5].actions.map((a) => a.id)).toEqual(['send', 'cancel']);
+  });
+
+  it('sits after send_one on a multi-message card', async () => {
+    const session = makeSession();
+    const sendButtonMessage = vi.fn(async () => '$ev');
+    session.sendButtonMessage = sendButtonMessage;
+    await notifyQueuedMessage(session, 'hello', {
+      ...matrixDeps(), queueRelease: { noteQueued: vi.fn() }, convoId: 'c1',
+      allowSendOne: true, allowMakeTask: true,
+    });
+    expect(sendButtonMessage.mock.calls[0][5].actions.map((a) => a.id))
+      .toEqual(['send', 'send_one', 'make_task', 'cancel']);
+  });
+
+  it('files the tapped text, retires the card through the durable cancel release, and says so', async () => {
+    const session = twoQueuedSession();
+    const makeTask = vi.fn(async () => ({ ok: true, num: 7, id: 'it_7' }));
+    const notify = vi.fn();
+    const { emitRelease, emitted } = durableRelease();
+    const queueRelease = { dropItem: vi.fn() };
+    const deps = matrixDeps();
+
+    const handled = resolveQueueReleaseTap('make_task', session, {
+      ...deps,
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease,
+      emitRelease,
+      notify,
+      makeTask,
+    });
+
+    expect(handled).toBe(true);
+    await vi.waitFor(() => expect(makeTask).toHaveBeenCalledTimes(1));
+    expect(makeTask.mock.calls[0][0]).toBe(session);
+    expect(makeTask.mock.calls[0][1]).toEqual({ text: 'Refactor the auth module\nkeep the public API' });
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(
+      '📌 Filed as task #7. The agent will be told when this turn ends.',
+    ));
+    // The message left the queue exactly as a cancel tap would remove it —
+    // write-ahead, splice both arrays in lockstep, drop the live entry.
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
+    expect(session.queueNotifications.map((n) => n.id)).toEqual(['pr_2::0']);
+    expect(emitted).toEqual([{ convoId: 'c1', promptId: 'pr_1', action: 'cancel', releasedIds: ['pr_1::0'] }]);
+    expect(queueRelease.dropItem).toHaveBeenCalledWith('c1', 'pr_1::0');
+    // Never dispatched: filing is the alternative to sending, not a send.
+    expect(deps.flushQueue).not.toHaveBeenCalled();
+  });
+
+  // The item is filed; only the queued copy's fate is uncertain, and the two
+  // ways it can go (a turn-end flush already sent it; the durable release
+  // fail-closed) are indistinguishable from here.
+  it('says the task was filed even when the queued copy could not be withdrawn', async () => {
+    const session = twoQueuedSession();
+    const notify = vi.fn();
+    resolveQueueReleaseTap('make_task', session, {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease: { dropItem: vi.fn() },
+      // Write-ahead fail-close: the release never happens, so the message stays.
+      emitRelease: vi.fn(() => false),
+      notify,
+      makeTask: vi.fn(async () => ({ ok: true, num: 7, id: 'it_7' })),
+    });
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(
+      '📌 Filed as task #7, but the queued message was already sent or could not be withdrawn.',
+    ));
+    expect(session.queuedMessages).toHaveLength(2);
+  });
+
+  it('leaves the message queued and says so when the journal refuses the item', async () => {
+    const session = twoQueuedSession();
+    const notify = vi.fn();
+    const { emitRelease, emitted } = durableRelease();
+    const queueRelease = { dropItem: vi.fn() };
+
+    resolveQueueReleaseTap('make_task', session, {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease,
+      emitRelease,
+      notify,
+      makeTask: vi.fn(async () => ({ ok: false, error: 'journal unreachable' })),
+    });
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(
+      "Couldn't file that as a task (journal unreachable). It is still queued.",
+    ));
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(session.queueNotifications.map((n) => n.id)).toEqual(['pr_1::0', 'pr_2::0']);
+    expect(emitted).toEqual([]);
+    expect(queueRelease.dropItem).not.toHaveBeenCalled();
+  });
+
+  it('a thrown makeTask degrades to the same "still queued" notice', async () => {
+    const session = twoQueuedSession();
+    const notify = vi.fn();
+    const { emitRelease } = durableRelease();
+
+    resolveQueueReleaseTap('make_task', session, {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease: { dropItem: vi.fn() },
+      emitRelease,
+      notify,
+      makeTask: vi.fn(async () => { throw new Error('boom'); }),
+    });
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(
+      "Couldn't file that as a task (boom). It is still queued.",
+    ));
+    expect(session.queuedMessages).toHaveLength(2);
+  });
+
+  it('files nothing on a media entry or a stale card, and SAYS so; unhandled without the seam', async () => {
+    const makeTask = vi.fn(async () => ({ ok: true, num: 9, id: 'it_9' }));
+
+    // A card is durable and the queue is shared, so a media entry can be under
+    // a card that offered the action. Nothing to file — and saying nothing
+    // would look exactly like a successful filing.
+    const media = twoQueuedSession([{ type: 'image', source: {} }]);
+    const mediaNotify = vi.fn();
+    expect(resolveQueueReleaseTap('make_task', media, {
+      ...matrixDeps(), entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] }, convoId: 'c1',
+      queueRelease: { dropItem: vi.fn() }, emitRelease: vi.fn(), notify: mediaNotify, makeTask,
+    })).toBe(true);
+    expect(makeTask).not.toHaveBeenCalled();
+    expect(media.queuedMessages).toHaveLength(2);
+    expect(mediaNotify).toHaveBeenCalledWith("That queued message isn't text, so there's nothing to put in a task.");
+
+    // The tapped message already flushed or was cancelled elsewhere.
+    const stale = twoQueuedSession();
+    const staleNotify = vi.fn();
+    expect(resolveQueueReleaseTap('make_task', stale, {
+      ...matrixDeps(), entry: { prompt_id: 'pr_9', itemIds: ['pr_9::0'] }, convoId: 'c1',
+      queueRelease: { dropItem: vi.fn() }, emitRelease: vi.fn(), notify: staleNotify, makeTask,
+    })).toBe(true);
+    expect(makeTask).not.toHaveBeenCalled();
+    expect(stale.queuedMessages).toHaveLength(2);
+    expect(staleNotify).toHaveBeenCalledWith('That queued message is no longer here — nothing was filed.');
+
+    // A caller that never wired the seam cannot honour the action: report it
+    // unhandled rather than silently swallowing the tap.
+    const unwiredNotify = vi.fn();
+    expect(resolveQueueReleaseTap('make_task', twoQueuedSession(), {
+      ...matrixDeps(), entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] }, convoId: 'c1',
+      notify: unwiredNotify,
+    })).toBe(false);
+    await Promise.resolve();
+    expect(unwiredNotify).not.toHaveBeenCalled();
+  });
+
+  // #1 (review): the tap is acknowledged synchronously and the card stays on
+  // screen until the POST resolves, so an impatient double tap must not file
+  // two tasks — and must not produce a second release whose failure would tell
+  // the user, falsely, that the message is still going out.
+  it('ignores a second tap while the first is still filing', async () => {
+    const session = twoQueuedSession();
+    let resolveFirst;
+    const makeTask = vi.fn(() => new Promise((resolve) => { resolveFirst = resolve; }));
+    const notify = vi.fn();
+    const { emitRelease, emitted } = durableRelease();
+    const queueRelease = { dropItem: vi.fn() };
+    const deps = {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease,
+      emitRelease,
+      notify,
+      makeTask,
+    };
+
+    expect(resolveQueueReleaseTap('make_task', session, deps)).toBe(true);
+    await Promise.resolve();
+    // Second tap, first POST still in flight: handled, but nothing new starts.
+    expect(resolveQueueReleaseTap('make_task', session, deps)).toBe(true);
+    expect(makeTask).toHaveBeenCalledTimes(1);
+
+    resolveFirst({ ok: true, num: 7, id: 'it_7' });
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(notify).toHaveBeenCalledWith('📌 Filed as task #7. The agent will be told when this turn ends.');
+    expect(emitted).toHaveLength(1);
+    expect(queueRelease.dropItem).toHaveBeenCalledTimes(1);
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
+
+    // The guard is released once the filing settles: the entry is gone now, so
+    // a later tap is the stale path, not a silently swallowed one.
+    await vi.waitFor(() => expect(session._makeTaskInFlight.size).toBe(0));
+    notify.mockClear();
+    resolveQueueReleaseTap('make_task', session, deps);
+    expect(notify).toHaveBeenCalledWith('That queued message is no longer here — nothing was filed.');
+    expect(makeTask).toHaveBeenCalledTimes(1);
+  });
+
+  // #5 (review): makeTask is the seam that queues the agent's heads-up, so by
+  // the time it resolves the queue has grown UNDER the tapped index. The
+  // release must still splice the tapped message and keep both arrays aligned.
+  it('splices the tapped entry even when filing appended a heads-up to the queue', async () => {
+    const session = twoQueuedSession();
+    const notify = vi.fn();
+    const { emitRelease } = durableRelease();
+    const queueRelease = { dropItem: vi.fn() };
+    const makeTask = vi.fn(async (s) => {
+      // What index.js's journalQueueMedia does: push the entry, then let
+      // notifyQueuedMessage reserve its lockstep notification slot.
+      s.queuedMessages.push([{ type: 'text', text: '📌 #7 filed' }]);
+      s.queueNotifications.push({ eventId: null, plain: '📨 Queued (3): 📌 #7 filed', id: 'pr_3::0' });
+      return { ok: true, num: 7, id: 'it_7' };
+    });
+
+    resolveQueueReleaseTap('make_task', session, {
+      ...matrixDeps(),
+      entry: { prompt_id: 'pr_1', itemIds: ['pr_1::0'] },
+      convoId: 'c1',
+      queueRelease,
+      emitRelease,
+      notify,
+      makeTask,
+    });
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(expect.stringContaining('Filed as task #7')));
+    expect(session.queuedMessages).toEqual([
+      [{ type: 'text', text: 'second' }],
+      [{ type: 'text', text: '📌 #7 filed' }],
+    ]);
+    expect(session.queueNotifications.map((n) => n.id)).toEqual(['pr_2::0', 'pr_3::0']);
+  });
+
+  it('only a non-empty all-text entry counts as filable', () => {
+    expect(isTextOnlyQueueEntry([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }])).toBe(true);
+    expect(isTextOnlyQueueEntry([{ type: 'text', text: 'a' }, { type: 'image', source: {} }])).toBe(false);
+    expect(isTextOnlyQueueEntry([{ type: 'text' }])).toBe(false);
+    expect(isTextOnlyQueueEntry([])).toBe(false);
+    expect(isTextOnlyQueueEntry(null)).toBe(false);
+  });
+
+  // The media seam feeds saved files, images, video frames AND the one
+  // text-shaped entry (a voice note's transcript). mirrorToJournal is what
+  // tells them apart, so the gate has to be computed there — a bare
+  // pass-through would offer the action on an image card.
+  it('index.js gates the media queue seam on mirrorToJournal and the entry shape', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('queueMedia: (session, entry) => journalQueueMedia(session, {');
+    expect(start).toBeGreaterThan(-1);
+    const seam = src.slice(start, src.indexOf('}),', start));
+    expect(seam).toMatch(/allowMakeTask:\s*entry\.mirrorToJournal === true && isTextOnlyQueueEntry\(entry\.blocks\)/);
+  });
+
+  it('index.js threads allowMakeTask at every notifyQueuedMessage call site and wires makeTask to the tap', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const calls = [...src.matchAll(/notifyQueuedMessage\(/g)];
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of calls) {
+      const args = src.slice(call.index, src.indexOf('});', call.index));
+      expect(args).toMatch(/allowMakeTask/);
+    }
+    const start = src.indexOf('resolveQueueReleaseTap(answer.choice, session, {');
+    expect(start).toBeGreaterThan(-1);
+    expect(src.slice(start, src.indexOf('});', start))).toMatch(/\bmakeTask\b/);
+  });
+});
+
+// index.js's journal half of the action, extracted and run against stubs (the
+// same technique the emitRelease wiring test above uses — index.js boots a
+// bridge on import, so its functions are read out of the source).
+describe("journalMakeTaskFromQueue (index.js)", () => {
+  function loadMakeTask(sandbox) {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('async function journalMakeTaskFromQueue(session, { text, username })');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\n}\n', start);
+    expect(end).toBeGreaterThan(start);
+    return runInNewContext(`(${src.slice(start, end + 2)})`, {
+      VOICE_NOTE_PREFIX: '[Voice note transcription]:',
+      journalConvoIdFor: () => 'convo-1',
+      formatItemTurn: realFormatItemTurn,
+      console: { warn: () => {} },
+      ...sandbox,
+    });
+  }
+
+  const created = (over = {}) => ({
+    status: 201,
+    data: { item: { id: 'it_7', num: 7, title: 'Refactor the auth module', awaiting: 'agent', ...over } },
+  });
+
+  it('titles from the first line, bodies from the rest, and files it as the user', async () => {
+    const create = vi.fn(async () => created());
+    const journalQueueMedia = vi.fn(async () => {});
+    const makeTask = loadMakeTask({ itemsClient: { create }, journalQueueMedia });
+
+    const result = await makeTask({ busy: true }, {
+      text: 'Refactor the auth module\nkeep the public API\nand the tests',
+      username: 'dan',
+    });
+
+    expect(result).toEqual({ ok: true, num: 7, id: 'it_7' });
+    expect(create).toHaveBeenCalledTimes(1);
+    // One deliberate tap: never idempotency-keyed (a second tap means "file
+    // another one"), so `create` is called with the body alone.
+    expect(create.mock.calls[0]).toEqual([{
+      kind: 'task',
+      title: 'Refactor the auth module',
+      body: 'keep the public API\nand the tests',
+      convo_id: 'convo-1',
+      on_behalf_of: 'user',
+    }]);
+
+    // The journal's own `created` marker carries an agent sender and is dropped
+    // by the router's user: filter, so the agent's heads-up is queued here —
+    // and the queued heads-up must not itself offer "📌 Make task".
+    expect(journalQueueMedia).toHaveBeenCalledTimes(1);
+    const queued = journalQueueMedia.mock.calls[0][1];
+    expect(queued.mirrorToJournal).toBe(false);
+    expect(queued.allowMakeTask).toBeUndefined();
+    expect(queued.preview).toBe('📌 #7 filed');
+    expect(queued.blocks[0].text).toBe(queued.fullText);
+    expect(queued.blocks[0].text).toContain('📌 dan filed a new task #7 "Refactor the auth module":');
+    expect(queued.blocks[0].text).toContain('keep the public API');
+  });
+
+  it("strips a voice note's transport label before titling the task", async () => {
+    const create = vi.fn(async () => created({ title: 'buy milk' }));
+    const makeTask = loadMakeTask({ itemsClient: { create }, journalQueueMedia: vi.fn(async () => {}) });
+
+    await makeTask({}, { text: '[Voice note transcription]: buy milk', username: 'dan' });
+
+    expect(create.mock.calls[0][0].title).toBe('buy milk');
+    expect(create.mock.calls[0][0].body).toBe('');
+  });
+
+  it('caps the title at 200 characters', async () => {
+    const create = vi.fn(async () => created());
+    const makeTask = loadMakeTask({ itemsClient: { create }, journalQueueMedia: vi.fn(async () => {}) });
+
+    await makeTask({}, { text: 'x'.repeat(400), username: 'dan' });
+
+    expect(create.mock.calls[0][0].title).toHaveLength(200);
+  });
+
+  it('reports the journal error and never queues a heads-up for an item that does not exist', async () => {
+    const journalQueueMedia = vi.fn(async () => {});
+    const unreachable = loadMakeTask({
+      itemsClient: { create: async () => ({ status: 0, data: { error: 'journal unreachable' } }) },
+      journalQueueMedia,
+    });
+    await expect(unreachable({}, { text: 'hi', username: 'dan' }))
+      .resolves.toEqual({ ok: false, error: 'journal unreachable' });
+
+    const refused = loadMakeTask({
+      itemsClient: { create: async () => ({ status: 400, data: {} }) },
+      journalQueueMedia,
+    });
+    await expect(refused({}, { text: 'hi', username: 'dan' }))
+      .resolves.toEqual({ ok: false, error: 'HTTP 400' });
+
+    // 201 and 200 are the two creations (see below); anything else with an
+    // item body is some other route's answer (or a proxy's), not proof that
+    // this task exists.
+    const wrongStatus = loadMakeTask({
+      itemsClient: { create: async () => ({ ...created(), status: 202 }) },
+      journalQueueMedia,
+    });
+    await expect(wrongStatus({}, { text: 'hi', username: 'dan' }))
+      .resolves.toEqual({ ok: false, error: 'HTTP 202' });
+
+    // 201 with an unusable body is a failure too — a heads-up naming item
+    // #undefined is worse than saying it didn't file.
+    const garbled = loadMakeTask({
+      itemsClient: { create: async () => ({ status: 201, data: { item: { id: 'it_7' } } }) },
+      journalQueueMedia,
+    });
+    expect((await garbled({}, { text: 'hi', username: 'dan' })).ok).toBe(false);
+
+    expect(journalQueueMedia).not.toHaveBeenCalled();
+  });
+
+  it('treats a 200 as the creation it is — the journal replaying an item this call already filed', async () => {
+    // An idempotent duplicate (or a POST whose response we lost and retried)
+    // answers 200 with the real item body. Calling that a failure would tell
+    // the user nothing was filed while the task sits in their backlog.
+    const journalQueueMedia = vi.fn(async () => {});
+    const makeTask = loadMakeTask({
+      itemsClient: { create: async () => ({ ...created(), status: 200 }) },
+      journalQueueMedia,
+    });
+
+    await expect(makeTask({}, { text: 'Refactor the auth module', username: 'dan' }))
+      .resolves.toEqual({ ok: true, num: 7, id: 'it_7' });
+    expect(journalQueueMedia).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an empty message without calling the journal', async () => {
+    const create = vi.fn();
+    const makeTask = loadMakeTask({ itemsClient: { create }, journalQueueMedia: vi.fn() });
+
+    await expect(makeTask({}, { text: '  \n ', username: 'dan' }))
+      .resolves.toEqual({ ok: false, error: 'nothing to file' });
+    await expect(makeTask({}, { text: '[Voice note transcription]:   ', username: 'dan' }))
+      .resolves.toEqual({ ok: false, error: 'nothing to file' });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('still reports success when the heads-up tile fails — the item IS filed', async () => {
+    const makeTask = loadMakeTask({
+      itemsClient: { create: async () => created() },
+      journalQueueMedia: vi.fn(async () => { throw new Error('publish failed'); }),
+    });
+
+    await expect(makeTask({}, { text: 'hi', username: 'dan' }))
+      .resolves.toEqual({ ok: true, num: 7, id: 'it_7' });
   });
 });

@@ -93,6 +93,90 @@ describe('createJournalInputConsumer', () => {
     };
   }
 
+  it('routes a user item marker to routeItemToSession when the seam is wired, and ignores it otherwise', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn() });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', seq: 7, payload }));
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    const [session, item, ctx] = deps.routeItemToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(item).toEqual({ payload, seq: 7 });
+    expect(ctx).toEqual({ username: 'dan' });
+    // agent-authored marker (the bridge's own API write echo): dropped
+    consumer(baseFrame({ type: 'item', sender: 'agent:dev-2', payload }));
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    // unwired seam: pass-through, and nothing else in the pipeline reacts
+    const bareDeps = makeDeps();
+    const bare = createJournalInputConsumer(bareDeps);
+    bare(baseFrame({ type: 'item', payload }));
+    expect(bareDeps.findSessionByConvoId).not.toHaveBeenCalled();
+    expect(bareDeps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('an item marker wakes a reaped session, exactly as text does', () => {
+    // Spec: a reply "wakes the box if asleep". Answering the agent's question
+    // hours later — after the idle reaper took the session — is the case the
+    // tracker exists for, so the marker must auto-resume and then route into
+    // the resumed session, not hit the unknown-convo notice.
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const resumed = { claudeSessionId: 'convo-1', resumed: true };
+    const deps = makeDeps({
+      routeItemToSession: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      resumeSessionForConvo: vi.fn(() => resumed),
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', payload }));
+    expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'dan' });
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeItemToSession.mock.calls[0][0]).toBe(resumed);
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('a marker that can never become a turn is dropped outright — no wake, no route, no notice', () => {
+    // Backlog housekeeping produces no turn (lib/items-turn.js isTurnWorthy),
+    // so respawning a whole agent session for it would be pure cost. Same for
+    // a field edit, an unknown action and a malformed marker. And because it
+    // is not input at all, a sessionless convo must stay SILENT: publishing
+    // the unknown-convo notice would answer a backlog drag on an idle box
+    // with "no active session" — a complaint about something the user never
+    // asked the agent to do.
+    const deps = makeDeps({
+      routeItemToSession: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      resumeSessionForConvo: vi.fn(() => ({ claudeSessionId: 'convo-1' })),
+    });
+    const consumer = createJournalInputConsumer(deps);
+    for (const payload of [
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'reordered', by: 'user', awaiting: null, resolution: null },
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'updated', by: 'user', awaiting: null, resolution: null },
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'archived', by: 'user', awaiting: null, resolution: null },
+      { action: 'commented' },
+    ]) {
+      consumer(baseFrame({ type: 'item', payload }));
+    }
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('an item marker for a dead session on a bridge with no resume seam notices instead of routing', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn(), findSessionByConvoId: vi.fn(() => null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', payload }));
+    expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
+  });
+
+  it('a routeItemToSession that throws never breaks the consumer', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn(() => { throw new Error('boom'); }) });
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(baseFrame({ type: 'item', payload }))).not.toThrow();
+  });
+
   it('ignores frames whose sender is not user:* (agent echoes — the loop-prevention filter)', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
@@ -133,6 +217,36 @@ describe('createJournalInputConsumer', () => {
     expect(() => consumer(baseFrame({ payload: null }))).not.toThrow();
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
     expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it('ignores a flagged fallback text (journal mirror of an item marker) for a live session — no route, no warn', () => {
+    // Spec: docs/superpowers/specs/2026-09-08-task-decision-tracker-design.md
+    // "Old-client fallback" — the journal mirrors an item marker as a plain
+    // `text` event for pre-tracker clients. The marker path already
+    // delivered the turn, so this frame must be silence: no routeTextToSession
+    // call, and (being an ordinary, expected frame, not an anomaly) no warn.
+    const deps = makeDeps();
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      payload: { body: '📌 Task #1 "x" — dan commented:\nhi', fallback_for: 'item', item_id: 'it_1', num: 1, action: 'commented' },
+    }));
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(warnings.length).toBe(0);
+  });
+
+  it('routes the same text frame as usual when it carries no fallback_for flag', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      payload: { body: '📌 Task #1 "x" — dan commented:\nhi', item_id: 'it_1', num: 1, action: 'commented' },
+    }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    const [session, body, ctx] = deps.routeTextToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(body).toBe('📌 Task #1 "x" — dan commented:\nhi');
+    expect(ctx).toEqual({ username: 'dan' });
   });
 
   it('routes a prompt_reply event for a known session to routePromptReply with target_seq/choice/text', () => {
@@ -1552,9 +1666,18 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
       target_seq: CARD_SEQ, choice: 'send_one', text: null,
     });
 
+    // 'make_task' (items tracker) is a wire action too: the tap files the
+    // queued message as a task instead of sending it, so the router must let
+    // it through exactly like send_one.
+    consumer(tap('make_task'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(3);
+    expect(deps.routePromptReply.mock.calls[2][1]).toEqual({
+      target_seq: CARD_SEQ, choice: 'make_task', text: null,
+    });
+
     // Unknown action on a known card → warn + user notice, no route.
     consumer(tap('frobnicate'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(3); // unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
     expect(warnings.some(w => /invalid queued_release action/.test(w))).toBe(true);
 
@@ -1565,7 +1688,7 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     // never falling through to the ordinary answer path.
     deps.noticeQueuedReleaseIgnored.mockClear();
     consumer(tap('send'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // still unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(3); // still unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'tombstoned' }));
   });
 });

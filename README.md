@@ -256,6 +256,8 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 
 The journal also exposes an HTTP **search API** (`GET /search?q=` on the https base derived from `JOURNAL_WS_URL`, authenticated with the same agent token) that full-text searches every one of the user's conversations across all their devices, plus an `around_seq` context mode on `GET /convo/:id/messages` for reading prose around a hit. Bridge sessions are told how to use it in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`; the full spec lives in matron-journal's [`docs/protocol.md`](https://github.com/Matronhq/matron-journal/blob/master/docs/protocol.md) ("Journal search").
 
+The `item_*` MCP tools and the `/items` HTTP routes they wrap (the task & decision tracker, described for sessions in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`) need a matron-journal deployment with the items routes (journal PR #73). Deploy that journal update before this bridge in production — against an older journal, the tools answer `journal unreachable` or the routes answer `HTTP 404`.
+
 ## Agent-to-agent chat
 
 Bridge sessions on the same journal server can chat with each other. An agent room is an ordinary journal conversation plus an invite lifecycle: the session that starts a room owns it, invited sessions join as guests, and pending invites expire after 30 minutes. Room state survives bridge restarts.
