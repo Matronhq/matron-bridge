@@ -21,7 +21,8 @@ import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, LOGIN_SUCCESS_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
+import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
   effectiveExtras,
@@ -3223,79 +3224,6 @@ function unwrapUrls(text) {
   return out;
 }
 
-// Build a clean, purpose-built Matrix message from a settled free-text
-// TUI screen instead of dumping the raw PTY content. Each cue type
-// (OAuth flow, press-enter ack, etc) gets its own formatter so the user
-// sees a focused message — no separator bars, status chrome, OSC title
-// leaks, spinner ticks, task lists, etc. Returns null when nothing
-// useful can be extracted (caller should not send anything in that
-// case rather than dumping the raw screen).
-function formatTuiCueMessage(screen, urls, { hasNewUrls = true } = {}) {
-  // All cue matching runs on the compact form (lowercased, whitespace and
-  // apostrophes removed): the TUI shimmer-animates some of these lines with
-  // per-character escapes, which stripAnsi renders letter-spaced ("P r e s s
-  // E n t e r …") — word-spaced regexes never match those. See
-  // compactScreenText in lib/prompt-detector.js.
-  const compact = compactScreenText(screen);
-  // Press-Enter acknowledgment (e.g. post-login "Login successful.
-  // Press Enter to continue…") — checked BEFORE the OAuth branch: the
-  // success screen still carries the wizard's "use the url below" text and
-  // the OAuth URL in the scrollback above it, and oauth-first ordering
-  // re-rendered a "sign in" card at the exact moment login succeeded
-  // (live-test round 5's post-paste duplicate). The press-enter cue is the
-  // actionable state; older wizard text above it is history.
-  //
-  // Result line: JUST ABOVE the cue line, and only on the strict
-  // login-result tokens. The tail also contains the resumed session's
-  // repainted chat transcript, and a whole-screen search with loose words
-  // ("complete", "finished") kept matching the USER'S OWN old messages —
-  // surfacing a random fragment of prior conversation as a "✅ …" card
-  // (live-test rounds 1 and 2).
-  if (AUTO_ENTER_COMPACT_RE.test(compact)) {
-    const lines = screen.split('\n').map(l => l.trim()).filter(Boolean);
-    const cueIdx = lines.findIndex(l => AUTO_ENTER_COMPACT_RE.test(compactScreenText(l)));
-    const nearby = cueIdx >= 0 ? lines.slice(Math.max(0, cueIdx - 4), cueIdx + 1) : [];
-    const resultLine =
-      nearby.find(l => LOGIN_SUCCESS_COMPACT_RE.test(compactScreenText(l))) ||
-      'Claude is continuing…';
-    const display = despaceTuiLine(resultLine);
-    const plain = `✅ ${display}`;
-    const html = `<b>✅ ${escapeHtml(display)}</b>`;
-    return { plain, html };
-  }
-  // OAuth / "open this URL to sign in" flow. Triggered by /login.
-  // Screen layout: "Browser didn't open? Use the url below to sign in
-  // (c to copy)" + URL + "Paste code here if prompted >".
-  // Gated on hasNewUrls: the card's entire content is the URL, so a
-  // re-render where every URL was already surfaced can only ever be a
-  // duplicate of a card the user already has.
-  const isOauth = /browserdidntopen|usetheurl|copytheurl|pastecodehere/.test(compact);
-  if (isOauth && urls.length > 0 && hasNewUrls) {
-    const url = urls[0];
-    const plain =
-      `🔗 Claude needs you to sign in.\n\n` +
-      `Open this URL in your browser:\n${url}\n\n` +
-      `After authorising, paste the code (the long string after \`#\` in the callback URL) back here.`;
-    const html =
-      `<b>🔗 Claude needs you to sign in.</b><br/><br/>` +
-      `Open this URL in your browser:<br/>` +
-      `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a><br/><br/>` +
-      `After authorising, paste the code (the long string after <code>#</code> in the callback URL) back here.`;
-    return { plain, html };
-  }
-  // Generic input cue we couldn't parse — surface a one-liner pointing
-  // at the cue with any URLs, but don't dump the whole screen. Same
-  // hasNewUrls gate as the OAuth card: all-stale URLs = duplicate.
-  if (urls.length > 0 && hasNewUrls) {
-    const plain = `Claude is asking you to act on this URL:\n${urls.join('\n')}`;
-    const html =
-      `<b>Claude is asking you to act on this URL:</b><br/>` +
-      urls.map(u => `<a href="${escapeHtml(u)}">${escapeHtml(u)}</a>`).join('<br/>');
-    return { plain, html };
-  }
-  return null;
-}
-
 // Surface free-text TUI output (e.g. the /login OAuth URL screen, "press
 // enter to continue" notices) to Matrix. Triggered by the prompt-detector's
 // `screen-update` event whenever the screen settles with URLs or input
@@ -3333,9 +3261,15 @@ function handleInteractiveScreenUpdate(session, update) {
     return;
   }
   if (message) {
-    console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
-    if (session.sendHtml) session.sendHtml(message.plain, message.html);
-    else if (session.sendCallback) session.sendCallback(message.plain);
+    // `parts` (URL cues) are deliberately separate messages so a URL can be
+    // copied on its own — see urlCueParts. Sent in order; sendToRoom's
+    // journal publish is an ordered enqueue, so they land as written.
+    const parts = message.parts || [message];
+    console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue in ${parts.length} message(s) (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
+    for (const part of parts) {
+      if (session.sendHtml) session.sendHtml(part.plain, part.html);
+      else if (session.sendCallback) session.sendCallback(part.plain);
+    }
   }
   // A free-text TUI cue means claude is waiting on the user just like a
   // structured prompt does — clear busy so the user's response (OAuth
@@ -3460,19 +3394,6 @@ function handleUnclassifiedPrompt(session, { screen }) {
 // interactive session back to print mode — long enough for the TUI to paint
 // its idle screen so planModeSwitch doesn't refuse the switch.
 const LOGIN_RETURN_TO_PRINT_DELAY_MS = 2500;
-
-// Undo the letter-spacing stripAnsi leaves on shimmer-animated TUI lines
-// ("L o g i n   s u c c e s s f u l .") for display. Only rewrites lines that
-// are mostly single-character tokens; normal prose is untouched. Runs of 2+
-// spaces are word gaps, single spaces are letter gaps.
-function despaceTuiLine(line) {
-  const trimmed = String(line || '').trim();
-  const toks = trimmed.split(/\s+/);
-  if (toks.length < 6) return trimmed;
-  const singles = toks.filter(t => t.length === 1).length;
-  if (singles / toks.length <= 0.6) return trimmed;
-  return trimmed.split(/ {2,}/).map(word => word.replace(/ /g, '')).join(' ');
-}
 
 // --- Structured Question Handling ---
 
