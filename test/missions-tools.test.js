@@ -23,7 +23,9 @@ function fixture(clientOverrides = {}) {
 describe('missions handlers', () => {
   it('start: validates title/body, fills convo_id, passes idem key, caches the mission on the session', async () => {
     const { h, client, session } = fixture();
-    expect((await h.start({ roomId: '!r:s', title: '' })).status).toBe(400);
+    const emptyTitle = await h.start({ roomId: '!r:s', title: '' });
+    expect(emptyTitle.status).toBe(400);
+    expect(emptyTitle.body.error).toBe('title must be a non-empty string of at most 200 characters');
     expect((await h.start({ roomId: '!r:s', title: 'x'.repeat(201) })).status).toBe(400);
     expect((await h.start({ roomId: '!r:s', title: 'ok', body: 'y'.repeat(32769) })).status).toBe(400);
     const r = await h.start({ roomId: '!r:s', title: ' M ', body: 'goal', idem_key: 'k' });
@@ -61,7 +63,7 @@ describe('missions handlers', () => {
     client.get.mockResolvedValueOnce({ status: 200, data: { mission: { id: 'ms_9', num: 9 }, milestones: [], items: [], conversations: [{ id: 'c1' }] } });
     const r = await h.get({ roomId: '!r:s' });
     expect(r.status).toBe(200);
-    expect(client.list).toHaveBeenCalledWith({ state: 'open' });
+    expect(client.list.mock.calls[0]).toEqual([]);
     expect(session.missionId).toBe('ms_9');
   });
 
@@ -76,6 +78,9 @@ describe('missions handlers', () => {
     const { h, client, session } = fixture();
     session.missionId = 'ms_1';
     expect((await h.update({ roomId: '!r:s' })).status).toBe(400);
+    const emptyTitle = await h.update({ roomId: '!r:s', title: '' });
+    expect(emptyTitle.status).toBe(400);
+    expect(emptyTitle.body.error).toBe('title must be a non-empty string of at most 200 characters');
     expect((await h.update({ roomId: '!r:s', title: 'New' })).status).toBe(200);
     expect(client.update.mock.calls[0]).toEqual(['ms_1', { title: 'New' }]);
     expect((await h.close({ roomId: '!r:s' })).status).toBe(400);
@@ -115,7 +120,7 @@ describe('missions handlers', () => {
     expect(client.list).not.toHaveBeenCalled();
     const r2 = await h.update({ roomId: '!r:s', title: 'New2' });
     expect(r2.status).toBe(200);
-    expect(client.list).toHaveBeenCalledWith({ state: 'open' });
+    expect(client.list.mock.calls[0]).toEqual([]);
     expect(client.update.mock.calls[1][0]).toBe('ms_9');
     expect(session.missionId).toBe('ms_9');
   });
@@ -150,5 +155,80 @@ describe('missions handlers', () => {
     const { h: h5, session: s5 } = fixture({ close: vi.fn(async () => down) });
     s5.missionId = 'ms_1';
     expect((await h5.close({ roomId: '!r:s', summary: 's' })).status).toBe(502);
+  });
+
+  it('cold resolve lists missions in EVERY state and finds a CLOSED one by origin', async () => {
+    // After a bridge restart, a conversation whose mission is closed must
+    // still resolve to it — otherwise the model is told "call mission_start",
+    // POST /missions answers 200 existing:true with that same closed mission,
+    // and the loop never ends. Resolving it lets the journal say 409 closed.
+    const closed = { id: 'ms_c', num: 6, title: 'Done', origin_convo_id: 'c1', state: 'closed' };
+    const { h, client, session } = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions: [closed] } })),
+      update: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'closed' } })),
+    });
+    const r = await h.update({ roomId: '!r:s', title: 'New' });
+    expect(client.list.mock.calls[0]).toEqual([]);
+    expect(client.list.mock.calls[0][0]?.state).toBeUndefined();
+    expect(session.missionId).toBe('ms_c');
+    expect(r.status).toBe(409);
+    expect(r.body.blocked_by).toBe('closed');
+  });
+
+  it('cold resolve finds a CLOSED mission this conversation merely JOINED, and caches it', async () => {
+    const closed = { id: 'ms_c', num: 6, title: 'Done', origin_convo_id: 'cOther', state: 'closed' };
+    const { h, client, session } = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions: [closed] } })),
+      get: vi.fn(async () => ({ status: 200, data: { mission: closed, milestones: [], items: [], conversations: [{ id: 'cOther' }, { id: 'c1' }] } })),
+      close: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'closed' } })),
+    });
+    const r = await h.close({ roomId: '!r:s', summary: 's' });
+    expect(r.status).toBe(409);
+    expect(client.get.mock.calls[0][0]).toBe('ms_c');
+    expect(session.missionId).toBe('ms_c');
+    // Cached: a second call re-uses it without scanning again.
+    await h.close({ roomId: '!r:s', summary: 's' });
+    expect(client.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('cold resolve picks the ONE matching mission out of several and stops scanning there', async () => {
+    const missions = [
+      { id: 'ms_a', num: 1, origin_convo_id: 'cA', state: 'open' },
+      { id: 'ms_b', num: 2, origin_convo_id: 'cB', state: 'closed' },
+      { id: 'ms_c', num: 3, origin_convo_id: 'cC', state: 'open' },
+    ];
+    const detail = (id, convos) => ({ status: 200, data: { mission: { id }, milestones: [], items: [], conversations: convos } });
+    const { h, client, session } = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions } })),
+      get: vi.fn(async (id) => detail(id, id === 'ms_b' ? [{ id: 'cB' }, { id: 'c1' }] : [{ id: `c${id.slice(-1).toUpperCase()}` }])),
+    });
+    const r = await h.update({ roomId: '!r:s', title: 'New' });
+    expect(r.status).toBe(200);
+    expect(session.missionId).toBe('ms_b');
+    expect(client.update.mock.calls[0][0]).toBe('ms_b');
+    // ms_a then ms_b — the scan stops on the match, never reaching ms_c.
+    expect(client.get.mock.calls.map((c) => c[0])).toEqual(['ms_a', 'ms_b']);
+  });
+
+  it('start / post 404 says the conversation was refused, NOT that the routes are missing', async () => {
+    const notFound = { status: 404, data: { error: 'not_found' } };
+    const convoText = 'the journal did not accept this conversation — it may have no journal row yet, or its mission is not visible to this session';
+
+    const { h: h1 } = fixture({ start: vi.fn(async () => notFound) });
+    const r1 = await h1.start({ roomId: '!r:s', title: 'M' });
+    expect(r1.status).toBe(404);
+    expect(r1.body.error).toBe(convoText);
+
+    const { h: h2 } = fixture({ postMilestone: vi.fn(async () => notFound) });
+    const r2 = await h2.post({ roomId: '!r:s', kind: 'progress', title: 't' });
+    expect(r2.status).toBe(404);
+    expect(r2.body.error).toBe(convoText);
+  });
+
+  it('the NO_ROUTES sentence is reserved for a 404 from GET /missions, the collection route', async () => {
+    const { h } = fixture({ list: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+    const r = await h.update({ roomId: '!r:s', title: 'New' });
+    expect(r.status).toBe(404);
+    expect(r.body.error).toMatch(/does not have the \/missions routes yet/);
   });
 });
