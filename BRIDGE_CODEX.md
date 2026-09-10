@@ -48,18 +48,19 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 - `POST $BASE/items/:id/comments` — `{"body":"..."}` (and/or `attachments`). This route does not take `awaiting` — a comment never changes who the item is waiting on by itself. To hand the item over, take it back, or clear it, follow up with `PATCH $BASE/items/:id` and `{"awaiting":"user"}` / `"agent"` / `null` (setting it to `"user"`/`"agent"` 409s on a closed item — reopen it first; clearing it to `null` is fine either way).
 - `PATCH $BASE/items/:id` — edit `title`, `body`, `labels`, `links`, and/or `awaiting` (open or closed).
 - `POST $BASE/items/:id/close` — `{"resolution":"done"|"answered"|"decided"|"reversed"|"cancelled","comment":"..."}`. `POST $BASE/items/:id/reopen` with an optional `{"comment":"..."}` undoes it.
-- Give every `POST` an `Idempotency-Key` header (any string unique to that intent, e.g. `$(uuidgen)`) so a retried request can't file or comment twice.
+- Give every `POST` an `Idempotency-Key` header (any string unique to that intent — set `KEY=$(uuidgen)` once and reuse the same `$KEY` when you retry) so a retried request can't file or comment twice.
 
 **Your own `convo_id`:** for listing, prefer omitting `convo` — see every open item across this user's conversations — rather than chasing this conversation's id. `POST /items` has no such escape hatch (`convo_id` is required to file), so when you do need the real id: `GET $BASE/search?q=<terms>&limit=1` returns hits from *any* of the user's conversations, so a short or common phrase can resolve to the wrong one. Use a long, unusual phrase from something you just said, and check the hit's `ts` is from this turn (not an old conversation that happened to reuse similar words) before trusting its `convo_id`.
 
 ```bash
 BASE=<https base, as above>
 CONVO_ID=<this conversation's id — see above>
+KEY=$(uuidgen)   # one key per intent; reuse it if you retry this exact request
 
 curl -sS -X POST "$BASE/items" \
   -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Idempotency-Key: $KEY" \
   -d "{\"kind\":\"question\",\"title\":\"Which auth flow?\",\"body\":\"OAuth vs API key — recommend OAuth.\",\"convo_id\":\"$CONVO_ID\"}"
 
 curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
@@ -67,3 +68,28 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
 ```
 
 If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
+
+## Missions & milestones
+
+A mission is the human-readable record of one piece of work; milestones are its checkpoints and jump targets back into the transcript. Same base URL and token discipline as the items routes above. **Start the mission as soon as you know what the work is; milestones are refused until the conversation has one.** Post a milestone with `kind:"user_input"` whenever an input from the user starts or redirects work, and `kind:"progress"` as often as useful. Close it when the work is done, not when the session ends.
+
+- `POST $BASE/missions` — `{"title":"...","body":"goal","convo_id":"<id>"}` → 201 mission (`num` is its number); 200 with `existing:true` if the conversation already has one.
+- `POST $BASE/milestones` — `{"convo_id":"<id>","kind":"user_input"|"progress","title":"...","body":"..."}` → 201; 409 `blocked_by:"no_mission"` means start the mission first, then retry.
+- `GET $BASE/missions/:num` — milestones newest first, open items, conversations. `PATCH $BASE/missions/:num` `{"title"?,"body"?}` to rename.
+- `POST $BASE/missions/:num/join` `{"convo_id":"<id>"}` — attach this conversation to an existing mission. Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not — put the mission number in its task and have it join that mission by number.
+- `POST $BASE/missions/:num/close` `{"summary":"..."}` — 409 `blocked_by:"user_items"|"agent_items"` lists the open items: close each (`/items/:id/close`) or move it (`PATCH $BASE/items/:id` `{"mission":"#N"}`); items awaiting the user cannot be cleared by you.
+- Give every `POST $BASE/missions` and `POST $BASE/milestones` an `Idempotency-Key`, and REUSE the same key when you retry the same request — a fresh key on a retry mints a second mission or milestone (and a second transcript marker). Set it in a variable once, then reuse that variable.
+
+```bash
+KEY=$(uuidgen)   # one key per REQUEST, reused verbatim on every retry of it
+curl -sS -X POST "$BASE/missions" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
+  -d "{\"title\":\"Missions & milestones\",\"body\":\"Ship the journal half\",\"convo_id\":\"$CONVO_ID\"}"
+
+KEY=$(uuidgen)
+curl -sS -X POST "$BASE/milestones" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
+  -d "{\"convo_id\":\"$CONVO_ID\",\"kind\":\"user_input\",\"title\":\"Dan asked for missions\"}"
+```

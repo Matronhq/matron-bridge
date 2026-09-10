@@ -8,6 +8,8 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
+import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { missionIdemKey } from './lib/missions-idem.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -713,6 +715,100 @@ server.tool(
     before: z.string().optional().describe('Item id to place this one before'),
   },
   async (args) => callItems('reorder', args, (d) => itemLine(d.item)),
+);
+
+// --- Missions & milestones (spec 2026-09-10) ---
+//
+// Same shape as callItems. A 409 is the interesting case here: the journal
+// says WHY (blocked_by) and the renderer turns that into the next call the
+// model should make — never isError, never raw JSON. Other errors go
+// through formatJournalError, which turns the journal's machine words into
+// sentences.
+//
+// The two creating ops carry an idempotency key the model never sees or
+// supplies: a retried milestone_post would otherwise mint a second
+// milestone AND a second transcript marker (see lib/missions-idem.js).
+async function callMissions(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  if (name === 'start' || name === 'post') {
+    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
+  }
+  try {
+    const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatBlocked(data)}` }] };
+    if (!res.ok) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatJournalError(name, data) || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
+  }
+}
+const missionToolName = (op) => ({ start: 'mission_start', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+
+server.tool(
+  'mission_start',
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has one this returns it unchanged.",
+  {
+    title: z.string().describe('One line, ≤200 chars — what the work is'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
+  },
+  async (args) => callMissions('start', args, formatStartAck),
+);
+
+server.tool(
+  'milestone_post',
+  "Post a milestone: a checkpoint on this conversation's mission that is also a jump target back to this exact point in the transcript. kind 'user_input' whenever an input from the user starts or redirects work (skip typos, one-word answers, clarifications) — the user's stated purpose is to get back to their last input easily. kind 'progress' as often as useful: a landed PR, a diagnosis, a decision, a phase done. There is no cap. Refused with an instruction if the conversation has no mission yet.",
+  {
+    kind: z.enum(['user_input', 'progress']),
+    title: z.string().describe('One line, ≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
+  },
+  async (args) => callMissions('post', args, formatMilestoneAck),
+);
+
+server.tool(
+  'mission_update',
+  "Rename this conversation's mission or rewrite its standing description (title and/or body). Use it when the work changes shape.",
+  {
+    title: z.string().optional().describe('≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB'),
+  },
+  async (args) => callMissions('update', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'mission_join',
+  'Attach this conversation to an existing mission by number (e.g. work handed over from another session). Items filed here from now on belong to that mission.',
+  { num: z.number().int().min(1).describe('The mission number, e.g. 61') },
+  async (args) => callMissions('join', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'mission_get',
+  "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's mission.",
+  { num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission') },
+  async (args) => callMissions('get', args, formatMissionDetail),
+);
+
+server.tool(
+  'mission_close',
+  "Close this conversation's mission when the work is DONE (not when the session ends), with a summary. Refuses while items are open: close each with a real resolution, or item_move it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those.",
+  { summary: z.string().describe('Markdown ≤32 KiB — how it went, what shipped, what is left') },
+  async (args) => callMissions('close', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'item_move',
+  "Move an item to another mission by number, or detach it (mission: null). The only way an item's mission ever changes.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
+  },
+  async (args) => callItems('move', args, (d) => itemLine(d.item)),
 );
 
 const transport = new StdioServerTransport();

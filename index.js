@@ -7,6 +7,8 @@ import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createItemsHandlers } from './lib/items-tools.js';
+import { createMissionsClient } from './lib/missions-client.js';
+import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -470,8 +472,16 @@ const _journalToken = resolveJournalToken();
 // no journal configured the base URL is empty and every call resolves status
 // 0, which the handlers turn into a 502 "journal unreachable" — a tool that
 // says so beats one that throws.
+const journalHttpBase = JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '';
 const itemsClient = createItemsClient({
-  baseUrl: JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '',
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Missions & milestones (spec 2026-09-10): same base URL and token as the
+// items client; a missing journal resolves status 0 → 502 in the handlers.
+const missionsClient = createMissionsClient({
+  baseUrl: journalHttpBase,
   token: _journalToken,
 });
 
@@ -9893,6 +9903,12 @@ const itemsHandlers = createItemsHandlers({
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
 });
 
+const missionsHandlers = createMissionsHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: missionsClient,
+});
+
 // Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
 // agent_boxes / agent_session_start MCP tools and the kind:'spawn' outcome
 // frames. Constructed exactly once, here — the factory starts an unref'd
@@ -10319,14 +10335,24 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The seven item_* tool routes. One matcher rather than seven blocks:
+      // The eight item_* tool routes. One matcher rather than eight blocks:
       // the handler names ARE the path segments, and the anchored alternation
       // is the allowlist (no dynamic property lookup from raw input).
-      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder)$/);
+      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder|move)$/);
       if (itemsRoute) {
         const name = itemsRoute[1];
         await respondAgentChatRoute(res, data, itemsHandlers[name],
           (status, b) => debug(`items/${name} ${status} ${b.error || (b.item ? `#${b.item.num ?? '?'}` : `${(b.items || []).length} items`)}`));
+        return;
+      }
+
+      // The six mission_* / milestone_post tool routes; same one-matcher
+      // allowlist shape as /items above.
+      const missionsRoute = url.pathname.match(/^\/missions\/(start|post|update|join|get|close)$/);
+      if (missionsRoute) {
+        const name = missionsRoute[1];
+        await respondAgentChatRoute(res, data, missionsHandlers[name],
+          (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
         return;
       }
 
