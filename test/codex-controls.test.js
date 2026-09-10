@@ -74,7 +74,10 @@ describe('Codex native controls', () => {
     await h.run('/login');
     expect(h.session.codex.rpc.mock.calls.map(c => c[0])).toEqual(['account/login/cancel', 'account/login/start']);
     expect(h.session._codexLoginId).toBe('new');
-    expect(h.opts.reply).toHaveBeenCalledWith(expect.stringContaining('Enter this one-time code on that page'));
+    expect(h.opts.reply).toHaveBeenNthCalledWith(1, expect.stringContaining('code from the next message'));
+    expect(h.opts.reply.mock.calls[0][0]).not.toContain('ABCD-1234');
+    expect(h.opts.reply).toHaveBeenNthCalledWith(2, 'ABCD-1234');
+    expect(h.opts.reply).toHaveBeenCalledTimes(2);
     expect(h.opts.send).not.toHaveBeenCalled();
   });
   it('serializes sign-in requests while a device code is being allocated', async () => {
