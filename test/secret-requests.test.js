@@ -544,6 +544,31 @@ describe('per-room pending cap', () => {
     expect(h.items.calls.create.length).toBe(5);
   });
 
+  it('closes the item as answered when the submission beats the filing', async () => {
+    let n = 0;
+    const release = [];
+    const items = makeItems();
+    const slowCreate = items.create;
+    items.create = (body) => new Promise((resolve) => { release.push(() => resolve(slowCreate(body))); });
+    const h = makeHarness({ newId: () => `sec-${++n}`, items });
+    const creating = h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await new Promise((r) => setTimeout(r, 0));
+    // The user reached the form through the item and submitted before create() resumed.
+    const sub = await h.store.submit('sec-1', DUMMY);
+    expect(sub.status).toBe(200);
+    await sub.done;
+    expect(h.items.calls.close).toEqual([]); // nothing to close yet — no item id
+    release[0]();
+    const r = await creating;
+    expect(r.alreadySubmitted).toBe(true);
+    expect(h.items.calls.close.length).toBe(1);
+    expect(h.items.calls.close[0]).toMatchObject({ id: 'it_abc', body: { resolution: 'answered' } });
+    expect(h.saved.requests).toEqual([]);
+    expect(h.chat).toEqual([]);          // no "here is your link" for an answered request
+    expect([...h.scheduler.armed.values()].filter((t) => t.delay === SECRET_REQUEST_TTL_MS)).toEqual([]); // no expiry timer
+    expect(h.turns.length).toBe(1);      // the agent still got the value
+  });
+
   it('keeps the reserved slot when the tracker rejects the item — the request itself is still live', async () => {
     const items = makeItems();
     items.create = async () => { throw new Error('network down'); };
