@@ -12,7 +12,6 @@ import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
-const SECRET_TIMEOUT_MS = 300000;    // 5 min max wait for secret submission
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
 // same env var through the same validation, keeping one expiry for the whole
 // request lifecycle (default 5 min; out-of-range overrides fall back).
@@ -28,16 +27,17 @@ const server = new McpServer({
 
 server.tool(
   'request_secret',
-  'Request a secret from the user via a secure web form. The secret is written to a file and the file path is returned. Use this for API keys, tokens, passwords — anything that should not appear in chat.',
+  'Request a secret from the user via a secure web form: API keys, tokens, passwords, or whole key files (multiline: true) — anything that must not appear in chat. This tool does NOT block and returns nothing secret: it files the request in the user\'s tracker (their Decisions list) alongside a chat link, then returns immediately. The user has 24 hours. When they submit, you receive a turn telling you the local file path to read the value from — so carry on with other work in the meantime and never poll for it.',
   {
     label: z.string().describe('A short label describing what secret is needed, e.g. "AWS access key" or "database password"'),
+    multiline: z.boolean().optional().describe('Render a multi-line box instead of a masked one-line field. Use for PEM keys, certificates and JSON service-account files, whose newlines a one-line field would destroy.'),
   },
-  async ({ label }) => {
+  async ({ label, multiline }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/secret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, roomId: ROOM_ID }),
+        body: JSON.stringify({ label, roomId: ROOM_ID, multiline: multiline === true }),
       });
 
       if (!postRes.ok) {
@@ -45,23 +45,18 @@ server.tool(
         return { content: [{ type: 'text', text: `Error requesting secret: ${err}` }] };
       }
 
-      const { secretId } = await postRes.json();
-
-      // Poll for the secret to be submitted
-      const deadline = Date.now() + SECRET_TIMEOUT_MS;
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-
-        const pollRes = await fetch(`${BRIDGE_API}/secret/${secretId}`);
-        if (!pollRes.ok) continue;
-
-        const data = await pollRes.json();
-        if (data.answered) {
-          return { content: [{ type: 'text', text: `Secret written to: ${data.path}` }] };
-        }
-      }
-
-      return { content: [{ type: 'text', text: 'Secret request timed out — no input received within 5 minutes.' }] };
+      // No polling: the bridge holds the request for 24 h and delivers the
+      // answer as a turn. The request id is the fallback identifier when the
+      // tracker item could not be filed (no journal on this box).
+      const { secretId, itemNum, itemError } = await postRes.json();
+      const ref = Number.isInteger(itemNum) ? `#${itemNum}` : secretId;
+      const filed = itemError ? ` The tracker item could not be filed (${itemError}) — the chat link still works.` : '';
+      return {
+        content: [{
+          type: 'text',
+          text: `Secret requested (${ref}) — the user has 24 hours; you will receive a turn "🔐 Secret "${label}" submitted — read it from <path>" when it lands. Carry on with other work; do not poll.${filed}`,
+        }],
+      };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }

@@ -25,7 +25,13 @@ const PORT = resolveViewerPort();
 const SECRET = process.env.HMAC_SECRET;
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+// 512 KB rather than body-parser's 100 KB default: the only form that POSTs
+// here is the secure-input one, and a multi-line credential is percent-encoded
+// on the way (every newline costs six characters, every `+`/`/` in a base64
+// blob costs three), so the 100 KB default put the real ceiling on a pasted
+// PEM or kubeconfig at ~32 KB in the worst case. Still small enough that a
+// flood of oversized bodies is not a memory story.
+app.use(express.urlencoded({ extended: false, limit: '512kb' }));
 app.use(express.json());
 
 // Escape a value for interpolation into HTML text or attribute context.
@@ -72,7 +78,22 @@ function renderHtml(filename, content) {
 </html>`;
 }
 
-function renderSecretForm(label, token) {
+// Two shapes, chosen by the signed token (item #120). A masked single-line
+// field is right for an API key and wrong for a PEM or a service-account JSON:
+// the browser strips nothing, but a password input cannot hold a newline at
+// all, so a multi-line credential pasted into one arrives mangled or truncated.
+// `multiline` therefore travels in the link payload, signed like everything
+// else — the holder of a single-line link cannot flip it.
+//
+// NOTE (HTML spec, "textarea wrapping transformation"): a browser normalises a
+// textarea's submitted value to CRLF line endings. The bridge writes whatever
+// arrives byte-for-byte rather than converting, so a key pasted with LF
+// endings lands on disk with CRLF ones. Consumers that care (ssh-keygen is
+// fine; some strict PEM parsers are not) should normalise on read.
+function renderSecretForm(label, token, multiline = false) {
+  const field = multiline
+    ? '<textarea name="value" rows="12" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Paste value here..." autofocus required></textarea>'
+    : '<input type="password" name="value" placeholder="Paste secret here..." autocomplete="off" autofocus required>';
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -82,22 +103,24 @@ function renderSecretForm(label, token) {
   <style>
     body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
     .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 480px; width: 100%; }
+    .card.wide { max-width: 760px; }
     h2 { margin: 0 0 8px; font-size: 18px; }
     .label { color: #8b949e; margin-bottom: 20px; font-size: 14px; }
-    input[type="password"] { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; box-sizing: border-box; }
-    input[type="password"]:focus { outline: none; border-color: #58a6ff; }
+    input[type="password"], textarea { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; box-sizing: border-box; }
+    input[type="password"]:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+    textarea { resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
     button { margin-top: 16px; padding: 10px 24px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%; }
     button:hover { background: #2ea043; }
     .note { margin-top: 12px; font-size: 12px; color: #8b949e; }
   </style>
 </head>
 <body>
-  <div class="card">
+  <div class="card${multiline ? ' wide' : ''}">
     <h2>🔐 Enter Secret</h2>
     <div class="label">${escapeHtml(label)}</div>
     <form method="POST" action="/secret">
       <input type="hidden" name="token" value="${escapeHtml(token)}">
-      <input type="password" name="value" placeholder="Paste secret here..." autofocus required>
+      ${field}
       <button type="submit">Submit</button>
     </form>
     <div class="note">This value will be written to a secure file and auto-deleted after 1 hour. It will not appear in chat.</div>
@@ -392,12 +415,15 @@ app.get('/secret', (req, res) => {
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.secretId || !data.label) return res.status(400).send('Invalid secret token');
 
-  res.type('html').send(renderSecretForm(data.label, token));
+  res.type('html').send(renderSecretForm(data.label, token, data.multiline === true));
 });
 
 app.post('/secret', async (req, res) => {
   const { token, value } = req.body;
-  if (!token || !value) return res.status(400).send('Missing token or value');
+  // An empty submission is the only rejected value: everything else — leading
+  // spaces, a trailing newline, CRLF — is forwarded byte-for-byte, because a
+  // credential is not text to be tidied up.
+  if (!token || typeof value !== 'string' || value === '') return res.status(400).send('Missing token or value');
 
   const data = verifyToken(token);
   if (!data) return res.status(403).send('Invalid or expired token');
@@ -423,6 +449,20 @@ app.post('/secret', async (req, res) => {
     console.error('Secret submit proxy error:', err);
     res.status(500).send('Failed to reach bridge API');
   }
+});
+
+// A submission past the body-parser ceiling would otherwise render Express's
+// default error page — a stack trace, and no hint that the value was simply
+// too big. Scoped to /secret so no other route's error handling changes.
+// The error carries no part of the body, so nothing sensitive is logged.
+app.use('/secret', (err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    console.warn('[viewer] secret submission rejected: body too large');
+    return res.status(413).type('html').send(
+      '<!DOCTYPE html><html><body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;"><div><h2>Too large</h2><p>That value is bigger than this form accepts. Go back and submit a smaller one, or hand the agent a file path instead.</p></div></body></html>'
+    );
+  }
+  return next(err);
 });
 
 // Both sensitive GET routes serve only the no-secret shell page — the GET
