@@ -1666,18 +1666,9 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
       target_seq: CARD_SEQ, choice: 'send_one', text: null,
     });
 
-    // 'make_task' (items tracker) is a wire action too: the tap files the
-    // queued message as a task instead of sending it, so the router must let
-    // it through exactly like send_one.
-    consumer(tap('make_task'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(3);
-    expect(deps.routePromptReply.mock.calls[2][1]).toEqual({
-      target_seq: CARD_SEQ, choice: 'make_task', text: null,
-    });
-
     // Unknown action on a known card → warn + user notice, no route.
     consumer(tap('frobnicate'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(3); // unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
     expect(warnings.some(w => /invalid queued_release action/.test(w))).toBe(true);
 
@@ -1688,7 +1679,7 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     // never falling through to the ordinary answer path.
     deps.noticeQueuedReleaseIgnored.mockClear();
     consumer(tap('send'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(3); // still unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // still unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'tombstoned' }));
   });
 });

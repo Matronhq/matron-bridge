@@ -160,7 +160,7 @@ agent's marker turns into a prompt — see *Routing*).
 |---|---|
 | `GET /items?convo=&kind=&state=&awaiting=&label=&sort=rank|updated&since=&limit=&cursor=` | List. `since` = `updated_at` watermark for cheap polling. Default `limit` 100, max 500. Returns `{items:[…], next_cursor?}`; each item carries `comment_count`, `last_comment_at`, `has_image`. |
 | `GET /items/:id` | One item + full thread `{item, comments:[…]}`. Accepts `#num` as well as id. |
-| `POST /items` | Create. Body `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id?, supersedes?, on_behalf_of?}`. Agents default `convo_id` to their current conversation (bridge fills it in); clients must pass it. `on_behalf_of: "user"` (agent callers only) records the item as user-created with a marker `by: "user"`, for the queued-card "Make task" tap, which the bridge performs with its own token; the marker's sender stays the agent device so it neither wakes nor re-prompts. Returns the item. |
+| `POST /items` | Create. Body `{kind, title, body?, labels?, links?, attachments?, awaiting?, position?, after?, before?, convo_id?, supersedes?, on_behalf_of?}`. Agents default `convo_id` to their current conversation (bridge fills it in); clients must pass it. `on_behalf_of: "user"` (agent callers only) records the item as user-created with a marker `by: "user"`; it was added for the queued-card "Make task" tap (since removed — see below), which the bridge performed with its own token, and is retained in the API for any future caller with the same shape. The marker's sender stays the agent device so it neither wakes nor re-prompts. Returns the item. |
 | `PATCH /items/:id` | Update `title, body, labels, links, awaiting`. Author-agnostic. |
 | `POST /items/:id/comments` | `{body, attachments?}` → comment. Applies the `awaiting` flip rules. |
 | `PATCH /items/:id/comments/:cid` | Agent-only, `{transcript}` on one attachment. |
@@ -300,12 +300,10 @@ for user-authored writes other than `reordered`.
 
 ### Queued card: "Make task"
 
-`busy-queue.js`'s `queued_release` prompt gains a third action, **📌 Make
-task**. Resolving it: remove the queued text from the batch, `POST /items`
-with `kind:'task'`, `created_by:'user'`, title = first line (≤ 200 chars),
-body = the rest, attachments = the queued attachments; the resulting
-`created` marker is consumed by the router and joins the batch, so the
-agent hears "Item #13 filed: …" at turn end instead of the raw message.
+This action shipped and was removed on 2026-09-10 (decision #164): task
+filing is mainly for the agent, and the composer's own "Make task" pill
+already covers the user's case, so the queued card keeps only send / send
+just this one / cancel.
 
 ## Agent tools (matron-bridge, `ask-user.js`)
 
@@ -469,8 +467,8 @@ attribution; push classification; conformance fixtures.
 
 **Bridge**: router turns an `item` event into the synthetic turn text
 (fixtures per action, with and without attachments); busy-queue deferral and
-batch merge rules; "Make task" from the queued card; MCP wrappers against a
-stubbed journal including upload-before-create; tool descriptions snapshot.
+batch merge rules; MCP wrappers against a stubbed journal including
+upload-before-create; tool descriptions snapshot.
 
 **Apps**: GRDB migration; `ItemsSync` reconcile (since, marker refetch,
 empty-table full fetch); panel VM sectioning, scope filtering, badge count,
