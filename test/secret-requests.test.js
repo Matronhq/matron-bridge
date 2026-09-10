@@ -484,13 +484,17 @@ describe('turn delivery', () => {
     expect(h.notices[0].text).toMatch(/^Couldn't deliver/);
   });
 
-  it('wakes the session for an expiry too, with its own notice', async () => {
+  it('does NOT wake a reaped session for an expiry — a notice records it instead', async () => {
     const h = makeHarness({ session: null, resumeTo: makeSession('!room') });
     await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
     h.advance(SECRET_REQUEST_TTL_MS);
     await h.scheduler.fireDue(SECRET_REQUEST_TTL_MS);
-    expect(h.resumes[0].notice).toBe('⏳ Session was idle — auto-resuming it to report an expired secret request.');
-    expect(h.turns[0].text).toContain('request expired (24 h)');
+    expect(h.resumes).toEqual([]);
+    expect(h.turns).toEqual([]);
+    expect(h.notices.length).toBe(1);
+    expect(h.notices[0].convoId).toBe('convo-1');
+    expect(h.notices[0].text).toContain('"AWS access key" secret request expired (24 h)');
+    expect(h.notices[0].text).toContain('was not woken');
   });
 
   it('uses the PERSISTED convo id after a restart, so a notice always has a destination', async () => {
