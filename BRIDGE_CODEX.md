@@ -38,6 +38,7 @@ If browser tools are needed but unavailable, ask the user to run `/restart --bro
 ## Journal history
 
 - To find something the user said in a past session on any of their boxes, query the journal's search API rather than grepping local transcripts: `GET <https base of JOURNAL_WS_URL, /ws stripped>/search?q=<url-encoded terms>&limit=50` with `Authorization: Bearer <agent token>` (the contents of `JOURNAL_TOKEN_FILE`, or `JOURNAL_TOKEN` when the file variable is unset). Never print or paste the token — your commands and output are mirrored into the journal — read it inside the request (`-H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"`) and never use `curl -v`/`--trace`. Read context around a hit with `GET /convo/:id/messages?around_seq=<seq>` (works across boxes, prose only). `GET /help` on the same base URL returns the full API digest; the spec is `docs/protocol.md` in matron-journal.
+- Make these calls with `curl` (its default `User-Agent` is fine). The journal sits behind Cloudflare, whose Browser Integrity Check rejects Python's default `Python-urllib/…` User-Agent with `403` and the body `error code: 1010` before the request ever reaches the journal — so a Python `urllib` call without an explicit `User-Agent` header always 403s here, on `/search` and `/items` alike. If you must use Python, set `User-Agent` explicitly (e.g. `curl/8`). Pace request bursts.
 
 ## Tasks & decisions (`/items` HTTP API)
 
@@ -67,7 +68,7 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
   -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"
 ```
 
-If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
+If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header (see Journal history above). If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
 
 ## Missions & milestones
 
