@@ -4,6 +4,7 @@ import {
   formatSecretChatNotice,
   formatSecretItemBody,
   SECRET_REQUEST_TTL_MS,
+  isOwnSecretFileName,
 } from '../lib/secret-requests.js';
 
 // Item #120: request_secret is non-blocking. The bridge files a tracker
@@ -523,6 +524,38 @@ describe('per-room pending cap', () => {
     expect(h.chat.length).toBe(5);
   });
 
+  it('holds under parallel creates: the slot is taken before the item is filed', async () => {
+    let n = 0;
+    // A slow tracker: every create parks until released, so all six requests
+    // are in flight at once and the count alone cannot separate them.
+    const release = [];
+    const items = makeItems();
+    const slowCreate = items.create;
+    items.create = (body) => new Promise((resolve) => { release.push(() => resolve(slowCreate(body))); });
+    const h = makeHarness({ newId: () => `sec-${++n}`, items });
+    const results = Promise.all(Array.from({ length: 6 }, (_, i) => h.store.create({ label: `k${i}`, roomId: '!room', convoId: 'c' })));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(release.length).toBe(5);
+    for (const go of release) go();
+    const out = await results;
+    expect(out.filter((r) => r.secretId).length).toBe(5);
+    expect(out.filter((r) => r.error).length).toBe(1);
+    expect(h.saved.requests.length).toBe(5);
+    expect(h.items.calls.create.length).toBe(5);
+  });
+
+  it('keeps the reserved slot when the tracker rejects the item — the request itself is still live', async () => {
+    const items = makeItems();
+    items.create = async () => { throw new Error('network down'); };
+    let n = 0;
+    const h = makeHarness({ newId: () => `sec-${++n}`, items });
+    const r = await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    expect(r.secretId).toBe('sec-1');
+    expect(r.itemError).toBe('network down');
+    expect(h.saved.requests.length).toBe(1);
+    expect(h.saved.requests[0].itemId).toBeNull();
+  });
+
   it('counts per room, and frees a slot when one is answered', async () => {
     let n = 0;
     const h = makeHarness({ newId: () => `sec-${++n}`, maxPendingPerRoom: 2 });
@@ -542,17 +575,41 @@ describe('orphaned secret files', () => {
       startAt: 10_000_000,
       fileTtlMs: 3600_000,
       listSecretFiles: () => [
-        { path: '/tmp/secrets/old.txt', mtimeMs: 10_000_000 - 3600_001 },
-        { path: '/tmp/secrets/exactly-due.txt', mtimeMs: 10_000_000 - 3600_000 },
-        { path: '/tmp/secrets/young.txt', mtimeMs: 10_000_000 - 600_000 },
+        { path: '/tmp/secrets/11111111-1111-4111-8111-111111111111.txt', mtimeMs: 10_000_000 - 3600_001 },
+        { path: '/tmp/secrets/22222222-2222-4222-8222-222222222222.txt', mtimeMs: 10_000_000 - 3600_000 },
+        { path: '/tmp/secrets/33333333-3333-4333-8333-333333333333.txt', mtimeMs: 10_000_000 - 600_000 },
       ],
     });
     h.store.init();
-    expect(h.removed).toEqual(['/tmp/secrets/old.txt', '/tmp/secrets/exactly-due.txt']);
+    expect(h.removed).toEqual(['/tmp/secrets/11111111-1111-4111-8111-111111111111.txt', '/tmp/secrets/22222222-2222-4222-8222-222222222222.txt']);
     // The young one is armed for its REMAINING life, not a fresh full hour.
     expect(h.scheduler.only().delay).toBe(3600_000 - 600_000);
     await h.scheduler.fireDue(3600_000);
-    expect(h.removed).toContain('/tmp/secrets/young.txt');
+    expect(h.removed).toContain('/tmp/secrets/33333333-3333-4333-8333-333333333333.txt');
+  });
+
+  it('never touches a file this process could not have named, whatever the lister returns', async () => {
+    const h = makeHarness({
+      startAt: 10_000_000,
+      fileTtlMs: 3600_000,
+      listSecretFiles: () => [
+        { path: '/tmp/secrets/aws-prod.txt', mtimeMs: 1 },
+        { path: '/tmp/secrets/notes.txt', mtimeMs: 1 },
+        { path: '/tmp/secrets/3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt', mtimeMs: 1 },
+        { path: '/tmp/secrets/3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt.bak', mtimeMs: 1 },
+      ],
+    });
+    h.store.init();
+    expect(h.removed).toEqual(['/tmp/secrets/3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt']);
+  });
+
+  it('isOwnSecretFileName accepts exactly <uuid>.txt', () => {
+    expect(isOwnSecretFileName('3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt')).toBe(true);
+    expect(isOwnSecretFileName('3F2504E0-4F89-11D3-9A0C-0305E82C3301.txt')).toBe(true);
+    for (const bad of ['aws.txt', '3f2504e0-4f89-11d3-9a0c-0305e82c3301', '3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt.bak',
+      'x3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt', '', null, 42]) {
+      expect(isOwnSecretFileName(bad)).toBe(false);
+    }
   });
 
   it('survives a listing that throws', () => {

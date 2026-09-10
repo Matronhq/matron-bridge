@@ -125,7 +125,7 @@ import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter, VOICE_NOTE_PREFIX } from './lib/journal-media.js';
 import { createItemTurnRouter, formatItemTurn } from './lib/items-turn.js';
-import { createSecretRequests } from './lib/secret-requests.js';
+import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
@@ -9758,7 +9758,9 @@ const secretRequests = createSecretRequests({
   listSecretFiles: () => {
     try {
       return fs.readdirSync(SECRETS_DIR)
-        .filter((name) => name.endsWith('.txt'))
+        // Only files THIS process names (`<uuid>.txt`): an operator may keep
+        // their own credentials in ~/.secrets, and those are never ours to age out.
+        .filter(isOwnSecretFileName)
         .map((name) => {
           const filePath = path.join(SECRETS_DIR, name);
           try { return { path: filePath, mtimeMs: fs.statSync(filePath).mtimeMs }; }

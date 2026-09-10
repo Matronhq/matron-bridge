@@ -85,6 +85,8 @@ describe('bridge wiring', () => {
     const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
     expect(wiring).toContain('listSecretFiles:');
     expect(wiring).toContain('SECRETS_DIR');
+    // Only files this process names are ever listed for the sweep.
+    expect(wiring).toContain('.filter(isOwnSecretFileName)');
   });
 });
 
