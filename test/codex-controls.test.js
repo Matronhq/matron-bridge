@@ -87,6 +87,22 @@ describe('Codex native controls', () => {
     await first;
     expect(h.session._codexAccountCommandPending).toBe(false);
   });
+  it.each([false, true])('cancels a login allocated after the session dies (cancel fails: %s)', async cancelFails => {
+    const h = setup(); let resolve;
+    h.session.codex.rpc.mockReturnValueOnce(new Promise(r => { resolve = r; }));
+    if (cancelFails) h.session.codex.rpc.mockRejectedValueOnce(new Error('Connection closed'));
+    const login = h.run('/login');
+    h.session.alive = false;
+    resolve({ loginId: 'orphan', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD-1234' });
+    expect(await login).toBe(true);
+    expect(h.session.codex.rpc.mock.calls).toEqual([
+      ['account/login/start', { type: 'chatgptDeviceCode' }],
+      ['account/login/cancel', { loginId: 'orphan' }],
+    ]);
+    expect(h.session._codexLoginId).toBeNull();
+    expect(h.session._codexAccountCommandPending).toBe(false);
+    expect(h.opts.reply).not.toHaveBeenCalled();
+  });
   it.each([
     { verificationUrl: 'http://example.com' },
     { verificationUrl: 'https://user:password@example.com' },
