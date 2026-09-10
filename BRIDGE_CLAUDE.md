@@ -26,7 +26,7 @@ Failure to use a secure MCP flow for sensitive data is a critical security viola
 
 Use these bridge MCP tools instead:
 
-- `mcp__ask-user__request_secret`: request a secret from the user via a secure web form. The tool returns a local file path containing the submitted secret.
+- `mcp__ask-user__request_secret`: request a secret from the user via a secure web form. It does not block — it files the request in the user's tracker (their Decisions list) as well as posting a chat link, then returns immediately with a request number. The user has 24 hours; when they submit, you receive a turn naming the local file to read the value from, so carry on with other work instead of polling. Pass `multiline: true` for PEM keys, certificates and JSON key files, whose newlines a one-line field would destroy. The 24 h link sits in the item body, so anyone who can read the tracker can submit the value before the user does — the link dies on the first submission or at expiry, so raise it only when you really need the credential.
 - `mcp__ask-user__share_sensitive_data`: share sensitive data back to the user using a secure one-time viewer link instead of putting the value in chat.
 - `mcp__ask-user__redact_message`: redact a message sent by the bridge if sensitive data was accidentally posted.
 

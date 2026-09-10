@@ -125,6 +125,7 @@ import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter, VOICE_NOTE_PREFIX } from './lib/journal-media.js';
 import { createItemTurnRouter, formatItemTurn } from './lib/items-turn.js';
+import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
@@ -389,7 +390,13 @@ for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
   }
 }
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
-const SECRET_TTL_MS = 3600000; // 1 hour
+const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on disk
+// Open secure-input requests, persisted like TIMERS_FILE / INFLIGHT_FILE above:
+// a request now lives 24 h (SECRET_REQUEST_TTL_MS in lib/secret-requests.js),
+// far longer than any bridge uptime guarantee, so the expiry timer is re-armed
+// from this file at startup.
+// It holds NO secret value and NO file path — see lib/secret-requests.js.
+const SECRET_REQUESTS_FILE = path.join(os.homedir(), '.matron-bridge-secrets.json');
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
 
@@ -626,10 +633,18 @@ function generateFileLink(filePath, workdir) {
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
 
-function generateSecretLink(secretId, label, roomId) {
+// The secure-input link. Its ttl is the REQUEST's lifetime (24 h), not
+// LINK_EXPIRY_MS: a file link is a glance at something the user is looking at
+// right now, whereas a secret request is a chore they may only get to
+// tomorrow, and a link that died first would strand a live request. `multiline`
+// rides in the signed payload so the viewer renders a textarea rather than a
+// masked one-line field — signed, so the holder cannot flip it.
+function generateSecretLink(secretId, label, roomId, { ttlMs = LINK_EXPIRY_MS, multiline = false } = {}) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
-  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ secretId, label, roomId, exp })).toString('base64url');
+  const exp = Math.floor((Date.now() + ttlMs) / 1000);
+  const payloadObj = { secretId, label, roomId, exp };
+  if (multiline) payloadObj.multiline = true;
+  const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
@@ -9713,7 +9728,84 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   return newSession;
 }
 
-const pendingSecrets = new Map();
+// Open secure-input requests (item #120). `request_secret` no longer blocks:
+// the store owns the whole 24 h lifecycle — the tracker question, the signed
+// link, the 0600 write, the answer turn and the expiry — and persists the
+// non-sensitive part of each request so a bridge restart re-arms it.
+//
+// Everything below is a seam; none of the branching lives here. In particular
+// the delivery seams are the SAME four the item-turn router uses, so a secret
+// arriving mid-turn parks on the shared queue rather than in a second one, and
+// a secret arriving after the idle reaper has been through wakes the session
+// exactly as an item reply does.
+const secretRequests = createSecretRequests({
+  load: () => (fs.existsSync(SECRET_REQUESTS_FILE) ? JSON.parse(fs.readFileSync(SECRET_REQUESTS_FILE, 'utf-8')) : null),
+  // 0600: the file names every open request, its room and its item. Not
+  // secret, but not other local users' business either.
+  save: (data) => atomicWriteFileSync(SECRET_REQUESTS_FILE, JSON.stringify(data, null, 2), { mode: 0o600 }),
+  newId: () => randomUUID(),
+  // The only place a submitted value touches this process's own code. 0600,
+  // in the 0700 SECRETS_DIR created at startup.
+  writeSecretFile: (secretId, value) => {
+    const filePath = path.join(SECRETS_DIR, `${secretId}.txt`);
+    fs.writeFileSync(filePath, value, { mode: 0o600 });
+    return filePath;
+  },
+  removeSecretFile: (filePath) => { fs.unlink(filePath, () => {}); },
+  // Feeds the startup sweep: a submitted file is unlinked an hour later by a
+  // timer, and that timer dies with the bridge, so a restart inside the hour
+  // used to strand the file on disk indefinitely.
+  listSecretFiles: () => {
+    try {
+      return fs.readdirSync(SECRETS_DIR)
+        // Only files THIS process names (`<uuid>.txt`): an operator may keep
+        // their own credentials in ~/.secrets, and those are never ours to age out.
+        .filter(isOwnSecretFileName)
+        .map((name) => {
+          const filePath = path.join(SECRETS_DIR, name);
+          try { return { path: filePath, mtimeMs: fs.statSync(filePath).mtimeMs }; }
+          catch { return null; }
+        })
+        .filter(Boolean);
+    } catch {
+      // No directory yet (first boot, before main()'s mkdir) — nothing to do.
+      return [];
+    }
+  },
+  items: itemsClient,
+  generateLink: (secretId, { label, roomId, multiline, ttlMs }) =>
+    generateSecretLink(secretId, label, roomId, { ttlMs, multiline }),
+  notifyChat: (record, { plain, html }) => {
+    const session = record.roomId ? sessions.get(record.roomId) : null;
+    if (!session) return;
+    if (html && session.sendHtml) session.sendHtml(plain, html);
+    else if (session.sendCallback) session.sendCallback(plain);
+  },
+  // LIVE sessions only. A killed-but-still-mapped session would take the
+  // inject branch, fail it (sendToSession refuses on !alive) and dead-end in
+  // the undeliverable notice — whereas falling through to resumeSession
+  // revives it instead (resumeSleepingSession evicts the corpse first).
+  getSession: (roomId) => {
+    const s = sessions.get(roomId);
+    return s && s.alive ? s : null;
+  },
+  // SESSION_IDLE_TIMEOUT_MS defaults to an hour and a request lives a day, so
+  // the session is usually gone by the time the user submits. Wake it the way
+  // an item reply wakes one; sendToSession then parks the turn in
+  // _resumeOutbox until the resumed TUI is ready to receive it.
+  resumeSession: (roomId, notice) => journalResumeRoom(roomId, notice),
+  inject: (session, text) => sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true }),
+  queue: (session, { text, preview }) => journalQueueMedia(session, {
+    blocks: [{ type: 'text', text }],
+    mirrorToJournal: false,
+    preview,
+    fullText: text,
+  }),
+  publishNotice: journalPublishNotice,
+  fileTtlMs: SECRET_TTL_MS,
+  log: console,
+});
+
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
 // Pending print-mode permission prompts (spec 2026-08-10-auto-permission-mode).
@@ -9939,20 +10031,19 @@ function validateShowFileBody(data) {
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
-  // GET /secret/:id — MCP server polls for secret submission
+  // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
+  // uses it (request_secret is non-blocking since item #120); it stays so a
+  // bridge upgraded under an already-running MCP server still answers.
   if (req.method === 'GET' && url.pathname.startsWith('/secret/')) {
     const secretId = url.pathname.split('/')[2];
-    const s = pendingSecrets.get(secretId);
-    if (!s) {
+    const state = secretRequests.read(secretId);
+    if (!state) {
       res.writeHead(404);
       res.end(JSON.stringify({ error: 'Secret request not found' }));
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ answered: s.answered, path: s.path || null }));
-    if (s.answered) {
-      pendingSecrets.delete(secretId);
-    }
+    res.end(JSON.stringify(state));
     return;
   }
 
@@ -10076,36 +10167,31 @@ const apiServer = createServer(async (req, res) => {
       const data = JSON.parse(body);
 
       if (url.pathname === '/secret') {
-        const { label, roomId } = data;
+        const { label, roomId, multiline } = data;
         if (!label || !roomId) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'label and roomId are required' }));
           return;
         }
 
-        const secretId = randomUUID();
-
-        pendingSecrets.set(secretId, {
-          label,
-          answered: false,
-          path: null,
-        });
-
         const activeSession = sessions.get(roomId);
-
-        if (activeSession) {
-          const link = generateSecretLink(secretId, label, activeSession.roomId);
-          if (link && activeSession.sendHtml) {
-            const plain = `🔐 Secret requested: ${label} — Enter secret: ${link}`;
-            const html = `🔐 Secret requested: <b>${escapeHtml(label)}</b> — <a href="${link}">Enter secret</a>`;
-            activeSession.sendHtml(plain, html);
-          } else if (activeSession.sendCallback) {
-            activeSession.sendCallback(`🔐 Secret requested: ${label} (viewer not configured)`);
-          }
+        const created = await secretRequests.create({
+          label,
+          roomId,
+          convoId: activeSession ? journalConvoIdFor(activeSession) : null,
+          multiline: multiline === true,
+        });
+        // Per-room cap: nothing was minted, filed or announced, so this is a
+        // refusal the tool can act on, not a partial request to clean up.
+        if (created.error) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: created.error }));
+          return;
         }
 
+        const { secretId, itemNum, itemError } = created;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ secretId }));
+        res.end(JSON.stringify({ secretId, itemNum, itemError }));
         return;
       } else if (url.pathname === '/permission-request') {
         const { roomId, toolName, input } = data;
@@ -10246,41 +10332,19 @@ const apiServer = createServer(async (req, res) => {
 
       const secretSubmitMatch = url.pathname.match(/^\/secret\/([^/]+)\/submit$/);
       if (secretSubmitMatch) {
-        const secretId = secretSubmitMatch[1];
-        const s = pendingSecrets.get(secretId);
-        if (!s) {
-          res.writeHead(404);
-          res.end(JSON.stringify({ error: 'Secret request not found or already submitted' }));
+        // `value` is written verbatim — no trim, no line-ending conversion.
+        // The store answers as soon as the file is on disk; closing the
+        // tracker item and delivering the agent's turn continue on `done`, so
+        // a slow journal never holds the user's browser open.
+        const result = await secretRequests.submit(secretSubmitMatch[1], data.value);
+        if (!result.ok) {
+          res.writeHead(result.status);
+          res.end(JSON.stringify({ error: result.error }));
           return;
         }
-
-        const { value } = data;
-        if (!value) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'value is required' }));
-          return;
-        }
-
-        // Write secret to file
-        const filePath = path.join(SECRETS_DIR, `${secretId}.txt`);
-        try {
-          fs.writeFileSync(filePath, value, { mode: 0o600 });
-        } catch (err) {
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: `Failed to write secret: ${err.message}` }));
-          return;
-        }
-
-        s.answered = true;
-        s.path = filePath;
-
-        // Schedule cleanup after 1 hour
-        setTimeout(() => {
-          fs.unlink(filePath, () => {});
-        }, SECRET_TTL_MS);
-
+        result.done.catch(() => {});
         res.writeHead(200);
-        res.end(JSON.stringify({ ok: true, path: filePath }));
+        res.end(JSON.stringify({ ok: true, path: result.path }));
         return;
       }
 
@@ -11270,6 +11334,11 @@ async function main() {
   // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
   const rearmed = timerStore.init();
   if (rearmed > 0) console.log(`Re-armed ${rearmed} persisted timer(s) from ${TIMERS_FILE}`);
+  // Re-arm open secure-input requests. Anything that came due while the bridge
+  // was down expires here: its tracker question closes as cancelled and the
+  // agent is told, so a 24 h request never silently outlives its link.
+  const secretsRearmed = secretRequests.init();
+  if (secretsRearmed > 0) console.log(`Re-armed ${secretsRearmed} pending secret request(s) from ${SECRET_REQUESTS_FILE}`);
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
   console.log(`Journal: connecting to ${JOURNAL_WS_URL}`);

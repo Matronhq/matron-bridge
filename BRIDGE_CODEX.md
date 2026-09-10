@@ -16,7 +16,7 @@ Never put passwords, tokens, private keys, credentials, or other secrets in chat
 
 Use the Matron `ask-user` MCP server:
 
-- `request_secret` opens a secure input form and returns a local file path with the submitted secret.
+- `request_secret` opens a secure input form. It does not block: it files a question in the user's tracker (their Decisions list), posts the link in chat, and returns a request number immediately. The user has 24 hours, and the submission arrives as a turn naming the local file to read — do not poll. Use `multiline: true` for PEM keys, certificates and JSON key files. The 24 h link sits in the item body, so anyone who can read the tracker can submit before the user does; it dies on the first submission or at expiry.
 - `share_sensitive_data` shares sensitive output through a secure one-time viewer link.
 - `redact_message` removes accidentally posted sensitive data from a bridge message.
 - `send_attachment` delivers an ordinary file to the conversation, or an explicitly selected agent chat room.
