@@ -92,4 +92,63 @@ describe('missions handlers', () => {
     const r = await h.close({ roomId: '!r:s', summary: 's' });
     expect(r.status).toBe(409); expect(r.body.items).toEqual([{ num: 64, title: 'Q?' }]);
   });
+
+  it('get: explicit num 404 passes through the journal error, not the NO_ROUTES sentence', async () => {
+    const { h } = fixture({ get: vi.fn(async () => ({ status: 404, data: { error: 'no such mission' } })) });
+    const r = await h.get({ roomId: '!r:s', num: 999 });
+    expect(r.status).toBe(404);
+    expect(r.body).toEqual({ error: 'no such mission' });
+  });
+
+  it('update: a 404 for the cached mission id clears the cache so the next call re-resolves cold', async () => {
+    const otherMission = { id: 'ms_9', num: 9, title: 'M', origin_convo_id: 'c1', state: 'open' };
+    const { h, client, session } = fixture({
+      update: vi.fn()
+        .mockResolvedValueOnce({ status: 404, data: { error: 'no such mission' } })
+        .mockResolvedValueOnce({ status: 200, data: { mission: otherMission } }),
+      list: vi.fn(async () => ({ status: 200, data: { missions: [otherMission] } })),
+    });
+    session.missionId = 'ms_1';
+    const r1 = await h.update({ roomId: '!r:s', title: 'New' });
+    expect(r1.status).toBe(404);
+    expect(session.missionId).toBeUndefined();
+    expect(client.list).not.toHaveBeenCalled();
+    const r2 = await h.update({ roomId: '!r:s', title: 'New2' });
+    expect(r2.status).toBe(200);
+    expect(client.list).toHaveBeenCalledWith({ state: 'open' });
+    expect(client.update.mock.calls[1][0]).toBe('ms_9');
+    expect(session.missionId).toBe('ms_9');
+  });
+
+  it('close: a 409 (closed / other_mission) for the cached id does not clear the cache — the mission still exists', async () => {
+    const { h, session } = fixture({ close: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'closed' } })) });
+    session.missionId = 'ms_1';
+    const r = await h.close({ roomId: '!r:s', summary: 's' });
+    expect(r.status).toBe(409);
+    expect(session.missionId).toBe('ms_1');
+  });
+
+  it('status 0 (journal unreachable) becomes 502 for start, update, join, get and close', async () => {
+    const down = { status: 0, data: { error: 'journal unreachable' } };
+
+    const { h: h1 } = fixture({ start: vi.fn(async () => down) });
+    expect((await h1.start({ roomId: '!r:s', title: 't' })).status).toBe(502);
+
+    const { h: h2, session: s2 } = fixture({ update: vi.fn(async () => down) });
+    s2.missionId = 'ms_1';
+    expect((await h2.update({ roomId: '!r:s', title: 't' })).status).toBe(502);
+
+    const { h: h3 } = fixture({ join: vi.fn(async () => down) });
+    expect((await h3.join({ roomId: '!r:s', num: 61 })).status).toBe(502);
+
+    const { h: h4, session: s4 } = fixture({ get: vi.fn(async () => down) });
+    s4.missionId = 'ms_1';
+    expect((await h4.get({ roomId: '!r:s' })).status).toBe(502);
+    const { h: h4b } = fixture({ get: vi.fn(async () => down) });
+    expect((await h4b.get({ roomId: '!r:s', num: 5 })).status).toBe(502);
+
+    const { h: h5, session: s5 } = fixture({ close: vi.fn(async () => down) });
+    s5.missionId = 'ms_1';
+    expect((await h5.close({ roomId: '!r:s', summary: 's' })).status).toBe(502);
+  });
 });
