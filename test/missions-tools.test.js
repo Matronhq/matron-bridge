@@ -210,6 +210,17 @@ describe('missions handlers', () => {
     expect(client.get.mock.calls.map((c) => c[0])).toEqual(['ms_a', 'ms_b']);
   });
 
+  it('cold resolve against an unreachable or failing journal reports the outage, never "no mission"', async () => {
+    for (const listResult of [{ status: 0, data: { error: 'journal unreachable' } }, { status: 500, data: { error: 'boom' } }]) {
+      const { h, client, session } = fixture({ list: vi.fn(async () => listResult) });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(listResult.status === 0 ? 502 : 500);
+      expect(r.body.error).not.toContain('mission_start');
+      expect(session.missionId).toBeUndefined();
+      expect(client.update).not.toHaveBeenCalled();
+    }
+  });
+
   it('start / post 404 says the conversation was refused, NOT that the routes are missing', async () => {
     const notFound = { status: 404, data: { error: 'not_found' } };
     const convoText = 'the journal did not accept this conversation — it may have no journal row yet, or its mission is not visible to this session';
