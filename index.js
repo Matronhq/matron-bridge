@@ -131,6 +131,7 @@ import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/comp
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
+import { createSummaryModelNag } from './lib/summary-model-nag.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
@@ -465,6 +466,20 @@ const _journalToken = resolveJournalToken();
 const itemsClient = createItemsClient({
   baseUrl: JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '',
   token: _journalToken,
+});
+
+// With no summary model this box silently loses written titles, its roster
+// summary and its summary events (lib/summary-model-nag.js). Nothing said so
+// until now — a 2026-09-10 fleet survey found ten of eleven boxes in that
+// state — so file one tracker task per box instead of a log line nobody
+// reads. Built unconditionally; it no-ops when a model IS configured.
+const summaryModelNag = createSummaryModelNag({
+  client: itemsClient,
+  // The hostname, not SERVER_LABEL: that one is a room-name abbreviation
+  // ("fatima" -> "FATI") and this title is meant to name a box the way Dan
+  // and `agent_boxes` do.
+  box: os.hostname(),
+  log: (m) => console.log(m),
 });
 // Return path (Matron -> bridge input, this PR): where the inbound cursor is
 // persisted (survives a bridge restart — see lib/journal-publisher.js) and
@@ -5862,7 +5877,12 @@ async function maybeUpdatePinnedSummary(session) {
   // 5-message threshold (short chats never get there); without Gemini
   // it is the only naming that runs.
   applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
-  if (!summaryModel) return;
+  if (!summaryModel) {
+    // Nothing else in the bridge notices that summarization is off. Say so
+    // once, in the tracker, now that a conversation exists to file against.
+    summaryModelNag.maybeFile(journalConvoIdFor(session));
+    return;
+  }
 
   if (!session.chatHistory) session.chatHistory = [];
   debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
