@@ -164,7 +164,7 @@ import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, no
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
-import { handleCodexControl, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
+import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
@@ -2222,6 +2222,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
       payload.question, escapeHtml(payload.question), payload) ?? false,
     submitAsyncAnswer: submitCodexAsyncAnswer,
+    onLoginComplete: s => {
+      void refreshCodexMetadata(s, { force: true });
+      flushPendingSessionQueue(s);
+    },
     publishText: (s, message) => { s.responseBuffer += message; flushResponse(s); }, enabled: JOURNAL_ENABLED,
   });
 
@@ -2282,6 +2286,12 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     if (!sawTurnCompleted || code !== 0) {
       const detail = session._codexLastError || stderr ||
         `Codex exited with ${signal ? `signal ${signal}` : `code ${code}`}`;
+      if (codex.transport === 'app-server' && isCodexAuthError(detail)) {
+        finishCodexTurn(session, { error: 'Codex needs you to sign in. Preparing a device code…',
+          usage: session._codexCompletedUsage, preserveQueue: true });
+        void runCodexControl(session, '/login');
+        return;
+      }
       finishCodexTurn(session, { error: detail, usage: session._codexCompletedUsage });
       return;
     }
@@ -4886,6 +4896,9 @@ function flushResponse(session) {
 // false, unchanged from before.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
   if (!session.alive || session._autoStopped) return false;
+  if (session.codex?.transport === 'app-server' && (session._codexAccountCommandPending || session._codexLoginId)) {
+    return reportSessionSendFailure(session, 'Complete Codex sign-in in your browser first. Enter the device code there, then send your message again after Matron confirms. Use /login cancel to cancel.');
+  }
   const nativeCompact = session.codex?.transport === 'app-server' && contentBlocks.length === 1
     && contentBlocks[0]?.type === 'text' && isCompactCommand(contentBlocks[0].text);
   if (nativeCompact && contentBlocks[0].text.trim() !== '/compact') {

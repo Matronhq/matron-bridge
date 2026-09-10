@@ -105,6 +105,8 @@ codex login
 codex login status
 ```
 
+In a Matron Codex conversation, send `/login` to sign in directly from chat. Matron also starts this flow when a model turn fails because credentials are missing or expired. Open the displayed link and enter the one-time code **on the OpenAI page**; nothing needs to be pasted back into Matron. Device-code login may need enabling in ChatGPT security settings or workspace permissions. Matron confirms completion automatically. Send the failed message again afterward; already-queued messages resume after successful login. `/login cancel` cancels the attempt, and `/login` replaces it with a fresh code if it expires. A bridge restart interrupts pending sign-in, so request a new code afterward.
+
 `codex login` uses the browser-based ChatGPT flow by default. On a headless machine, use device authentication:
 
 ```bash

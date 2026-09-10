@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { handleCodexControl, listCodexThreads, mergeCodexThreads, offerCodexBuild } from '../lib/codex-controls.js';
+import { handleCodexControl, isCodexAuthError, listCodexThreads, mergeCodexThreads, offerCodexBuild } from '../lib/codex-controls.js';
 import { codexMcpConfig } from '../lib/codex-mcp.js';
 import { normalizeCodexSandbox } from '../lib/codex-session.js';
 import { readFileSync } from 'node:fs';
@@ -67,6 +67,60 @@ describe('Codex native controls', () => {
     await h.run('/login'); expect(h.opts.reply).toHaveBeenCalledWith(expect.stringContaining('ABCD'));
     await h.run('/login cancel'); expect(h.session.codex.rpc).toHaveBeenCalledWith('account/login/cancel', { loginId: 'login' });
     await h.run('/logout'); expect(h.session.codex.rpc).toHaveBeenCalledWith('account/logout'); expect(h.opts.send).not.toHaveBeenCalled();
+  });
+  it('explains where to enter the code and replaces an old attempt before publishing a new one', async () => {
+    const h = setup(); h.session._codexLoginId = 'old';
+    h.session.codex.rpc.mockResolvedValue({ loginId: 'new', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD-1234' });
+    await h.run('/login');
+    expect(h.session.codex.rpc.mock.calls.map(c => c[0])).toEqual(['account/login/cancel', 'account/login/start']);
+    expect(h.session._codexLoginId).toBe('new');
+    expect(h.opts.reply).toHaveBeenCalledWith(expect.stringContaining('Enter this one-time code on that page'));
+    expect(h.opts.send).not.toHaveBeenCalled();
+  });
+  it('serializes sign-in requests while a device code is being allocated', async () => {
+    const h = setup(); let resolve;
+    h.session.codex.rpc.mockReturnValue(new Promise(r => { resolve = r; }));
+    const first = h.run('/login');
+    await h.run('/login'); await h.run('/logout');
+    expect(h.session.codex.rpc).toHaveBeenCalledTimes(1);
+    resolve({ loginId: 'new', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD-1234' });
+    await first;
+    expect(h.session._codexAccountCommandPending).toBe(false);
+  });
+  it.each([false, true])('cancels a login allocated after the session dies (cancel fails: %s)', async cancelFails => {
+    const h = setup(); let resolve;
+    h.session.codex.rpc.mockReturnValueOnce(new Promise(r => { resolve = r; }));
+    if (cancelFails) h.session.codex.rpc.mockRejectedValueOnce(new Error('Connection closed'));
+    const login = h.run('/login');
+    h.session.alive = false;
+    resolve({ loginId: 'orphan', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD-1234' });
+    expect(await login).toBe(true);
+    expect(h.session.codex.rpc.mock.calls).toEqual([
+      ['account/login/start', { type: 'chatgptDeviceCode' }],
+      ['account/login/cancel', { loginId: 'orphan' }],
+    ]);
+    expect(h.session._codexLoginId).toBeNull();
+    expect(h.session._codexAccountCommandPending).toBe(false);
+    expect(h.opts.reply).not.toHaveBeenCalled();
+  });
+  it.each([
+    { verificationUrl: 'http://example.com' },
+    { verificationUrl: 'https://user:password@example.com' },
+    { userCode: undefined },
+    { userCode: 'paste <script> here' },
+  ])('cancels an unusable device-code response: %j', async invalid => {
+    const h = setup();
+    h.session.codex.rpc.mockResolvedValue({ loginId: 'new', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD-1234', ...invalid });
+    await h.run('/login');
+    expect(h.session.codex.rpc).toHaveBeenLastCalledWith('account/login/cancel', { loginId: 'new' });
+    expect(h.session._codexLoginId).toBeNull();
+    expect(h.session._codexAccountCommandPending).toBe(false);
+    expect(h.opts.reply).not.toHaveBeenCalledWith(expect.stringContaining('🔗'));
+  });
+  it('recognizes the observed missing-credentials failure without treating quota or tool access as login failures', () => {
+    expect(isCodexAuthError('unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses')).toBe(true);
+    expect(isCodexAuthError('Token refresh failed: refresh_token_reused')).toBe(true);
+    for (const error of ['429 Too Many Requests', '403 Forbidden', 'Permission denied', 'Model not found', null]) expect(isCodexAuthError(error)).toBe(false);
   });
   it('uses native MCP status and native compact controls', async () => {
     const h = setup(); h.session.codex.rpc.mockResolvedValue({ data: [{ name: 'ask-user', authStatus: 'notLoggedIn', tools: { request_secret: {} } }] });
