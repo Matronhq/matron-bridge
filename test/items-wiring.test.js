@@ -8,13 +8,13 @@ import { describe, expect, it } from 'vitest';
 // silently — a missing route answers 404 with no stack trace anywhere, and a
 // tool that forgets roomId gets "roomId is required" from a handler the user
 // never sees.
-const TOOLS = ['create', 'list', 'get', 'comment', 'close', 'reopen', 'reorder'];
+const TOOLS = ['create', 'list', 'get', 'comment', 'close', 'reopen', 'reorder', 'move'];
 
 describe('items tracker wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
 
-  it('mounts all seven /items routes through the shared handler map', () => {
+  it('mounts all eight /items routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/items\\\/\(([a-z|]+)\)\$\/\)/);
     expect(m, 'the /items route matcher is missing from index.js').toBeTruthy();
     expect(m[1].split('|').sort()).toEqual([...TOOLS].sort());
@@ -25,7 +25,7 @@ describe('items tracker wiring', () => {
     expect(index).toMatch(/uploadLocalFile: \(session, reqPath\) => resolveAndUploadLocalFile\(\{ session, reqPath, publisher: journalPublisher \}\)/);
   });
 
-  it('registers all seven item_* tools, each posting through callItems', () => {
+  it('registers all eight item_* tools, each posting through callItems', () => {
     for (const t of TOOLS) {
       expect(askUser, `item_${t} is not registered`).toContain(`'item_${t}',`);
       expect(askUser, `item_${t} does not go through callItems`).toContain(`callItems('${t}',`);
