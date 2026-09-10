@@ -86,10 +86,11 @@ function renderHtml(filename, content) {
 // else — the holder of a single-line link cannot flip it.
 //
 // NOTE (HTML spec, "textarea wrapping transformation"): a browser normalises a
-// textarea's submitted value to CRLF line endings. The bridge writes whatever
-// arrives byte-for-byte rather than converting, so a key pasted with LF
-// endings lands on disk with CRLF ones. Consumers that care (ssh-keygen is
-// fine; some strict PEM parsers are not) should normalise on read.
+// textarea's submitted value to CRLF line endings, so what the user pasted is
+// unrecoverable by the time it is posted. The value still travels from here to
+// the bridge byte-for-byte — the CRLF→LF conversion happens once, on the
+// bridge's submit path (lib/secret-requests.js normalizeLineEndings), so every
+// client of that API writes the same bytes. The form says so below.
 function renderSecretForm(label, token, multiline = false) {
   const field = multiline
     ? '<textarea name="value" rows="12" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Paste value here..." autofocus required></textarea>'
@@ -123,7 +124,7 @@ function renderSecretForm(label, token, multiline = false) {
       ${field}
       <button type="submit">Submit</button>
     </form>
-    <div class="note">This value will be written to a secure file and auto-deleted after 1 hour. It will not appear in chat.</div>
+    <div class="note">This value will be written to a secure file and auto-deleted after 1 hour. It will not appear in chat.${multiline ? ' Line endings are saved as LF.' : ''}</div>
   </div>
 </body>
 </html>`;

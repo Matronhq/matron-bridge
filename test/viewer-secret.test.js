@@ -98,6 +98,13 @@ describe('GET /secret', () => {
     }
   });
 
+  it('promises LF line endings on the multiline form only', async () => {
+    const multi = await (await getForm({ secretId: 'sec-1', label: 'k', multiline: true })).text();
+    expect(multi).toContain('Line endings are saved as LF.');
+    const single = await (await getForm({ secretId: 'sec-1', label: 'k' })).text();
+    expect(single).not.toContain('Line endings are saved as LF.');
+  });
+
   it('escapes the label', async () => {
     const html = await (await getForm({ secretId: 'sec-1', label: '<img src=x onerror=1>' })).text();
     expect(html).not.toContain('<img src=x');

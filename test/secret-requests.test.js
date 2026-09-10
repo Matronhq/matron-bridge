@@ -240,6 +240,48 @@ describe('createSecretRequests.create', () => {
   });
 });
 
+describe('createSecretRequests.submit line endings', () => {
+  // The HTML standard makes EVERY textarea submission CRLF, so the endings the
+  // user actually pasted are unrecoverable by the time the value arrives. On a
+  // Unix host CRLF silently alters a PEM, a .env or a JSON key file, so a
+  // multiline request normalises to LF here — on the bridge side, so any
+  // client of the submit API gets the same bytes on disk. A single-line
+  // request is never touched: nothing in it should contain a newline at all,
+  // and if one does it was deliberate.
+  async function submitInto(value, { multiline }) {
+    const h = makeHarness();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c', multiline });
+    await (await h.store.submit('sec-1', value)).done;
+    return h.files.get('sec-1');
+  }
+
+  it('converts CRLF to LF for a multiline request, keeping the trailing newline', async () => {
+    const written = await submitInto('-----BEGIN-----\r\nabc\r\n\r\n-----END-----\r\n', { multiline: true });
+    expect(written).toBe('-----BEGIN-----\nabc\n\n-----END-----\n');
+    expect(written.endsWith('\n')).toBe(true);
+    expect(written).not.toContain('\r');
+  });
+
+  it('leaves a lone carriage return alone', async () => {
+    const written = await submitInto('a\rb\r\nc\r', { multiline: true });
+    expect(written).toBe('a\rb\nc\r');
+  });
+
+  it('leaves an all-LF multiline value byte-for-byte', async () => {
+    const value = 'one\ntwo\n\n';
+    expect(await submitInto(value, { multiline: true })).toBe(value);
+  });
+
+  it('does not touch CRLF in a single-line request', async () => {
+    const value = 'has\r\na newline somehow\r\n';
+    expect(await submitInto(value, { multiline: false })).toBe(value);
+  });
+
+  it('still trims nothing at either end', async () => {
+    expect(await submitInto('  padded  ', { multiline: true })).toBe('  padded  ');
+  });
+});
+
 describe('createSecretRequests.submit', () => {
   it('writes the value verbatim and reports the path', async () => {
     const h = makeHarness();
