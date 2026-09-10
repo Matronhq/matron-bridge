@@ -57,6 +57,16 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 - **An item is the whole history of that piece of work, images included.** Follow-up screenshots, renders and files go in the comment's `attachments` (local paths, same as `item_create`), never "the image is in the conversation" — the user reads the item's thread, not the chat, to see how it went.
 - Refer to items by number (`#12`) in chat rather than pasting their contents back in — this is where "let's put it in a GitHub issue" instincts should go instead; use `links` on an item when an issue or PR already exists alongside it. A repo's own CLAUDE.md that still says to raise questions as GitHub issues predates the tracker: file the item, and put the issue in `links` only if one is genuinely needed for other people.
 
+## Missions & milestones
+
+A mission is the human-readable record of one piece of work; milestones are its checkpoints, and each one is a link back to where it happened in the transcript. The user reads the mission page to see the shape of hours of work without scrolling.
+
+- **Start the mission with `mission_start` (title + goal) as soon as you know what the work is** — usually right after the user's first substantive input. Milestones are refused until the conversation has a mission; name it yourself from what you know, then post the milestone again. Rename later with `mission_update` if the work changes shape. A spawned session inherits its parent's mission; `mission_join` attaches this conversation to an existing one by number.
+- Post a milestone with `kind: "user_input"` whenever an input from the user starts or redirects work. Skip typos, one-word answers and clarifications. The user's stated purpose is "to be able to go back to my last input easily".
+- Post `kind: "progress"` milestones as often as they are useful — a landed PR, a diagnosis, a decision, a phase done. There is no upper limit; hours of unattended work should leave a readable trail.
+- Close the mission (`mission_close` with a summary) when the work is done, not when the session ends. It refuses while items are open: close each with a real resolution, or `item_move` it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those.
+- Numbers are shared: `#63` may be an item, a mission or a milestone. Refer to any of them by number. `mission_get` reads a mission's milestones, open items and conversations.
+
 ## Searching the journal
 
 The journal server has a full-text search API over every one of the user's conversations, across all their boxes. When asked to find something the user said or did in a past session ("where did I ask about X"), use it — do not grep local `~/.claude/projects/` transcripts (they only cover this box), and do not message other agents to ask them to look.

@@ -67,3 +67,26 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
 ```
 
 If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
+
+## Missions & milestones
+
+A mission is the human-readable record of one piece of work; milestones are its checkpoints and jump targets back into the transcript. Same base URL and token discipline as the items routes above. **Start the mission as soon as you know what the work is; milestones are refused until the conversation has one.** Post a milestone with `kind:"user_input"` whenever an input from the user starts or redirects work, and `kind:"progress"` as often as useful. Close it when the work is done, not when the session ends.
+
+- `POST $BASE/missions` — `{"title":"...","body":"goal","convo_id":"<id>"}` → 201 mission (`num` is its number); 200 with `existing:true` if the conversation already has one.
+- `POST $BASE/milestones` — `{"convo_id":"<id>","kind":"user_input"|"progress","title":"...","body":"..."}` → 201; 409 `blocked_by:"no_mission"` means start the mission first, then retry.
+- `GET $BASE/missions/:num` — milestones newest first, open items, conversations. `PATCH $BASE/missions/:num` `{"title"?,"body"?}` to rename.
+- `POST $BASE/missions/:num/join` `{"convo_id":"<id>"}` — attach this conversation to an existing mission.
+- `POST $BASE/missions/:num/close` `{"summary":"..."}` — 409 `blocked_by:"user_items"|"agent_items"` lists the open items: close each (`/items/:id/close`) or move it (`PATCH $BASE/items/:id` `{"mission":"#N"}`); items awaiting the user cannot be cleared by you.
+- Give every `POST` an `Idempotency-Key` header.
+
+```bash
+curl -sS -X POST "$BASE/missions" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"title\":\"Missions & milestones\",\"body\":\"Ship the journal half\",\"convo_id\":\"$CONVO_ID\"}"
+
+curl -sS -X POST "$BASE/milestones" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"convo_id\":\"$CONVO_ID\",\"kind\":\"user_input\",\"title\":\"Dan asked for missions\"}"
+```
