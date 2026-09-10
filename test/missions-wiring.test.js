@@ -2,7 +2,15 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const OPS = ['start', 'post', 'update', 'join', 'get', 'close'];
-const TOOLS = { mission_start: 'start', milestone_post: 'post', mission_update: 'update', mission_join: 'join', mission_get: 'get', mission_close: 'close' };
+const TOOL_CALLS = {
+  mission_start: "callMissions('start', args, formatStartAck)",
+  milestone_post: "callMissions('post', args, formatMilestoneAck)",
+  mission_update: "callMissions('update', args, (d) => missionLine(d.mission))",
+  mission_join: "callMissions('join', args, (d) => missionLine(d.mission))",
+  mission_get: "callMissions('get', args, formatMissionDetail)",
+  mission_close: "callMissions('close', args, (d) => missionLine(d.mission))",
+  item_move: "callItems('move', args, (d) => itemLine(d.item))",
+};
 
 describe('missions wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
@@ -18,13 +26,15 @@ describe('missions wiring', () => {
     expect(index).toMatch(/createMissionsHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: missionsClient,?\s*\}\)/);
   });
 
-  it('registers the six mission tools and item_move, each posting through the loopback helper', () => {
-    for (const [tool, op] of Object.entries(TOOLS)) {
+  it('registers the six mission tools and item_move, each pinned to its exact renderer', () => {
+    for (const [tool, call] of Object.entries(TOOL_CALLS)) {
       expect(askUser, `${tool} is not registered`).toContain(`'${tool}',`);
-      expect(askUser, `${tool} does not go through callMissions`).toContain(`callMissions('${op}',`);
+      expect(askUser, `${tool} does not go through ${call}`).toContain(call);
     }
-    expect(askUser).toContain(`'item_move',`);
-    expect(askUser).toContain(`callItems('move',`);
+  });
+
+  it('no mission or item_move tool schema takes a convo_id parameter', () => {
+    expect(askUser).not.toMatch(/(?<!\w)convo_id:\s*z\./);
   });
 
   it('both prompt files carry the missions section', () => {

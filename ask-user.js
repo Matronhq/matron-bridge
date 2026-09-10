@@ -729,14 +729,14 @@ async function callMissions(name, args, render) {
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
     });
     const data = await res.json().catch(() => ({}));
-    if (res.status === 409) return { content: [{ type: 'text', text: `${toolName(name)} failed: ${formatBlocked(data)}` }] };
-    if (!res.ok) return { content: [{ type: 'text', text: `${toolName(name)} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    if (res.status === 409) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatBlocked(data)}` }] };
+    if (!res.ok) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${data?.error || `HTTP ${res.status}`}` }] };
     return { content: [{ type: 'text', text: render(data) }] };
   } catch (err) {
-    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
   }
 }
-const toolName = (op) => ({ start: 'mission_start', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+const missionToolName = (op) => ({ start: 'mission_start', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
 
 server.tool(
   'mission_start',

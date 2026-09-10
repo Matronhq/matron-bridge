@@ -472,15 +472,16 @@ const _journalToken = resolveJournalToken();
 // no journal configured the base URL is empty and every call resolves status
 // 0, which the handlers turn into a 502 "journal unreachable" — a tool that
 // says so beats one that throws.
+const journalHttpBase = JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '';
 const itemsClient = createItemsClient({
-  baseUrl: JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '',
+  baseUrl: journalHttpBase,
   token: _journalToken,
 });
 
 // Missions & milestones (spec 2026-09-10): same base URL and token as the
 // items client; a missing journal resolves status 0 → 502 in the handlers.
 const missionsClient = createMissionsClient({
-  baseUrl: JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '',
+  baseUrl: journalHttpBase,
   token: _journalToken,
 });
 
@@ -10334,7 +10335,7 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The seven item_* tool routes. One matcher rather than seven blocks:
+      // The eight item_* tool routes. One matcher rather than eight blocks:
       // the handler names ARE the path segments, and the anchored alternation
       // is the allowlist (no dynamic property lookup from raw input).
       const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder|move)$/);
