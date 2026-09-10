@@ -61,11 +61,30 @@ describe('bridge wiring', () => {
     expect(index).toMatch(/multiline/);
   });
 
-  it('delivers the turn through the item-turn seams rather than a second queue', () => {
-    const deliver = index.slice(index.indexOf('function deliverSecretTurn'));
-    expect(deliver).toContain('journalQueueMedia(');
-    expect(deliver).toContain('sendToSession(');
-    expect(deliver).toContain('journalPublishNotice(');
+  // The delivery BEHAVIOUR (idle / busy / reaped / resume-failed) is unit-
+  // tested in test/secret-requests.test.js now that the branches live in the
+  // module. All that is left to assert here is that index.js hands the module
+  // the real seams rather than reimplementing any of them.
+  it('hands the store the real session seams, including the auto-resume', () => {
+    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    // Live sessions only — a dead-but-mapped session must fall through to the
+    // resume, not dead-end in the undeliverable notice.
+    expect(wiring).toMatch(/getSession: \(roomId\) => \{[\s\S]*?s && s\.alive \? s : null;/);
+    expect(wiring).toMatch(/resumeSession: \(roomId, notice\) => journalResumeRoom\(roomId, notice\)/);
+    expect(wiring).toContain('sendToSession(');
+    expect(wiring).toContain('journalQueueMedia(');
+    expect(wiring).toContain('journalPublishNotice(');
+  });
+
+  it('persists the request store with owner-only permissions', () => {
+    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    expect(wiring).toMatch(/mode: 0o600/);
+  });
+
+  it('sweeps orphaned secret files through the store rather than a bespoke scan', () => {
+    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    expect(wiring).toContain('listSecretFiles:');
+    expect(wiring).toContain('SECRETS_DIR');
   });
 });
 
@@ -77,6 +96,8 @@ describe('agent-facing docs', () => {
     expect(bullet).toMatch(/does not block|non-blocking/i);
     expect(bullet).toMatch(/turn/i);
     expect(bullet).toMatch(/multiline/);
+    // Whoever can read the tracker can spend the link before the user does.
+    expect(md).toMatch(/anyone who can read the tracker/i);
     // The SECURITY rules around it stay intact.
     expect(md).toContain('Never post sensitive data directly in Matron chat messages.');
     expect(md).toContain('Failure to use a secure MCP flow for sensitive data is a critical security violation.');

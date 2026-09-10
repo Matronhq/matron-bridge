@@ -69,15 +69,28 @@ function makeItems(overrides = {}) {
   };
 }
 
+// A stand-in session. Only the two fields the store actually reads (`roomId`,
+// `busy`) are real — everything else about a session is behind the inject /
+// queue seams.
+const makeSession = (roomId, { busy = false } = {}) => ({ roomId, busy });
+
 function makeHarness(opts = {}) {
   const scheduler = makeScheduler();
   const items = opts.items ?? makeItems();
   const files = new Map();
   const removed = [];
-  const turns = [];
-  const notices = [];
+  const turns = [];        // injected straight into a live idle session
+  const queuedTurns = [];  // parked on session.queuedMessages mid-turn
+  const notices = [];      // journal-side assistant notices (undeliverable)
+  const chat = [];         // the room notice posted when a request is filed
+  const resumes = [];      // auto-resume attempts
   let saved = opts.initial ?? null;
   let clock = opts.startAt ?? 1_000_000;
+
+  // Live sessions by room. Default: one idle session in !room, which is the
+  // ordinary case; opts.session lets a test start with none (reaped) or busy.
+  const live = new Map();
+  if (opts.session !== null) live.set('!room', opts.session ?? makeSession('!room'));
 
   const store = createSecretRequests({
     load: () => saved,
@@ -91,18 +104,33 @@ function makeHarness(opts = {}) {
       return `/tmp/secrets/${secretId}.txt`;
     }),
     removeSecretFile: (p) => removed.push(p),
+    listSecretFiles: opts.listSecretFiles ?? (() => []),
     items,
     generateLink: opts.generateLink
       ?? ((secretId, { multiline }) => `https://viewer.example/secret?token=t-${secretId}${multiline ? '-ml' : ''}`),
-    notifyChat: (record, info) => notices.push({ record, info }),
-    deliverTurn: async (record, text) => { turns.push({ roomId: record.roomId, text }); },
+    notifyChat: (record, info) => chat.push({ record, info }),
+    getSession: (roomId) => live.get(roomId) ?? null,
+    resumeSession: (roomId, notice) => {
+      resumes.push({ roomId, notice });
+      const revived = opts.resumeTo === undefined ? null : opts.resumeTo;
+      if (revived) live.set(roomId, revived);
+      return revived;
+    },
+    inject: (session, text) => {
+      if (opts.injectFails) return false;
+      turns.push({ roomId: session.roomId, text });
+      return true;
+    },
+    queue: async (session, { text, preview }) => { queuedTurns.push({ roomId: session.roomId, text, preview }); },
+    publishNotice: (convoId, text) => notices.push({ convoId, text }),
     log: { warn: () => {}, log: () => {} },
     ...(opts.ttlMs ? { ttlMs: opts.ttlMs } : {}),
     ...(opts.fileTtlMs ? { fileTtlMs: opts.fileTtlMs } : {}),
+    ...(opts.maxPendingPerRoom ? { maxPendingPerRoom: opts.maxPendingPerRoom } : {}),
   });
 
   return {
-    store, scheduler, items, files, removed, turns, notices,
+    store, scheduler, items, files, removed, turns, queuedTurns, notices, chat, resumes, live,
     get saved() { return saved; },
     advance: (ms) => { clock += ms; },
     get clock() { return clock; },
@@ -128,6 +156,15 @@ describe('formatSecretChatNotice', () => {
     expect(html).toContain('&lt;img src=x&gt;');
   });
 
+  it('escapes the link in the href, not only the label', () => {
+    // VIEWER_BASE_URL is operator config, but it lands in an attribute, so a
+    // quote in it must not be able to close the attribute and add another.
+    const { html } = formatSecretChatNotice({ label: 'k', link: 'https://v/s?a="x onmouseover=1', itemNum: 1 });
+    // The injected quote is neutralised, so the attribute still ends where
+    // the template says it does and `onmouseover` stays inside the href.
+    expect(html).toContain('href="https://v/s?a=&quot;x onmouseover=1">');
+  });
+
   it('drops the item number when the item could not be filed', () => {
     const { plain } = formatSecretChatNotice({ label: 'token', link: 'https://v/s', itemNum: null });
     expect(plain).toBe('🔐 Secret requested: token — [Enter secret](https://v/s) (24 h)');
@@ -151,6 +188,11 @@ describe('formatSecretItemBody', () => {
     expect(body).toContain('[Enter secret](https://v/secret?token=abc)');
     expect(body).toContain('Expires 2026-09-11T10:00:00.000Z.');
     expect(body).toContain('The value is written to a file the agent reads; it never enters chat.');
+  });
+
+  it('tells the user not to type the value into the item thread', () => {
+    const body = formatSecretItemBody({ label: 'k', link: 'https://v/s', expiresAt: 0 });
+    expect(body).toContain('Answer with the link above — do not type the value into this thread; anything posted here is stored in the journal in plain text.');
   });
 
   it('never renders a link element when there is no link', () => {
@@ -182,11 +224,11 @@ describe('createSecretRequests.create', () => {
   it('posts the chat notice with the link and the item number', async () => {
     const h = makeHarness();
     await h.store.create({ label: 'DB password', roomId: '!room', convoId: 'convo-1' });
-    expect(h.notices.length).toBe(1);
-    expect(h.notices[0].info.link).toBe('https://viewer.example/secret?token=t-sec-1');
-    expect(h.notices[0].info.itemNum).toBe(120);
-    expect(h.notices[0].info.plain).toContain('🔐 Secret requested: DB password');
-    expect(h.notices[0].info.plain).toContain('(#120, 24 h)');
+    expect(h.chat.length).toBe(1);
+    expect(h.chat[0].info.link).toBe('https://viewer.example/secret?token=t-sec-1');
+    expect(h.chat[0].info.itemNum).toBe(120);
+    expect(h.chat[0].info.plain).toContain('🔐 Secret requested: DB password');
+    expect(h.chat[0].info.plain).toContain('(#120, 24 h)');
   });
 
   it('asks for a link valid for the whole 24 h request lifetime, not the short file-link window', async () => {
@@ -206,11 +248,15 @@ describe('createSecretRequests.create', () => {
     await h.store.create({ label: 'k', roomId: '!room', convoId: 'convo-1', multiline: true });
     const rec = h.saved.requests[0];
     expect(Object.keys(rec).sort()).toEqual(
-      ['createdAt', 'expiresAt', 'itemId', 'itemNum', 'label', 'multiline', 'roomId', 'secretId'],
+      ['convoId', 'createdAt', 'expiresAt', 'itemId', 'itemNum', 'label', 'multiline', 'roomId', 'secretId'],
     );
+    // The convo id IS persisted (it is an id, not a value): without it an
+    // expiry or an undeliverable submission after a restart has nowhere to go.
+    expect(rec.convoId).toBe('convo-1');
     expect(rec.expiresAt - rec.createdAt).toBe(SECRET_REQUEST_TTL_MS);
-    expect(JSON.stringify(h.saved)).not.toContain('convo-1');
+    // …but never a value and never a path.
     expect(JSON.stringify(h.saved)).not.toContain('/tmp/secrets');
+    expect(JSON.stringify(h.saved)).not.toContain(DUMMY);
   });
 
   it('arms an expiry timer 24 h out', async () => {
@@ -228,7 +274,7 @@ describe('createSecretRequests.create', () => {
     expect(res.itemError).toBe('journal unreachable');
     // The request itself is live regardless — the link still works.
     expect(h.saved.requests.length).toBe(1);
-    expect(h.notices[0].info.plain).not.toContain('#');
+    expect(h.chat[0].info.plain).not.toContain('#');
   });
 
   it('skips the item (and says why) when the session has no journal conversation', async () => {
@@ -372,6 +418,145 @@ describe('createSecretRequests.submit', () => {
   });
 });
 
+describe('turn delivery', () => {
+  // The reason this matters: SESSION_IDLE_TIMEOUT_MS defaults to an hour and
+  // the request window is twenty-four, so by submit time the session is
+  // usually GONE. Publishing "read it from <path>" as an assistant notice
+  // would show the user a sentence the agent never reads while the tracker
+  // item closes as answered — the worst possible pair. So an absent session
+  // is woken, exactly as an item reply wakes one, and only a wake that fails
+  // degrades to a notice, in the voice that says so.
+  async function submitWith(opts) {
+    const h = makeHarness(opts);
+    await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    return h;
+  }
+
+  it('injects straight into a live idle session', async () => {
+    const h = await submitWith({});
+    expect(h.resumes).toEqual([]);
+    expect(h.turns).toEqual([{ roomId: '!room', text: '🔐 Secret "AWS access key" submitted — read it from /tmp/secrets/sec-1.txt' }]);
+    expect(h.queuedTurns).toEqual([]);
+    expect(h.notices).toEqual([]);
+  });
+
+  it('parks on the shared queue when a turn is running', async () => {
+    const h = await submitWith({ session: makeSession('!room', { busy: true }) });
+    expect(h.turns).toEqual([]);
+    expect(h.queuedTurns.length).toBe(1);
+    expect(h.queuedTurns[0].text).toContain('submitted — read it from');
+    expect(h.queuedTurns[0].preview).toContain('AWS access key');
+    expect(h.notices).toEqual([]);
+  });
+
+  it('auto-resumes a reaped session and then injects into it', async () => {
+    const h = await submitWith({ session: null, resumeTo: makeSession('!room') });
+    expect(h.resumes.length).toBe(1);
+    expect(h.resumes[0].roomId).toBe('!room');
+    expect(h.resumes[0].notice).toBe('⏳ Session was idle — auto-resuming it to receive the secret you just submitted.');
+    expect(h.turns.length).toBe(1);
+    expect(h.notices).toEqual([]);
+  });
+
+  it('queues instead of injecting when the resumed session is already busy', async () => {
+    const h = await submitWith({ session: null, resumeTo: makeSession('!room', { busy: true }) });
+    expect(h.resumes.length).toBe(1);
+    expect(h.queuedTurns.length).toBe(1);
+    expect(h.turns).toEqual([]);
+  });
+
+  it('falls back to an undeliverable notice — never to text that reads as if the agent has it', async () => {
+    const h = await submitWith({ session: null });
+    expect(h.resumes.length).toBe(1);
+    expect(h.turns).toEqual([]);
+    expect(h.notices.length).toBe(1);
+    expect(h.notices[0].convoId).toBe('convo-1');
+    expect(h.notices[0].text).toMatch(/^Couldn't deliver/);
+    // The failure notice must not be mistakable for the agent's own turn.
+    expect(h.notices[0].text).not.toContain('read it from');
+    expect(h.notices[0].text).not.toContain('/tmp/secrets');
+  });
+
+  it('falls back to the notice when inject refuses (dead session object)', async () => {
+    const h = await submitWith({ injectFails: true });
+    expect(h.notices.length).toBe(1);
+    expect(h.notices[0].text).toMatch(/^Couldn't deliver/);
+  });
+
+  it('wakes the session for an expiry too, with its own notice', async () => {
+    const h = makeHarness({ session: null, resumeTo: makeSession('!room') });
+    await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
+    h.advance(SECRET_REQUEST_TTL_MS);
+    await h.scheduler.fireDue(SECRET_REQUEST_TTL_MS);
+    expect(h.resumes[0].notice).toBe('⏳ Session was idle — auto-resuming it to report an expired secret request.');
+    expect(h.turns[0].text).toContain('request expired (24 h)');
+  });
+
+  it('uses the PERSISTED convo id after a restart, so a notice always has a destination', async () => {
+    const seed = makeHarness();
+    await seed.store.create({ label: 'k', roomId: '!room', convoId: 'convo-1' });
+    const h = makeHarness({ initial: seed.saved, session: null, startAt: 1_000_000 + 1000 });
+    h.store.init();
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    expect(h.notices[0].convoId).toBe('convo-1');
+  });
+});
+
+describe('per-room pending cap', () => {
+  it('refuses a sixth pending request in the same room, with an actionable message', async () => {
+    let n = 0;
+    const h = makeHarness({ newId: () => `sec-${++n}` });
+    for (let i = 0; i < 5; i++) {
+      expect((await h.store.create({ label: `k${i}`, roomId: '!room', convoId: 'c' })).secretId).toBeTruthy();
+    }
+    const sixth = await h.store.create({ label: 'k6', roomId: '!room', convoId: 'c' });
+    expect(sixth.secretId).toBeFalsy();
+    expect(sixth.error).toBe('5 secret requests already pending for this session — wait for one to be answered or expire');
+    expect(h.saved.requests.length).toBe(5);
+    // Nothing was filed, linked or announced for the refused one.
+    expect(h.items.calls.create.length).toBe(5);
+    expect(h.chat.length).toBe(5);
+  });
+
+  it('counts per room, and frees a slot when one is answered', async () => {
+    let n = 0;
+    const h = makeHarness({ newId: () => `sec-${++n}`, maxPendingPerRoom: 2 });
+    await h.store.create({ label: 'a', roomId: '!room', convoId: 'c' });
+    await h.store.create({ label: 'b', roomId: '!room', convoId: 'c' });
+    expect((await h.store.create({ label: 'c', roomId: '!room', convoId: 'c' })).error).toBeTruthy();
+    // Another room is unaffected.
+    expect((await h.store.create({ label: 'd', roomId: '!other', convoId: 'c2' })).secretId).toBeTruthy();
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    expect((await h.store.create({ label: 'e', roomId: '!room', convoId: 'c' })).secretId).toBeTruthy();
+  });
+});
+
+describe('orphaned secret files', () => {
+  it('sweeps files older than the file TTL at init and re-arms the young ones', async () => {
+    const h = makeHarness({
+      startAt: 10_000_000,
+      fileTtlMs: 3600_000,
+      listSecretFiles: () => [
+        { path: '/tmp/secrets/old.txt', mtimeMs: 10_000_000 - 3600_001 },
+        { path: '/tmp/secrets/exactly-due.txt', mtimeMs: 10_000_000 - 3600_000 },
+        { path: '/tmp/secrets/young.txt', mtimeMs: 10_000_000 - 600_000 },
+      ],
+    });
+    h.store.init();
+    expect(h.removed).toEqual(['/tmp/secrets/old.txt', '/tmp/secrets/exactly-due.txt']);
+    // The young one is armed for its REMAINING life, not a fresh full hour.
+    expect(h.scheduler.only().delay).toBe(3600_000 - 600_000);
+    await h.scheduler.fireDue(3600_000);
+    expect(h.removed).toContain('/tmp/secrets/young.txt');
+  });
+
+  it('survives a listing that throws', () => {
+    const h = makeHarness({ listSecretFiles: () => { throw new Error('ENOENT'); } });
+    expect(() => h.store.init()).not.toThrow();
+  });
+});
+
 describe('createSecretRequests.read (legacy GET compatibility)', () => {
   it('reports pending, then answered once, then forgets', async () => {
     const h = makeHarness();
@@ -433,8 +618,8 @@ describe('createSecretRequests.init (persistence across a restart)', () => {
   it('keeps multiline and the item link across the restart', async () => {
     const h = makeHarness({ initial: created, startAt: 1_000_000 });
     h.store.init();
-    expect(h.store.peek('sec-1').multiline).toBe(true);
-    expect(h.store.peek('sec-1').itemId).toBe('it_abc');
+    expect(h.store.peekForTest('sec-1').multiline).toBe(true);
+    expect(h.store.peekForTest('sec-1').itemId).toBe('it_abc');
   });
 
   it('drops an already-expired request, closing its item as cancelled', async () => {

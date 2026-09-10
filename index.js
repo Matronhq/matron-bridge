@@ -9728,42 +9728,21 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   return newSession;
 }
 
-// One synthetic agent turn for a secret submission or expiry, delivered
-// through exactly the seams lib/items-turn.js uses: inject when the session is
-// idle, park on the SHARED session.queuedMessages when a turn is running, and
-// fall back to a journal notice when there is no session left to tell. There
-// is deliberately no second queue here.
-async function deliverSecretTurn(record, text) {
-  const session = record.roomId ? sessions.get(record.roomId) : null;
-  if (!session) {
-    // Reaped session, or a request that outlived a bridge restart: the convo
-    // id survives in the persisted session record, so the user still sees
-    // what became of the request even though no agent is listening.
-    const persisted = record.roomId ? loadPersistedSessions()[String(record.roomId)] : null;
-    journalPublishNotice(persisted?.journalConvoId || persisted?.sessionId || null, text);
-    return;
-  }
-  if (session.busy) {
-    await journalQueueMedia(session, {
-      blocks: [{ type: 'text', text }],
-      mirrorToJournal: false,
-      preview: `🔐 ${record.label}`,
-      fullText: text,
-    });
-    return;
-  }
-  if (!sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true })) {
-    journalPublishNotice(journalConvoIdFor(session), text);
-  }
-}
-
 // Open secure-input requests (item #120). `request_secret` no longer blocks:
-// this store owns the whole 24 h lifecycle — the tracker question, the signed
+// the store owns the whole 24 h lifecycle — the tracker question, the signed
 // link, the 0600 write, the answer turn and the expiry — and persists the
 // non-sensitive part of each request so a bridge restart re-arms it.
+//
+// Everything below is a seam; none of the branching lives here. In particular
+// the delivery seams are the SAME four the item-turn router uses, so a secret
+// arriving mid-turn parks on the shared queue rather than in a second one, and
+// a secret arriving after the idle reaper has been through wakes the session
+// exactly as an item reply does.
 const secretRequests = createSecretRequests({
   load: () => (fs.existsSync(SECRET_REQUESTS_FILE) ? JSON.parse(fs.readFileSync(SECRET_REQUESTS_FILE, 'utf-8')) : null),
-  save: (data) => atomicWriteFileSync(SECRET_REQUESTS_FILE, JSON.stringify(data, null, 2)),
+  // 0600: the file names every open request, its room and its item. Not
+  // secret, but not other local users' business either.
+  save: (data) => atomicWriteFileSync(SECRET_REQUESTS_FILE, JSON.stringify(data, null, 2), { mode: 0o600 }),
   newId: () => randomUUID(),
   // The only place a submitted value touches this process's own code. 0600,
   // in the 0700 SECRETS_DIR created at startup.
@@ -9773,6 +9752,24 @@ const secretRequests = createSecretRequests({
     return filePath;
   },
   removeSecretFile: (filePath) => { fs.unlink(filePath, () => {}); },
+  // Feeds the startup sweep: a submitted file is unlinked an hour later by a
+  // timer, and that timer dies with the bridge, so a restart inside the hour
+  // used to strand the file on disk indefinitely.
+  listSecretFiles: () => {
+    try {
+      return fs.readdirSync(SECRETS_DIR)
+        .filter((name) => name.endsWith('.txt'))
+        .map((name) => {
+          const filePath = path.join(SECRETS_DIR, name);
+          try { return { path: filePath, mtimeMs: fs.statSync(filePath).mtimeMs }; }
+          catch { return null; }
+        })
+        .filter(Boolean);
+    } catch {
+      // No directory yet (first boot, before main()'s mkdir) — nothing to do.
+      return [];
+    }
+  },
   items: itemsClient,
   generateLink: (secretId, { label, roomId, multiline, ttlMs }) =>
     generateSecretLink(secretId, label, roomId, { ttlMs, multiline }),
@@ -9782,7 +9779,27 @@ const secretRequests = createSecretRequests({
     if (html && session.sendHtml) session.sendHtml(plain, html);
     else if (session.sendCallback) session.sendCallback(plain);
   },
-  deliverTurn: deliverSecretTurn,
+  // LIVE sessions only. A killed-but-still-mapped session would take the
+  // inject branch, fail it (sendToSession refuses on !alive) and dead-end in
+  // the undeliverable notice — whereas falling through to resumeSession
+  // revives it instead (resumeSleepingSession evicts the corpse first).
+  getSession: (roomId) => {
+    const s = sessions.get(roomId);
+    return s && s.alive ? s : null;
+  },
+  // SESSION_IDLE_TIMEOUT_MS defaults to an hour and a request lives a day, so
+  // the session is usually gone by the time the user submits. Wake it the way
+  // an item reply wakes one; sendToSession then parks the turn in
+  // _resumeOutbox until the resumed TUI is ready to receive it.
+  resumeSession: (roomId, notice) => journalResumeRoom(roomId, notice),
+  inject: (session, text) => sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true }),
+  queue: (session, { text, preview }) => journalQueueMedia(session, {
+    blocks: [{ type: 'text', text }],
+    mirrorToJournal: false,
+    preview,
+    fullText: text,
+  }),
+  publishNotice: journalPublishNotice,
   fileTtlMs: SECRET_TTL_MS,
   log: console,
 });
@@ -10156,13 +10173,21 @@ const apiServer = createServer(async (req, res) => {
         }
 
         const activeSession = sessions.get(roomId);
-        const { secretId, itemNum, itemError } = await secretRequests.create({
+        const created = await secretRequests.create({
           label,
           roomId,
           convoId: activeSession ? journalConvoIdFor(activeSession) : null,
           multiline: multiline === true,
         });
+        // Per-room cap: nothing was minted, filed or announced, so this is a
+        // refusal the tool can act on, not a partial request to clean up.
+        if (created.error) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: created.error }));
+          return;
+        }
 
+        const { secretId, itemNum, itemError } = created;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId, itemNum, itemError }));
         return;

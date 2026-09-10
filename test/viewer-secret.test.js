@@ -175,6 +175,21 @@ describe('POST /secret', () => {
     expect(apiRequests.length).toBe(0);
   });
 
+  it('leaves the app-wide 100 KB urlencoded ceiling in place for other routes', async () => {
+    // The bigger parser is mounted on THIS route only. /sensitive/reveal also
+    // accepts urlencoded bodies, and nothing about a secure-input form should
+    // widen its ceiling.
+    const body = new URLSearchParams();
+    body.set('token', 'x');
+    body.set('junk', 'y'.repeat(150 * 1024));
+    const res = await fetch(`http://127.0.0.1:${port}/sensitive/reveal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    expect(res.status).toBe(413);
+  });
+
   it('accepts a 64 KB multi-line value, and explains a rejection past the ceiling', async () => {
     const token = secretToken({ secretId: 'sec-1', label: 'kubeconfig', multiline: true });
     const big = `${'k'.repeat(64 * 1024)}\r\n`;

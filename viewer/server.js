@@ -25,13 +25,20 @@ const PORT = resolveViewerPort();
 const SECRET = process.env.HMAC_SECRET;
 
 const app = express();
-// 512 KB rather than body-parser's 100 KB default: the only form that POSTs
-// here is the secure-input one, and a multi-line credential is percent-encoded
-// on the way (every newline costs six characters, every `+`/`/` in a base64
-// blob costs three), so the 100 KB default put the real ceiling on a pasted
-// PEM or kubeconfig at ~32 KB in the worst case. Still small enough that a
-// flood of oversized bodies is not a memory story.
-app.use(express.urlencoded({ extended: false, limit: '512kb' }));
+// App-wide urlencoded parsing keeps body-parser's 100 KB default — /sensitive
+// /reveal accepts urlencoded bodies too, and nothing about a secure-input form
+// should widen ITS ceiling. Only POST /secret gets the bigger parser, mounted
+// on the route (secretFormParser, below): a multi-line credential is
+// percent-encoded on the way (every newline costs six characters, every `+`
+// or `/` in a base64 blob costs three), so 100 KB put the real ceiling on a
+// pasted PEM or kubeconfig at ~32 KB in the worst case. Skipping the app-wide
+// parser for that one route is what makes the route-mounted one reachable —
+// whichever parser runs first wins, and a 413 from this one could not be
+// undone downstream.
+const appFormParser = express.urlencoded({ extended: false });
+app.use((req, res, next) => (
+  req.method === 'POST' && req.path === '/secret' ? next() : appFormParser(req, res, next)
+));
 app.use(express.json());
 
 // Escape a value for interpolation into HTML text or attribute context.
@@ -419,7 +426,23 @@ app.get('/secret', (req, res) => {
   res.type('html').send(renderSecretForm(data.label, token, data.multiline === true));
 });
 
-app.post('/secret', async (req, res) => {
+// The secure-input POST's own budget and its own parser. The budget exists
+// for the same reason revealLimiter does — behind the tunnel every request is
+// one loopback IP, so a shared counter lets cheap repeatable traffic starve
+// the one action the user pressed a button for — and it matters more here
+// than anywhere else on this server: a secret link now lives 24 h rather than
+// 15 min, so the window in which a token guesser can hammer this route is
+// ~96× longer than it was for a file link.
+const secretLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.SECRET_RATE_LIMIT || '30', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+const secretFormParser = express.urlencoded({ extended: false, limit: '512kb' });
+
+app.post('/secret', secretLimiter, secretFormParser, async (req, res) => {
   const { token, value } = req.body;
   // An empty submission is the only rejected value: everything else — leading
   // spaces, a trailing newline, CRLF — is forwarded byte-for-byte, because a

@@ -41,7 +41,11 @@ server.tool(
       });
 
       if (!postRes.ok) {
-        const err = await postRes.text();
+        // The bridge answers JSON (a 429 is the per-session pending cap) —
+        // show its sentence, not the raw envelope.
+        const raw = await postRes.text();
+        let err = raw;
+        try { err = JSON.parse(raw).error || raw; } catch { /* not JSON — show it as-is */ }
         return { content: [{ type: 'text', text: `Error requesting secret: ${err}` }] };
       }
 
