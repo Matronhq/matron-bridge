@@ -75,18 +75,20 @@ A mission is the human-readable record of one piece of work; milestones are its 
 - `POST $BASE/missions` — `{"title":"...","body":"goal","convo_id":"<id>"}` → 201 mission (`num` is its number); 200 with `existing:true` if the conversation already has one.
 - `POST $BASE/milestones` — `{"convo_id":"<id>","kind":"user_input"|"progress","title":"...","body":"..."}` → 201; 409 `blocked_by:"no_mission"` means start the mission first, then retry.
 - `GET $BASE/missions/:num` — milestones newest first, open items, conversations. `PATCH $BASE/missions/:num` `{"title"?,"body"?}` to rename.
-- `POST $BASE/missions/:num/join` `{"convo_id":"<id>"}` — attach this conversation to an existing mission.
+- `POST $BASE/missions/:num/join` `{"convo_id":"<id>"}` — attach this conversation to an existing mission. Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not — put the mission number in its task and have it join that mission by number.
 - `POST $BASE/missions/:num/close` `{"summary":"..."}` — 409 `blocked_by:"user_items"|"agent_items"` lists the open items: close each (`/items/:id/close`) or move it (`PATCH $BASE/items/:id` `{"mission":"#N"}`); items awaiting the user cannot be cleared by you.
-- Give every `POST` an `Idempotency-Key` header.
+- Give every `POST $BASE/missions` and `POST $BASE/milestones` an `Idempotency-Key`, and REUSE the same key when you retry the same request — a fresh key on a retry mints a second mission or milestone (and a second transcript marker). Set it in a variable once, then reuse that variable.
 
 ```bash
+KEY=$(uuidgen)   # one key per REQUEST, reused verbatim on every retry of it
 curl -sS -X POST "$BASE/missions" \
   -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
-  -H "Content-Type: application/json" -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
   -d "{\"title\":\"Missions & milestones\",\"body\":\"Ship the journal half\",\"convo_id\":\"$CONVO_ID\"}"
 
+KEY=$(uuidgen)
 curl -sS -X POST "$BASE/milestones" \
   -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
-  -H "Content-Type: application/json" -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
   -d "{\"convo_id\":\"$CONVO_ID\",\"kind\":\"user_input\",\"title\":\"Dan asked for missions\"}"
 ```

@@ -8,7 +8,8 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
-import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked } from './lib/missions-format.js';
+import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { missionIdemKey } from './lib/missions-idem.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -720,17 +721,27 @@ server.tool(
 //
 // Same shape as callItems. A 409 is the interesting case here: the journal
 // says WHY (blocked_by) and the renderer turns that into the next call the
-// model should make — never isError, never raw JSON.
+// model should make — never isError, never raw JSON. Other errors go
+// through formatJournalError, which turns the journal's machine words into
+// sentences.
+//
+// The two creating ops carry an idempotency key the model never sees or
+// supplies: a retried milestone_post would otherwise mint a second
+// milestone AND a second transcript marker (see lib/missions-idem.js).
 async function callMissions(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  if (name === 'start' || name === 'post') {
+    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
+  }
   try {
     const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json().catch(() => ({}));
     if (res.status === 409) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatBlocked(data)}` }] };
-    if (!res.ok) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${data?.error || `HTTP ${res.status}`}` }] };
+    if (!res.ok) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatJournalError(name, data) || `HTTP ${res.status}`}` }] };
     return { content: [{ type: 'text', text: render(data) }] };
   } catch (err) {
     return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };

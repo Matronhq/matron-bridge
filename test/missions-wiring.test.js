@@ -37,6 +37,26 @@ describe('missions wiring', () => {
     expect(askUser).not.toMatch(/(?<!\w)convo_id:\s*z\./);
   });
 
+  it('callMissions maps the journal error codes and sends an idem_key for the two creating ops only', () => {
+    expect(askUser).toMatch(/import \{[^}]*\bformatJournalError\b[^}]*\} from '\.\/lib\/missions-format\.js'/);
+    expect(askUser).toMatch(/import \{[^}]*\bmissionIdemKey\b[^}]*\} from '\.\/lib\/missions-idem\.js'/);
+    const start = askUser.indexOf('async function callMissions');
+    const end = askUser.indexOf('const missionToolName');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const fn = askUser.slice(start, end);
+    // Non-409 errors are rendered through the mapper, never as data.error.
+    expect(fn).toContain('formatJournalError(name, data)');
+    expect(fn).not.toMatch(/failed: \$\{data\?\.error/);
+    // start and post carry a key the model never supplies; update/join/get/
+    // close must not (they are not idempotent routes on the journal).
+    expect(fn).toMatch(/name === 'start' \|\| name === 'post'/);
+    expect(fn).toMatch(/payload\.idem_key = missionIdemKey\(\{ op: name, roomId: ROOM_ID, kind: args\?\.kind, title: args\?\.title, body: args\?\.body \}\)/);
+    expect(fn).toContain('body: JSON.stringify(payload)');
+    // …and no tool schema exposes it.
+    expect(askUser).not.toMatch(/idem_key:\s*z\./);
+  });
+
   it('both prompt files carry the missions section', () => {
     expect(claudeMd).toMatch(/^## Missions & milestones/m);
     expect(claudeMd).toMatch(/mission_start/);
@@ -44,5 +64,21 @@ describe('missions wiring', () => {
     expect(claudeMd).toMatch(/refused until the conversation has a mission/);
     expect(codexMd).toMatch(/^## Missions & milestones/m);
     expect(codexMd).toMatch(/POST \$BASE\/milestones/);
+  });
+
+  it('the prompts promise only the inheritance the journal actually wires, and idempotency-key REUSE', () => {
+    // Only conversations with a parent_convo_id inherit; a box spawned via
+    // agent_session_start does not, so the prompt must not imply it does.
+    expect(claudeMd).toContain("Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not — put the mission number in its task and have it `mission_join #N`.");
+    expect(claudeMd).not.toMatch(/A spawned session inherits its parent's mission/);
+    expect(codexMd).toMatch(/Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not/);
+    // A fresh uuid per attempt defeats the whole point of the header.
+    // Scoped to the missions section — the items section above it has its own
+    // (older) idempotency wording that this branch does not touch.
+    const missionsSection = codexMd.slice(codexMd.indexOf('## Missions & milestones'));
+    expect(missionsSection).toMatch(/REUSE the same key when you retry the same request/);
+    expect(missionsSection).not.toMatch(/Idempotency-Key: \$\(uuidgen\)/);
+    expect(missionsSection).toMatch(/KEY=\$\(uuidgen\)/);
+    expect(missionsSection).toMatch(/Idempotency-Key: \$KEY/);
   });
 });
