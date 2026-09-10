@@ -7,6 +7,8 @@ import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createItemsHandlers } from './lib/items-tools.js';
+import { createMissionsClient } from './lib/missions-client.js';
+import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -126,12 +128,14 @@ import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter, VOICE_NOTE_PREFIX } from './lib/journal-media.js';
 import { createItemTurnRouter, formatItemTurn } from './lib/items-turn.js';
+import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
+import { createSummaryModelNag } from './lib/summary-model-nag.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
@@ -161,7 +165,7 @@ import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, no
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
-import { handleCodexControl, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
+import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
@@ -389,7 +393,13 @@ for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
   }
 }
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
-const SECRET_TTL_MS = 3600000; // 1 hour
+const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on disk
+// Open secure-input requests, persisted like TIMERS_FILE / INFLIGHT_FILE above:
+// a request now lives 24 h (SECRET_REQUEST_TTL_MS in lib/secret-requests.js),
+// far longer than any bridge uptime guarantee, so the expiry timer is re-armed
+// from this file at startup.
+// It holds NO secret value and NO file path — see lib/secret-requests.js.
+const SECRET_REQUESTS_FILE = path.join(os.homedir(), '.matron-bridge-secrets.json');
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
 
@@ -463,9 +473,31 @@ const _journalToken = resolveJournalToken();
 // no journal configured the base URL is empty and every call resolves status
 // 0, which the handlers turn into a 502 "journal unreachable" — a tool that
 // says so beats one that throws.
+const journalHttpBase = JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '';
 const itemsClient = createItemsClient({
-  baseUrl: JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '',
+  baseUrl: journalHttpBase,
   token: _journalToken,
+});
+
+// Missions & milestones (spec 2026-09-10): same base URL and token as the
+// items client; a missing journal resolves status 0 → 502 in the handlers.
+const missionsClient = createMissionsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// With no summary model this box silently loses written titles, its roster
+// summary and its summary events (lib/summary-model-nag.js). Nothing said so
+// until now — a 2026-09-10 fleet survey found ten of eleven boxes in that
+// state — so file one tracker task per box instead of a log line nobody
+// reads. Built unconditionally; it no-ops when a model IS configured.
+const summaryModelNag = createSummaryModelNag({
+  client: itemsClient,
+  // The hostname, not SERVER_LABEL: that one is a room-name abbreviation
+  // ("fatima" -> "FATI") and this title is meant to name a box the way Dan
+  // and `agent_boxes` do.
+  box: os.hostname(),
+  log: (m) => console.log(m),
 });
 // Return path (Matron -> bridge input, this PR): where the inbound cursor is
 // persisted (survives a bridge restart — see lib/journal-publisher.js) and
@@ -612,10 +644,18 @@ function generateFileLink(filePath, workdir) {
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
 
-function generateSecretLink(secretId, label, roomId) {
+// The secure-input link. Its ttl is the REQUEST's lifetime (24 h), not
+// LINK_EXPIRY_MS: a file link is a glance at something the user is looking at
+// right now, whereas a secret request is a chore they may only get to
+// tomorrow, and a link that died first would strand a live request. `multiline`
+// rides in the signed payload so the viewer renders a textarea rather than a
+// masked one-line field — signed, so the holder cannot flip it.
+function generateSecretLink(secretId, label, roomId, { ttlMs = LINK_EXPIRY_MS, multiline = false } = {}) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
-  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ secretId, label, roomId, exp })).toString('base64url');
+  const exp = Math.floor((Date.now() + ttlMs) / 1000);
+  const payloadObj = { secretId, label, roomId, exp };
+  if (multiline) payloadObj.multiline = true;
+  const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
@@ -1793,6 +1833,20 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // !restart to take effect.
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
+    // Load every MCP tool up front instead of letting Claude Code defer
+    // them behind ToolSearch. With deferral on, the item_* tools (and the
+    // rest of ask-user) reach the model only as names in a reminder, and a
+    // tool that needs a schema lookup before its first call is a tool the
+    // model reaches for last: a fleet survey on 2026-09-09 found not one
+    // item_* call on any box other than the one whose sessions were
+    // steered to them by hand, while questions went out as prose. The
+    // cost is a larger (cached) tool prefix per request. Values: `false`
+    // loads everything; `auto:N` defers past N% of context. Operators can
+    // set it in the bridge's `.env` like any other setting (dotenv loads
+    // that with `override: true` at startup, so `.env` beats the service
+    // environment — the same rule as for every other bridge setting), and
+    // whatever `process.env` holds by now wins over the default.
+    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     // No MCP_TOOL_TIMEOUT default here. #254 briefly injected a 10-minute
     // backstop so a wedged MCP server couldn't hang a turn forever, but a
     // hard kill also cut off legitimately long calls (long builds, big test
@@ -2169,6 +2223,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
       payload.question, escapeHtml(payload.question), payload) ?? false,
     submitAsyncAnswer: submitCodexAsyncAnswer,
+    onLoginComplete: s => {
+      void refreshCodexMetadata(s, { force: true });
+      flushPendingSessionQueue(s);
+    },
     publishText: (s, message) => { s.responseBuffer += message; flushResponse(s); }, enabled: JOURNAL_ENABLED,
   });
 
@@ -2229,6 +2287,12 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     if (!sawTurnCompleted || code !== 0) {
       const detail = session._codexLastError || stderr ||
         `Codex exited with ${signal ? `signal ${signal}` : `code ${code}`}`;
+      if (codex.transport === 'app-server' && isCodexAuthError(detail)) {
+        finishCodexTurn(session, { error: 'Codex needs you to sign in. Preparing a device code…',
+          usage: session._codexCompletedUsage, preserveQueue: true });
+        void runCodexControl(session, '/login');
+        return;
+      }
       finishCodexTurn(session, { error: detail, usage: session._codexCompletedUsage });
       return;
     }
@@ -2605,6 +2669,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Same up-front MCP tool loading as spawnEnv above.
+    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
     // No MCP_TOOL_TIMEOUT default, same reasoning as spawnEnv above:
@@ -4751,6 +4817,9 @@ function flushResponse(session) {
 // false, unchanged from before.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
   if (!session.alive || session._autoStopped) return false;
+  if (session.codex?.transport === 'app-server' && (session._codexAccountCommandPending || session._codexLoginId)) {
+    return reportSessionSendFailure(session, 'Complete Codex sign-in in your browser first. Enter the device code there, then send your message again after Matron confirms. Use /login cancel to cancel.');
+  }
   const nativeCompact = session.codex?.transport === 'app-server' && contentBlocks.length === 1
     && contentBlocks[0]?.type === 'text' && isCompactCommand(contentBlocks[0].text);
   if (nativeCompact && contentBlocks[0].text.trim() !== '/compact') {
@@ -5767,7 +5836,12 @@ async function maybeUpdatePinnedSummary(session) {
   // 5-message threshold (short chats never get there); without Gemini
   // it is the only naming that runs.
   applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
-  if (!summaryModel) return;
+  if (!summaryModel) {
+    // Nothing else in the bridge notices that summarization is off. Say so
+    // once, in the tracker, now that a conversation exists to file against.
+    summaryModelNag.maybeFile(journalConvoIdFor(session));
+    return;
+  }
 
   if (!session.chatHistory) session.chatHistory = [];
   debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
@@ -9598,7 +9672,84 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   return newSession;
 }
 
-const pendingSecrets = new Map();
+// Open secure-input requests (item #120). `request_secret` no longer blocks:
+// the store owns the whole 24 h lifecycle — the tracker question, the signed
+// link, the 0600 write, the answer turn and the expiry — and persists the
+// non-sensitive part of each request so a bridge restart re-arms it.
+//
+// Everything below is a seam; none of the branching lives here. In particular
+// the delivery seams are the SAME four the item-turn router uses, so a secret
+// arriving mid-turn parks on the shared queue rather than in a second one, and
+// a secret arriving after the idle reaper has been through wakes the session
+// exactly as an item reply does.
+const secretRequests = createSecretRequests({
+  load: () => (fs.existsSync(SECRET_REQUESTS_FILE) ? JSON.parse(fs.readFileSync(SECRET_REQUESTS_FILE, 'utf-8')) : null),
+  // 0600: the file names every open request, its room and its item. Not
+  // secret, but not other local users' business either.
+  save: (data) => atomicWriteFileSync(SECRET_REQUESTS_FILE, JSON.stringify(data, null, 2), { mode: 0o600 }),
+  newId: () => randomUUID(),
+  // The only place a submitted value touches this process's own code. 0600,
+  // in the 0700 SECRETS_DIR created at startup.
+  writeSecretFile: (secretId, value) => {
+    const filePath = path.join(SECRETS_DIR, `${secretId}.txt`);
+    fs.writeFileSync(filePath, value, { mode: 0o600 });
+    return filePath;
+  },
+  removeSecretFile: (filePath) => { fs.unlink(filePath, () => {}); },
+  // Feeds the startup sweep: a submitted file is unlinked an hour later by a
+  // timer, and that timer dies with the bridge, so a restart inside the hour
+  // used to strand the file on disk indefinitely.
+  listSecretFiles: () => {
+    try {
+      return fs.readdirSync(SECRETS_DIR)
+        // Only files THIS process names (`<uuid>.txt`): an operator may keep
+        // their own credentials in ~/.secrets, and those are never ours to age out.
+        .filter(isOwnSecretFileName)
+        .map((name) => {
+          const filePath = path.join(SECRETS_DIR, name);
+          try { return { path: filePath, mtimeMs: fs.statSync(filePath).mtimeMs }; }
+          catch { return null; }
+        })
+        .filter(Boolean);
+    } catch {
+      // No directory yet (first boot, before main()'s mkdir) — nothing to do.
+      return [];
+    }
+  },
+  items: itemsClient,
+  generateLink: (secretId, { label, roomId, multiline, ttlMs }) =>
+    generateSecretLink(secretId, label, roomId, { ttlMs, multiline }),
+  notifyChat: (record, { plain, html }) => {
+    const session = record.roomId ? sessions.get(record.roomId) : null;
+    if (!session) return;
+    if (html && session.sendHtml) session.sendHtml(plain, html);
+    else if (session.sendCallback) session.sendCallback(plain);
+  },
+  // LIVE sessions only. A killed-but-still-mapped session would take the
+  // inject branch, fail it (sendToSession refuses on !alive) and dead-end in
+  // the undeliverable notice — whereas falling through to resumeSession
+  // revives it instead (resumeSleepingSession evicts the corpse first).
+  getSession: (roomId) => {
+    const s = sessions.get(roomId);
+    return s && s.alive ? s : null;
+  },
+  // SESSION_IDLE_TIMEOUT_MS defaults to an hour and a request lives a day, so
+  // the session is usually gone by the time the user submits. Wake it the way
+  // an item reply wakes one; sendToSession then parks the turn in
+  // _resumeOutbox until the resumed TUI is ready to receive it.
+  resumeSession: (roomId, notice) => journalResumeRoom(roomId, notice),
+  inject: (session, text) => sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true }),
+  queue: (session, { text, preview }) => journalQueueMedia(session, {
+    blocks: [{ type: 'text', text }],
+    mirrorToJournal: false,
+    preview,
+    fullText: text,
+  }),
+  publishNotice: journalPublishNotice,
+  fileTtlMs: SECRET_TTL_MS,
+  log: console,
+});
+
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
 // Pending print-mode permission prompts (spec 2026-08-10-auto-permission-mode).
@@ -9684,6 +9835,12 @@ const itemsHandlers = createItemsHandlers({
   journalConvoIdFor,
   client: itemsClient,
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+});
+
+const missionsHandlers = createMissionsHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: missionsClient,
 });
 
 // Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
@@ -9824,20 +9981,19 @@ function validateShowFileBody(data) {
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
-  // GET /secret/:id — MCP server polls for secret submission
+  // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
+  // uses it (request_secret is non-blocking since item #120); it stays so a
+  // bridge upgraded under an already-running MCP server still answers.
   if (req.method === 'GET' && url.pathname.startsWith('/secret/')) {
     const secretId = url.pathname.split('/')[2];
-    const s = pendingSecrets.get(secretId);
-    if (!s) {
+    const state = secretRequests.read(secretId);
+    if (!state) {
       res.writeHead(404);
       res.end(JSON.stringify({ error: 'Secret request not found' }));
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ answered: s.answered, path: s.path || null }));
-    if (s.answered) {
-      pendingSecrets.delete(secretId);
-    }
+    res.end(JSON.stringify(state));
     return;
   }
 
@@ -9961,36 +10117,31 @@ const apiServer = createServer(async (req, res) => {
       const data = JSON.parse(body);
 
       if (url.pathname === '/secret') {
-        const { label, roomId } = data;
+        const { label, roomId, multiline } = data;
         if (!label || !roomId) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'label and roomId are required' }));
           return;
         }
 
-        const secretId = randomUUID();
-
-        pendingSecrets.set(secretId, {
-          label,
-          answered: false,
-          path: null,
-        });
-
         const activeSession = sessions.get(roomId);
-
-        if (activeSession) {
-          const link = generateSecretLink(secretId, label, activeSession.roomId);
-          if (link && activeSession.sendHtml) {
-            const plain = `🔐 Secret requested: ${label} — Enter secret: ${link}`;
-            const html = `🔐 Secret requested: <b>${escapeHtml(label)}</b> — <a href="${link}">Enter secret</a>`;
-            activeSession.sendHtml(plain, html);
-          } else if (activeSession.sendCallback) {
-            activeSession.sendCallback(`🔐 Secret requested: ${label} (viewer not configured)`);
-          }
+        const created = await secretRequests.create({
+          label,
+          roomId,
+          convoId: activeSession ? journalConvoIdFor(activeSession) : null,
+          multiline: multiline === true,
+        });
+        // Per-room cap: nothing was minted, filed or announced, so this is a
+        // refusal the tool can act on, not a partial request to clean up.
+        if (created.error) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: created.error }));
+          return;
         }
 
+        const { secretId, itemNum, itemError } = created;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ secretId }));
+        res.end(JSON.stringify({ secretId, itemNum, itemError }));
         return;
       } else if (url.pathname === '/permission-request') {
         const { roomId, toolName, input } = data;
@@ -10118,10 +10269,10 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The seven item_* tool routes. One matcher rather than seven blocks:
+      // The eight item_* tool routes. One matcher rather than eight blocks:
       // the handler names ARE the path segments, and the anchored alternation
       // is the allowlist (no dynamic property lookup from raw input).
-      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder)$/);
+      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder|move)$/);
       if (itemsRoute) {
         const name = itemsRoute[1];
         await respondAgentChatRoute(res, data, itemsHandlers[name],
@@ -10129,43 +10280,31 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      // The six mission_* / milestone_post tool routes; same one-matcher
+      // allowlist shape as /items above.
+      const missionsRoute = url.pathname.match(/^\/missions\/(start|post|update|join|get|close)$/);
+      if (missionsRoute) {
+        const name = missionsRoute[1];
+        await respondAgentChatRoute(res, data, missionsHandlers[name],
+          (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
       const secretSubmitMatch = url.pathname.match(/^\/secret\/([^/]+)\/submit$/);
       if (secretSubmitMatch) {
-        const secretId = secretSubmitMatch[1];
-        const s = pendingSecrets.get(secretId);
-        if (!s) {
-          res.writeHead(404);
-          res.end(JSON.stringify({ error: 'Secret request not found or already submitted' }));
+        // `value` is written verbatim — no trim, no line-ending conversion.
+        // The store answers as soon as the file is on disk; closing the
+        // tracker item and delivering the agent's turn continue on `done`, so
+        // a slow journal never holds the user's browser open.
+        const result = await secretRequests.submit(secretSubmitMatch[1], data.value);
+        if (!result.ok) {
+          res.writeHead(result.status);
+          res.end(JSON.stringify({ error: result.error }));
           return;
         }
-
-        const { value } = data;
-        if (!value) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'value is required' }));
-          return;
-        }
-
-        // Write secret to file
-        const filePath = path.join(SECRETS_DIR, `${secretId}.txt`);
-        try {
-          fs.writeFileSync(filePath, value, { mode: 0o600 });
-        } catch (err) {
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: `Failed to write secret: ${err.message}` }));
-          return;
-        }
-
-        s.answered = true;
-        s.path = filePath;
-
-        // Schedule cleanup after 1 hour
-        setTimeout(() => {
-          fs.unlink(filePath, () => {});
-        }, SECRET_TTL_MS);
-
+        result.done.catch(() => {});
         res.writeHead(200);
-        res.end(JSON.stringify({ ok: true, path: filePath }));
+        res.end(JSON.stringify({ ok: true, path: result.path }));
         return;
       }
 
@@ -11155,6 +11294,11 @@ async function main() {
   // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
   const rearmed = timerStore.init();
   if (rearmed > 0) console.log(`Re-armed ${rearmed} persisted timer(s) from ${TIMERS_FILE}`);
+  // Re-arm open secure-input requests. Anything that came due while the bridge
+  // was down expires here: its tracker question closes as cancelled and the
+  // agent is told, so a 24 h request never silently outlives its link.
+  const secretsRearmed = secretRequests.init();
+  if (secretsRearmed > 0) console.log(`Re-armed ${secretsRearmed} pending secret request(s) from ${SECRET_REQUESTS_FILE}`);
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
   console.log(`Journal: connecting to ${JOURNAL_WS_URL}`);

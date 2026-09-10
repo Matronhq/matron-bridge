@@ -8,11 +8,12 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
+import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { missionIdemKey } from './lib/missions-idem.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
-const SECRET_TIMEOUT_MS = 300000;    // 5 min max wait for secret submission
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
 // same env var through the same validation, keeping one expiry for the whole
 // request lifecycle (default 5 min; out-of-range overrides fall back).
@@ -28,40 +29,40 @@ const server = new McpServer({
 
 server.tool(
   'request_secret',
-  'Request a secret from the user via a secure web form. The secret is written to a file and the file path is returned. Use this for API keys, tokens, passwords — anything that should not appear in chat.',
+  'Request a secret from the user via a secure web form: API keys, tokens, passwords, or whole key files (multiline: true) — anything that must not appear in chat. This tool does NOT block and returns nothing secret: it files the request in the user\'s tracker (their Decisions list) alongside a chat link, then returns immediately. The user has 24 hours. When they submit, you receive a turn telling you the local file path to read the value from — so carry on with other work in the meantime and never poll for it.',
   {
     label: z.string().describe('A short label describing what secret is needed, e.g. "AWS access key" or "database password"'),
+    multiline: z.boolean().optional().describe('Render a multi-line box instead of a masked one-line field. Use for PEM keys, certificates and JSON service-account files, whose newlines a one-line field would destroy.'),
   },
-  async ({ label }) => {
+  async ({ label, multiline }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/secret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, roomId: ROOM_ID }),
+        body: JSON.stringify({ label, roomId: ROOM_ID, multiline: multiline === true }),
       });
 
       if (!postRes.ok) {
-        const err = await postRes.text();
+        // The bridge answers JSON (a 429 is the per-session pending cap) —
+        // show its sentence, not the raw envelope.
+        const raw = await postRes.text();
+        let err = raw;
+        try { err = JSON.parse(raw).error || raw; } catch { /* not JSON — show it as-is */ }
         return { content: [{ type: 'text', text: `Error requesting secret: ${err}` }] };
       }
 
-      const { secretId } = await postRes.json();
-
-      // Poll for the secret to be submitted
-      const deadline = Date.now() + SECRET_TIMEOUT_MS;
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-
-        const pollRes = await fetch(`${BRIDGE_API}/secret/${secretId}`);
-        if (!pollRes.ok) continue;
-
-        const data = await pollRes.json();
-        if (data.answered) {
-          return { content: [{ type: 'text', text: `Secret written to: ${data.path}` }] };
-        }
-      }
-
-      return { content: [{ type: 'text', text: 'Secret request timed out — no input received within 5 minutes.' }] };
+      // No polling: the bridge holds the request for 24 h and delivers the
+      // answer as a turn. The request id is the fallback identifier when the
+      // tracker item could not be filed (no journal on this box).
+      const { secretId, itemNum, itemError } = await postRes.json();
+      const ref = Number.isInteger(itemNum) ? `#${itemNum}` : secretId;
+      const filed = itemError ? ` The tracker item could not be filed (${itemError}) — the chat link still works.` : '';
+      return {
+        content: [{
+          type: 'text',
+          text: `Secret requested (${ref}) — the user has 24 hours; you will receive a turn "🔐 Secret "${label}" submitted — read it from <path>" when it lands. Carry on with other work; do not poll.${filed}`,
+        }],
+      };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -673,7 +674,7 @@ server.tool(
 
 server.tool(
   'item_comment',
-  "Add a comment to an item (text and/or attachments by local path) — progress, findings, or a follow-up question in the same thread. Optionally set `awaiting` to hand the item to the user ('user'), take it back ('agent'), or clear it (null). Prefer `item_close` when the item is actually resolved.",
+  "Add a comment to an item (text and/or attachments by local path) — progress, findings, or a follow-up question in the same thread. The item is the full record of that piece of work: put follow-up screenshots, images and files in `attachments` here, not in the chat with a note that they are in the conversation. Optionally set `awaiting` to hand the item to the user ('user'), take it back ('agent'), or clear it (null). Prefer `item_close` when the item is actually resolved.",
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     body: z.string().optional().describe('Markdown'),
@@ -714,6 +715,100 @@ server.tool(
     before: z.string().optional().describe('Item id to place this one before'),
   },
   async (args) => callItems('reorder', args, (d) => itemLine(d.item)),
+);
+
+// --- Missions & milestones (spec 2026-09-10) ---
+//
+// Same shape as callItems. A 409 is the interesting case here: the journal
+// says WHY (blocked_by) and the renderer turns that into the next call the
+// model should make — never isError, never raw JSON. Other errors go
+// through formatJournalError, which turns the journal's machine words into
+// sentences.
+//
+// The two creating ops carry an idempotency key the model never sees or
+// supplies: a retried milestone_post would otherwise mint a second
+// milestone AND a second transcript marker (see lib/missions-idem.js).
+async function callMissions(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  if (name === 'start' || name === 'post') {
+    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
+  }
+  try {
+    const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatBlocked(data)}` }] };
+    if (!res.ok) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatJournalError(name, data) || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
+  }
+}
+const missionToolName = (op) => ({ start: 'mission_start', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+
+server.tool(
+  'mission_start',
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has one this returns it unchanged.",
+  {
+    title: z.string().describe('One line, ≤200 chars — what the work is'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
+  },
+  async (args) => callMissions('start', args, formatStartAck),
+);
+
+server.tool(
+  'milestone_post',
+  "Post a milestone: a checkpoint on this conversation's mission that is also a jump target back to this exact point in the transcript. kind 'user_input' whenever an input from the user starts or redirects work (skip typos, one-word answers, clarifications) — the user's stated purpose is to get back to their last input easily. kind 'progress' as often as useful: a landed PR, a diagnosis, a decision, a phase done. There is no cap. Refused with an instruction if the conversation has no mission yet.",
+  {
+    kind: z.enum(['user_input', 'progress']),
+    title: z.string().describe('One line, ≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
+  },
+  async (args) => callMissions('post', args, formatMilestoneAck),
+);
+
+server.tool(
+  'mission_update',
+  "Rename this conversation's mission or rewrite its standing description (title and/or body). Use it when the work changes shape.",
+  {
+    title: z.string().optional().describe('≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB'),
+  },
+  async (args) => callMissions('update', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'mission_join',
+  'Attach this conversation to an existing mission by number (e.g. work handed over from another session). Items filed here from now on belong to that mission.',
+  { num: z.number().int().min(1).describe('The mission number, e.g. 61') },
+  async (args) => callMissions('join', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'mission_get',
+  "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's mission.",
+  { num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission') },
+  async (args) => callMissions('get', args, formatMissionDetail),
+);
+
+server.tool(
+  'mission_close',
+  "Close this conversation's mission when the work is DONE (not when the session ends), with a summary. Refuses while items are open: close each with a real resolution, or item_move it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those.",
+  { summary: z.string().describe('Markdown ≤32 KiB — how it went, what shipped, what is left') },
+  async (args) => callMissions('close', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'item_move',
+  "Move an item to another mission by number, or detach it (mission: null). The only way an item's mission ever changes.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
+  },
+  async (args) => callItems('move', args, (d) => itemLine(d.item)),
 );
 
 const transport = new StdioServerTransport();

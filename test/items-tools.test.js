@@ -202,4 +202,20 @@ describe('items handlers', () => {
     expect(r.status).toBe(404);
     expect(client.update).not.toHaveBeenCalled();
   });
+
+  it('move: sets or clears the item mission through PATCH; validates the target', async () => {
+    const { h, client } = fixture();
+    expect((await h.move({ roomId: '!r:s', id: 'it_1' })).status).toBe(400);
+    expect((await h.move({ roomId: '!r:s', id: 'it_1', mission: 'sixty' })).status).toBe(400);
+    for (const bad of [0, -1, 61.5, '#0', '#007', '#abc', '', undefined]) {
+      expect((await h.move({ roomId: '!r:s', id: 'it_1', mission: bad })).status, `mission ${JSON.stringify(bad)}`).toBe(400);
+    }
+    expect(client.update).not.toHaveBeenCalled();
+    expect((await h.move({ roomId: '!r:s', id: 'it_1', mission: 61 })).status).toBe(200);
+    expect(client.update.mock.calls[0]).toEqual(['it_1', { mission: '#61' }]);
+    expect((await h.move({ roomId: '!r:s', id: '#4', mission: '#62' })).status).toBe(200);
+    expect(client.update.mock.calls[1]).toEqual(['#4', { mission: '#62' }]);
+    expect((await h.move({ roomId: '!r:s', id: 'it_1', mission: null })).status).toBe(200);
+    expect(client.update.mock.calls[2]).toEqual(['it_1', { mission: null }]);
+  });
 });

@@ -16,7 +16,7 @@ Never put passwords, tokens, private keys, credentials, or other secrets in chat
 
 Use the Matron `ask-user` MCP server:
 
-- `request_secret` opens a secure input form and returns a local file path with the submitted secret.
+- `request_secret` opens a secure input form. It does not block: it files a question in the user's tracker (their Decisions list), posts the link in chat, and returns a request number immediately. The user has 24 hours, and the submission arrives as a turn naming the local file to read — do not poll. Use `multiline: true` for PEM keys, certificates and JSON key files. The 24 h link sits in the item body, so anyone who can read the tracker can submit before the user does; it dies on the first submission or at expiry.
 - `share_sensitive_data` shares sensitive output through a secure one-time viewer link.
 - `redact_message` removes accidentally posted sensitive data from a bridge message.
 - `send_attachment` delivers an ordinary file to the conversation, or an explicitly selected agent chat room.
@@ -41,25 +41,26 @@ If browser tools are needed but unavailable, ask the user to run `/restart --bro
 
 ## Tasks & decisions (`/items` HTTP API)
 
-The user has a task & decision tracker beside the chat — a persistent, shared list, not another chat message. There is no MCP tool for it in this session; call the journal's `/items` routes directly, same base URL and token discipline as journal search above (`Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")`, read inside the request, never printed, no `-v`/`--trace`). Below, `$BASE` is that same https base (`JOURNAL_WS_URL` with `wss://` → `https://`, trailing `/ws` stripped).
+The user has a task & decision tracker beside the chat — a persistent, shared list, not another chat message. **Before you end a turn with a question for the user, file it there (`kind: "question"`, options and your recommendation in `body`), say in chat which item you're waiting on (`#12`), and carry on with whatever doesn't depend on it.** A call you made is a `decision`; work you're deferring is a `task`. Do not file these as GitHub issues instead — the tracker is the user's list; a repo CLAUDE.md that still says otherwise predates it. There is no MCP tool for it in this session; call the journal's `/items` routes directly, same base URL and token discipline as journal search above (`Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")`, read inside the request, never printed, no `-v`/`--trace`). Below, `$BASE` is that same https base (`JOURNAL_WS_URL` with `wss://` → `https://`, trailing `/ws` stripped).
 
 - `GET $BASE/items?convo=<id>&state=open` — list items for one conversation. `state` is `open` or `closed` — there is no `any`, and the raw route has no default; omit `state` to get both. Add `kind=task|question|decision`, `awaiting=user|agent`, or `label=<name>` to narrow further. Omit `convo` to list across every conversation of this user instead — there is no "current conversation" default here (see below).
 - `POST $BASE/items` — file one: `{"kind":"question"|"decision"|"task","title":"...","body":"...","convo_id":"<id>"}` (optional `labels`, `links`, `awaiting`, `supersedes`, and at most one of `position` (`"top"`/`"bottom"`), `after`, or `before` an existing item id — omitting all three lands it at the bottom). `convo_id` is required — the journal does not fill it in for an HTTP caller the way the MCP tools do for a Claude Code session.
 - `POST $BASE/items/:id/comments` — `{"body":"..."}` (and/or `attachments`). This route does not take `awaiting` — a comment never changes who the item is waiting on by itself. To hand the item over, take it back, or clear it, follow up with `PATCH $BASE/items/:id` and `{"awaiting":"user"}` / `"agent"` / `null` (setting it to `"user"`/`"agent"` 409s on a closed item — reopen it first; clearing it to `null` is fine either way).
 - `PATCH $BASE/items/:id` — edit `title`, `body`, `labels`, `links`, and/or `awaiting` (open or closed).
 - `POST $BASE/items/:id/close` — `{"resolution":"done"|"answered"|"decided"|"reversed"|"cancelled","comment":"..."}`. `POST $BASE/items/:id/reopen` with an optional `{"comment":"..."}` undoes it.
-- Give every `POST` an `Idempotency-Key` header (any string unique to that intent, e.g. `$(uuidgen)`) so a retried request can't file or comment twice.
+- Give every `POST` an `Idempotency-Key` header (any string unique to that intent — set `KEY=$(uuidgen)` once and reuse the same `$KEY` when you retry) so a retried request can't file or comment twice.
 
 **Your own `convo_id`:** for listing, prefer omitting `convo` — see every open item across this user's conversations — rather than chasing this conversation's id. `POST /items` has no such escape hatch (`convo_id` is required to file), so when you do need the real id: `GET $BASE/search?q=<terms>&limit=1` returns hits from *any* of the user's conversations, so a short or common phrase can resolve to the wrong one. Use a long, unusual phrase from something you just said, and check the hit's `ts` is from this turn (not an old conversation that happened to reuse similar words) before trusting its `convo_id`.
 
 ```bash
 BASE=<https base, as above>
 CONVO_ID=<this conversation's id — see above>
+KEY=$(uuidgen)   # one key per intent; reuse it if you retry this exact request
 
 curl -sS -X POST "$BASE/items" \
   -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Idempotency-Key: $KEY" \
   -d "{\"kind\":\"question\",\"title\":\"Which auth flow?\",\"body\":\"OAuth vs API key — recommend OAuth.\",\"convo_id\":\"$CONVO_ID\"}"
 
 curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
@@ -67,3 +68,28 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
 ```
 
 If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
+
+## Missions & milestones
+
+A mission is the human-readable record of one piece of work; milestones are its checkpoints and jump targets back into the transcript. Same base URL and token discipline as the items routes above. **Start the mission as soon as you know what the work is; milestones are refused until the conversation has one.** Post a milestone with `kind:"user_input"` whenever an input from the user starts or redirects work, and `kind:"progress"` as often as useful. Close it when the work is done, not when the session ends.
+
+- `POST $BASE/missions` — `{"title":"...","body":"goal","convo_id":"<id>"}` → 201 mission (`num` is its number); 200 with `existing:true` if the conversation already has one.
+- `POST $BASE/milestones` — `{"convo_id":"<id>","kind":"user_input"|"progress","title":"...","body":"..."}` → 201; 409 `blocked_by:"no_mission"` means start the mission first, then retry.
+- `GET $BASE/missions/:num` — milestones newest first, open items, conversations. `PATCH $BASE/missions/:num` `{"title"?,"body"?}` to rename.
+- `POST $BASE/missions/:num/join` `{"convo_id":"<id>"}` — attach this conversation to an existing mission. Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not — put the mission number in its task and have it join that mission by number.
+- `POST $BASE/missions/:num/close` `{"summary":"..."}` — 409 `blocked_by:"user_items"|"agent_items"` lists the open items: close each (`/items/:id/close`) or move it (`PATCH $BASE/items/:id` `{"mission":"#N"}`); items awaiting the user cannot be cleared by you.
+- Give every `POST $BASE/missions` and `POST $BASE/milestones` an `Idempotency-Key`, and REUSE the same key when you retry the same request — a fresh key on a retry mints a second mission or milestone (and a second transcript marker). Set it in a variable once, then reuse that variable.
+
+```bash
+KEY=$(uuidgen)   # one key per REQUEST, reused verbatim on every retry of it
+curl -sS -X POST "$BASE/missions" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
+  -d "{\"title\":\"Missions & milestones\",\"body\":\"Ship the journal half\",\"convo_id\":\"$CONVO_ID\"}"
+
+KEY=$(uuidgen)
+curl -sS -X POST "$BASE/milestones" \
+  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
+  -d "{\"convo_id\":\"$CONVO_ID\",\"kind\":\"user_input\",\"title\":\"Dan asked for missions\"}"
+```
