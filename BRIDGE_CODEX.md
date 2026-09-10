@@ -48,18 +48,19 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 - `POST $BASE/items/:id/comments` — `{"body":"..."}` (and/or `attachments`). This route does not take `awaiting` — a comment never changes who the item is waiting on by itself. To hand the item over, take it back, or clear it, follow up with `PATCH $BASE/items/:id` and `{"awaiting":"user"}` / `"agent"` / `null` (setting it to `"user"`/`"agent"` 409s on a closed item — reopen it first; clearing it to `null` is fine either way).
 - `PATCH $BASE/items/:id` — edit `title`, `body`, `labels`, `links`, and/or `awaiting` (open or closed).
 - `POST $BASE/items/:id/close` — `{"resolution":"done"|"answered"|"decided"|"reversed"|"cancelled","comment":"..."}`. `POST $BASE/items/:id/reopen` with an optional `{"comment":"..."}` undoes it.
-- Give every `POST` an `Idempotency-Key` header (any string unique to that intent, e.g. `$(uuidgen)`) so a retried request can't file or comment twice.
+- Give every `POST` an `Idempotency-Key` header (any string unique to that intent — set `KEY=$(uuidgen)` once and reuse the same `$KEY` when you retry) so a retried request can't file or comment twice.
 
 **Your own `convo_id`:** for listing, prefer omitting `convo` — see every open item across this user's conversations — rather than chasing this conversation's id. `POST /items` has no such escape hatch (`convo_id` is required to file), so when you do need the real id: `GET $BASE/search?q=<terms>&limit=1` returns hits from *any* of the user's conversations, so a short or common phrase can resolve to the wrong one. Use a long, unusual phrase from something you just said, and check the hit's `ts` is from this turn (not an old conversation that happened to reuse similar words) before trusting its `convo_id`.
 
 ```bash
 BASE=<https base, as above>
 CONVO_ID=<this conversation's id — see above>
+KEY=$(uuidgen)   # one key per intent; reuse it if you retry this exact request
 
 curl -sS -X POST "$BASE/items" \
   -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Idempotency-Key: $KEY" \
   -d "{\"kind\":\"question\",\"title\":\"Which auth flow?\",\"body\":\"OAuth vs API key — recommend OAuth.\",\"convo_id\":\"$CONVO_ID\"}"
 
 curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \

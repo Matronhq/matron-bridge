@@ -221,6 +221,17 @@ describe('missions handlers', () => {
     }
   });
 
+  it('cold resolve treats a 200 with an unreadable list as a 502, never as a mission', async () => {
+    for (const body of [{}, { missions: null }, { missions: 'nope' }]) {
+      const { h, client, session } = fixture({ list: vi.fn(async () => ({ status: 200, data: body })) });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(502);
+      expect(r.body.error).toBe('the journal returned an unreadable mission list');
+      expect(session.missionId).toBeUndefined();
+      expect(client.update).not.toHaveBeenCalled();
+    }
+  });
+
   it('start / post 404 says the conversation was refused, NOT that the routes are missing', async () => {
     const notFound = { status: 404, data: { error: 'not_found' } };
     const convoText = 'the journal did not accept this conversation — it may have no journal row yet, or its mission is not visible to this session';

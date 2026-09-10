@@ -36,6 +36,12 @@ describe('missionIdemKey', () => {
   });
 
   it('defaults now to the clock', () => {
-    expect(missionIdemKey({ op: 'start', roomId: '!r:s', title: 'M' })).toBe(missionIdemKey({ op: 'start', roomId: '!r:s', title: 'M', now: Date.now() }));
+    // Two clock reads can straddle a ten-minute boundary; accept either
+    // adjacent bucket rather than flake once every ten minutes.
+    const before = Date.now();
+    const key = missionIdemKey({ op: 'start', roomId: '!r:s', title: 'M' });
+    const after = Date.now();
+    const candidates = new Set([before, after].map((now) => missionIdemKey({ op: 'start', roomId: '!r:s', title: 'M', now })));
+    expect(candidates.has(key)).toBe(true);
   });
 });
