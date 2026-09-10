@@ -12,6 +12,32 @@ function setup(extraOptions = {}) {
   return { codex, session, publisher, ...options };
 }
 describe('Codex journal publication', () => {
+  it('only completes the current login and refreshes state once', () => {
+    const onLoginComplete = vi.fn(); const h = setup({ onLoginComplete });
+    h.session._codexLoginId = 'current'; h.session._codexMetadata = { old: true };
+    const completed = loginId => h.codex.emit('account', { method: 'account/login/completed', params: { loginId, success: true } });
+    completed('old');
+    expect(h.session._codexLoginId).toBe('current'); expect(h.notice).not.toHaveBeenCalled();
+    completed('current'); completed('current');
+    expect(h.session._codexLoginId).toBeNull(); expect(h.session._codexMetadata).toBeNull();
+    expect(onLoginComplete).toHaveBeenCalledExactlyOnceWith(h.session);
+    expect(h.notice).toHaveBeenCalledTimes(1);
+    expect(h.notice).toHaveBeenCalledWith(h.session, expect.stringContaining('login completed'));
+  });
+  it('reports an expired device code without releasing queued input', () => {
+    const onLoginComplete = vi.fn(); const h = setup({ onLoginComplete });
+    h.session._codexLoginId = 'expired';
+    h.codex.emit('account', { method: 'account/login/completed', params: { loginId: 'expired', success: false, error: 'Device code expired' } });
+    expect(h.session._codexLoginId).toBeNull(); expect(onLoginComplete).not.toHaveBeenCalled();
+    expect(h.notice).toHaveBeenCalledWith(h.session, expect.stringContaining('Device code expired'));
+  });
+  it('abandons login on connection loss and ignores late completion', () => {
+    const h = setup(); h.session._codexLoginId = 'lost';
+    h.codex.emit('connection-reset');
+    h.codex.emit('account', { method: 'account/login/completed', params: { loginId: 'lost', success: true } });
+    expect(h.session._codexLoginId).toBeNull();
+    expect(h.notice).toHaveBeenCalledExactlyOnceWith(h.session, expect.stringContaining('sign-in was interrupted'));
+  });
   it('announces manual compaction and confirms once only after a successful turn exit', () => {
     const h = setup(); h.codex.operation = { kind: 'compact' };
     const item = { id: 'compact', type: 'contextCompaction' };
