@@ -183,7 +183,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] fix the folder picker');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0a] fix the folder picker');
   });
 
   it('does nothing until a user message exists, then still applies later', () => {
@@ -193,7 +193,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(d.updateRoomName).not.toHaveBeenCalled();
     session.chatHistory.push({ role: 'user', text: 'now do the thing' });
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] now do the thing');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0a] now do the thing');
   });
 
   it('applies only once per session', () => {
@@ -210,9 +210,9 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     const title = d.updateRoomName.mock.calls[0][1];
-    expect(title.startsWith('[f0] refactor the whole session store')).toBe(true);
+    expect(title.startsWith('[f0a] refactor the whole session store')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
-    expect(title.length).toBe(66); // '[f0] ' + 60 chars + ellipsis
+    expect(title.length).toBe(67); // '[f0a] ' + 60 chars + ellipsis
   });
 
   it('survives a missing history and applies once one arrives, shorting the room id when the session id is unknown', () => {
@@ -221,7 +221,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(applyFallbackTitle(session, d)).toBe(false);
     session.chatHistory = [{ role: 'user', text: 'hi' }];
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('7c0ffee0-aaaa-bbbb-cccc-000000000000', '[7c] hi');
+    expect(d.updateRoomName).toHaveBeenCalledWith('7c0ffee0-aaaa-bbbb-cccc-000000000000', '[7c0] hi');
   });
 
   it('never lets angle brackets or reassembled script fragments into the title', () => {
@@ -256,7 +256,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0a] carry on');
   });
 
   it('still replaces the legacy bare-basename seed from sessions persisted before labeling', () => {
@@ -268,7 +268,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0a] carry on');
   });
 
   it('skips a tag-only first user message and titles from the next real one', () => {
@@ -282,13 +282,13 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] the real prompt');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0a] the real prompt');
   });
 });
 
-describe('withSessionShort (2-char session-id title prefix)', () => {
-  it('prefixes the first two characters of the id in brackets', () => {
-    expect(withSessionShort('b53e6542', 'css token migration')).toBe('[b5] css token migration');
+describe('withSessionShort (3-char session-id title prefix)', () => {
+  it('prefixes the first three characters of the id in brackets', () => {
+    expect(withSessionShort('b53e6542', 'css token migration')).toBe('[b53] css token migration');
   });
 
   it('leaves the title bare when there is no id to short', () => {
@@ -298,7 +298,7 @@ describe('withSessionShort (2-char session-id title prefix)', () => {
   });
 
   it('puts a marker ahead of the short, and ahead of a bare title', () => {
-    expect(withSessionShort('b53e6542', 'port the tests', '🐣')).toBe('🐣 [b5] port the tests');
+    expect(withSessionShort('b53e6542', 'port the tests', '🐣')).toBe('🐣 [b53] port the tests');
     expect(withSessionShort(undefined, 'port the tests', '🐣')).toBe('🐣 port the tests');
   });
 });
@@ -309,7 +309,15 @@ describe('withSessionShort (2-char session-id title prefix)', () => {
 // would fail to parse on the box that reads it — hence the round trips.
 describe('sessionShortFromTitle', () => {
   it('peels the short off a published title', () => {
+    expect(sessionShortFromTitle('[2h5] Remote work')).toBe('2h5');
+  });
+
+  it('still peels the two-character short every pre-2026-09 title carries', () => {
+    // Titles only rewrite on rename, so a bridge that shorts to three must
+    // read the two-character form for ever — its own archive and every
+    // peer title minted by an older bridge are full of them.
     expect(sessionShortFromTitle('[2h] Remote work')).toBe('2h');
+    expect(sessionShortFromTitle('↔️ [2h] mac ↔️ dev-2 — ci triage')).toBe('2h');
   });
 
   it('reads THROUGH every marker the bridge puts ahead of the short', () => {
@@ -321,18 +329,18 @@ describe('sessionShortFromTitle', () => {
   });
 
   it('round-trips whatever withSessionShort wrote', () => {
-    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'css token migration'))).toBe('b5');
-    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'port the tests', '🐣'))).toBe('b5');
+    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'css token migration'))).toBe('b53');
+    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'port the tests', '🐣'))).toBe('b53');
     // …and a title that never earned a short comes back empty, not '[u'.
     expect(sessionShortFromTitle(withSessionShort('', 'untagged'))).toBe('');
   });
 
   it('returns nothing for bracketed text that is not a short', () => {
-    // Same closed set as the apps' splitTitle: exactly two alphanumerics,
+    // Same closed set as the apps' splitTitle: two or three alphanumerics,
     // a trailing space, and a non-empty title after it. Anything else is
     // ordinary title text that happens to start with a bracket.
     expect(sessionShortFromTitle('Remote work')).toBe('');
-    expect(sessionShortFromTitle('[abc] three chars')).toBe('');
+    expect(sessionShortFromTitle('[abcd] four chars')).toBe('');
     expect(sessionShortFromTitle('[a] one char')).toBe('');
     expect(sessionShortFromTitle('[a ] space')).toBe('');
     expect(sessionShortFromTitle('[2h]no space')).toBe('');
@@ -363,7 +371,7 @@ describe('spawned-session titles (🐣 marker + task-derived fallback)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '🐣 [f0] port the flaky auth tests to the new harness');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '🐣 [f0a] port the flaky auth tests to the new harness');
   });
 
   it('cleans and truncates the task exactly like a first-message title', () => {
@@ -377,7 +385,7 @@ describe('spawned-session titles (🐣 marker + task-derived fallback)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     const [, title] = d.updateRoomName.mock.calls[0];
-    expect(title.startsWith('🐣 [f0] xxx')).toBe(true);
+    expect(title.startsWith('🐣 [f0a] xxx')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
     expect(title).not.toContain('<');
   });
@@ -385,8 +393,8 @@ describe('spawned-session titles (🐣 marker + task-derived fallback)', () => {
   it('titleMarkerFor keeps the marker for a live spawned session and infers it from a persisted title', () => {
     expect(titleMarkerFor({ spawnedByAgent: true })).toBe('🐣');
     // After a bridge restart the flag is gone; the current title carries it.
-    expect(titleMarkerFor({ _journalTitleHint: '🐣 [f0] port the tests' })).toBe('🐣');
-    expect(titleMarkerFor({ _journalTitleHint: '[f0] a chat about 🐣 emoji' })).toBe('');
+    expect(titleMarkerFor({ _journalTitleHint: '🐣 [f0a] port the tests' })).toBe('🐣');
+    expect(titleMarkerFor({ _journalTitleHint: '[f0a] a chat about 🐣 emoji' })).toBe('');
     expect(titleMarkerFor({})).toBe('');
     expect(titleMarkerFor(undefined)).toBe('');
   });

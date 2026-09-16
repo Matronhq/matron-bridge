@@ -189,7 +189,7 @@ describe('createAgentChatHandlers', () => {
       // then the local inject — a request delivered before the waiters exist
       // can settle into the void.
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'inviteLocal', 'deliverLocalInvite']);
-      expect(calls[0].opts.title).toBe('M:ab ↔️ Local work — ci triage');
+      expect(calls[0].opts.title).toBe('M:ab1 ↔️ Local work — ci triage');
       expect(calls[2].fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 1, peerName: 'Local work' });
       expect(invites.invite).not.toHaveBeenCalled();
       expect(deliverLocalInvite).toHaveBeenCalledWith(expect.objectContaining({
@@ -211,11 +211,11 @@ describe('createAgentChatHandlers', () => {
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'invite']);
       // The peer's conversation title ('Remote work') never earned a session
       // short, so that half of the tag falls back to its plain device name.
-      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'M:ab ↔️ dev-2 — ci triage', sessionState: 'waiting' } });
+      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'M:ab1 ↔️ dev-2 — ci triage', sessionState: 'waiting' } });
       expect(calls[1]).toEqual({ call: 'publishText', convoId: chatRoomId, payload: { body: 'hi, seen the red build?', from: 'agent' } });
       expect(calls[2].fields).toEqual({
         role: 'owner', state: 'pending', sessionRoomId: '!sess', targetConvoId: 'convo-remote',
-        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: 'M:ab ↔️ dev-2 — ci triage',
+        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: 'M:ab1 ↔️ dev-2 — ci triage',
       });
       // targetConvoId rides along with the device: the caller picked a
       // specific conversation, and without it the receiving bridge is left
@@ -235,7 +235,7 @@ describe('createAgentChatHandlers', () => {
     it('omits the topic suffix from the title when no topic given', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: undefined });
-      expect(calls[0].opts.title).toBe('M:ab ↔️ dev-2');
+      expect(calls[0].opts.title).toBe('M:ab1 ↔️ dev-2');
     });
 
     // The title is what the apps render in the chat list, and the two tags in
@@ -260,7 +260,7 @@ describe('createAgentChatHandlers', () => {
         // bracket as a session short and put `:xx` on the room tag again.
         const { handlers, calls } = makeFixture(withPeerTitle('[2h] Remote work'));
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+        expect(titleOf(calls)).toBe('M:ab1 ↔️ D:2h — ci triage');
         expect(titleOf(calls)).not.toMatch(/^↔️ /);
         expect(titleOf(calls)).not.toMatch(/^\S*\s*\[/);
         // …and the room id no longer leaks into the title at all.
@@ -270,7 +270,7 @@ describe('createAgentChatHandlers', () => {
       it('tags the peer from the short baked into its conversation title', async () => {
         const { handlers, calls } = makeFixture(withPeerTitle('[2h] Remote work'));
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+        expect(titleOf(calls)).toBe('M:ab1 ↔️ D:2h — ci triage');
       });
 
       it('reads the peer short from behind a leading marker', async () => {
@@ -279,7 +279,7 @@ describe('createAgentChatHandlers', () => {
         for (const marker of ['🐣', '↔️', '🔗']) {
           const { handlers, calls } = makeFixture(withPeerTitle(`${marker} [2h] Remote work`));
           await handlers.chatStart(good);
-          expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+          expect(titleOf(calls)).toBe('M:ab1 ↔️ D:2h — ci triage');
         }
       });
 
@@ -287,7 +287,7 @@ describe('createAgentChatHandlers', () => {
         // Seed titles never earned one, and a bare "D:" says nothing.
         const { handlers, calls } = makeFixture(withPeerTitle('Remote work'));
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('M:ab ↔️ dev-2 — ci triage');
+        expect(titleOf(calls)).toBe('M:ab1 ↔️ dev-2 — ci triage');
       });
 
       it('falls back to our own device name when THIS session has no short', async () => {
@@ -305,7 +305,7 @@ describe('createAgentChatHandlers', () => {
           ...withPeerTitle('[2h] Remote work'), session: { claudeSessionId: undefined, roomId: 'zz9' },
         });
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('M:zz ↔️ D:2h — ci triage');
+        expect(titleOf(calls)).toBe('M:zz9 ↔️ D:2h — ci triage');
       });
 
       it('derives both letters against the whole roster, not from initials', async () => {
@@ -319,7 +319,7 @@ describe('createAgentChatHandlers', () => {
           }),
         } });
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('Y:ab ↔️ Z:2h — ci triage');
+        expect(titleOf(calls)).toBe('Y:ab1 ↔️ Z:2h — ci triage');
       });
 
       it('derives our own letter even when the roster omits us', async () => {
@@ -331,7 +331,7 @@ describe('createAgentChatHandlers', () => {
           }),
         } });
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('Y:ab ↔️ Z:2h — ci triage');
+        expect(titleOf(calls)).toBe('Y:ab1 ↔️ Z:2h — ci triage');
       });
 
       it('prefers a tag character the journal supplies for a box', async () => {
@@ -345,7 +345,7 @@ describe('createAgentChatHandlers', () => {
           }),
         } });
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('🍎:ab ↔️ 2:2h — ci triage');
+        expect(titleOf(calls)).toBe('🍎:ab1 ↔️ 2:2h — ci triage');
       });
 
       it('tags BOTH ends of a same-bridge room, one box letter twice', async () => {
@@ -354,7 +354,7 @@ describe('createAgentChatHandlers', () => {
           conversations: ROSTER.conversations.map((c) => (c.id === 'convo-self' ? { ...c, title: '[2h] Local work' } : c)),
         }) } });
         await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
-        expect(titleOf(calls)).toBe('M:ab ↔️ M:2h — ci triage');
+        expect(titleOf(calls)).toBe('M:ab1 ↔️ M:2h — ci triage');
       });
 
       it('falls back to the peer CONVO title on a same-bridge room with no short', async () => {
@@ -362,7 +362,7 @@ describe('createAgentChatHandlers', () => {
         // device name, so the fallback side keeps the conversation title.
         const { handlers, calls } = makeFixture();
         await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
-        expect(titleOf(calls)).toBe('M:ab ↔️ Local work — ci triage');
+        expect(titleOf(calls)).toBe('M:ab1 ↔️ Local work — ci triage');
       });
 
       it('names an unknown peer device rather than tagging a nameless box', async () => {
@@ -371,7 +371,7 @@ describe('createAgentChatHandlers', () => {
           conversations: ROSTER.conversations,
         }) } });
         await handlers.chatStart(good);
-        expect(titleOf(calls)).toBe('M:ab ↔️ device 7 — ci triage');
+        expect(titleOf(calls)).toBe('M:ab1 ↔️ device 7 — ci triage');
       });
     });
 
@@ -386,7 +386,7 @@ describe('createAgentChatHandlers', () => {
     it('caps the title at 120 chars', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: 'x'.repeat(300) });
-      expect(calls[0].opts.title.startsWith('M:ab ↔️ dev-2 — xxx')).toBe(true);
+      expect(calls[0].opts.title.startsWith('M:ab1 ↔️ dev-2 — xxx')).toBe(true);
       expect(calls[0].opts.title).toHaveLength(120);
     });
 
@@ -1621,7 +1621,7 @@ describe('chatMute / chatUnmute', () => {
   function muted(f, { state = 'joined' } = {}) {
     f.rooms.record('room-1', {
       role: 'owner', state, sessionRoomId: '!sess',
-      peerDeviceId: 7, peerName: 'dev-2', title: 'M:ab ↔️ dev-2', targetConvoId: 'convo-remote',
+      peerDeviceId: 7, peerName: 'dev-2', title: 'M:ab1 ↔️ dev-2', targetConvoId: 'convo-remote',
     });
   }
 
@@ -1658,7 +1658,7 @@ describe('chatMute / chatUnmute', () => {
     const roomLine = f.calls.find((c) => c.call === 'publishText');
     expect(roomLine.convoId).toBe('room-1');
     expect(roomLine.payload.from).toBe('agent');
-    expect(roomLine.payload.body).toMatch(/^🔇 .* muted "M:ab ↔️ dev-2": you are looping on the same question$/);
+    expect(roomLine.payload.body).toMatch(/^🔇 .* muted "M:ab1 ↔️ dev-2": you are looping on the same question$/);
 
     const peerNotice = f.calls.find((c) => c.call === 'publishSessionNotice');
     expect(peerNotice.sessionKey).toBe('!guest');
@@ -1668,7 +1668,7 @@ describe('chatMute / chatUnmute', () => {
     const card = f.calls.find((c) => c.call === 'publishMuteCard');
     expect(card).toMatchObject({
       sessionKey: '!sess', roomId: 'room-1',
-      roomTitle: 'M:ab ↔️ dev-2', reason: 'you are looping on the same question',
+      roomTitle: 'M:ab1 ↔️ dev-2', reason: 'you are looping on the same question',
     });
   });
 
@@ -1942,7 +1942,7 @@ describe('review findings (mute + reuse seams)', () => {
   // same turn, and the turn-end flush then injected the whole flood anyway.
   it('REGRESSION (C2): muting drops what the room already has queued for this session', async () => {
     const f = makeFixture({ droppedCount: 4 });
-    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'M:ab ↔️ dev-2' });
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'M:ab1 ↔️ dev-2' });
     const res = await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'flooding' });
     expect(f.dropPendingRoomMessages).toHaveBeenCalledWith('!sess', 'room-1');
     // The ⏳ those messages published is owed an outcome — silently dropping
@@ -1968,7 +1968,7 @@ describe('review findings (mute + reuse seams)', () => {
     f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest' });
     f.rooms.record('room-l', {
       role: 'owner', state: 'joined', sessionRoomId: '!sess',
-      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab ↔️ M:cd',
+      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab1 ↔️ M:cd',
     });
     await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-l', reason: 'looping' });
     expect(f.routeLocalRoomMessage).toHaveBeenCalledWith('room-l', '!sess', expect.stringMatching(/^🔇 /));
@@ -1982,7 +1982,7 @@ describe('review findings (mute + reuse seams)', () => {
     f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest', claudeSessionId: 'cd' });
     f.rooms.record('room-l', {
       role: 'owner', state: 'joined', sessionRoomId: '!sess',
-      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab ↔️ M:cd',
+      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab1 ↔️ M:cd',
     });
     const res = await f.handlers.chatMute({ roomId: '!guest', room_id: 'room-l', reason: 'owner is spamming' });
     expect(res.status).toBe(200);
