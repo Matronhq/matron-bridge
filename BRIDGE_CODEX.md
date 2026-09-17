@@ -70,6 +70,10 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
 
 If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header (see Journal history above). If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
 
+## Reminders and the box's sleep (`reminder_*` tools)
+
+Nothing you schedule inside your own process survives the bridge's idle reap (about an hour of silence), a restart, or this dev box idle-stopping. For a check-back further out than about an hour, use `reminder_create` on the `ask-user` server (pass exactly one of `in` — `45m`, `2h`, `1d2h` — or `at`, a clock time on this box): the bridge persists it, re-arms it after a restart, and the dev host wakes the box for it, then delivers the text into this conversation as a turn starting `⏰ Reminder #N`. `reminder_list` and `reminder_cancel` manage them; the user sees each as a card with Send-now / Cancel buttons. `hold_awake: true` keeps the box awake and the session un-reaped until it fires — only for work that must not be interrupted, since every awake dev VM costs the shared host memory.
+
 ## Missions & milestones
 
 A mission is the human-readable record of one piece of work; milestones are its checkpoints and jump targets back into the transcript. The `ask-user` server exposes these as MCP tools too — `mission_start`, `mission_update`, `mission_join`, `mission_get`, `mission_close`, `milestone_post`, `item_move` — prefer them; the HTTP routes below are the fallback when the tools are absent, same base URL and token discipline as the items routes above. **Start the mission as soon as you know what the work is; milestones are refused until the conversation has one.** Post a milestone with `kind:"user_input"` whenever an input from the user starts or redirects work, and `kind:"progress"` as often as useful. Close it when the work is done, not when the session ends.
