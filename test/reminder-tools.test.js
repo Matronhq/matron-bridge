@@ -60,6 +60,26 @@ describe('reminder handlers', () => {
     expect(store.listForConvo('c1')).toHaveLength(1);
   });
 
+  it('a failed save is a failed create: nothing armed, nothing listed, no announce, 500', async () => {
+    const setTimer = vi.fn(() => 1);
+    const store = createTimerStore({
+      load: () => null, save: () => { throw new Error('ENOSPC'); }, now: () => NOW,
+      setTimer, clearTimer: () => {}, onFire: () => {},
+    });
+    const announce = vi.fn(async () => {});
+    const h = createReminderHandlers({
+      sessions: new Map([['!r:s', { journalConvoId: 'c1' }]]),
+      journalConvoIdFor: (s) => s.journalConvoId, timerStore: store, now: () => NOW, announce,
+    });
+    const r = await h.create({ roomId: '!r:s', text: 'x', in: '2h', hold_awake: true });
+    expect(r.status).toBe(500);
+    expect(r.body.error).toMatch(/NOT set/);
+    expect(setTimer).not.toHaveBeenCalled();
+    expect(announce).not.toHaveBeenCalled();
+    expect(store.listForConvo('c1')).toEqual([]);
+    expect(store.holdAwakeUntil('c1')).toBeNull();
+  });
+
   it('validates text, the in/at pair, bounds and hold_awake', async () => {
     const { h } = fixture();
     expect((await h.create({ roomId: '!r:s', in: '1h' })).status).toBe(400);

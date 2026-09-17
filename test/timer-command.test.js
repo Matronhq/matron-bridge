@@ -446,6 +446,28 @@ describe('hold-awake reminders', () => {
   });
 });
 
+describe('add({ requirePersist })', () => {
+  const failing = (setTimer) => createTimerStore({
+    load: () => null, save: () => { throw new Error('ENOSPC'); }, now: () => 0,
+    setTimer, clearTimer: () => {}, onFire: () => {}, log: () => {},
+  });
+
+  it('rolls the record back and arms nothing when the save fails', () => {
+    const setTimer = vi.fn(() => 1);
+    const store = failing(setTimer);
+    expect(store.add({ convoId: 'c1', text: 'x', delayMs: 60_000, requirePersist: true })).toBeNull();
+    expect(store.listForConvo('c1')).toEqual([]);
+    expect(setTimer).not.toHaveBeenCalled();
+  });
+
+  it('without it a failed save still arms in memory, as /timer always has', () => {
+    const setTimer = vi.fn(() => 1);
+    const store = failing(setTimer);
+    expect(store.add({ convoId: 'c1', text: 'x', delayMs: 60_000 })).toMatchObject({ id: 1 });
+    expect(setTimer).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('keepAwakeMarker', () => {
   it('is null without held records and the latest held fireAt otherwise', () => {
     expect(keepAwakeMarker([])).toBeNull();
