@@ -83,16 +83,18 @@ describe('configureCodexSinkEnv', () => {
     expect(spawnEnv.PATH).toBe(first);
   });
 
-  it('does NOT prepend the shim in wrapper-producer mode (MATRON_CODEX_REAL_BIN set) but still sets the sink dir', () => {
+  it('does NOT prepend the shim in wrapper-producer mode (MATRON_CODEX_REAL_BIN resolves) but still sets the sink dir', () => {
     // The wrapper is the sole producer here; if the shim were also
     // on PATH the wrapper's internal bare `codex exec` would resolve to it and
     // emit a duplicate card for the same run (the dual-producer bug).
+    // REAL_BIN must point at a path that actually resolves — a real wrapper
+    // deployment does; process.execPath is a stand-in that always exists.
     const spawnEnv = { PATH: '/usr/bin:/bin' };
     const dir = configureCodexSinkEnv({
       spawnEnv,
       workdir: '/w',
       sessionId: 'sid',
-      env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: '/opt/real/codex' },
+      env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: process.execPath },
       mkdirSync: vi.fn(),
       chmodSync: vi.fn(),
     });
@@ -101,6 +103,22 @@ describe('configureCodexSinkEnv', () => {
     // ...but the shim is NOT prepended, so bare `codex` reaches the real codex.
     expect(spawnEnv.PATH).toBe('/usr/bin:/bin');
     expect(spawnEnv.PATH.split(path.delimiter)[0]).not.toBe(SHIPPED_SHIM_DIR);
+  });
+
+  it('DOES prepend the shim when MATRON_CODEX_REAL_BIN is set but does not resolve', () => {
+    // A set-but-missing REAL_BIN is not a wrapper producer (detectProducer says
+    // so too). Suppressing the shim here on raw presence alone would leave the
+    // session with no producer at all — the silent empty-view. Prepend the shim.
+    const spawnEnv = { PATH: '/usr/bin:/bin' };
+    configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: '/opt/real/does-not-exist' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).toBe(SHIPPED_SHIM_DIR);
   });
 
   it('does not touch PATH when visualization is disabled', () => {
