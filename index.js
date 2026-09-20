@@ -116,7 +116,7 @@ import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
@@ -218,6 +218,12 @@ if (!['bypass', 'auto'].includes(MATRON_PERMISSION_MODE)) {
   console.warn(`[permissions] Unknown MATRON_PERMISSION_MODE=${JSON.stringify(process.env.MATRON_PERMISSION_MODE)}; defaulting to bypass.`);
 }
 const DEFAULT_BYPASS_MODE = MATRON_PERMISSION_MODE !== 'auto';
+// Claude Code exits 1 on --dangerously-skip-permissions under root unless
+// IS_SANDBOX=1 (lib/permission-prompt.js isRootOutsideSandbox). Say so once
+// at boot; each affected spawn also downgrades to auto and warns the room.
+if (isRootOutsideSandbox()) {
+  console.warn(`[permissions] ${ROOT_BYPASS_WARNING}`);
+}
 // Idle reaping: a session is killed if no activity (incoming user message OR
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
@@ -1742,7 +1748,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  const bypassMode = resolveBypassMode(options.bypass, persistedForRoom?.bypassMode, DEFAULT_BYPASS_MODE);
+  const requestedBypassMode = resolveBypassMode(options.bypass, persistedForRoom?.bypassMode, DEFAULT_BYPASS_MODE);
+  // Root guard: the session's persisted choice stays as requested; only the
+  // spawn args downgrade (see guardRootBypass).
+  const { bypass: bypassMode, downgraded: rootDowngraded } = guardRootBypass(requestedBypassMode);
+  if (rootDowngraded) {
+    console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
+    const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
+    Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
+  }
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   let showFileToken;
@@ -1891,7 +1905,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     showFilePinnedRoots,
     _showFileInFlight: 0,
     mcpExtras,
-    bypassMode,
+    bypassMode: requestedBypassMode,
     permAllowedTools: new Set(),
     responseBuffer: '',
     sendCallback: null,
@@ -2657,9 +2671,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // Fresh sessions pre-assign --session-id so the transcript path is known
   // before spawn; resumes pass --resume only. The exclusivity rule lives in
   // planSessionIdentity.
+  // Interactive sessions run bypassed; under root (where Claude Code exits 1
+  // on the bypass flag) they fall back to auto mode, whose TUI permission
+  // prompts lib/prompt-detector.js already surfaces as Matron yes/no cards.
+  const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
+  if (ivRootDowngraded) {
+    console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
+    const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
+    Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
+  }
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
-    '--dangerously-skip-permissions',
+    ...(ivBypass ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'auto']),
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
