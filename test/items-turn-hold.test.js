@@ -119,6 +119,21 @@ describe('holding a turn for the journal transcript', () => {
     expect(injected).toHaveLength(1);
   });
 
+  it('a voice note on a NEW item: the created turn is held, then leads with the item body and carries the words', async () => {
+    const getItem = vi.fn(async () => ({ status: 200, data: { item: { body: 'see the note' } } }));
+    const { route, injected } = harness({ getItem });
+    const created = { ...base, kind: 'task', action: 'created', comment: { id: 'ic_b', body: '', attachments: [audio({ transcript_status: 'pending' })] } };
+    const run = route(session, { payload: created }, { username: 'dan' });
+    await tick();
+    expect(injected).toHaveLength(0);
+    await route(session, { payload: followUp('ic_b', { kind: 'task', for_action: 'created' }) }, { username: 'dan' });
+    await run;
+    expect(injected).toHaveLength(1);
+    expect(injected[0].text.split('\n').slice(0, 3)).toEqual([
+      '📌 dan filed a new task #12 "Which auth?":', 'see the note', '[voice note v.m4a — transcript: use option A]',
+    ]);
+  });
+
   it('a journal without whisper (no status field) behaves exactly as before', async () => {
     const { route, deps, injected } = harness();
     await route(session, { payload: { ...base, action: 'commented', comment: { id: 'ic_1', body: '', attachments: [audio()] } } }, { username: 'dan' });
