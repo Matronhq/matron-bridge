@@ -76,6 +76,23 @@ describe('holding a turn for the journal transcript', () => {
     expect(injected).toHaveLength(1);
   });
 
+  it('timeout path delivers to the conversation\'s CURRENT session; a failed hand-over is not remembered as delivered', async () => {
+    const current = { journalConvoId: 'c1', busy: false, current: true };
+    const h = harness({ holdTimeoutMs: 10, resolveSession: vi.fn(() => current) });
+    await h.route(session, { payload: pending() }, { username: 'dan' });
+    expect(h.injected[0].session).toBe(current);
+
+    const refuse = harness({ holdTimeoutMs: 10, injectBlocks: vi.fn(() => false) });
+    await refuse.route(session, { payload: pending('ic_9') }, { username: 'dan' });
+    expect(refuse.deps.publishNotice).toHaveBeenCalledOnce();
+    refuse.deps.injectBlocks.mockImplementation(() => true);
+    await refuse.route(session, { payload: followUp('ic_9') }, { username: 'dan' }); // replay gets its chance
+    expect(refuse.deps.injectBlocks).toHaveBeenCalledTimes(2);
+    // …and once delivered, a replayed `commented` frame neither waits nor repeats.
+    await refuse.route(session, { payload: pending('ic_9') }, { username: 'dan' });
+    expect(refuse.deps.injectBlocks).toHaveBeenCalledTimes(2);
+  });
+
   it('a later reply waits behind the held turn (marker order), and a follow-up that beats its turn to the front still releases it', async () => {
     const { route, injected } = harness();
     const a = route(session, { payload: pending('ic_a') }, { username: 'dan' });
