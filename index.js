@@ -8283,6 +8283,8 @@ const itemTurnRouter = createItemTurnRouter({
   // item arrives with transcript:null and only the bridge can fill it in.
   setTranscript: (id, commentId, body) => itemsClient.setTranscript(id, commentId, body),
   getItem: (id) => itemsClient.get(id),
+  // A turn held for the journal's transcript may outlive its session.
+  resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
   log: console,
 });
 
