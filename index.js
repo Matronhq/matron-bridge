@@ -561,6 +561,41 @@ function handleJournalReconnect() {
   // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
+  // Every hello_ok is a fresh epoch for the journal's copy of this box's
+  // status too (a box that just woke reports itself before anyone asks).
+  publishBoxStatus('reconnect');
+}
+
+// Box status lives in the journal (matron-journal #82): this box's activity,
+// usage limits, disk and account, sent as a `box_status` op so every client
+// sees them from /devices — including one that has never talked to this
+// box, and while this box is asleep. Same payload the recent_folders RPC
+// reply carries (lib/journal-rpc.js), built from the same thunks, so the
+// two never disagree. Fired on every hello_ok, after each usage-limits
+// refresh (the numbers changed), and at shutdown (the last report before
+// the host idle-stops the VM is the one clients will see all night).
+// Fails open like every other journal send: a dropped report is replaced
+// by the next one.
+function publishBoxStatus(reason) {
+  if (!JOURNAL_ENABLED) return false;
+  let activity = null;
+  let limits = null;
+  let disk = null;
+  let accountEmail = null;
+  try { activity = buildActivity({ sessions, persisted: loadPersistedSessions() }); } catch { /* best-effort */ }
+  try { limits = buildLimits(usageLimitsCache); } catch { /* best-effort */ }
+  try { disk = buildDisk({ path: DEFAULT_WORKDIR }); } catch { /* best-effort */ }
+  try { accountEmail = getAccountEmail(); } catch { /* best-effort */ }
+  if (!activity && !limits && !disk && !accountEmail) return false;
+  const sent = journalPublisher.sendRoomOp({
+    op: 'box_status',
+    ...(activity ? { activity } : {}),
+    ...(limits ? { limits } : {}),
+    ...(disk ? { disk } : {}),
+    ...(accountEmail ? { account: { email: accountEmail } } : {}),
+  });
+  debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
+  return sent;
 }
 
 const journalPublisher = createJournalPublisher({
@@ -1411,7 +1446,12 @@ function refreshUsageLimits(cwd) {
     .then((raw) => {
       const parsed = parseUsageLimits(raw);
       usageLimitsCache.fetchedAt = Date.now();
-      if (parsed.ok) usageLimitsCache.lines = parsed.lines;
+      if (parsed.ok) {
+        usageLimitsCache.lines = parsed.lines;
+        // Fresh numbers: the journal's copy of this box's status is stale
+        // the moment they land.
+        publishBoxStatus('limits refresh');
+      }
       return parsed.ok;
     })
     .catch((e) => {
@@ -11431,6 +11471,11 @@ async function gracefulShutdown(signal) {
   // / killSession ran outside the try, so a throw there rejected the promise the
   // signal handlers ignore, and the process never exited (unhandled rejection).
   try {
+    // Last box-status report before this process goes: with the host
+    // idle-stopping the VM right after, these are the numbers every client
+    // will see for this box until it wakes again. Sent before the sessions
+    // are killed so `activity` still describes what was running.
+    publishBoxStatus('shutdown');
     stopCpuSampler();
     for (const [, session] of sessions) {
       killSession(session);
