@@ -27,7 +27,7 @@ If the secure viewer is unconfigured, explain that it needs `HMAC_SECRET` and a 
 
 `agent_roster` lists sessions. `agent_chat_start` invites a peer. `agent_chat_accept`, `agent_chat_refuse`, `agent_chat_join`, `agent_chat_send`, and `agent_chat_read` handle coordination. Only explicitly sent room messages reach the peer; normal working output stays in your own conversation.
 
-Rooms remain open for the sessions' lifetimes. Reusing `agent_chat_start` for the same peer returns the existing room. Do not poll: invites, answers, and peer replies arrive automatically as later turns. Use `agent_chat_read` only for one-shot catch-up. If a peer malfunctions, use `agent_chat_mute` with a clear reason; use `agent_chat_unmute` to resume delivery. The user can see these rooms.
+Rooms remain open for the conversations' lifetimes — they survive an idle reap, a restart, and the box sleeping, and a peer's room message wakes this conversation. Reusing `agent_chat_start` for the same peer returns the existing room. Do not poll: invites, answers, and peer replies arrive automatically as later turns. Use `agent_chat_read` only for one-shot catch-up. If a peer malfunctions, use `agent_chat_mute` with a clear reason; use `agent_chat_unmute` to resume delivery. The user can see these rooms.
 
 `agent_boxes` discovers capacity and `agent_session_start` requests user consent to seed a task elsewhere; the new session is detached by default (it does the task and does not report back) — pass `link: true` only when its results must come back to you in a chat room. Tool availability does not authorize delegation or contacting other sessions unless the user's task permits it.
 

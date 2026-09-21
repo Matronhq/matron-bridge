@@ -303,7 +303,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). You and a given peer session share ONE room for the life of both sessions: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),
@@ -529,16 +529,18 @@ server.tool(
 );
 
 // There is deliberately NO agent_chat_leave tool (2026-08-19). A room lives
-// for the life of the two sessions: agents kept closing rooms and opening new
-// ones for every exchange, which filled the user's chat list with dead
+// for the life of the two conversations: agents kept closing rooms and opening
+// new ones for every exchange, which filled the user's chat list with dead
 // single-exchange rooms and lost the thread between two sessions that talk
 // repeatedly. agent_chat_mute below is the escape hatch instead. The
-// /agent-chat-leave route and chatLeave internals still exist — session
-// eviction uses them to close a dead session's rooms out.
+// /agent-chat-leave route and chatLeave internals still exist, but since
+// 2026-09-21 no teardown calls them: a room outlives the claude process (idle
+// reap, restart, box asleep) and is only left, lazily, once its conversation
+// can no longer be resumed (index.js orphanRoomBinding).
 
 server.tool(
   'agent_chat_mute',
-  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both sessions). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
+  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both conversations, across restarts and sleeps). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
   {
     room_id: z.string().describe('The agent chat room id to mute'),
     reason: z.string().describe('Why you are muting it, in one line — shown to your user, who decides whether to unmute'),

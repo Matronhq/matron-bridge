@@ -123,7 +123,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
@@ -8943,10 +8943,23 @@ function journalOnRoomFrame(room, frame) {
 // `[room …]` line and hands it to roomDelivery against room.sessionRoomId
 // (callers substitute the guest binding in for the fan-out above).
 function deliverRoomFrameTo(room, frame) {
-  const session = sessions.get(room.sessionRoomId);
+  let session = sessions.get(room.sessionRoomId);
   if (!session || !session.alive) {
-    debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} not live — dropping (agent_chat_read recovers)`);
-    return;
+    // The bound session is not running — reaped, !stopped, or the bridge /
+    // box restarted since it joined. Rooms outlive the claude process
+    // (2026-09-21): wake the conversation through its persisted session
+    // record, the way an item reply or a chat request does, and let the
+    // message ride the resume hold into the coalesced room inbox (the
+    // readiness seam flushes it). Only a conversation that cannot be
+    // resumed at all is truly gone — that binding is left now, lazily, so
+    // the peer hears 'left' at the moment it matters instead of on every
+    // teardown.
+    session = journalResumeRoom(room.sessionRoomId, ROOM_WAKE_NOTICE);
+    if (!session) {
+      debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} is gone and not resumable — leaving the room (agent_chat_read recovers the message)`);
+      orphanRoomBinding(frame.convo_id, room.sessionRoomId);
+      return;
+    }
   }
   const sender = frame.sender || '';
   const from = sender.startsWith('agent:') ? `${sender.slice(6)} (agent)` : sender.startsWith('user:') ? sender.slice(5) : sender;
@@ -9466,6 +9479,32 @@ function journalHandleInboundEvent(frame) {
   if (_releaseReconcileTimer) scheduleReleaseReconcile();
 }
 
+// Leave ONE room binding whose session key no longer resolves to a
+// resumable conversation — the lazy half of "rooms outlive the claude
+// process" (see journalEvictConvoInput). Called from deliverRoomFrameTo when
+// a peer writes to a room and journalResumeRoom finds nothing to wake. Only a
+// 'joined' binding is acted on; anything else is already terminal or still
+// mid-invite. Tell the peer (fire-and-forget — there is no one left to
+// report a failure to; an owner's leave is rejected server-side, a journal
+// gap noted in the original PR) and mark the binding left. A local
+// (same-bridge) room has no journal participant state to leave: flip both
+// bindings (pairwise rooms end when either side goes) and tell the
+// surviving end directly, the way a remote 'left' frame would have.
+function orphanRoomBinding(roomId, sessionKey) {
+  const r = agentRooms.get(roomId);
+  const binding = r && agentRooms.bindingFor(roomId, sessionKey);
+  if (!binding || binding.state !== 'joined') return;
+  if (r.guestSessionRoomId != null) {
+    const otherKey = binding.binding === 'guest' ? r.sessionRoomId : r.guestSessionRoomId;
+    agentRooms.setState(roomId, 'left');
+    agentRooms.setGuestState(roomId, 'left');
+    journalNotifyRoomEvent(roomId, 'left the room', { sessionKey: otherKey });
+    return;
+  }
+  agentInvites.leave({ roomId }).catch(() => {});
+  agentRooms.setState(roomId, 'left');
+}
+
 // Evict the reply-staleness guard record for a torn-down session's convo
 // (issue #98 nit — the consumer's per-convo map is otherwise never pruned).
 // Called from every TERMINAL session teardown (the exit handlers' non-restart
@@ -9476,28 +9515,16 @@ function journalHandleInboundEvent(frame) {
 // Hoisted function declaration — the exit handlers are defined earlier in
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
-  // Terminal teardown leaves this session's joined rooms too: an orphaned
-  // 'joined' entry stays bound to a dead session key forever — isActive
-  // true, every peer frame dropped at debug level, noticeUnknownConvo
-  // suppressed by the known-room guard: a permanent silent black hole
-  // (whole-branch review, I4). Tell the peer (fire-and-forget — there is no
-  // one left to report a failure to; an owner's leave is rejected
-  // server-side, a journal gap noted in the PR) and mark the binding left.
-  for (const r of agentRooms.forSession(session?.roomId)) {
-    if (r.state !== 'joined') continue;
-    if (r.guestSessionRoomId != null) {
-      // Local room: no journal participant state to leave — flip both
-      // bindings (pairwise rooms end when either side goes) and tell the
-      // surviving end directly, the way a remote 'left' frame would have.
-      const otherKey = r.binding === 'guest' ? r.sessionRoomId : r.guestSessionRoomId;
-      agentRooms.setState(r.roomId, 'left');
-      agentRooms.setGuestState(r.roomId, 'left');
-      journalNotifyRoomEvent(r.roomId, 'left the room', { sessionKey: otherKey });
-      continue;
-    }
-    agentInvites.leave({ roomId: r.roomId }).catch(() => {});
-    agentRooms.setState(r.roomId, 'left');
-  }
+  // Terminal teardown deliberately does NOT leave this session's rooms
+  // (2026-09-21). It used to — every non-restart exit, the one-hour idle
+  // reap and !stop included, marked each joined room 'left' and told the
+  // peer — so a conversation the user simply left idle came back from
+  // auto-resume with no rooms, and its next agent_chat_start opened a
+  // duplicate. The session KEY (the Matron conversation) is what a room
+  // binds to, and it outlives the claude process; a peer's next message
+  // wakes the conversation through deliverRoomFrameTo, which is also where
+  // a binding whose conversation can no longer be resumed is left — lazily,
+  // by orphanRoomBinding, at the one moment it matters.
   // …and drops any pending room-message inbox with the session: there is no
   // live session left to coalesce into, and the room content is durable in
   // the journal (agent_chat_read recovers it). Auto-restart and
