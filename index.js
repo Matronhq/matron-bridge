@@ -124,7 +124,7 @@ import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
-import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
@@ -337,6 +337,14 @@ function mcpConfigPathFor(extras = []) {
 // disk by the time any session spawns. Per-extras variants are generated
 // lazily on first use.
 mcpConfigPathFor([]);
+// Every server a session of this bridge can be running — the always-on set
+// and each extras group, local overlay included — resolved exactly as the
+// spawn resolves them (absolute paths, macify). The idle reaper uses these
+// to tell claude's own MCP servers from work in flight (lib/work-hold.js).
+const MCP_SERVER_SIGNATURES = mcpServerSignatures(
+  [[], ...KNOWN_MCP_EXTRAS.map((ex) => [ex])].flatMap((extras) =>
+    Object.values(buildMcpServers({ baseConfig: RAW_MCP_CONFIG, extras, askUserBaseDir: __dirname }).config.mcpServers)),
+);
 // Drop (and warn about) any machine default that names an extra no config block
 // defines. buildMcpServers would silently ignore it at spawn time, so filtering
 // here keeps /start and /restart from advertising an extra that never loads.
@@ -11288,12 +11296,13 @@ function readProcessTable() {
 }
 
 // {reason} when this session has work in flight (a turn running, or a live
-// non-MCP descendant of its claude process — a tool call, a background
-// task), null when the idle clock should rule. See lib/work-hold.js.
+// descendant of its claude process that is not one of its configured MCP
+// servers — a tool call, a background task), null when the idle clock
+// should rule. See lib/work-hold.js.
 function sessionWorkHold(session, last, now, table) {
   return workHold({
     busy: !!session.busy,
-    children: liveWorkChildren(sessionChildPid(session), table),
+    children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
     idleSince: last,
     now,
   });

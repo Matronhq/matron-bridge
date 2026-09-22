@@ -48,7 +48,19 @@ describe('work in flight holds the session and the box', () => {
 
   it('decides with the pure helper on the session\'s busy flag and live work children', () => {
     const body = fnBody('sessionWorkHold');
-    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table\),\s*idleSince: last,\s*now,?\s*\}\)/);
+    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table, MCP_SERVER_SIGNATURES\),\s*idleSince: last,\s*now,?\s*\}\)/);
+  });
+
+  it('knows the MCP servers by the merged config claude is spawned with — every extras group, local overlay included', () => {
+    // Bugbot on #289: a stock-server denylist pinned a session that had an
+    // mcp-config.local.json extra running. The signatures come from the same
+    // buildMcpServers() resolution the spawn uses (absolute paths, macify).
+    expect(index).toMatch(/import \{[^}]*\bmcpServerSignatures\b[^}]*\} from '\.\/lib\/work-hold\.js'/);
+    const decl = index.indexOf('const MCP_SERVER_SIGNATURES = mcpServerSignatures(');
+    expect(decl).toBeGreaterThan(-1);
+    const block = index.slice(decl, decl + 600);
+    expect(block).toMatch(/KNOWN_MCP_EXTRAS\.map\(/);
+    expect(block).toMatch(/buildMcpServers\(\{ baseConfig: RAW_MCP_CONFIG, extras, askUserBaseDir: __dirname \}\)/);
   });
 
   it('reads the process table with ps, failing closed to an empty table', () => {
