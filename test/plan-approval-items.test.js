@@ -202,3 +202,17 @@ describe('formatPlanItemBody, review round', () => {
     expect(body).toMatch(/truncated/i);
   });
 });
+
+describe('same hook twice', () => {
+  it('a second opened for the same hook keeps the item it already has: no close, no second create', async () => {
+    const { items, store } = makeStore();
+    const session = { roomId: 'r1', convoId: 'c1' };
+    await store.opened(session, PLAN, { toolUseId: 'tu_A' });
+    const again = await store.opened(session, PLAN, { toolUseId: 'tu_A' });
+    expect(again).toBe(41);
+    expect(items.calls.create).toHaveLength(1);
+    expect(items.calls.close).toHaveLength(0);
+    expect(session.planItemId).toBe('it_41');
+    expect(session.planToolUseId).toBe('tu_A');
+  });
+});
