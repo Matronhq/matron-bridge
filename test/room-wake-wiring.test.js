@@ -51,6 +51,25 @@ describe('rooms survive session teardown', () => {
     expect(orphan).toMatch(/journalNotifyRoomEvent\(roomId, 'left the room', \{ sessionKey: otherKey \}\)/);
   });
 
+  it('a muted binding never wakes a sleeping session — the mute is decided before the wake', () => {
+    // Bugbot on #288: journalResumeRoom ran before roomFrameDisposition, so a
+    // muted binding still respawned the reaped session on every peer message,
+    // then dropped the frame as muted-drop. Mute must keep the session asleep.
+    const body = fnBody('deliverRoomFrameTo');
+    const gate = body.indexOf('roomFrameDisposition(');
+    const wake = body.indexOf('journalResumeRoom(');
+    expect(gate).toBeGreaterThan(-1);
+    expect(wake).toBeGreaterThan(gate);
+    // The muted branch returns before the wake is reached.
+    const muted = body.slice(body.indexOf("if (disposition !== 'deliver')"), wake);
+    expect(muted).toMatch(/\n {4}return;\n {2}\}/);
+    // Dan's own message into a muted, sleeping conversation still gets its
+    // receipt there, so it does not look lost — without waking it.
+    expect(muted).toMatch(/live \? journalConvoIdFor\(session\) : sleepingConvoIdFor\(room\.sessionRoomId\)/);
+    expect(muted).toMatch(/ROOM_MUTED_NOT_DELIVERED_NOTICE/);
+    expect(fnBody('sleepingConvoIdFor')).toMatch(/loadPersistedSessions\(\)\[roomId\]/);
+  });
+
   it('tells the agent and the guidance that rooms outlive restarts and sleeps', () => {
     for (const [name, text] of [['BRIDGE_CLAUDE.md', claudeMd], ['BRIDGE_CODEX.md', codexMd], ['ask-user.js', askUser]]) {
       expect(text, `${name} should say rooms survive a restart / reap / sleep`).toMatch(/room[^\n]*(restart|asleep|sleep|reap)/i);

@@ -8567,6 +8567,16 @@ function journalResumeRoom(roomId, noticeText = JOURNAL_RESUME_NOTICE) {
   return resumeSleepingSession(roomId, prev, prev.journalConvoId || prev.sessionId || null, noticeText);
 }
 
+// The journal conversation a NOT-running session key maps to, from the same
+// persisted record journalResumeRoom would wake it through — for the one
+// case that needs to write into a sleeping conversation without waking it
+// (a muted room's receipt in deliverRoomFrameTo). Null when nothing is
+// persisted: then there is no conversation to write into either.
+function sleepingConvoIdFor(roomId) {
+  const prev = loadPersistedSessions()[roomId];
+  return prev ? (prev.journalConvoId || prev.sessionId || null) : null;
+}
+
 // A "Carry on" tap. The router has already auto-resumed the session for a
 // verified resume tap (lib/journal-input-router.js), so `session` is live by
 // the time this runs; the lookup is a fallback for the ordering-independent
@@ -8943,24 +8953,6 @@ function journalOnRoomFrame(room, frame) {
 // `[room …]` line and hands it to roomDelivery against room.sessionRoomId
 // (callers substitute the guest binding in for the fan-out above).
 function deliverRoomFrameTo(room, frame) {
-  let session = sessions.get(room.sessionRoomId);
-  if (!session || !session.alive) {
-    // The bound session is not running — reaped, !stopped, or the bridge /
-    // box restarted since it joined. Rooms outlive the claude process
-    // (2026-09-21): wake the conversation through its persisted session
-    // record, the way an item reply or a chat request does, and let the
-    // message ride the resume hold into the coalesced room inbox (the
-    // readiness seam flushes it). Only a conversation that cannot be
-    // resumed at all is truly gone — that binding is left now, lazily, so
-    // the peer hears 'left' at the moment it matters instead of on every
-    // teardown.
-    session = journalResumeRoom(room.sessionRoomId, ROOM_WAKE_NOTICE);
-    if (!session) {
-      debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} is gone and not resumable — leaving the room (agent_chat_read recovers the message)`);
-      orphanRoomBinding(frame.convo_id, room.sessionRoomId);
-      return;
-    }
-  }
   const sender = frame.sender || '';
   const from = sender.startsWith('agent:') ? `${sender.slice(6)} (agent)` : sender.startsWith('user:') ? sender.slice(5) : sender;
   const payload = frame.payload || {};
@@ -8975,6 +8967,8 @@ function deliverRoomFrameTo(room, frame) {
     body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.blob_ref ? ` (blob ${payload.blob_ref})` : ''}${payload.caption ? `: ${payload.caption}` : ''}]`;
   }
   if (!body) return;
+  let session = sessions.get(room.sessionRoomId);
+  const live = !!(session && session.alive);
   // The user's copy of the peer's message. The agent-facing injection below
   // passes skipJournalMirror (the message is durable in the room convo), so
   // without this the session conversation shows the agent's REPLY to a peer
@@ -9000,39 +8994,59 @@ function deliverRoomFrameTo(room, frame) {
   // Runs BEFORE this message's own notice so the journal reads in the order
   // things happened: any ⏳ from an earlier batch is closed by its 📨 above
   // the 💬 line for the message that arrived after it.
-  maybeFlushRoomDelivery(session);
+  if (live) maybeFlushRoomDelivery(session);
   const echoFrom = roomEchoLabel(sender, from);
+  const roomTitle = room.title || room.topic || null;
   // Mute gate (2026-08-19). agent_chat_mute replaced agent_chat_leave as the
   // way out of a room the agent can't work with, so a muted binding takes NO
   // delivery at all: no injected turn, no pending-inbox growth, and no reply
   // waiter — which is why it sits above all three. Only the decision lives in
   // lib/room-delivery.js (roomFrameDisposition), because index.js can't be
-  // imported by a test.
+  // imported by a test. It also sits above the WAKE below (Bugbot on #288):
+  // a muted binding whose session the reaper took down must stay down —
+  // waking it only to drop the frame as muted would hand a peer that keeps
+  // writing exactly the respawn-per-message the mute was reached for.
   const disposition = roomFrameDisposition({
     muted: agentRooms.isMuted(frame.convo_id, room.sessionRoomId),
     sender,
   });
   if (disposition !== 'deliver') {
     // A `user:` frame is something Dan typed into the room himself, so
-    // swallowing it silently would look exactly like the message being lost.
-    // He gets the 💬 echo and then the 🔇 line in the ⏳'s place — the same
-    // seam, the same job: say what happened to it. Peer AGENT frames get
-    // nothing at all: a notice per dropped frame would relay the very spam
-    // the mute was reached for. Either way agent_chat_read still reads the
-    // room back in full.
+    // swallowing it silently would look like the message being lost: he gets
+    // the 💬 echo and then the 🔇 line in the ⏳'s place. Peer AGENT frames
+    // get nothing (a notice per frame would relay the spam the mute was for);
+    // agent_chat_read still reads the room in full. A sleeping conversation
+    // gets the same receipt via its persisted session record, no wake.
     if (disposition === 'muted-user' && echoFrom) {
-      journalPublishNotice(
-        journalConvoIdFor(session),
-        formatRoomMessageNotice({ from: echoFrom, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
-      );
-      journalPublishNotice(journalConvoIdFor(session), ROOM_MUTED_NOT_DELIVERED_NOTICE);
+      const convoId = live ? journalConvoIdFor(session) : sleepingConvoIdFor(room.sessionRoomId);
+      if (convoId) {
+        journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }));
+        journalPublishNotice(convoId, ROOM_MUTED_NOT_DELIVERED_NOTICE);
+      }
     }
     return;
+  }
+  if (!live) {
+    // The bound session is not running — reaped, !stopped, or the bridge /
+    // box restarted since it joined. Rooms outlive the claude process
+    // (2026-09-21): wake the conversation through its persisted session
+    // record, the way an item reply or a chat request does, and let the
+    // message ride the resume hold into the coalesced room inbox (the
+    // readiness seam flushes it). Only a conversation that cannot be
+    // resumed at all is truly gone — that binding is left now, lazily, so
+    // the peer hears 'left' at the moment it matters instead of on every
+    // teardown.
+    session = journalResumeRoom(room.sessionRoomId, ROOM_WAKE_NOTICE);
+    if (!session) {
+      debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} is gone and not resumable — leaving the room (agent_chat_read recovers the message)`);
+      orphanRoomBinding(frame.convo_id, room.sessionRoomId);
+      return;
+    }
   }
   if (echoFrom) {
     journalPublishNotice(
       journalConvoIdFor(session),
-      formatRoomMessageNotice({ from: echoFrom, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
+      formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }),
     );
   }
   // A reply consumed by an agent_chat_send wait already reached the agent
@@ -9053,7 +9067,7 @@ function deliverRoomFrameTo(room, frame) {
   // case the agent responded fastest.
   const queuedBefore = roomDelivery.pendingCount(session.roomId);
   roomDelivery.deliver(session, session.roomId, {
-    roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
+    roomId: frame.convo_id, roomTitle, from, body, at: frame.ts,
   });
   if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
     journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
