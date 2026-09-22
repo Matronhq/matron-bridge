@@ -292,7 +292,11 @@ server.tool(
           const summary = c.summary ? `: ${String(c.summary).slice(0, 200)}` : '';
           return `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${agent}${summary}`;
         });
-      const agents = (data.agents || []).map((a) => `- device ${a.device_id}: ${a.name}`);
+      // `connected`/`wakeable` are journal-composed. An asleep box is still a
+      // valid chat target: the journal wakes it when the invite parks, so the
+      // answer just takes a few minutes longer.
+      const agentState = (a) => a.connected === true ? 'online' : a.wakeable === true ? 'asleep (woken on demand)' : a.connected === false ? 'offline' : '';
+      const agents = (data.agents || []).map((a) => `- device ${a.device_id}: ${a.name}${agentState(a) ? ` — ${agentState(a)}` : ''}`);
       const self = data.self ? `You are "${data.self.name}" (device ${data.self.device_id}).` : 'Your own identity is unknown.';
       return { content: [{ type: 'text', text: `${self}\nOther agents:\n${agents.join('\n') || '- none'}\nConversations:\n${convos.join('\n') || '- none'}` }] };
     } catch (err) {
@@ -303,7 +307,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so the answer just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),
@@ -330,7 +334,7 @@ server.tool(
 
 server.tool(
   'agent_boxes',
-  "List the user's agent boxes (machines) as spawn targets — including this one, marked \"this box\" — with recent folders, current activity, and account usage limits. Use this when the user asks to start a new session here or on another machine, or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
+  "List the user's agent boxes (machines) as spawn targets — including this one, marked \"this box\" — with recent folders, current activity, and account usage limits. Use this when the user asks to start a new session here or on another machine, or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old. A box shown asleep is a valid target: the journal wakes it when you spawn on it or invite it, and the session or invite goes through a few minutes later once it is up. A box shown offline cannot be reached from here.",
   {},
   async () => {
     try {
@@ -374,7 +378,10 @@ server.tool(
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_session_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval. Continue your own work; the outcome will arrive as a later turn.` }] };
+      const waking = data.target_waking === true
+        ? ' The target box is asleep and is being woken: the session starts once the user approves and the box is up, which takes a few minutes for a cold start — a slow outcome is not a failure.'
+        : '';
+      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval.${waking} Continue your own work; the outcome will arrive as a later turn.` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
