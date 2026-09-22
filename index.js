@@ -117,6 +117,7 @@ import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
@@ -1896,6 +1897,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     sendCallback: null,
     pendingPlan: null,
     pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
     sendHtml: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
@@ -2190,6 +2192,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sendCallback: null,
     pendingPlan: null,
     pendingPlanDenialId: null,
+    planItemId: null,
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
@@ -2720,6 +2723,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     sendCallback: null,
     pendingPlan: null,
     pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
@@ -3022,8 +3026,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(preview)}</blockquote>` +
         `Reply <code>build</code> to execute, or send feedback.`;
       session.sendHtml(plainPlan, htmlPlan);
+      // The card's mirror in the tracker (lib/plan-approval-items.js): a
+      // question the user can find and answer from the Decisions list.
+      void planItems.opened(session, planText || '');
     } else if (session.sendCallback) {
       session.sendCallback(plainPlan);
+      void planItems.opened(session, planText || '');
     } else {
       // No output channel yet — auto-deny so the hook unblocks.
       const pending = pendingPlanDecisions.get(toolUseId);
@@ -4412,6 +4420,8 @@ function handleClaudeEvent(session, event) {
         } else {
           session.sendCallback(plainPlan);
         }
+        // The card's mirror in the tracker (lib/plan-approval-items.js).
+        void planItems.opened(session, planText);
       }
 
       // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
@@ -8292,6 +8302,19 @@ function journalOnItem(session, item, ctx) {
   // Same reasoning as journalOnMedia: answering the agent's question is the
   // user back in the loop, so it refreshes the self-restart budget.
   session._agentRestartCount = 0;
+  // `build` typed on the plan's own tracker item is the same answer as
+  // `build` in the conversation (lib/plan-approval-items.js): approve the
+  // plan through the one shared path instead of handing the agent a
+  // "📌 dan replied: build" turn it cannot act on. Same pending-plan gate
+  // dispatchPlanBuild applies, so a stale item can never trigger a build.
+  const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
+  if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
+    const cmdCtx = journalSessionCommandCtx(session);
+    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml }).catch((e) => {
+      try { console.warn(`[plan-items] build from item reply failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    });
+    return;
+  }
   // Fire-and-forget, matching routeMediaToSession's contract — the route
   // swallows its own failures, so this catch is belt-and-braces.
   itemTurnRouter(session, item, ctx).catch((e) => {
@@ -9506,6 +9529,9 @@ function journalEvictConvoInput(session) {
 async function approvePlanBuild(session, { sendHtml }) {
   const toolUseId = session.pendingPlanDenialId;
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
+  // The tracker mirror closes as decided, whichever mode settles the plan
+  // below (lib/plan-approval-items.js); best-effort, never blocks the build.
+  void planItems.resolved(session, 'build');
 
   // Check if a tool_result already exists in the session history for this tool_use_id.
   // Claude CLI auto-generates a tool_result for permission denials, so sending another
@@ -9801,6 +9827,21 @@ const missionsHandlers = createMissionsHandlers({
   sessions,
   journalConvoIdFor,
   client: missionsClient,
+});
+
+// Plan approvals mirrored into the tracker (lib/plan-approval-items.js,
+// item #2317): the "📋 Plan Ready" card files a question the user can find
+// and answer from the Decisions list; build / timeout / a newer plan close
+// it. The item id persists next to pendingPlanDenialId so a restart can
+// still close it.
+const planItems = createPlanApprovalItems({
+  items: itemsClient,
+  journalConvoIdFor,
+  persist: (session, planItemId) => {
+    if (!session?.roomId || !session.claudeSessionId) return;
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { planItemId });
+  },
+  log: console,
 });
 
 // The three reminder_* tools (lib/reminder-tools.js): the agent-callable
@@ -10606,6 +10647,11 @@ const apiServer = createServer(async (req, res) => {
           pendingPlanDecisions.delete(tool_use_id);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ decision: 'deny', reason: 'timeout waiting for user' }));
+          // The plan is dead: its tracker mirror closes as cancelled
+          // (lib/plan-approval-items.js). The session may have been
+          // replaced meanwhile; whichever holds the room now owns the item.
+          const holder = sessions.get(target.roomId);
+          if (holder) void planItems.resolved(holder, 'timeout');
         }, PLAN_DECISION_TIMEOUT_MS);
         pendingPlanDecisions.set(tool_use_id, {
           resolve: ({ decision, reason }) => {
