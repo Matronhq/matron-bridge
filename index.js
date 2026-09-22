@@ -1658,6 +1658,15 @@ function journalFlushForSession(session) {
   }
 }
 
+// Room card for a root-downgraded spawn (lib/permission-prompt.js
+// guardRootBypass). Must run after the session is in `sessions`: sendToRoom
+// mirrors into the journal via sessions.get(roomId) and drops the notice for
+// a room with no live entry.
+function postRootBypassWarning(roomId) {
+  const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
+  Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
@@ -1752,11 +1761,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Root guard: the session's persisted choice stays as requested; only the
   // spawn args downgrade (see guardRootBypass).
   const { bypass: bypassMode, downgraded: rootDowngraded } = guardRootBypass(requestedBypassMode);
-  if (rootDowngraded) {
-    console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
-    const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
-    Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
-  }
+  if (rootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   let showFileToken;
@@ -2155,6 +2160,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
   journalSeedTitle(session, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
   journalSpawnStatus(session);
+  // The root-downgrade card goes out only now: sendToRoom journals through
+  // sessions.get(roomId), which is empty until the sessions.set above, so a
+  // fresh !start / RPC start / recreateSession spawn would drop it.
+  if (rootDowngraded) postRootBypassWarning(roomId);
   return session;
 }
 
@@ -2675,11 +2684,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // on the bypass flag) they fall back to auto mode, whose TUI permission
   // prompts lib/prompt-detector.js already surfaces as Matron yes/no cards.
   const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
-  if (ivRootDowngraded) {
-    console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
-    const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
-    Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
-  }
+  if (ivRootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     ...(ivBypass ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'auto']),
@@ -3074,6 +3079,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   if (resumeSessionId && session.planItemId) void planItems.reconcileRestored(session);
   // Subagent activity watcher — see createSession() for the rationale.
   setupSubagentWatcher(session, cwd, sessionId);
+  // After sessions.set for the same reason as in createSession.
+  if (ivRootDowngraded) postRootBypassWarning(roomId);
   return session;
 }
 
