@@ -26,7 +26,7 @@ function makeStore() {
   const store = createPlanApprovalItems({
     items,
     journalConvoIdFor: (session) => session.convoId ?? null,
-    persist: (session, planItemId) => persisted.push({ roomId: session.roomId, planItemId }),
+    persist: (session, planItemId, planToolUseId) => persisted.push({ roomId: session.roomId, planItemId, ...(planToolUseId !== undefined ? { planToolUseId } : {}) }),
     log: { warn() {} },
   });
   return { items, store, persisted };
@@ -63,7 +63,7 @@ describe('opened', () => {
     expect(body.body).toContain(PLAN);
     expect(opts?.idemKey).toBeTruthy();
     expect(session.planItemId).toBe('it_41');
-    expect(persisted).toEqual([{ roomId: 'r1', planItemId: 'it_41' }]);
+    expect(persisted.at(-1)).toMatchObject({ roomId: 'r1', planItemId: 'it_41' });
   });
 
   it('a newer plan supersedes the open one: the old item closes as cancelled first', async () => {
@@ -82,7 +82,7 @@ describe('opened', () => {
     items.create = async () => { throw new Error('boom'); };
     const session = { roomId: 'r1', convoId: 'c1' };
     expect(await store.opened(session, PLAN)).toBeNull();
-    expect(session.planItemId).toBeUndefined();
+    expect(session.planItemId).toBeFalsy();
   });
 });
 
@@ -94,11 +94,11 @@ describe('resolved', () => {
     await store.resolved(s1, 'build');
     expect(items.calls.close.at(-1)).toEqual({ id: 'it_41', body: { resolution: 'decided', comment: expect.stringMatching(/approved/i) } });
     expect(s1.planItemId).toBeNull();
-    expect(persisted.at(-1)).toEqual({ roomId: 'r1', planItemId: null });
+    expect(persisted.at(-1)).toMatchObject({ roomId: 'r1', planItemId: null });
     const s2 = { roomId: 'r2', convoId: 'c2' };
     await store.opened(s2, PLAN);
     await store.resolved(s2, 'timeout');
-    expect(items.calls.close.at(-1)).toEqual({ id: 'it_42', body: { resolution: 'cancelled', comment: expect.stringMatching(/timed out|without an answer/i) } });
+    expect(items.calls.close.at(-1)).toEqual({ id: 'it_42', body: { resolution: 'cancelled', comment: expect.stringMatching(/approval window closed/i) } });
   });
 
   it('is a no-op with nothing open, and swallows a journal failure', async () => {
@@ -125,5 +125,80 @@ describe('isBuildReply', () => {
     expect(store.isBuildReply(session, marker({ comment: { body: 'build it later' } }))).toBe(false);
     expect(store.isBuildReply({ ...session, planItemId: null }, marker())).toBe(false);
     expect(store.isBuildReply(session, null)).toBe(false);
+  });
+});
+
+// --- Review round: the item is tied to the hook's tool_use_id ---------------
+
+describe('ownership by tool_use_id', () => {
+  it('opened records the hook id and keys idempotency on it; a resolve for another hook is a no-op', async () => {
+    const { items, store, persisted } = makeStore();
+    const session = { roomId: 'r1', convoId: 'c1' };
+    await store.opened(session, PLAN, { toolUseId: 'tu_A' });
+    expect(items.calls.create[0].opts.idemKey).toBe('plan:r1:tu_A');
+    expect(session.planToolUseId).toBe('tu_A');
+    expect(persisted.at(-1)).toEqual({ roomId: 'r1', planItemId: 'it_41', planToolUseId: 'tu_A' });
+    await store.resolved(session, 'timeout', { toolUseId: 'tu_STALE' });
+    expect(items.calls.close).toHaveLength(0);
+    expect(session.planItemId).toBe('it_41');
+    await store.resolved(session, 'timeout', { toolUseId: 'tu_A' });
+    expect(items.calls.close).toHaveLength(1);
+    expect(session.planItemId).toBeNull();
+    expect(session.planToolUseId).toBeNull();
+  });
+
+  it('a resolve that lands while the create is still in flight closes the fresh item instead of remembering it', async () => {
+    const { items, store } = makeStore();
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const realCreate = items.create;
+    items.create = async (...args) => { await gate; return realCreate(...args); };
+    const session = { roomId: 'r1', convoId: 'c1' };
+    const opening = store.opened(session, PLAN, { toolUseId: 'tu_A' });
+    await store.resolved(session, 'build', { toolUseId: 'tu_A' });
+    release();
+    await opening;
+    expect(session.planItemId).toBeNull();
+    expect(items.calls.close).toEqual([{ id: 'it_41', body: { resolution: 'cancelled', comment: expect.stringMatching(/settled/i) } }]);
+  });
+});
+
+describe('reconcileRestored', () => {
+  it('closes a restored item whose plan cannot be built any more (iv-mode: the hook died with the process)', async () => {
+    const { items, store } = makeStore();
+    const session = { roomId: 'r1', convoId: 'c1', planItemId: 'it_9', planToolUseId: 'tu_A', pendingPlanDenialId: null };
+    await store.reconcileRestored(session);
+    expect(items.calls.close).toEqual([{ id: 'it_9', body: { resolution: 'cancelled', comment: expect.stringMatching(/restart/i) } }]);
+    expect(session.planItemId).toBeNull();
+  });
+  it('keeps a restored item whose plan can still be built (print-mode: the denial id came back with it)', async () => {
+    const { items, store } = makeStore();
+    const session = { roomId: 'r1', convoId: 'c1', planItemId: 'it_9', planToolUseId: 'tu_A', pendingPlanDenialId: 'tu_A' };
+    await store.reconcileRestored(session);
+    expect(items.calls.close).toHaveLength(0);
+    expect(session.planItemId).toBe('it_9');
+  });
+});
+
+describe('consumedReply', () => {
+  it('a build comment that approved the plan is remembered, so a replay of it is not a turn either', () => {
+    const { store } = makeStore();
+    const session = { roomId: 'r1', convoId: 'c1', planItemId: 'it_41', planToolUseId: 'tu_A' };
+    const marker = { item_id: 'it_41', action: 'commented', by: 'user', comment: { id: 'ic_1', body: 'build' } };
+    expect(store.consumedReply(marker)).toBe(false);
+    expect(store.isBuildReply(session, marker)).toBe(true);
+    expect(store.consumedReply(marker)).toBe(true);
+    expect(store.consumedReply({ ...marker, comment: { id: 'ic_2', body: 'build' } })).toBe(false);
+  });
+});
+
+describe('formatPlanItemBody, review round', () => {
+  it('puts how-to-answer before the plan, and closes a fence the cut left open', () => {
+    const plan = '```\n' + 'x'.repeat(PLAN_BODY_MAX + 10) + '\n```';
+    const body = formatPlanItemBody({ plan });
+    expect(body.indexOf('reply `build`')).toBeLessThan(body.indexOf('xxxx'));
+    const fences = (body.match(/```/g) || []).length;
+    expect(fences % 2).toBe(0);
+    expect(body).toMatch(/truncated/i);
   });
 });

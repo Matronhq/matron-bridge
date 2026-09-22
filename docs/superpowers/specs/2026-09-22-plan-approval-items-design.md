@@ -28,15 +28,28 @@ bridge knows about it. The Decisions list is where the user looks.
   persisted next to `pendingPlanDenialId` so a restart can still close
   it). An open plan item is closed as cancelled ("Replaced by a newer
   plan.") first, so one session has at most one open plan item.
-- **resolved(session, 'build' | 'timeout')** — `approvePlanBuild` (build
-  in the conversation or on the item) closes it `decided`; the iv-mode
-  hook timeout closes it `cancelled`.
+- **Tied to the hook.** The item is remembered with the ExitPlanMode
+  `tool_use_id` it belongs to (`session.planToolUseId`, persisted with the
+  item id, also the idempotency key). A settle names its hook, so a stale
+  iv-mode timer that outlives a restart can never close a newer plan's
+  item; a settle that lands while the item is still being filed closes the
+  fresh item instead of remembering it.
+- **resolved(session, 'build' | 'timeout', { toolUseId })** —
+  `approvePlanBuild` (build in the conversation or on the item) closes it
+  `decided`; the iv-mode hook timeout closes it `cancelled`.
+- **reconcileRestored(session)** — after a restart restored `planItemId`
+  with no `pendingPlanDenialId` (iv-mode: the hook died with the old
+  process and the plan can never be built), the item closes `cancelled`
+  ("restarted") instead of lingering as an unanswerable question.
+  Print-mode persists the denial id and keeps working across restarts.
 - **isBuildReply(session, marker)** — `journalOnItem` runs it before
   routing an item marker: the user's own `build` comment on this session's
   open plan item approves the plan through `approvePlanBuild`, gated on
   the same pending-plan predicate `dispatchPlanBuild` uses, instead of
-  becoming a "📌 dan replied: build" turn. Any other reply on the item
-  routes as it always did (feedback reaches the agent as a turn).
+  becoming a "📌 dan replied: build" turn; a journal replay of a build
+  comment already acted on (`consumedReply`) is dropped too. Any other
+  reply on the item routes as it always did (feedback reaches the agent as
+  a turn).
 
 Feedback in the conversation does not close the item: the plan is still
 pending in the session's own state until `build`, a timeout, or a revised

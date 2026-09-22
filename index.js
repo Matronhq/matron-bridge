@@ -1898,6 +1898,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pendingPlan: null,
     pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
     planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
     sendHtml: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
@@ -2132,6 +2133,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // the parent's stream emits a Task tool_use. The watcher object is cheap
   // to construct; it doesn't poll until the first Task fires.
   sessions.set(roomId, session);
+  // A plan item restored with this session may belong to a hook that died
+  // with the old process (lib/plan-approval-items.js reconcileRestored).
+  if (resumeSessionId && session.planItemId) void planItems.reconcileRestored(session);
   if (session.claudeSessionId) {
     setupSubagentWatcher(session, cwd, session.claudeSessionId);
   }
@@ -2193,6 +2197,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     pendingPlan: null,
     pendingPlanDenialId: null,
     planItemId: null,
+    planToolUseId: null,
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
@@ -2724,6 +2729,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pendingPlan: null,
     pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
     planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
@@ -3028,10 +3034,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       session.sendHtml(plainPlan, htmlPlan);
       // The card's mirror in the tracker (lib/plan-approval-items.js): a
       // question the user can find and answer from the Decisions list.
-      void planItems.opened(session, planText || '');
+      void planItems.opened(session, planText || '', { toolUseId });
     } else if (session.sendCallback) {
       session.sendCallback(plainPlan);
-      void planItems.opened(session, planText || '');
+      void planItems.opened(session, planText || '', { toolUseId });
     } else {
       // No output channel yet — auto-deny so the hook unblocks.
       const pending = pendingPlanDecisions.get(toolUseId);
@@ -3040,6 +3046,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   };
 
   sessions.set(roomId, session);
+  // A plan item restored with this session may belong to a hook that died
+  // with the old process (lib/plan-approval-items.js reconcileRestored).
+  if (resumeSessionId && session.planItemId) void planItems.reconcileRestored(session);
   // Subagent activity watcher — see createSession() for the rationale.
   setupSubagentWatcher(session, cwd, sessionId);
   return session;
@@ -4421,7 +4430,7 @@ function handleClaudeEvent(session, event) {
           session.sendCallback(plainPlan);
         }
         // The card's mirror in the tracker (lib/plan-approval-items.js).
-        void planItems.opened(session, planText);
+        void planItems.opened(session, planText, { toolUseId: planDenial.tool_use_id });
       }
 
       // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
@@ -8307,6 +8316,7 @@ function journalOnItem(session, item, ctx) {
   // plan through the one shared path instead of handing the agent a
   // "📌 dan replied: build" turn it cannot act on. Same pending-plan gate
   // dispatchPlanBuild applies, so a stale item can never trigger a build.
+  if (planItems.consumedReply(item?.payload)) return; // a replay of a build already acted on
   const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
   if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
     const cmdCtx = journalSessionCommandCtx(session);
@@ -9531,7 +9541,7 @@ async function approvePlanBuild(session, { sendHtml }) {
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
   // The tracker mirror closes as decided, whichever mode settles the plan
   // below (lib/plan-approval-items.js); best-effort, never blocks the build.
-  void planItems.resolved(session, 'build');
+  void planItems.resolved(session, 'build', { toolUseId: session.ivPendingPlanToolUseId || toolUseId || null });
 
   // Check if a tool_result already exists in the session history for this tool_use_id.
   // Claude CLI auto-generates a tool_result for permission denials, so sending another
@@ -9837,9 +9847,9 @@ const missionsHandlers = createMissionsHandlers({
 const planItems = createPlanApprovalItems({
   items: itemsClient,
   journalConvoIdFor,
-  persist: (session, planItemId) => {
+  persist: (session, planItemId, planToolUseId) => {
     if (!session?.roomId || !session.claudeSessionId) return;
-    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { planItemId });
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { planItemId, planToolUseId });
   },
   log: console,
 });
@@ -10651,7 +10661,7 @@ const apiServer = createServer(async (req, res) => {
           // (lib/plan-approval-items.js). The session may have been
           // replaced meanwhile; whichever holds the room now owns the item.
           const holder = sessions.get(target.roomId);
-          if (holder) void planItems.resolved(holder, 'timeout');
+          if (holder) void planItems.resolved(holder, 'timeout', { toolUseId: tool_use_id });
         }, PLAN_DECISION_TIMEOUT_MS);
         pendingPlanDecisions.set(tool_use_id, {
           resolve: ({ decision, reason }) => {
