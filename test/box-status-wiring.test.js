@@ -33,5 +33,9 @@ describe('box status wiring', () => {
     const shutdown = index.slice(index.indexOf('async function gracefulShutdown('), index.indexOf('async function gracefulShutdown(') + 1200);
     // Before the sessions are killed, so `activity` still describes what ran.
     expect(shutdown).toMatch(/publishBoxStatus\('shutdown'\);\n\s*stopCpuSampler\(\);\n\s*for \(const \[, session\] of sessions\) \{\n\s*killSession\(session\);/);
+    // ...and the publisher flush that waits for the room-op write to be
+    // confirmed (lib/journal-publisher.js sendRoomOp/flush) still runs after
+    // it, before process.exit — otherwise the report races the exit.
+    expect(shutdown).toMatch(/publishBoxStatus\('shutdown'\);[\s\S]*?await journalPublisher\.flush\(\{ timeoutMs: FLUSH_TIMEOUT_MS \}\);[\s\S]*?process\.exit\(0\);/);
   });
 });
