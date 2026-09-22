@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
@@ -124,6 +124,7 @@ import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
+import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
@@ -336,6 +337,14 @@ function mcpConfigPathFor(extras = []) {
 // disk by the time any session spawns. Per-extras variants are generated
 // lazily on first use.
 mcpConfigPathFor([]);
+// Every server a session of this bridge can be running — the always-on set
+// and each extras group, local overlay included — resolved exactly as the
+// spawn resolves them (absolute paths, macify). The idle reaper uses these
+// to tell claude's own MCP servers from work in flight (lib/work-hold.js).
+const MCP_SERVER_SIGNATURES = mcpServerSignatures(
+  [[], ...KNOWN_MCP_EXTRAS.map((ex) => [ex])].flatMap((extras) =>
+    Object.values(buildMcpServers({ baseConfig: RAW_MCP_CONFIG, extras, askUserBaseDir: __dirname }).config.mcpServers)),
+);
 // Drop (and warn about) any machine default that names an extra no config block
 // defines. buildMcpServers would silently ignore it at spawn time, so filtering
 // here keeps /start and /restart from advertising an extra that never loads.
@@ -8655,14 +8664,31 @@ async function fireTimer(record) {
 // from what is on disk; failures are logged, never thrown — the timers
 // themselves were already persisted and a missing marker only means the
 // box may sleep, which is the default anyway.
+// Work in flight leases the same marker (lib/work-hold.js, 2026-09-21): the
+// idle reaper sets workHoldUntil/workHoldSessions once per tick and rewrites
+// the file through refreshKeepAwakeMarker, so a session mid-turn or with a
+// live background job keeps the box up even if its load dips below the
+// probe's threshold. The two sources share one writer: a timer save cannot
+// forget the work lease, a reaper tick cannot forget the reminders.
+let workHoldUntil = 0;
+let workHoldSessions = 0;
+
 function writeKeepAwakeMarker(timers) {
+  writeKeepAwake(keepAwakeMarker(timers));
+}
+
+function refreshKeepAwakeMarker() {
+  writeKeepAwake(timerStore.holdAwakeMarker());
+}
+
+function writeKeepAwake(marker) {
   try {
-    const marker = keepAwakeMarker(timers);
-    if (!marker) {
+    const until = keepAwakeUntil({ timerUntil: marker?.until ?? null, workUntil: workHoldUntil });
+    if (!until) {
       fs.rmSync(KEEPAWAKE_FILE, { force: true });
       return;
     }
-    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ ...marker, updatedAt: Date.now() }, null, 2));
+    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ until, reminders: marker?.reminders ?? 0, work: workHoldSessions, updatedAt: Date.now() }, null, 2));
   } catch (e) {
     try { console.warn(`[timer] keep-awake marker update failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -11250,14 +11276,61 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   }
 }
 
+// The claude child's pid for every session shape: print mode (child_process),
+// interactive mode (node-pty handle), codex (its own spawn wrapper).
+function sessionChildPid(session) {
+  const pid = session.proc?.pid ?? session.iv?.pty?.pid ?? session.codex?.child?.pid ?? null;
+  return Number.isInteger(pid) ? pid : null;
+}
+
+// `ps` rather than /proc so the same call works on the macOS bridges. Fails
+// closed to an empty table: with no table there are no work children, and
+// the idle clock rules as it did before — never the other way round.
+function readProcessTable() {
+  try {
+    return parseProcessTable(execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 }));
+  } catch (e) {
+    debug(`readProcessTable failed: ${e.message}`);
+    return [];
+  }
+}
+
+// {reason} when this session has work in flight (a turn running, or a live
+// descendant of its claude process that is not one of its configured MCP
+// servers — a tool call, a background task), null when the idle clock
+// should rule. See lib/work-hold.js.
+function sessionWorkHold(session, last, now, table) {
+  return workHold({
+    busy: !!session.busy,
+    children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
+    idleSince: last,
+    now,
+  });
+}
+
 function startIdleReaper() {
   setInterval(() => {
     const now = Date.now();
+    // Read the process table at most once per tick, and only if some session
+    // has actually passed the idle timeout — most ticks never get that far.
+    let table = null;
+    const processTable = () => (table ??= readProcessTable());
+    let held = 0;
     for (const [roomId, session] of sessions) {
       if (!session.alive) continue;
       if (session._autoStopped) continue;
       const last = session.lastActivityAt || session.startedAt || 0;
       if (now - last < SESSION_IDLE_TIMEOUT_MS) continue;
+      // Work in flight is not idle (lib/work-hold.js): a turn still running,
+      // or a background job the agent started — a colleague's hour-plus rake
+      // test was cut off here at the 60-minute mark (Dan, 2026-09-21).
+      // Bounded at WORK_HOLD_MAX_MS from the last activity inside workHold.
+      const hold = sessionWorkHold(session, last, now, processTable());
+      if (hold) {
+        held += 1;
+        debug(`Not reaping ${roomId}: ${hold.reason}`);
+        continue;
+      }
       // A pending hold-awake reminder (reminder_create hold_awake: true) is
       // the agent saying the work in between must not be interrupted — the
       // box stays up for it (KEEPAWAKE_FILE), and so does the session.
@@ -11287,6 +11360,12 @@ function startIdleReaper() {
         journalEvictConvoInput(session);
       }
     }
+    // Lease the host-side keep-awake marker for the held sessions; a lease
+    // is re-issued every tick and lapses on its own when nothing holds, so a
+    // crashed bridge cannot pin the box.
+    workHoldUntil = held > 0 ? now + WORK_HOLD_LEASE_MS : 0;
+    workHoldSessions = held;
+    refreshKeepAwakeMarker();
   }, SESSION_IDLE_CHECK_MS).unref();
 }
 
