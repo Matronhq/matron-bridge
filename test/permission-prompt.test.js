@@ -102,14 +102,18 @@ describe('renderPermissionCard', () => {
 });
 
 describe('permissionSpawnArgs', () => {
-  it('default: auto mode plus the prompt tool', () => {
+  it('default: auto mode, the prompt tool, and no on-disk settings sources (bridge decides)', () => {
     expect(permissionSpawnArgs(false)).toEqual([
       '--permission-mode', 'auto',
       '--permission-prompt-tool', 'mcp__ask-user__permission_request',
+      // Empty --setting-sources: the CLI resolves no user/project/local rules
+      // itself, so every gated MCP call reaches the prompt tool and the bridge
+      // classifier is the deciding layer.
+      '--setting-sources', '',
     ]);
   });
 
-  it('bypass: the old skip-permissions flag', () => {
+  it('bypass: the old skip-permissions flag, no setting-sources override', () => {
     expect(permissionSpawnArgs(true)).toEqual(['--dangerously-skip-permissions']);
   });
 });
@@ -340,6 +344,7 @@ describe('guardRootBypass', () => {
     expect(permissionSpawnArgs(bypass)).toEqual([
       '--permission-mode', 'auto',
       '--permission-prompt-tool', 'mcp__ask-user__permission_request',
+      '--setting-sources', '',
     ]);
   });
 });

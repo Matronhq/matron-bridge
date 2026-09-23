@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   decidePermissionOutcome,
+  resolvePermissionRequest,
+  classifyPermissionPostResponse,
   listSessionGrants,
   revokeSessionGrant,
   DENY_MESSAGE,
@@ -73,11 +75,88 @@ describe('decidePermissionOutcome — classifier → POST /permission-request re
   });
 
   it('integrates with buildPermissionSnapshot output shape', () => {
-    // buildPermissionSnapshot() with no source files returns just the baseline
-    // (no mcp allow/deny/ask beyond the default show-file entry) → any webflow
-    // tool is default-gated → card.
+    // buildPermissionSnapshot() with no source files returns an empty snapshot
+    // (no mcp allow/deny/ask) → any webflow tool is default-gated → card.
     const snap = buildPermissionSnapshot({ sourcePaths: [] });
     expect(decidePermissionOutcome(snap, 'mcp__webflow__pages_get').kind).toBe('card');
+  });
+});
+
+// The route-level decision sequence the POST /permission-request handler runs
+// (index.js calls resolvePermissionRequest, then writes the HTTP response / fires
+// the deny notice / mints the card off its result). These lock the ORDERING —
+// the session grant short-circuits BEFORE the classifier — which the handler
+// depends on and which a parallel inline copy could silently drift from.
+describe('resolvePermissionRequest — POST /permission-request handler sequence', () => {
+  it('a session "Always allow" grant short-circuits to a silent allow before the classifier', () => {
+    // The classifier would DENY this tool, but the live grant wins: the handler
+    // must never card/deny a tool the user already granted for the session.
+    const snap = snapshot({ deny: ['mcp__webflow__pages_delete'] });
+    const out = resolvePermissionRequest({
+      permAllowedTools: new Set(['mcp__webflow__pages_delete']),
+      snapshot: snap,
+      toolName: 'mcp__webflow__pages_delete',
+    });
+    expect(out.kind).toBe('allow');
+    expect(out.body).toEqual({ behavior: 'allow' });
+    expect(out.source).toBe('grant');
+  });
+
+  it('with no grant, defers to the classifier: allow rule → silent allow (not a grant)', () => {
+    const snap = snapshot({ allow: ['mcp__webflow__pages_get'] });
+    const out = resolvePermissionRequest({
+      permAllowedTools: new Set(),
+      snapshot: snap,
+      toolName: 'mcp__webflow__pages_get',
+    });
+    expect(out.kind).toBe('allow');
+    expect(out.source).toBeUndefined();
+  });
+
+  it('with no grant, a policy deny → deny + visible notice (with the stripped tool name)', () => {
+    const snap = snapshot({ deny: ['mcp__webflow__pages_delete'] });
+    const out = resolvePermissionRequest({
+      permAllowedTools: new Set(),
+      snapshot: snap,
+      toolName: 'mcp__webflow__pages_delete',
+    });
+    expect(out.kind).toBe('deny');
+    expect(out.body).toEqual({ behavior: 'deny', message: DENY_MESSAGE });
+    expect(out.notice).toContain('mcp__webflow__pages_delete');
+  });
+
+  it('with no grant, an undecided tool → card', () => {
+    const out = resolvePermissionRequest({
+      permAllowedTools: new Set(),
+      snapshot: snapshot(),
+      toolName: 'mcp__webflow__pages_get',
+    });
+    expect(out.kind).toBe('card');
+  });
+
+  it('a missing permAllowedTools set is treated as no grants (classifier decides)', () => {
+    const snap = snapshot({ allow: ['mcp__webflow__pages_get'] });
+    const out = resolvePermissionRequest({
+      permAllowedTools: undefined,
+      snapshot: snap,
+      toolName: 'mcp__webflow__pages_get',
+    });
+    expect(out.kind).toBe('allow');
+    expect(out.source).toBeUndefined();
+  });
+
+  it('the deny notice strips bidi control characters from the tool name', () => {
+    // Mirror the card path: a bidi-laden tool name must not display-spoof the
+    // room notice. U+202E (RLO) is dropped.
+    const evil = 'mcp__webflow__pages‮eteled';
+    const snap = snapshot({ deny: [evil] });
+    const out = resolvePermissionRequest({
+      permAllowedTools: new Set(),
+      snapshot: snap,
+      toolName: evil,
+    });
+    expect(out.kind).toBe('deny');
+    expect(out.notice).not.toContain('‮');
   });
 });
 
@@ -113,5 +192,42 @@ describe('session grant helpers (!permissions list + revoke; Always-allow write 
   it('revokeSessionGrant is a safe no-op on a missing Set or bad name', () => {
     expect(revokeSessionGrant(undefined, 'mcp__x__y')).toBe(false);
     expect(revokeSessionGrant(new Set(), 42)).toBe(false);
+  });
+});
+
+// The ask-user permission_request tool's mapping of the bridge's POST response
+// to its immediate action (allow / deny / poll). This is the ask-user.js deny
+// branch: a classifier policy deny the bridge decided without a card. ask-user.js
+// registers its MCP server on import, so the mapping is extracted here to be
+// testable in isolation.
+describe('classifyPermissionPostResponse — ask-user tool response mapping', () => {
+  it('behavior:allow → allow (grant or classifier silent-allow, no card)', () => {
+    expect(classifyPermissionPostResponse({ behavior: 'allow' })).toEqual({ action: 'allow' });
+  });
+
+  it('behavior:deny → deny with the bridge message (the ask-user deny branch)', () => {
+    expect(classifyPermissionPostResponse({ behavior: 'deny', message: 'blocked by policy' }))
+      .toEqual({ action: 'deny', message: 'blocked by policy' });
+  });
+
+  it('behavior:deny with no message falls back to the standard DENY_MESSAGE', () => {
+    expect(classifyPermissionPostResponse({ behavior: 'deny' }))
+      .toEqual({ action: 'deny', message: DENY_MESSAGE });
+  });
+
+  it('a minted card (valid requestId, no behavior) → poll', () => {
+    expect(classifyPermissionPostResponse({ requestId: 'ab'.repeat(4) }))
+      .toEqual({ action: 'poll', requestId: 'ab'.repeat(4) });
+  });
+
+  it('fail-closed: a missing/empty request id with no verdict → deny', () => {
+    expect(classifyPermissionPostResponse({}).action).toBe('deny');
+    expect(classifyPermissionPostResponse({ requestId: '' }).action).toBe('deny');
+    expect(classifyPermissionPostResponse({ requestId: 42 }).action).toBe('deny');
+  });
+
+  it('fail-closed: a malformed (non-object) response → deny', () => {
+    expect(classifyPermissionPostResponse(null).action).toBe('deny');
+    expect(classifyPermissionPostResponse('nope').action).toBe('deny');
   });
 });

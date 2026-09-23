@@ -116,7 +116,7 @@ import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, decidePermissionOutcome, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
@@ -10367,19 +10367,18 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'No session for roomId' }));
           return;
         }
-        // Session-allowlisted (an earlier "Always allow" tap): short-circuit,
-        // no card.
-        if (permSession.permAllowedTools?.has(toolName)) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ behavior: 'allow' }));
-          return;
-        }
-        // Policy classifier (spawn-time snapshot). Runs AFTER the allowlist
-        // short-circuit, BEFORE the card mint. allow → silent allow (same tier
-        // as the allowlist above); deny → immediate deny + a visible room notice
-        // so a policy block isn't silent; anything else (ask / default-gated /
-        // uncertain) falls through to the card mint below, unchanged.
-        const outcome = decidePermissionOutcome(permSession.permissionSnapshot, toolName);
+        // Decision sequence (extracted to resolvePermissionRequest for
+        // route-level testing): an "Always allow (session)" grant short-circuits
+        // to a silent allow BEFORE the classifier; otherwise the classifier
+        // (spawn-time snapshot) decides — allow → silent allow; deny → immediate
+        // deny + a visible room notice so a policy block isn't silent; anything
+        // else (ask / default-gated / uncertain) falls through to the card mint
+        // below, unchanged.
+        const outcome = resolvePermissionRequest({
+          permAllowedTools: permSession.permAllowedTools,
+          snapshot: permSession.permissionSnapshot,
+          toolName,
+        });
         if (outcome.kind === 'allow') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(outcome.body));

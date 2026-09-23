@@ -192,7 +192,12 @@ describe('permission snapshot', () => {
     const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
       cwd: path.resolve('.'),
       encoding: 'utf8',
-      timeout: 1000,
+      // Generous ceiling, not a performance assertion: buildPermissionSnapshot
+      // rejects a non-regular file via fstat before any read, so this returns
+      // promptly. A 1 s cap flaked under load (node startup + ESM load alone can
+      // exceed it); 30 s still catches a genuine regression that blocks on the
+      // FIFO read while never tripping on a busy CI host.
+      timeout: 30000,
     });
 
     expect(result.error).toBeUndefined();
@@ -274,9 +279,14 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
 
-  it('includes the bridge print-mode MCP permission in every snapshot', () => {
+  it('is empty and certain when no sources are given', () => {
     const snapshot = buildPermissionSnapshot({ sourcePaths: [] });
 
-    expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('allow');
+    expect(snapshot.mcpAllow).toEqual([]);
+    expect(snapshot.mcpDeny).toEqual([]);
+    expect(snapshot.mcpAsk).toEqual([]);
+    expect(snapshot.uncertain).toBe(false);
+    // No hardcoded default grant: an unknown tool is default-gated (fail-closed).
+    expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('default-gated');
   });
 });
