@@ -8502,7 +8502,14 @@ async function journalOnCoordinator(convoId, { role }) {
   // while the journal answered.
   const session = findSessionByClaudeSessionId(convoId);
   const live = !!(session && session.alive);
-  const verdict = decideCoordinatorEvent({ role, convoId, truth, live, sessionCoordinator: !!session?.coordinator });
+  const verdict = decideCoordinatorEvent({
+    role,
+    convoId,
+    truth,
+    live,
+    sessionCoordinator: !!session?.coordinator,
+    pendingRole: session?._coordinatorPending ?? null,
+  });
   if (verdict === 'stale') {
     console.warn(`[coordinator] ignoring ${role} for ${convoId}: the journal says the Coordinator is ${truth.convoId ?? 'nobody'}`);
     return;
@@ -8534,8 +8541,21 @@ async function journalOnCoordinator(convoId, { role }) {
       next.currentModel = plan.model;
       persistSession(roomId, next.claudeSessionId, next.workdir, next.originRoomId, { model: plan.model, modelExplicit: false });
     }
-  } else if (plan.action === 'switch-model-live') {
-    applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });
+  } else {
+    // Busy: the role can only apply at a spawn. Record it as pending (a
+    // replay of this event during the turn is then 'none', not a second
+    // turn) and get a spawn at turn end through the deferred-command slot
+    // dispatchDeferredCommand replays — which also carries the queued turn
+    // below onto the replacement. A print-mode model switch parks a
+    // `!model … --implicit` there (itself a respawn); a slot the user already
+    // filled (/model, /restart) also ends in recreateSession, so it is kept.
+    // The replacement is a new session object built by createSession, which
+    // reads the role from the cache, so the pending mark is not carried.
+    if (plan.action === 'switch-model-live') {
+      applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });
+    }
+    session._coordinatorPending = role;
+    if (!session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
   await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));
 }

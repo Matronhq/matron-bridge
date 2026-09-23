@@ -342,3 +342,37 @@ describe('withCoordinatorModel', () => {
     expect(withCoordinatorModel({ workdir: '/w' })).toEqual({ workdir: '/w', model: 'opus[1m]', modelExplicit: false });
   });
 });
+
+describe('decideCoordinatorEvent — fix round 1', () => {
+  it('back-to-back events with the real lookup: the superseded one is stale, the latest transitions', async () => {
+    const { fetchImpl } = fakeFetch(() => new Promise((resolve) => setTimeout(() => resolve({ status: 200, body: { convo_id: 'B' } }), 20)));
+    const l = createCoordinatorLookup({ baseUrl: 'https://j', token: 't', fetchImpl, log: recordingLog().log });
+    const handle = async (convoId, role) => {
+      l.apply(convoId, role);
+      const truth = await l.refresh({ force: true });
+      return decideCoordinatorEvent({ role, convoId, truth, live: true, sessionCoordinator: false });
+    };
+    const [a, b] = await Promise.all([handle('A', 'assigned'), handle('B', 'assigned')]);
+    expect(a).toBe('stale');
+    expect(b).toBe('transition');
+  });
+
+  it('not fetched but known: judged against the cache snapshot, which already reflects later events', () => {
+    const stale = { fetched: false, known: true, convoId: 'B' };
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'A', truth: stale, live: true, sessionCoordinator: false })).toBe('stale');
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'B', truth: stale, live: true, sessionCoordinator: true })).toBe('stale');
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'B', truth: stale, live: true, sessionCoordinator: false })).toBe('transition');
+  });
+
+  it('only an entirely unknown role trusts the event outright', () => {
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'A', truth: { fetched: false, known: false, convoId: null }, live: true, sessionCoordinator: true })).toBe('transition');
+  });
+
+  it('a role already pending on a busy session is not repeated (replay during a long turn)', () => {
+    const truth = { fetched: true, known: true, convoId: 'a' };
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'a', truth, live: true, sessionCoordinator: false, pendingRole: 'assigned' })).toBe('none');
+    // a pending role outranks the spawn-time flag, both ways
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'a', truth: { fetched: true, known: true, convoId: null }, live: true, sessionCoordinator: false, pendingRole: 'assigned' })).toBe('transition');
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'a', truth: { fetched: true, known: true, convoId: null }, live: true, sessionCoordinator: true, pendingRole: 'released' })).toBe('none');
+  });
+});

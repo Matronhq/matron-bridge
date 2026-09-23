@@ -139,3 +139,17 @@ describe('live coordinator events (source inspection)', () => {
     expect(fn).toContain('sendTextToSession(session, text, { skipJournalMirror: true })');
   });
 });
+
+describe('live coordinator events — busy session (fix round 1)', () => {
+  it('a busy session records the pending role, the decision reads it, and a restart is parked when the slot is free', () => {
+    const fn = body('async function journalOnCoordinator(', '\nfunction ');
+    expect(fn).toContain('pendingRole: session?._coordinatorPending ?? null,');
+    expect(fn).toContain('session._coordinatorPending = role;');
+    expect(fn).toContain("if (!session._deferredCommandText) session._deferredCommandText = '!restart --force';");
+  });
+
+  it('recreateSession does not carry the pending role onto the replacement (the spawn applies it)', () => {
+    const fn = body('function recreateSession(', '\nfunction ');
+    expect(fn).not.toContain('_coordinatorPending');
+  });
+});
