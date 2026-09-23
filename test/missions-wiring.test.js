@@ -70,7 +70,7 @@ describe('missions wiring', () => {
   it('the prompts promise only the inheritance the journal actually wires, and idempotency-key REUSE', () => {
     // Only conversations with a parent_convo_id inherit; a box spawned via
     // agent_session_start does not, so the prompt must not imply it does.
-    expect(claudeMd).toContain("Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not — put the mission number in its task and have it `mission_join #N`.");
+    expect(claudeMd).toContain("Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not, unless you pass `mission: N` — then it is on mission #N from its first turn.");
     expect(claudeMd).not.toMatch(/A spawned session inherits its parent's mission/);
     expect(codexMd).toMatch(/Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not/);
     // A fresh uuid per attempt defeats the whole point of the header.
@@ -89,5 +89,13 @@ describe('missions wiring', () => {
     expect(fn).toMatch(/name === 'start' \|\| name === 'post' \|\| name === 'create'/);
     expect(askUser).toMatch(/import \{[^}]*\bformatCreateAck\b[^}]*\} from '\.\/lib\/missions-format\.js'/);
     expect(askUser).toContain("create: 'mission_create'");
+  });
+
+  it('both prompt files teach mission_create and the agent_session_start mission param', () => {
+    expect(claudeMd).toMatch(/`mission_create` creates a mission without joining this conversation to it/);
+    expect(claudeMd).toMatch(/`agent_session_start` .*`mission: N`/);
+    expect(codexMd).toMatch(/`mission_create`/);
+    expect(codexMd).toMatch(/`mission: N`/);
+    expect(codexMd).toMatch(/"attach":false/);
   });
 });
