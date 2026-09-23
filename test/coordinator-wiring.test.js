@@ -172,3 +172,16 @@ describe('live coordinator events — occupied but not busy (fix round 2)', () =
     expect(fn).toMatch(/else if \(previousParked && !parkedByCoordinator\)/);
   });
 });
+
+describe('agent_session_start mission (source inspection)', () => {
+  const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
+  const tool = askUser.slice(askUser.indexOf("'agent_session_start',"), askUser.indexOf("'restart_session',"));
+  it('exposes an optional positive-integer mission and forwards it', () => {
+    expect(tool).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    expect(tool).toContain('async ({ device_id, workdir, task, topic, model, link, mission }) => {');
+    expect(tool).toContain('...(mission ? { mission } : {})');
+  });
+  it('the ack says the new session joins the mission', () => {
+    expect(tool).toContain('` The new session joins mission #${mission} from its first turn.`');
+  });
+});

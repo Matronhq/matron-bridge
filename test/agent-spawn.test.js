@@ -230,6 +230,50 @@ describe('createAgentSpawnHandlers', () => {
       const res = await handlers.sessionStart(good);
       expect(res.status).toBe(504);
     });
+
+    it('mission: sent as mission_num, echoed back; absent when not given', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.sessionStart({ ...good, mission: 64 });
+      expect(sent[0].mission_num).toBe(64);
+      expect('mission' in sent[0]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1' });
+      expect(await p).toEqual({ status: 200, body: { status: 'pending', spawn_id: 'row-1', mission_num: 64 } });
+      const p2 = handlers.sessionStart(good);
+      expect('mission_num' in sent[1]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[1].request_id, spawn_id: 'row-2' });
+      await p2;
+    });
+
+    it('mission must be a positive integer; nothing is sent otherwise', async () => {
+      const { handlers, sent } = mk();
+      for (const mission of [0, -1, 1.5, '64', true]) {
+        const r = await handlers.sessionStart({ ...good, mission });
+        expect(r.status).toBe(400);
+        expect(r.body.error).toMatch(/mission must be a positive integer/);
+      }
+      expect(sent).toHaveLength(0);
+      const nullOk = handlers.sessionStart({ ...good, mission: null });
+      expect('mission_num' in sent[0]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'r' });
+      await nullOk;
+    });
+
+    it('journal refusals no_mission / mission_closed become sentences the agent can act on', async () => {
+      const a = mk();
+      const p1 = a.handlers.sessionStart({ ...good, mission: 99 });
+      a.handlers.onOpError({ code: 'no_mission', ref: a.sent[0].request_id, detail: 'x' });
+      const r1 = await p1;
+      expect(r1.status).toBe(404);
+      expect(r1.body.error).toMatch(/no mission #99/);
+      expect(r1.body.error).toMatch(/nothing was sent to the user/);
+      const b = mk();
+      const p2 = b.handlers.sessionStart({ ...good, mission: 61 });
+      b.handlers.onOpError({ code: 'mission_closed', ref: b.sent[0].request_id, detail: 'x' });
+      const r2 = await p2;
+      expect(r2.status).toBe(409);
+      expect(r2.body.error).toMatch(/mission #61 is closed/);
+      expect(r2.body.error).toMatch(/mission_create/);
+    });
   });
 
   describe('outcomes', () => {

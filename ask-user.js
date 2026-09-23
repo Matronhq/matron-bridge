@@ -358,7 +358,7 @@ server.tool(
 
 server.tool(
   'agent_session_start',
-  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval the new session runs detached by default: it does the task and does not report back — a clean break, which is what a spawn normally is. Pass link: true only when you need its results in a chat room; the room is then created on approval and the child is told to report there.",
+  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval the new session runs detached by default: it does the task and does not report back — a clean break, which is what a spawn normally is. Pass link: true only when you need its results in a chat room; the room is then created on approval and the child is told to report there. Pass mission: N to put the new session on mission #N from its first turn (the consent card says so) — the way to assign a mission made with mission_create.",
   {
     device_id: z.number().int().describe('Target box device id, from agent_boxes'),
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
@@ -366,13 +366,14 @@ server.tool(
     topic: z.string().max(200).optional().describe('Optional short room/session title'),
     model: z.string().optional().describe('Optional Claude model alias for the new session: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). Omit to use the target box\'s own default — only set it if the user asked for a specific model.'),
     link: z.boolean().optional().describe('Open a chat room between this session and the new one, and have it report its outcome there. Default false: the spawned session is detached and simply does its task. Set true only when you need its results back here.'),
+    mission: z.number().int().min(1).optional().describe('Mission number the new session joins before its first turn — e.g. one you made with mission_create. The consent card shows it.'),
   },
-  async ({ device_id, workdir, task, topic, model, link }) => {
+  async ({ device_id, workdir, task, topic, model, link, mission }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}), ...(link === true ? { link: true } : {}) }),
+        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}), ...(link === true ? { link: true } : {}), ...(mission ? { mission } : {}) }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
@@ -381,7 +382,8 @@ server.tool(
       const waking = data.target_waking === true
         ? ' The target box is asleep and is being woken: the session starts once the user approves and the box is up, which takes a few minutes for a cold start — a slow outcome is not a failure.'
         : '';
-      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval.${waking} Continue your own work; the outcome will arrive as a later turn.` }] };
+      const joins = mission ? ` The new session joins mission #${mission} from its first turn.` : '';
+      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval.${joins}${waking} Continue your own work; the outcome will arrive as a later turn.` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
