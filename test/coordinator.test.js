@@ -376,3 +376,16 @@ describe('decideCoordinatorEvent — fix round 1', () => {
     expect(decideCoordinatorEvent({ role: 'released', convoId: 'a', truth: { fetched: true, known: true, convoId: null }, live: true, sessionCoordinator: true, pendingRole: 'released' })).toBe('none');
   });
 });
+
+describe('planCoordinatorTransition — occupied but not busy (fix round 2)', () => {
+  it('a pending question, prompt or resume hold is never respawned over: no live model switch, role at the next spawn', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, busy: false, persisted: {} }))
+      .toEqual({ action: 'next-spawn', model: null });
+    expect(planCoordinatorTransition({ role: 'released', agent: 'claude', occupied: true, busy: false, persisted: {} }))
+      .toEqual({ action: 'next-spawn', model: null });
+  });
+  it('busy: the live /model path parks the switch as before', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, busy: true, persisted: {} }))
+      .toEqual({ action: 'switch-model-live', model: COORDINATOR_MODEL });
+  });
+});

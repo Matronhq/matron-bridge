@@ -145,11 +145,30 @@ describe('live coordinator events — busy session (fix round 1)', () => {
     const fn = body('async function journalOnCoordinator(', '\nfunction ');
     expect(fn).toContain('pendingRole: session?._coordinatorPending ?? null,');
     expect(fn).toContain('session._coordinatorPending = role;');
-    expect(fn).toContain("if (!session._deferredCommandText) session._deferredCommandText = '!restart --force';");
+    expect(fn).toContain("if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';");
   });
 
   it('recreateSession does not carry the pending role onto the replacement (the spawn applies it)', () => {
     const fn = body('function recreateSession(', '\nfunction ');
     expect(fn).not.toContain('_coordinatorPending');
+  });
+});
+
+describe('live coordinator events — occupied but not busy (fix round 2)', () => {
+  it('the plan is told whether the session is busy, not just occupied', () => {
+    const fn = body('async function journalOnCoordinator(', '\nfunction ');
+    expect(fn).toContain('busy: !!session.busy,');
+  });
+
+  it('a restart is parked only on a busy session (a hold/prompt flush would strand the queue behind it)', () => {
+    const fn = body('async function journalOnCoordinator(', '\nfunction ');
+    expect(fn).toContain("if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';");
+    expect(fn).not.toContain("if (!session._deferredCommandText) session._deferredCommandText = '!restart --force';");
+  });
+
+  it("a /model typed over the Coordinator's parked restart does not claim to replace a /restart the user never asked for", () => {
+    const fn = body('function applyModelSwitch(', '\nfunction ');
+    expect(fn).toContain("const parkedByCoordinator = !!session._coordinatorPending && previousParked === '!restart --force';");
+    expect(fn).toMatch(/else if \(previousParked && !parkedByCoordinator\)/);
   });
 });

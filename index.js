@@ -8525,6 +8525,7 @@ async function journalOnCoordinator(convoId, { role }) {
     role,
     agent: session.agent,
     occupied: sessionOccupiedForRoomDelivery(session),
+    busy: !!session.busy,
     persisted: getPersistedSession(roomId),
     // A `!model <x>` the user queued mid-turn is their pick; only the
     // `--implicit` form is ours to replace.
@@ -8542,20 +8543,29 @@ async function journalOnCoordinator(convoId, { role }) {
       persistSession(roomId, next.claudeSessionId, next.workdir, next.originRoomId, { model: plan.model, modelExplicit: false });
     }
   } else {
-    // Busy: the role can only apply at a spawn. Record it as pending (a
-    // replay of this event during the turn is then 'none', not a second
-    // turn) and get a spawn at turn end through the deferred-command slot
-    // dispatchDeferredCommand replays — which also carries the queued turn
-    // below onto the replacement. A print-mode model switch parks a
-    // `!model … --implicit` there (itself a respawn); a slot the user already
-    // filled (/model, /restart) also ends in recreateSession, so it is kept.
+    // Occupied: the role can only apply at a spawn. Record it as pending (a
+    // replay of this event meanwhile is then 'none', not a second turn).
     // The replacement is a new session object built by createSession, which
     // reads the role from the cache, so the pending mark is not carried.
+    //
+    // Busy (a running turn): get a spawn at turn end through the
+    // deferred-command slot dispatchDeferredCommand replays — which also
+    // carries the queued turn below onto the replacement. A print-mode model
+    // switch parks a `!model … --implicit` there (itself a respawn); a slot
+    // the user already filled (/model, /restart) also ends in
+    // recreateSession, so it is kept. Same gate as a user's /restart, which
+    // parks only on `busy`.
+    //
+    // Occupied but not busy (a pending question or prompt, the iv resume
+    // hold): nothing is parked. No turn end is coming to replay it, and
+    // flushQueue refuses to deliver past a parked restart, so it would strand
+    // the queued turn below. The turn is delivered by the normal queue
+    // flush; the role and the model apply at the next spawn.
     if (plan.action === 'switch-model-live') {
       applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });
     }
     session._coordinatorPending = role;
-    if (!session._deferredCommandText) session._deferredCommandText = '!restart --force';
+    if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
   await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));
 }
@@ -11258,10 +11268,15 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     // applies ahead of every queued message. One slot: a parked /restart is
     // replaced with a notice, same as the /login parked-slash convention.
     const previousParked = session._deferredCommandText;
+    // The Coordinator parks `!restart --force` on a busy session it could
+    // not respawn (journalOnCoordinator). A model switch restarts the
+    // session anyway, so replacing that one is not news to the user, who
+    // never asked for a /restart.
+    const parkedByCoordinator = !!session._coordinatorPending && previousParked === '!restart --force';
     session._deferredCommandText = `!model ${decision.normalized}${explicit ? '' : ' --implicit'}`;
     if (previousParked === session._deferredCommandText) {
       sendReply(`🧠 /model ${decision.normalized} is already queued — it will apply as soon as this turn finishes.`);
-    } else if (previousParked) {
+    } else if (previousParked && !parkedByCoordinator) {
       sendReply(`${decision.message.replace(/\.$/, '')} (replacing the queued /${previousParked.slice(1).split(' ')[0]}).`);
     } else {
       sendReply(decision.message);
