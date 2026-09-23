@@ -1062,6 +1062,10 @@ const journalRpcHandler = createRpcRequestHandler({
   },
   unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
   injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  // Spawn onto a mission: join the new conversation before its opening turn
+  // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
+  // further down; this only runs once the socket is live.
+  joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),
   serverLabel: SERVER_LABEL,
   log: console,
 });

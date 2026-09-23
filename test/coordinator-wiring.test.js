@@ -185,3 +185,10 @@ describe('agent_session_start mission (source inspection)', () => {
     expect(tool).toContain('` The new session joins mission #${mission} from its first turn.`');
   });
 });
+
+describe('spawn mission join (source inspection)', () => {
+  it('index wires the RPC start join to the existing missions join handler', () => {
+    const cfg = body('const journalRpcHandler = createRpcRequestHandler({', '\n});');
+    expect(cfg).toContain('joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),');
+  });
+});
