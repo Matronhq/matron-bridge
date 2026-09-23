@@ -74,3 +74,31 @@ describe('coordinator spawn wiring (source inspection)', () => {
     expect(index.match(/^\s+coordinator: !!options\.coordinator,$/gm)).toHaveLength(3);
   });
 });
+
+describe('explicit model picks are persisted as such (source inspection)', () => {
+  it('imports explicitModelFlag', () => {
+    expect(index).toMatch(/import \{[^}]*\bexplicitModelFlag\b[^}]*\} from '\.\/lib\/coordinator\.js'/);
+  });
+
+  it('RPC start, !start, !restart, !resume and !workdir mark the picked model explicit', () => {
+    const rpc = body('function journalStartSessionForRpc(', '\nfunction ');
+    expect(rpc).toContain('model ? { model, ...explicitModelFlag(model) } : undefined');
+    expect(index).toContain('startModel ? { model: startModel, ...explicitModelFlag(startModel) } : undefined');
+    expect(index).toContain('{ model: restartModelFlag.model, ...explicitModelFlag(restartModelFlag.model) }');
+    expect(index).toContain('...(resumeModelFlag.model ? explicitModelFlag(resumeModelFlag.model) : {}),');
+    expect(index).toContain('workdirModel ? { model: workdirModel, ...explicitModelFlag(workdirModel) } : undefined');
+  });
+
+  it('applyModelSwitch takes an explicit option; implicit switches persist modelExplicit:false and park with --implicit', () => {
+    const fn = body('function applyModelSwitch(', '\nfunction ');
+    expect(fn).toContain('function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true }) {');
+    expect(fn).toContain("session._deferredCommandText = `!model ${decision.normalized}${explicit ? '' : ' --implicit'}`;");
+    expect(fn.match(/explicit \? explicitModelFlag\([^)]*\) : \{ modelExplicit: false \}/g)).toHaveLength(3);
+  });
+
+  it('!model reads --implicit (the parked coordinator switch) and passes explicit through', () => {
+    const block = body("case '!model': {", "case '!mode': {");
+    expect(block).toContain("const implicit = parts.slice(2).includes('--implicit');");
+    expect(block).toContain('applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit });');
+  });
+});

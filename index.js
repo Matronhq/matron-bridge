@@ -10,7 +10,7 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions } from './lib/coordinator.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -1006,7 +1006,7 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   // persistSession keeps it null rather than inventing one.
   if ((mcpExtras.length > 0 || model || mintedConvoId) && (session.claudeSessionId || mintedConvoId)) {
     persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null,
-      model ? { model } : undefined);
+      model ? { model, ...explicitModelFlag(model) } : undefined);
   }
   return session;
 }
@@ -6447,7 +6447,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // picks are session-scoped and must not be persisted).
       if ((mcpExtras.length > 0 || startModel) && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId,
-          startModel ? { model: startModel } : undefined);
+          startModel ? { model: startModel, ...explicitModelFlag(startModel) } : undefined);
       }
 
       // Confirm in the origin room/convo. No matrix.to room link: Matron is
@@ -6566,7 +6566,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (restartModelFlag.model && restarted) {
         restarted.currentModel = restartModelFlag.model;
         persistSession(roomId, restarted.claudeSessionId, restarted.workdir, restarted.originRoomId,
-          { model: restartModelFlag.model });
+          { model: restartModelFlag.model, ...explicitModelFlag(restartModelFlag.model) });
       }
       const shownRestartExtras = effectiveExtras(effectiveRestartExtras, DEFAULT_MCP_EXTRAS);
       const extrasLine = shownRestartExtras.length > 0
@@ -6883,6 +6883,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         lastSummaryMsgCount: session.lastSummaryMsgCount || 0,
         lastRosterText: session.lastRosterText || '',
         model: session.currentModel || null,
+        // Only a --model typed now is a pick; resumeState.model may be a
+        // model Claude merely reported, so it must not be marked explicit.
+        ...(resumeModelFlag.model ? explicitModelFlag(resumeModelFlag.model) : {}),
         interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
         mcpExtras: session.mcpExtras,
         totalUsage: session.totalUsage,
@@ -6975,7 +6978,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (workdirModel) session.currentModel = workdirModel;
       if ((workdirExtras.length > 0 || workdirModel) && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId,
-          workdirModel ? { model: workdirModel } : undefined);
+          workdirModel ? { model: workdirModel, ...explicitModelFlag(workdirModel) } : undefined);
       }
 
       const workdirPermNote = permissionNote(session);
@@ -7341,7 +7344,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const arg = parts[1];
       if (arg) {
-        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml });
+        // `--implicit` is how a Coordinator model switch parked mid-turn
+        // (applyModelSwitch explicit:false) replays without turning into a
+        // user pick; nothing else sends it.
+        const implicit = parts.slice(2).includes('--implicit');
+        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit });
         break;
       }
       const current = session.currentModel || session.initData?.model || null;
@@ -11070,7 +11077,10 @@ function switchEffortAndTrack(session, arg, send) {
 // the live TUI (immediate); print sessions restart the claude -p process with
 // --model <alias> --resume (history preserved). Used by the !model command and
 // the model: picker button.
-function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+// explicit:false is the Coordinator's default-model switch (spec 2026-09-23
+// §2e): same path, but persisted as modelExplicit:false so a later
+// assignment may change it again.
+function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true }) {
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
@@ -11089,17 +11099,27 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     const efforts = codexSessionOptions(session).effortLevels;
     if (session.codex.effort && !efforts.some(e => e.value === session.codex.effort)) session.codex.effort = null;
     journalStatus(session);
-    persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model });
+    persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
+      { model, ...(explicit ? explicitModelFlag(model) : { modelExplicit: false }) });
     sendReply(model
       ? `Codex model set to ${model}; it will apply on the next turn.`
       : 'Codex model reset to the local config default; it will apply on the next turn.');
     return;
   }
   if (session.iv) {
-    // Interactive: type /model into the live TUI. Not persisted by design —
-    // the pick applies to the live session only (spec non-goal); a restart
-    // falls back to the persisted/default model.
-    switchModelInSession(session, arg, sendReply);
+    // Interactive: type /model into the live TUI. The MODEL is not persisted
+    // by design — the pick applies to the live session only (spec non-goal);
+    // a restart falls back to the persisted/default model. Whether a person
+    // picked it is persisted, so a later Coordinator assignment leaves it
+    // alone. The Coordinator's own switch does persist the model, so its
+    // next spawn stays on it.
+    const switched = switchModelInSession(session, arg, sendReply);
+    if (switched) {
+      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+        ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),
+        ...(explicit ? {} : { model: normalizeModelArg(arg) }),
+      });
+    }
     return;
   }
   const decision = planPrintModelSwitch(session, arg);
@@ -11112,7 +11132,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     // applies ahead of every queued message. One slot: a parked /restart is
     // replaced with a notice, same as the /login parked-slash convention.
     const previousParked = session._deferredCommandText;
-    session._deferredCommandText = `!model ${decision.normalized}`;
+    session._deferredCommandText = `!model ${decision.normalized}${explicit ? '' : ' --implicit'}`;
     if (previousParked === session._deferredCommandText) {
       sendReply(`🧠 /model ${decision.normalized} is already queued — it will apply as soon as this turn finishes.`);
     } else if (previousParked) {
@@ -11127,7 +11147,8 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     return;
   }
   sendReply(decision.message);
-  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: decision.normalized });
+  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
+    { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
   const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
   if (next) next.currentModel = decision.normalized;
 }
