@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
-import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 
@@ -741,7 +741,7 @@ server.tool(
 // milestone AND a second transcript marker (see lib/missions-idem.js).
 async function callMissions(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
-  if (name === 'start' || name === 'post') {
+  if (name === 'start' || name === 'post' || name === 'create') {
     payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
   }
   try {
@@ -758,7 +758,7 @@ async function callMissions(name, args, render) {
     return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
   }
 }
-const missionToolName = (op) => ({ start: 'mission_start', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_create', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
 
 server.tool(
   'mission_start',
@@ -768,6 +768,16 @@ server.tool(
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
   },
   async (args) => callMissions('start', args, formatStartAck),
+);
+
+server.tool(
+  'mission_create',
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work. Returns the mission number.",
+  {
+    title: z.string().describe('One line, ≤200 chars — what the work is'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — the goal: what done looks like, constraints, links'),
+  },
+  async (args) => callMissions('create', args, formatCreateAck),
 );
 
 server.tool(

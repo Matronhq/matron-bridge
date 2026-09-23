@@ -10653,9 +10653,9 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The six mission_* / milestone_post tool routes; same one-matcher
+      // The seven mission_* / milestone_post tool routes; same one-matcher
       // allowlist shape as /items above.
-      const missionsRoute = url.pathname.match(/^\/missions\/(start|post|update|join|get|close)$/);
+      const missionsRoute = url.pathname.match(/^\/missions\/(start|create|post|update|join|get|close)$/);
       if (missionsRoute) {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],

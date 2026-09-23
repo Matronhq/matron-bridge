@@ -7,6 +7,7 @@ function fixture(clientOverrides = {}) {
   const mission = { id: 'ms_1', num: 61, title: 'M', origin_convo_id: 'c1', state: 'open' };
   const client = {
     start: vi.fn(async () => ({ status: 201, data: { mission } })),
+    create: vi.fn(async () => ({ status: 201, data: { mission: { ...mission, id: 'ms_2', num: 62, origin_convo_id: 'c1' } } })),
     list: vi.fn(async () => ({ status: 200, data: { missions: [] } })),
     get: vi.fn(async () => ({ status: 200, data: { mission, milestones: [], items: [], conversations: [{ id: 'c1' }] } })),
     update: vi.fn(async () => ({ status: 200, data: { mission } })),
@@ -252,5 +253,31 @@ describe('missions handlers', () => {
     const r = await h.update({ roomId: '!r:s', title: 'New' });
     expect(r.status).toBe(404);
     expect(r.body.error).toMatch(/does not have the \/missions routes yet/);
+  });
+
+  it('create: attach:false, convo_id for provenance, idem key; does NOT join (no missionId cached)', async () => {
+    const { h, client, session } = fixture();
+    expect((await h.create({ roomId: '!r:s', title: '' })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', title: 'ok', body: 'y'.repeat(32769) })).status).toBe(400);
+    const r = await h.create({ roomId: '!r:s', title: ' Fix login ', body: 'goal', idem_key: 'k' });
+    expect(r.status).toBe(201);
+    expect(client.create.mock.calls[0]).toEqual([{ title: 'Fix login', body: 'goal', convo_id: 'c1', attach: false }, { idemKey: 'k' }]);
+    expect(client.start).not.toHaveBeenCalled();
+    expect(session.missionId).toBeUndefined();
+  });
+
+  it('create: a journal that ignored attach:false (existing:true) is an error, never "created"', async () => {
+    const { h, session } = fixture({ create: vi.fn(async () => ({ status: 200, data: { mission: { id: 'ms_1', num: 61 }, existing: true } })) });
+    const r = await h.create({ roomId: '!r:s', title: 'X' });
+    expect(r.status).toBe(502);
+    expect(r.body.error).toMatch(/does not support unassigned missions/);
+    expect(session.missionId).toBeUndefined();
+  });
+
+  it('create: unreachable → 502; 404 on the convo → the convo sentence', async () => {
+    const down = fixture({ create: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
+    expect((await down.h.create({ roomId: '!r:s', title: 'X' })).status).toBe(502);
+    const noConvo = fixture({ create: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+    expect((await noConvo.h.create({ roomId: '!r:s', title: 'X' })).body.error).toMatch(/did not accept this conversation/);
   });
 });
