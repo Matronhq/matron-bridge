@@ -220,13 +220,26 @@ describe('coordinatorTurnText', () => {
 });
 
 describe('explicit model', () => {
-  it('explicitModelFlag marks real picks only (not the preselected "default", not empty)', () => {
+  it('explicitModelFlag marks real picks only (not the preselected "default", not empty) — and clears a stale true for either', () => {
     expect(explicitModelFlag('sonnet')).toEqual({ modelExplicit: true });
     expect(explicitModelFlag('claude-opus-4-8')).toEqual({ modelExplicit: true });
     expect(explicitModelFlag('opus[1m]')).toEqual({ modelExplicit: true });
-    expect(explicitModelFlag('default')).toEqual({});
-    expect(explicitModelFlag('')).toEqual({});
-    expect(explicitModelFlag(null)).toEqual({});
+    // Always returns the key (never {}), so a caller spreading this over a
+    // persisted record can never leave a previous modelExplicit:true stale —
+    // picking "default" is itself a choice to stop being explicit.
+    expect(explicitModelFlag('default')).toEqual({ modelExplicit: false });
+    expect(explicitModelFlag('')).toEqual({ modelExplicit: false });
+    expect(explicitModelFlag(null)).toEqual({ modelExplicit: false });
+  });
+  it('an explicit /model default after an explicit pick clears the flag (persistSession merges {...existing, ...extra})', () => {
+    let persisted = { model: 'sonnet', ...explicitModelFlag('sonnet') };
+    expect(isModelExplicit(persisted)).toBe(true);
+    // applyModelSwitch's explicit path: persistSession(..., { model: decision.normalized, ...explicitModelFlag(decision.normalized) })
+    // merged as { ...existing, ...extra } — the bug this guards was extra
+    // omitting the key entirely for "default", leaving the old true in place.
+    persisted = { ...persisted, model: 'default', ...explicitModelFlag('default') };
+    expect(persisted.modelExplicit).toBe(false);
+    expect(isModelExplicit(persisted)).toBe(false);
   });
   it('isModelExplicit: the flag wins; legacy records count a persisted alias, not an observed full id', () => {
     expect(isModelExplicit({ modelExplicit: true, model: 'claude-fable-5' })).toBe(true);

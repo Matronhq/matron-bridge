@@ -7346,7 +7346,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (arg) {
         // `--implicit` is how a Coordinator model switch parked mid-turn
         // (applyModelSwitch explicit:false) replays without turning into a
-        // user pick; nothing else sends it.
+        // user pick. A person can type it too, but there's no reason to —
+        // it only downgrades this room's own pick to non-explicit.
         const implicit = parts.slice(2).includes('--implicit');
         applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit });
         break;
