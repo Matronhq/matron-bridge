@@ -10,6 +10,7 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -174,6 +175,7 @@ import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
+const DEFAULT_BRIDGE_COORDINATOR_MD_PATH = path.join(__dirname, 'BRIDGE_COORDINATOR.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work within the configured sandbox. Use native approval requests for actions requiring extra permission. Never post secrets in chat.';
 
@@ -425,6 +427,7 @@ const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on
 const SECRET_REQUESTS_FILE = path.join(os.homedir(), '.matron-bridge-secrets.json');
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
+const BRIDGE_COORDINATOR_MD_PATH = process.env.BRIDGE_COORDINATOR_MD_PATH || DEFAULT_BRIDGE_COORDINATOR_MD_PATH;
 
 // Gemini client for room topic summarization
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -457,6 +460,15 @@ function loadCodexBridgePrompt() {
 }
 
 const CODEX_BRIDGE_PROMPT = loadCodexBridgePrompt();
+
+// The Coordinator's instruction block (spec 2026-09-23 §2b), appended to the
+// system prompt / Codex developer instructions of the one room that holds
+// the role. Read once at boot like the two prompt files above.
+const COORDINATOR_BLOCK = loadCoordinatorBlock({
+  readFile: (p) => fs.readFileSync(p, 'utf-8'),
+  path: BRIDGE_COORDINATOR_MD_PATH,
+  log: console,
+});
 
 // Live-bash-output store (per-process). Tracks active matron-tee'd Bash commands
 // so that tool_result events can write the corresponding .done sentinel.
@@ -507,6 +519,16 @@ const itemsClient = createItemsClient({
 const missionsClient = createMissionsClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
+});
+
+// Which conversation is the user's Coordinator (spec 2026-09-23 §2a):
+// GET /coordinator on the same host and token as the items/missions
+// clients, cached (lib/coordinator.js). No journal configured → the base URL
+// is empty, the role stays unknown, and every session spawns ordinary.
+const coordinatorLookup = createCoordinatorLookup({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+  log: console,
 });
 
 // With no summary model this box silently loses written titles, its roster
@@ -579,6 +601,10 @@ function handleJournalReconnect() {
   // Every hello_ok is a fresh epoch for the journal's copy of this box's
   // status too (a box that just woke reports itself before anyone asks).
   publishBoxStatus('reconnect');
+  // A fresh epoch may follow a gap in which the Coordinator moved; the
+  // replayed `coordinator` events cover a live bridge, this covers a cursor
+  // reset (snapshot_required) that skipped them.
+  coordinatorLookup.refresh({ force: true });
 }
 
 // Box status lives in the journal (matron-journal #82): this box's activity,
@@ -654,6 +680,8 @@ const journalPublisher = createJournalPublisher({
 const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
 
 if (JOURNAL_ENABLED) {
+  // Warm the Coordinator cache before the first resume can ask for it.
+  coordinatorLookup.refresh({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
   // other publish here). No Matrix dependency: this convo has no Matrix
@@ -1716,6 +1744,30 @@ function postRootBypassWarning(roomId) {
   Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
 }
 
+// Coordinator role for one spawn (spec 2026-09-23 §2a). createSession is
+// synchronous with a dozen callers, so the spawn reads the cached answer and
+// kicks a throttled GET /coordinator behind it; hello_ok and `coordinator`
+// events are what keep the cache current. The room's journal conversation id
+// can sit in any of these fields depending on the path (fresh, resume,
+// pre-init restart, agent switch), so all of them are candidates. A role
+// that is not known yet (journal not reached since boot) spawns an ordinary
+// session and says so — never a failed spawn.
+function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
+  const candidates = [
+    options.journalConvoId,
+    persisted?.journalConvoId,
+    persisted?.sessionId,
+    resumeSessionId,
+    options.presetSessionId,
+  ];
+  const role = coordinatorLookup.roleFor(candidates);
+  coordinatorLookup.refresh();
+  if (!role.known && candidates.some((c) => typeof c === 'string' && c)) {
+    console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
+  }
+  return role.coordinator;
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
@@ -1731,6 +1783,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  const coordinator = coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persistedMode);
+  options = { ...options, coordinator };
   // A Claude session that changes cwd mid-flight (EnterWorktree is the common
   // case) has its transcript relocated to the NEW cwd's project dir, while the
   // bridge's persisted workdir stays where the session was spawned. Resuming
@@ -1836,14 +1890,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'] });
   const args = [
     '--print',
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     ...permissionSpawnArgs(bypassMode),
-    '--disallowed-tools', 'AskUserQuestion',
-    '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
+    '--disallowed-tools', ...printCoord.disallowedTools,
+    '--append-system-prompt', printCoord.appendSystemPrompt,
     '--include-partial-messages',
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
@@ -1950,6 +2005,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     agent: AGENT_CLAUDE,
     proc,
     roomId,
+    coordinator: !!options.coordinator,
     workdir: cwd,
     // The spawned session's effective env (shim prepended to PATH when
     // MATRON_CODEX_VIZ=1). The codex-viz activation guard must evaluate the
@@ -2240,15 +2296,16 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
     threadId: resumeSessionId || null,
     model,
     effort: persistedCodexState.effort || null,
-    sandbox: CODEX_SANDBOX_MODE,
+    sandbox: codexCoord.sandbox,
     networkAccess: CODEX_NETWORK_ACCESS,
-    developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
+    developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
     env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
@@ -2260,6 +2317,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     codex,
     proc: null,
     roomId,
+    coordinator: !!options.coordinator,
     workdir: cwd,
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
@@ -2734,6 +2792,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // prompts lib/prompt-detector.js already surfaces as Matron yes/no cards.
   const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
   if (ivRootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     ...(ivBypass ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'auto']),
@@ -2741,7 +2800,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
-    '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
+    // The Coordinator runs without file-editing tools (spec §2c). iv mode has
+    // no other disallowed tool, so an ordinary session gets no flag at all.
+    ...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),
+    '--append-system-prompt', ivCoord.appendSystemPrompt,
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(settings),
@@ -2795,6 +2857,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     proc: null,
     iv,
     roomId,
+    coordinator: !!options.coordinator,
     workdir: cwd,
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
