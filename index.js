@@ -10,7 +10,7 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag } from './lib/coordinator.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -8482,6 +8482,104 @@ function journalOnItem(session, item, ctx) {
   });
 }
 
+// A journal `coordinator` event (spec 2026-09-23 §2a/§2e; router seam
+// onCoordinatorEvent). The event is applied to the cache at once, then the
+// journal is re-read and only a role it confirms is acted on
+// (decideCoordinatorEvent) — so a replayed or reversed pair (A assigned, then
+// B assigned, replayed on reconnect) never tells A it is the Coordinator.
+// For a running session: an idle one is respawned through recreateSession —
+// the /model and /restart path — so the block and the no-edit tools apply
+// now, moving onto opus[1m] on the way when nobody picked a model; a busy one
+// gets the model switch through applyModelSwitch (parked until the turn
+// ends) and the role at its next spawn. Either way it is then told, as an
+// injected turn (queued behind a running turn, never dropped). A Coordinator
+// that is not running only has its persisted model updated; its next resume
+// reads the role from the cache.
+async function journalOnCoordinator(convoId, { role }) {
+  coordinatorLookup.apply(convoId, role);
+  const truth = await coordinatorLookup.refresh({ force: true });
+  // Looked up after the await: the session may have been reaped or respawned
+  // while the journal answered.
+  const session = findSessionByClaudeSessionId(convoId);
+  const live = !!(session && session.alive);
+  const verdict = decideCoordinatorEvent({ role, convoId, truth, live, sessionCoordinator: !!session?.coordinator });
+  if (verdict === 'stale') {
+    console.warn(`[coordinator] ignoring ${role} for ${convoId}: the journal says the Coordinator is ${truth.convoId ?? 'nobody'}`);
+    return;
+  }
+  if (verdict === 'persist-sleeping') {
+    persistCoordinatorModelForSleepingConvo(convoId);
+    return;
+  }
+  if (verdict !== 'transition') return;
+  const roomId = session.roomId;
+  const ctx = journalSessionCommandCtx(session);
+  const plan = planCoordinatorTransition({
+    role,
+    agent: session.agent,
+    occupied: sessionOccupiedForRoomDelivery(session),
+    persisted: getPersistedSession(roomId),
+    // A `!model <x>` the user queued mid-turn is their pick; only the
+    // `--implicit` form is ours to replace.
+    parkedCommand: session._deferredCommandText,
+  });
+  if (plan.action === 'respawn') {
+    ctx.sendReply(role === 'assigned'
+      ? '🧭 This chat is now the Coordinator — restarting the session to apply it (history preserved).'
+      : '🧭 This chat is no longer the Coordinator — restarting the session to lift its restrictions (history preserved).');
+    const next = recreateSession(roomId, plan.model ? { model: plan.model } : {}, ctx);
+    if (next && plan.model) {
+      // Same tail as applyModelSwitch: the replacement's live snapshot cannot
+      // know the new model until its first event, so say it, then persist.
+      next.currentModel = plan.model;
+      persistSession(roomId, next.claudeSessionId, next.workdir, next.originRoomId, { model: plan.model, modelExplicit: false });
+    }
+  } else if (plan.action === 'switch-model-live') {
+    applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });
+  }
+  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));
+}
+
+// The injected assigned/released turn. Same inject-or-queue rule as a
+// tracker reply (lib/items-turn.js): a busy session queues it behind the
+// running turn instead of losing it. Never mirrored — the journal already
+// shows the `coordinator` marker the apps render.
+async function deliverCoordinatorTurn(session, text) {
+  if (!text || !session?.alive) return;
+  if (sessionOccupiedForRoomDelivery(session)) {
+    await journalQueueMedia(session, {
+      blocks: [{ type: 'text', text }],
+      mirrorToJournal: false,
+      preview: text.split('\n')[0],
+      fullText: text,
+    });
+    return;
+  }
+  if (!sendTextToSession(session, text, { skipJournalMirror: true })) {
+    console.warn(`[coordinator] could not deliver the coordinator turn to ${session.roomId}`);
+  }
+}
+
+// A Coordinator assigned while its session is not running: move the
+// persisted model onto opus[1m] unless someone picked one (spec §2e). Same
+// record lookup as journalResumeConvo. Codex rooms keep their model.
+function persistCoordinatorModelForSleepingConvo(convoId) {
+  const data = loadPersistedSessions();
+  for (const [roomId, rec] of Object.entries(data)) {
+    if (!rec || (rec.journalConvoId !== convoId && rec.sessionId !== convoId)) continue;
+    const plan = planCoordinatorTransition({
+      role: 'assigned',
+      agent: normalizeAgent(rec.agent) || AGENT_CLAUDE,
+      occupied: false,
+      persisted: rec,
+    });
+    if (!plan.model) return;
+    data[roomId] = withCoordinatorModel(rec, plan.model);
+    savePersistedSessions(data);
+    return;
+  }
+}
+
 function journalOnMedia(session, media, ctx) {
   // A voice note or a photo is the user back in the loop just as much as
   // typed text is, so it refreshes the self-restart budget too (text resets
@@ -9555,6 +9653,13 @@ const journalInputConsumer = createJournalInputConsumer({
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
   routeItemToSession: journalOnItem,
+  // Coordinator role changes (spec 2026-09-23 §2a): never a turn by
+  // themselves; journalOnCoordinator re-reads the journal and decides.
+  onCoordinatorEvent: (convoId, ev) => {
+    journalOnCoordinator(convoId, ev).catch((e) => {
+      try { console.warn(`[coordinator] handling ${ev?.role} for ${convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    });
+  },
   routePromptReply: journalOnPromptReply,
   resumeSessionForConvo: journalResumeConvo,
   // A verified /sleep card tap whose session the idle reaper already removed

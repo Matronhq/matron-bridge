@@ -9,6 +9,8 @@ import {
   explicitModelFlag,
   isModelExplicit,
   planCoordinatorTransition,
+  decideCoordinatorEvent,
+  withCoordinatorModel,
   COORDINATOR_MODEL,
   COORDINATOR_ASSIGNED_PREFIX,
   COORDINATOR_RELEASED_TURN,
@@ -283,5 +285,60 @@ describe('planCoordinatorTransition', () => {
       .toEqual({ action: 'respawn', model: null });
     expect(planCoordinatorTransition({ role: 'released', agent: 'claude', occupied: true, persisted: {} }))
       .toEqual({ action: 'next-spawn', model: null });
+  });
+});
+
+describe('planCoordinatorTransition with a parked /model (controller ruling, Task 5 review)', () => {
+  it("the user's own queued /model pick counts as explicit: no implicit opus[1m] over it", () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, persisted: {}, parkedCommand: '!model sonnet' }))
+      .toEqual({ action: 'next-spawn', model: null });
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: false, persisted: { model: 'claude-fable-5' }, parkedCommand: '!model haiku' }))
+      .toEqual({ action: 'respawn', model: null });
+  });
+  it('a parked implicit switch or an unrelated parked command does not block it', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, persisted: {}, parkedCommand: '!model opus --implicit' }))
+      .toEqual({ action: 'switch-model-live', model: COORDINATOR_MODEL });
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, persisted: {}, parkedCommand: '!restart --force' }))
+      .toEqual({ action: 'switch-model-live', model: COORDINATOR_MODEL });
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, persisted: {}, parkedCommand: '!modelx' }))
+      .toEqual({ action: 'switch-model-live', model: COORDINATOR_MODEL });
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, persisted: {}, parkedCommand: null }))
+      .toEqual({ action: 'switch-model-live', model: COORDINATOR_MODEL });
+  });
+});
+
+describe('decideCoordinatorEvent', () => {
+  const live = { live: true, sessionCoordinator: false };
+  it('acts only on what the journal confirms: a replayed or reversed event is stale', () => {
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'a', truth: { fetched: true, convoId: 'b' }, ...live })).toBe('stale');
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'a', truth: { fetched: true, convoId: 'a' }, live: true, sessionCoordinator: true })).toBe('stale');
+  });
+  it('journal unreachable right now: trusts the event (it came from the journal socket)', () => {
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'a', truth: { fetched: false, convoId: null }, ...live })).toBe('transition');
+  });
+  it('no live session: an assignment is persisted for the next resume; a release needs nothing', () => {
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'a', truth: { fetched: true, convoId: 'a' }, live: false, sessionCoordinator: false })).toBe('persist-sleeping');
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'a', truth: { fetched: true, convoId: null }, live: false, sessionCoordinator: false })).toBe('none');
+  });
+  it('a session already running in that role is left alone (no duplicate turn)', () => {
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'a', truth: { fetched: true, convoId: 'a' }, live: true, sessionCoordinator: true })).toBe('none');
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'a', truth: { fetched: true, convoId: 'b' }, live: true, sessionCoordinator: false })).toBe('none');
+  });
+  it('otherwise: transition', () => {
+    expect(decideCoordinatorEvent({ role: 'assigned', convoId: 'a', truth: { fetched: true, convoId: 'a' }, ...live })).toBe('transition');
+    expect(decideCoordinatorEvent({ role: 'released', convoId: 'a', truth: { fetched: true, convoId: 'b' }, live: true, sessionCoordinator: true })).toBe('transition');
+  });
+});
+
+describe('withCoordinatorModel', () => {
+  it('sets the top-level model the spawn reads, the claude agent state resume reads, and marks it implicit', () => {
+    const rec = { workdir: '/w', model: 'claude-fable-5', agentSessions: { claude: { sessionId: 's', model: 'claude-fable-5' }, codex: { sessionId: 't', model: 'gpt' } } };
+    const out = withCoordinatorModel(rec);
+    expect(out.model).toBe('opus[1m]');
+    expect(out.modelExplicit).toBe(false);
+    expect(out.agentSessions.claude).toEqual({ sessionId: 's', model: 'opus[1m]' });
+    expect(out.agentSessions.codex).toEqual({ sessionId: 't', model: 'gpt' });
+    expect(rec.model).toBe('claude-fable-5');
+    expect(withCoordinatorModel({ workdir: '/w' })).toEqual({ workdir: '/w', model: 'opus[1m]', modelExplicit: false });
   });
 });

@@ -102,3 +102,40 @@ describe('explicit model picks are persisted as such (source inspection)', () =>
     expect(block).toContain('applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit });');
   });
 });
+
+describe('live coordinator events (source inspection)', () => {
+  it('the router seam is wired to journalOnCoordinator with a catch', () => {
+    expect(index).toMatch(/onCoordinatorEvent: \(convoId, ev\) => \{\s*journalOnCoordinator\(convoId, ev\)\.catch\(/);
+  });
+
+  it('journalOnCoordinator applies the event, re-reads the journal, then decides', () => {
+    const fn = body('async function journalOnCoordinator(', '\nfunction ');
+    const applyAt = fn.indexOf('coordinatorLookup.apply(convoId, role);');
+    const refreshAt = fn.indexOf('await coordinatorLookup.refresh({ force: true });');
+    const decideAt = fn.indexOf('decideCoordinatorEvent({');
+    expect(applyAt).toBeGreaterThan(-1);
+    expect(refreshAt).toBeGreaterThan(applyAt);
+    expect(decideAt).toBeGreaterThan(refreshAt);
+  });
+
+  it('respawns idle sessions via recreateSession, switches a busy one via applyModelSwitch explicit:false, then delivers the turn', () => {
+    const fn = body('async function journalOnCoordinator(', '\nfunction ');
+    expect(fn).toContain('planCoordinatorTransition({');
+    expect(fn).toContain("recreateSession(roomId, plan.model ? { model: plan.model } : {}, ctx)");
+    expect(fn).toContain('{ model: plan.model, modelExplicit: false }');
+    expect(fn).toContain('applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });');
+    expect(fn).toContain('await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));');
+  });
+
+  it("a user's parked /model pick is handed to the plan, so the implicit switch never overwrites it", () => {
+    const fn = body('async function journalOnCoordinator(', '\nfunction ');
+    expect(fn).toContain('parkedCommand: session._deferredCommandText,');
+  });
+
+  it('a busy session gets the turn queued, an idle one injected, neither mirrored to the journal', () => {
+    const fn = body('async function deliverCoordinatorTurn(', '\nfunction ');
+    expect(fn).toContain('sessionOccupiedForRoomDelivery(session)');
+    expect(fn).toContain('mirrorToJournal: false');
+    expect(fn).toContain('sendTextToSession(session, text, { skipJournalMirror: true })');
+  });
+});
