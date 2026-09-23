@@ -4,7 +4,7 @@ import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSyn
 import path from 'path';
 import { WebSocketServer } from 'ws';
 import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
-import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
+import { validateAndOpen, pinAllowedRoots, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
 // Port resolution with a legacy-name fallback: the Matrix→Matron rename left
@@ -313,11 +313,22 @@ app.get('/view', async (req, res) => {
 
   try {
     // Serve-time boundary (lib/file-link-guard.js): fd-pinned symlink,
-    // sensitivity, workdir-containment, and size checks. Legacy tokens
-    // without a workdir still get everything but containment. Every
-    // rejection — denied, missing, oversize — is a uniform 404 so the
-    // response leaks nothing about why.
-    const { content, realPath } = await validateAndOpen(data.path, { workdir: data.workdir });
+    // sensitivity, containment, and size checks. Every rejection — denied,
+    // missing, oversize — is a uniform 404 so the response leaks nothing.
+    //
+    // A token that carries pinned authorization roots is checked against that
+    // pinned identity (dev/ino re-stat) rather than a bare realpath(workdir):
+    // an empty/malformed pinned set is a BROKEN capability, refused as a 404
+    // rather than silently falling back to the workdir check. Legacy tokens
+    // with no pinnedRoots field keep the workdir-containment behaviour.
+    let allowedRoots;
+    if (data.pinnedRoots !== undefined) {
+      if (!Array.isArray(data.pinnedRoots) || data.pinnedRoots.length === 0) {
+        return res.status(404).send('File not found');
+      }
+      allowedRoots = await pinAllowedRoots(data.pinnedRoots);
+    }
+    const { content, realPath } = await validateAndOpen(data.path, { workdir: data.workdir, allowedRoots });
     res.type('html').send(renderHtml(path.basename(realPath), content.toString('utf-8')));
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
@@ -348,8 +359,19 @@ app.get('/download', downloadLimiter, async (req, res) => {
   if (!data || data.dl !== true) return res.status(403).send('Invalid or expired token');
 
   try {
+    // Same pinned-roots capability check as /view: a carried pinned set is
+    // enforced by pinned identity, an empty/malformed one is refused (404),
+    // and a legacy token with no pinnedRoots keeps workdir containment.
+    let allowedRoots;
+    if (data.pinnedRoots !== undefined) {
+      if (!Array.isArray(data.pinnedRoots) || data.pinnedRoots.length === 0) {
+        return res.status(404).send('File not found');
+      }
+      allowedRoots = await pinAllowedRoots(data.pinnedRoots);
+    }
     const { content, realPath } = await validateAndOpen(data.path, {
       workdir: data.workdir,
+      allowedRoots,
       maxBytes: MAX_DOWNLOAD_BYTES,
     });
     // Keep the header a plain quoted ASCII token: strip anything that could

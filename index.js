@@ -681,7 +681,7 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath, workdir) {
+function generateFileLink(filePath, workdir, pinnedRoots) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   // Normalize BEFORE gating and signing: a relative session.workdir (or
   // target) would otherwise resolve against the wrong process cwd in the
@@ -697,7 +697,14 @@ function generateFileLink(filePath, workdir) {
     return null;
   }
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
+  // Carry the session's pinned authorization roots INTO the signed token so
+  // serve-time containment is checked against a pinned filesystem identity
+  // (dev/ino re-stat), not a bare realpath(workdir) resolved at serve time.
+  // Only emit the field for a usable (non-empty) set; sessions without pinned
+  // roots mint a legacy token that keeps the workdir-containment behaviour.
+  const payloadObj = { path: absTarget, exp, workdir: absWorkdir };
+  if (Array.isArray(pinnedRoots) && pinnedRoots.length) payloadObj.pinnedRoots = pinnedRoots;
+  const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
@@ -1368,7 +1375,11 @@ function buildEditDiffPayload(session, toolName, input, label) {
   return {
     file_path: absPath,
     display_path: input.file_path,
-    viewer_url: generateFileLink(absPath, session.workdir),
+    viewer_url: generateFileLink(
+      absPath,
+      session.workdir,
+      session.showFilePinnedRoots?.roots?.map((r) => r.realPath),
+    ),
     tool: toolName,
     label: label || null,
     diff: result.diff,
