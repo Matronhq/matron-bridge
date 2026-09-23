@@ -1,5 +1,19 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createCoordinatorLookup } from '../lib/coordinator.js';
+import { readFileSync } from 'node:fs';
+import {
+  createCoordinatorLookup,
+  loadCoordinatorBlock,
+  claudeCoordinatorArgs,
+  codexCoordinatorOptions,
+  coordinatorTurnText,
+  explicitModelFlag,
+  isModelExplicit,
+  planCoordinatorTransition,
+  COORDINATOR_MODEL,
+  COORDINATOR_ASSIGNED_PREFIX,
+  COORDINATOR_RELEASED_TURN,
+  FALLBACK_COORDINATOR_BLOCK,
+} from '../lib/coordinator.js';
 
 function fakeFetch(handler) {
   const calls = [];
@@ -141,5 +155,120 @@ describe('createCoordinatorLookup', () => {
     await vi.waitFor(() => expect(answers).toHaveLength(1));
     answers.shift()({ status: 200, body: { convo_id: 'c2' } });
     expect(await second).toEqual({ known: true, convoId: 'c2', fetched: true });
+  });
+});
+
+describe('coordinator block file', () => {
+  const block = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+  it('says the essentials of spec §2b', () => {
+    expect(block).toMatch(/^# You are this user's Coordinator/m);
+    expect(block).toMatch(/never do the work yourself/i);
+    expect(block).toMatch(/mission_create/);
+    expect(block).toMatch(/agent_session_start/);
+    expect(block).toMatch(/`mission: N`/);
+    expect(block).toMatch(/mission_join/);
+    expect(block).toMatch(/item_list.*scope: "all"/);
+    expect(block).toMatch(/mission_get/);
+    expect(block).toMatch(/kind: "question"/);
+    expect(block).toMatch(/Never call `mission_start` or `mission_join` for this conversation/);
+  });
+});
+
+describe('loadCoordinatorBlock', () => {
+  it('trims the file; falls back (and warns) when unreadable or empty', () => {
+    expect(loadCoordinatorBlock({ readFile: () => '  hi \n', path: '/x' })).toBe('hi');
+    const warns = [];
+    const log = { warn: (m) => warns.push(m) };
+    expect(loadCoordinatorBlock({ readFile: () => { throw new Error('ENOENT'); }, path: '/x', log })).toBe(FALLBACK_COORDINATOR_BLOCK);
+    expect(loadCoordinatorBlock({ readFile: () => '   ', path: '/x', log })).toBe(FALLBACK_COORDINATOR_BLOCK);
+    expect(warns).toHaveLength(2);
+  });
+});
+
+describe('claudeCoordinatorArgs', () => {
+  it('a non-coordinator room gets exactly the base prompt and base disallowed list — no block, no flags', () => {
+    const base = ['AskUserQuestion'];
+    const r = claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', baseDisallowed: base });
+    expect(r).toEqual({ appendSystemPrompt: 'BASE', disallowedTools: ['AskUserQuestion'] });
+    expect(r.disallowedTools).not.toBe(base);
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK' }).disallowedTools).toEqual([]);
+  });
+  it('the coordinator room gets the block appended and Edit/Write/NotebookEdit disallowed, without duplicates', () => {
+    const r = claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', baseDisallowed: ['AskUserQuestion', 'Edit'] });
+    expect(r.appendSystemPrompt).toBe('BASE\n\nBLOCK');
+    expect(r.disallowedTools).toEqual(['AskUserQuestion', 'Edit', 'Write', 'NotebookEdit']);
+  });
+});
+
+describe('codexCoordinatorOptions', () => {
+  it('ordinary: unchanged; coordinator: block appended and read-only sandbox', () => {
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'danger-full-access' }))
+      .toEqual({ developerInstructions: 'B', sandbox: 'danger-full-access' });
+    expect(codexCoordinatorOptions({ coordinator: true, baseInstructions: 'B', block: 'K', baseSandbox: 'danger-full-access' }))
+      .toEqual({ developerInstructions: 'B\n\nK', sandbox: 'read-only' });
+  });
+});
+
+describe('coordinatorTurnText', () => {
+  it('uses the contract wording verbatim', () => {
+    expect(COORDINATOR_ASSIGNED_PREFIX).toBe("[coordinator] You are now this user's Coordinator.");
+    expect(COORDINATOR_RELEASED_TURN).toBe('[coordinator] You are no longer the Coordinator; carry on as an ordinary session.');
+    expect(coordinatorTurnText('assigned', 'BLOCK')).toBe("[coordinator] You are now this user's Coordinator.\n\nBLOCK");
+    expect(coordinatorTurnText('released', 'BLOCK')).toBe(COORDINATOR_RELEASED_TURN);
+    expect(coordinatorTurnText('other', 'BLOCK')).toBeNull();
+  });
+});
+
+describe('explicit model', () => {
+  it('explicitModelFlag marks real picks only (not the preselected "default", not empty)', () => {
+    expect(explicitModelFlag('sonnet')).toEqual({ modelExplicit: true });
+    expect(explicitModelFlag('claude-opus-4-8')).toEqual({ modelExplicit: true });
+    expect(explicitModelFlag('opus[1m]')).toEqual({ modelExplicit: true });
+    expect(explicitModelFlag('default')).toEqual({});
+    expect(explicitModelFlag('')).toEqual({});
+    expect(explicitModelFlag(null)).toEqual({});
+  });
+  it('isModelExplicit: the flag wins; legacy records count a persisted alias, not an observed full id', () => {
+    expect(isModelExplicit({ modelExplicit: true, model: 'claude-fable-5' })).toBe(true);
+    expect(isModelExplicit({ modelExplicit: false, model: 'sonnet' })).toBe(false);
+    expect(isModelExplicit({ model: 'sonnet' })).toBe(true);
+    expect(isModelExplicit({ model: 'OPUS' })).toBe(true);
+    expect(isModelExplicit({ model: 'claude-opus-4-8' })).toBe(false);
+    expect(isModelExplicit({ model: 'default' })).toBe(false);
+    expect(isModelExplicit({})).toBe(false);
+    expect(isModelExplicit(null)).toBe(false);
+  });
+});
+
+describe('planCoordinatorTransition', () => {
+  it('assigned, idle Claude room with no explicit model: respawn onto opus[1m]', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: false, persisted: { model: 'claude-fable-5' } }))
+      .toEqual({ action: 'respawn', model: COORDINATOR_MODEL });
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: false, persisted: null }))
+      .toEqual({ action: 'respawn', model: 'opus[1m]' });
+  });
+  it('an explicit user model is kept: respawn only to apply the role', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: false, persisted: { model: 'sonnet', modelExplicit: true } }))
+      .toEqual({ action: 'respawn', model: null });
+  });
+  it('already on opus[1m]: no model change', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: false, persisted: { model: 'opus[1m]', modelExplicit: false } }))
+      .toEqual({ action: 'respawn', model: null });
+  });
+  it('Codex never gets a Claude model', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'codex', occupied: false, persisted: {} }))
+      .toEqual({ action: 'respawn', model: null });
+  });
+  it('mid-turn: model switch goes through the live /model path; with nothing to switch, wait for the next spawn', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, persisted: {} }))
+      .toEqual({ action: 'switch-model-live', model: 'opus[1m]' });
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, persisted: { model: 'haiku', modelExplicit: true } }))
+      .toEqual({ action: 'next-spawn', model: null });
+  });
+  it('released never touches the model', () => {
+    expect(planCoordinatorTransition({ role: 'released', agent: 'claude', occupied: false, persisted: {} }))
+      .toEqual({ action: 'respawn', model: null });
+    expect(planCoordinatorTransition({ role: 'released', agent: 'claude', occupied: true, persisted: {} }))
+      .toEqual({ action: 'next-spawn', model: null });
   });
 });
