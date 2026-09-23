@@ -527,6 +527,44 @@ describe('start', () => {
       expect(warns.some((w) => /could not join mission #64 before the opening turn/.test(w))).toBe(true);
     });
 
+    it('mission_num: a join that hangs gives up at the overall join deadline and starts anyway (well inside the journal start timeout)', async () => {
+      vi.useFakeTimers();
+      try {
+        const warns = [];
+        const joinMission = vi.fn(() => new Promise(() => {}));
+        const { handler, responses, stopped, injected } = spawnHarness({ joinMission, log: { warn: (m) => warns.push(m), error: () => {} } });
+        handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(responses).toHaveLength(0);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(responses).toHaveLength(1);
+        expect(responses[0].ok).toBe(true);
+        expect(stopped).toHaveLength(0);
+        expect(injected[0][1]).toContain('You are on mission #64');
+        expect(joinMission).toHaveBeenCalledTimes(1);
+        expect(warns.some((w) => /could not join mission #64 before the opening turn/.test(w))).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('mission_num: no retry starts after the join deadline has passed', async () => {
+      vi.useFakeTimers();
+      try {
+        const joinMission = vi.fn(() => new Promise((resolve) => setTimeout(() => resolve({ status: 502, body: {} }), 4_000)));
+        const { handler, responses } = spawnHarness({ joinMission, joinRetryDelayMs: 300 });
+        handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(responses).toHaveLength(1);
+        expect(joinMission).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(joinMission).toHaveBeenCalledTimes(2);
+        expect(responses).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('mission_num: a closed mission (409 blocked_by) is not retried', async () => {
       const joinMission = vi.fn(async () => ({ status: 409, body: { error: 'conflict', blocked_by: 'closed' } }));
       const { handler, responses } = spawnHarness({ joinMission, joinRetryDelayMs: 0 });

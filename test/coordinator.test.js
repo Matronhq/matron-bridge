@@ -11,7 +11,9 @@ import {
   planCoordinatorTransition,
   decideCoordinatorEvent,
   withCoordinatorModel,
+  recreateSpawnModel,
   COORDINATOR_MODEL,
+  COORDINATOR_DISALLOWED_TOOLS,
   COORDINATOR_ASSIGNED_PREFIX,
   COORDINATOR_RELEASED_TURN,
   FALLBACK_COORDINATOR_BLOCK,
@@ -198,7 +200,7 @@ describe('claudeCoordinatorArgs', () => {
   it('the coordinator room gets the block appended and Edit/Write/NotebookEdit disallowed, without duplicates', () => {
     const r = claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', baseDisallowed: ['AskUserQuestion', 'Edit'] });
     expect(r.appendSystemPrompt).toBe('BASE\n\nBLOCK');
-    expect(r.disallowedTools).toEqual(['AskUserQuestion', 'Edit', 'Write', 'NotebookEdit']);
+    expect(r.disallowedTools).toEqual(['AskUserQuestion', 'Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
   });
 });
 
@@ -379,13 +381,44 @@ describe('decideCoordinatorEvent — fix round 1', () => {
 
 describe('planCoordinatorTransition — occupied but not busy (fix round 2)', () => {
   it('a pending question, prompt or resume hold is never respawned over: no live model switch, role at the next spawn', () => {
-    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, busy: false, persisted: {} }))
-      .toEqual({ action: 'next-spawn', model: null });
     expect(planCoordinatorTransition({ role: 'released', agent: 'claude', occupied: true, busy: false, persisted: {} }))
       .toEqual({ action: 'next-spawn', model: null });
+  });
+  it('the next spawn still gets opus[1m] when nobody picked a model (final review #2, spec §2e)', () => {
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, busy: false, persisted: {} }))
+      .toEqual({ action: 'next-spawn', model: COORDINATOR_MODEL });
+    expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, busy: false, persisted: { model: 'claude-sonnet-4-5-20250929' } }))
+      .toEqual({ action: 'next-spawn', model: COORDINATOR_MODEL });
+  });
+  it('an explicit pick, a parked user /model, Codex, or already on opus[1m] keeps the next spawn model-less', () => {
+    const base = { role: 'assigned', agent: 'claude', occupied: true, busy: false };
+    expect(planCoordinatorTransition({ ...base, persisted: { model: 'haiku', modelExplicit: true } })).toEqual({ action: 'next-spawn', model: null });
+    expect(planCoordinatorTransition({ ...base, persisted: {}, parkedCommand: '!model sonnet' })).toEqual({ action: 'next-spawn', model: null });
+    expect(planCoordinatorTransition({ ...base, agent: 'codex', persisted: {} })).toEqual({ action: 'next-spawn', model: null });
+    expect(planCoordinatorTransition({ ...base, persisted: { model: 'opus[1m]' } })).toEqual({ action: 'next-spawn', model: null });
   });
   it('busy: the live /model path parks the switch as before', () => {
     expect(planCoordinatorTransition({ role: 'assigned', agent: 'claude', occupied: true, busy: true, persisted: {} }))
       .toEqual({ action: 'switch-model-live', model: COORDINATOR_MODEL });
+  });
+});
+
+describe('COORDINATOR_DISALLOWED_TOOLS (final review ruling)', () => {
+  it('covers every file-editing tool, MultiEdit included', () => {
+    expect([...COORDINATOR_DISALLOWED_TOOLS]).toEqual(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
+  });
+});
+
+describe('recreateSpawnModel (final review #1)', () => {
+  it('a Claude session with a pending Coordinator model respawns on it, not on the observed live model', () => {
+    expect(recreateSpawnModel({ agent: 'claude', currentModel: 'claude-sonnet-4-5-20250929', pendingModel: 'opus[1m]' })).toBe('opus[1m]');
+  });
+  it('without a pending model it carries the live model as before (undefined when not observed yet)', () => {
+    expect(recreateSpawnModel({ agent: 'claude', currentModel: 'claude-sonnet-4-5-20250929', pendingModel: null })).toBe('claude-sonnet-4-5-20250929');
+    expect(recreateSpawnModel({ agent: 'claude', currentModel: null })).toBeUndefined();
+  });
+  it('Codex keeps its explicit null and ignores any pending model', () => {
+    expect(recreateSpawnModel({ agent: 'codex', currentModel: null, pendingModel: 'opus[1m]' })).toBeNull();
+    expect(recreateSpawnModel({ agent: 'codex', currentModel: 'gpt-5' })).toBe('gpt-5');
   });
 });

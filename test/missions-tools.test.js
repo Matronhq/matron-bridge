@@ -274,6 +274,22 @@ describe('missions handlers', () => {
     expect(session.missionId).toBeUndefined();
   });
 
+  it('create: an old journal that attached this conversation to the new mission (201, conversations > 0) is an error, never "created (unassigned)"', async () => {
+    const { h, session } = fixture({ create: vi.fn(async () => ({ status: 201, data: { mission: { id: 'ms_1', num: 62, conversations: 1 } } })) });
+    const r = await h.create({ roomId: '!r:s', title: 'X' });
+    expect(r.status).toBe(502);
+    expect(r.body.error).toMatch(/does not support unassigned missions/);
+    expect(r.body.error).toMatch(/#62/);
+    expect(session.missionId).toBeUndefined();
+  });
+
+  it('create: a 201 with conversations 0, or with no count at all, is the created mission', async () => {
+    const zero = fixture({ create: vi.fn(async () => ({ status: 201, data: { mission: { id: 'ms_1', num: 62, conversations: 0 } } })) });
+    expect((await zero.h.create({ roomId: '!r:s', title: 'X' })).status).toBe(201);
+    const noCount = fixture({ create: vi.fn(async () => ({ status: 201, data: { mission: { id: 'ms_1', num: 62 } } })) });
+    expect((await noCount.h.create({ roomId: '!r:s', title: 'X' })).status).toBe(201);
+  });
+
   it('create: unreachable → 502; 404 on the convo → the convo sentence', async () => {
     const down = fixture({ create: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
     expect((await down.h.create({ roomId: '!r:s', title: 'X' })).status).toBe(502);

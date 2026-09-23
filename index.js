@@ -10,7 +10,7 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel } from './lib/coordinator.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -1755,7 +1755,10 @@ function postRootBypassWarning(roomId) {
 // can sit in any of these fields depending on the path (fresh, resume,
 // pre-init restart, agent switch), so all of them are candidates. A role
 // that is not known yet (journal not reached since boot) spawns an ordinary
-// session and says so — never a failed spawn.
+// session and says so — never a failed spawn. Said once per room, and only
+// on a box with a journal: without one the role is never known, and a line
+// on every spawn forever is noise.
+const coordinatorUnknownWarned = new Set();
 function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   const candidates = [
     options.journalConvoId,
@@ -1766,7 +1769,8 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   ];
   const role = coordinatorLookup.roleFor(candidates);
   coordinatorLookup.refresh();
-  if (!role.known && candidates.some((c) => typeof c === 'string' && c)) {
+  if (JOURNAL_ENABLED && !role.known && !coordinatorUnknownWarned.has(roomId) && candidates.some((c) => typeof c === 'string' && c)) {
+    coordinatorUnknownWarned.add(roomId);
     console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
   }
   return role.coordinator;
@@ -8565,8 +8569,18 @@ async function journalOnCoordinator(convoId, { role }) {
     // flushQueue refuses to deliver past a parked restart, so it would strand
     // the queued turn below. The turn is delivered by the normal queue
     // flush; the role and the model apply at the next spawn.
+    //
+    // Either way the model is persisted now (a reap-and-resume reads the
+    // record) and held pending on the session, which recreateSession prefers
+    // over the live model: in iv mode the live model is re-observed from
+    // each assistant event and still reads as the old one after the typed
+    // /model, so the parked restart would otherwise carry it back.
     if (plan.action === 'switch-model-live') {
       applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });
+    }
+    if (plan.model) {
+      session._coordinatorModel = plan.model;
+      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: plan.model, modelExplicit: false });
     }
     session._coordinatorPending = role;
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
@@ -11255,6 +11269,9 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     // next spawn stays on it.
     const switched = switchModelInSession(session, arg, sendReply);
     if (switched) {
+      // A person's pick replaces any Coordinator model still pending on the
+      // session: a later restart must carry what they chose.
+      if (explicit) session._coordinatorModel = null;
       persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
         ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),
         ...(explicit ? {} : { model: normalizeModelArg(arg) }),
@@ -11389,9 +11406,10 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     // falling back to persisted.model can otherwise pick up Claude's model.
     // Claude keeps the historical undefined fallback for a not-yet-observed
     // live model so its persisted selection survives a TUI restart.
-    model: existing.agent === AGENT_CODEX
-      ? existing.currentModel
-      : (existing.currentModel || undefined),
+    // A Coordinator model still pending on the session (journalOnCoordinator
+    // could not respawn it) beats the live model, which in iv mode keeps
+    // reading as the old one — see recreateSpawnModel.
+    model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),
     ...overrides,
   });
   next.sendCallback = sendReply;

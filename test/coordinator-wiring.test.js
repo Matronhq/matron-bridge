@@ -192,3 +192,37 @@ describe('spawn mission join (source inspection)', () => {
     expect(cfg).toContain('joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),');
   });
 });
+
+describe('pending Coordinator model (final review #1/#2)', () => {
+  it('recreateSession prefers the pending Coordinator model over the observed live model, and overrides still win', () => {
+    const fn = body('function recreateSession(', '\nfunction ');
+    const modelAt = fn.indexOf('model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),');
+    expect(modelAt).toBeGreaterThan(-1);
+    expect(fn.indexOf('...overrides,', modelAt)).toBeGreaterThan(modelAt);
+    expect(fn).not.toContain('? existing.currentModel');
+  });
+
+  it('a live assignment that cannot respawn holds the model pending on the session and persists it implicit', () => {
+    const fn = body('async function journalOnCoordinator(', '\nfunction ');
+    const elseAt = fn.indexOf("if (plan.action === 'switch-model-live')");
+    expect(elseAt).toBeGreaterThan(-1);
+    const tail = fn.slice(fn.lastIndexOf('} else {', elseAt));
+    expect(tail).toContain('session._coordinatorModel = plan.model;');
+    expect(tail).toContain('persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: plan.model, modelExplicit: false });');
+  });
+
+  it("a person's interactive /model clears the pending Coordinator model (their pick is what a restart must carry)", () => {
+    const fn = body('function applyModelSwitch(', '\nfunction ');
+    const iv = fn.slice(fn.indexOf('if (session.iv) {'), fn.indexOf('const decision = planPrintModelSwitch(session, arg);'));
+    expect(iv).toContain('if (explicit) session._coordinatorModel = null;');
+  });
+});
+
+describe('role-not-known spawn warning (final review, Task 4 minor)', () => {
+  it('only on a box with a journal, and once per room', () => {
+    const fn = body('function coordinatorRoleAtSpawn(', '\nfunction ');
+    expect(fn).toMatch(/JOURNAL_ENABLED && !role\.known/);
+    expect(fn).toContain('coordinatorUnknownWarned.has(roomId)');
+    expect(fn).toContain('coordinatorUnknownWarned.add(roomId);');
+  });
+});
