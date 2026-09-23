@@ -5,6 +5,7 @@ import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
+import { bashTimeoutEnv } from './lib/bash-timeout-env.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
@@ -1983,6 +1984,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     PATH: pathWithNode,
     CLAUDECODE: '',
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    // Raise the Bash-tool timeout floor above the 2-min built-in default so long
+    // Codex reviews / test suites in bridge sessions aren't SIGTERM'd mid-run.
+    // Operator-overridable via BASH_DEFAULT_TIMEOUT_MS / BASH_MAX_TIMEOUT_MS in
+    // the bridge env (read from process.env inside the helper; explicit wins).
+    ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
     // Env is fixed at spawn time; toggling the flag later requires
@@ -2846,6 +2852,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     PATH: pathWithNode,
     CLAUDECODE: '',
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    // Raise the Bash-tool timeout floor above the 2-min built-in default so long
+    // Codex reviews / test suites in bridge sessions aren't SIGTERM'd mid-run.
+    // Operator-overridable via BASH_DEFAULT_TIMEOUT_MS / BASH_MAX_TIMEOUT_MS in
+    // the bridge env (read from process.env inside the helper; explicit wins).
+    ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
     // Same up-front MCP tool loading as spawnEnv above.
