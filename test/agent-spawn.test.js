@@ -265,6 +265,7 @@ describe('createAgentSpawnHandlers', () => {
       const r1 = await p1;
       expect(r1.status).toBe(404);
       expect(r1.body.error).toMatch(/no mission #99/);
+      expect(r1.body.error).toMatch(/private/);
       expect(r1.body.error).toMatch(/nothing was sent to the user/);
       const b = mk();
       const p2 = b.handlers.sessionStart({ ...good, mission: 61 });
