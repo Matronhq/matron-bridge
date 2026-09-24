@@ -10,7 +10,7 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -6891,9 +6891,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         lastSummaryMsgCount: session.lastSummaryMsgCount || 0,
         lastRosterText: session.lastRosterText || '',
         model: session.currentModel || null,
-        // Only a --model typed now is a pick; resumeState.model may be a
-        // model Claude merely reported, so it must not be marked explicit.
-        ...(resumeModelFlag.model ? explicitModelFlag(resumeModelFlag.model) : {}),
+        // Only a --model typed now is a fresh pick; resumeState.model may be
+        // a model Claude merely reported, so it must not be marked explicit
+        // on that basis. But !resume always mints a new room id, so this
+        // persistSession call has no prior record at that id to merge over —
+        // without carrying resumePersisted.modelExplicit forward, an
+        // explicit pick made before the resume is silently lost.
+        ...explicitModelFlagForResume(resumeModelFlag.model, resumePersisted),
         interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
         mcpExtras: session.mcpExtras,
         totalUsage: session.totalUsage,

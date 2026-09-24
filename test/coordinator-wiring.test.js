@@ -85,8 +85,12 @@ describe('explicit model picks are persisted as such (source inspection)', () =>
     expect(rpc).toContain('model ? { model, ...explicitModelFlag(model) } : undefined');
     expect(index).toContain('startModel ? { model: startModel, ...explicitModelFlag(startModel) } : undefined');
     expect(index).toContain('{ model: restartModelFlag.model, ...explicitModelFlag(restartModelFlag.model) }');
-    expect(index).toContain('...(resumeModelFlag.model ? explicitModelFlag(resumeModelFlag.model) : {}),');
     expect(index).toContain('workdirModel ? { model: workdirModel, ...explicitModelFlag(workdirModel) } : undefined');
+  });
+
+  it('!resume with no --model carries the previous room\'s modelExplicit flag across the new room id (not explicitModelFlag\'s ternary, which would drop it)', () => {
+    expect(index).toContain('...explicitModelFlagForResume(resumeModelFlag.model, resumePersisted),');
+    expect(index).not.toContain('...(resumeModelFlag.model ? explicitModelFlag(resumeModelFlag.model) : {}),');
   });
 
   it('applyModelSwitch takes an explicit option; implicit switches persist modelExplicit:false and park with --implicit', () => {

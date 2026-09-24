@@ -565,13 +565,17 @@ describe('start', () => {
       }
     });
 
-    it('mission_num: a closed mission (409 blocked_by) is not retried', async () => {
+    it('mission_num: a closed mission (409 blocked_by) is not retried, and — unlike a timed-out/pending join — the opening turn does not name a mission the journal has already refused', async () => {
+      const warns = [];
       const joinMission = vi.fn(async () => ({ status: 409, body: { error: 'conflict', blocked_by: 'closed' } }));
-      const { handler, responses } = spawnHarness({ joinMission, joinRetryDelayMs: 0 });
+      const { handler, responses, injected } = spawnHarness({ joinMission, joinRetryDelayMs: 0, log: { warn: (m) => warns.push(m), error: () => {} } });
       handler(REQ('start', { prompt: 'do the thing', mission_num: 61 }));
       await vi.waitFor(() => expect(responses).toHaveLength(1));
       expect(joinMission).toHaveBeenCalledTimes(1);
       expect(responses[0].ok).toBe(true);
+      expect(injected[0][1]).not.toContain('You are on mission');
+      expect(injected[0][1]).not.toContain('mission_start');
+      expect(warns.some((w) => /mission #61/.test(w) && /closed/.test(w))).toBe(true);
     });
 
     it('mission_num must be a positive integer; nothing is spawned otherwise', () => {

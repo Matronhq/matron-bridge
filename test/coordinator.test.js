@@ -7,6 +7,7 @@ import {
   codexCoordinatorOptions,
   coordinatorTurnText,
   explicitModelFlag,
+  explicitModelFlagForResume,
   isModelExplicit,
   planCoordinatorTransition,
   decideCoordinatorEvent,
@@ -254,6 +255,22 @@ describe('explicit model', () => {
     expect(isModelExplicit({ model: 'default' })).toBe(false);
     expect(isModelExplicit({})).toBe(false);
     expect(isModelExplicit(null)).toBe(false);
+  });
+});
+
+describe('explicitModelFlagForResume', () => {
+  it('a typed --model is a fresh pick: same as explicitModelFlag, ignores the persisted record', () => {
+    expect(explicitModelFlagForResume('sonnet', { modelExplicit: false })).toEqual({ modelExplicit: true });
+    expect(explicitModelFlagForResume('default', { modelExplicit: true })).toEqual({ modelExplicit: false });
+  });
+  it('no --model: carries the previous record\'s modelExplicit across the new room id', () => {
+    expect(explicitModelFlagForResume(undefined, { modelExplicit: true })).toEqual({ modelExplicit: true });
+    expect(explicitModelFlagForResume(undefined, { modelExplicit: false })).toEqual({ modelExplicit: false });
+  });
+  it('no --model and no modelExplicit on the persisted record: omits the key rather than guessing', () => {
+    expect(explicitModelFlagForResume(undefined, { model: 'sonnet' })).toEqual({});
+    expect(explicitModelFlagForResume(undefined, null)).toEqual({});
+    expect(explicitModelFlagForResume(undefined, undefined)).toEqual({});
   });
 });
 
