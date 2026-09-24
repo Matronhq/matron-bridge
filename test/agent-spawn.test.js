@@ -393,9 +393,14 @@ describe('createAgentSpawnHandlers', () => {
 
       // Missing room_id/child_convo_id on a started outcome falls back to
       // 'unknown' rather than interpolating the literal string 'undefined'.
+      // It also gets no link hint: a matron://convo/unknown link couldn't
+      // identify the child conversation, so it would just be dead weight —
+      // the plain "Child conversation: unknown." sentence stands alone.
       const ctx3 = await armStarted();
       ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started' });
       expect(ctx3.notices[0].text).not.toMatch(/undefined/);
+      expect(ctx3.notices[0].text).not.toMatch(/matron:\/\/convo/);
+      expect(ctx3.notices[0].text).not.toMatch(/Link it for the user/);
 
       // A child_convo_id carrying a raw ')' must not close the markdown
       // link's `(...)` early — that would splice whatever follows straight
