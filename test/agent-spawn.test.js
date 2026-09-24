@@ -415,6 +415,25 @@ describe('createAgentSpawnHandlers', () => {
       // closing paren right after it is the link's own, not a forged one.
       expect(linkSafeConvoId).not.toMatch(/[()]/);
       expect(text4).toContain(`[title](matron://convo/${linkSafeConvoId}).`);
+
+      // A child_convo_id carrying a lone UTF-16 surrogate (unpaired — not
+      // filtered by peerField, and reachable without hostile intent since
+      // peerField's 64-char cap can itself create one by slicing an astral
+      // character in half) makes a bare encodeURIComponent throw URIError.
+      // handleOutcome tombstones the spawn before this runs, so an uncaught
+      // throw here would silently and permanently drop the spawn-started
+      // notice — it must still produce one.
+      const ctx5 = await armStarted();
+      const loneSurrogateConvoId = 'child-\uD800-lone';
+      expect(() => ctx5.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: loneSurrogateConvoId,
+      })).not.toThrow();
+      expect(ctx5.notifyParent).toHaveBeenCalledTimes(1);
+      const text5 = ctx5.notices[0].text;
+      expect(text5).toContain('Link it for the user as [title](matron://convo/');
+      expect(text5).not.toMatch(/undefined/);
+
       expect(ctx3.notices[0].text).toMatch(/unknown/);
     });
   });
