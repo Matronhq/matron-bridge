@@ -396,6 +396,25 @@ describe('createAgentSpawnHandlers', () => {
       const ctx3 = await armStarted();
       ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started' });
       expect(ctx3.notices[0].text).not.toMatch(/undefined/);
+
+      // A child_convo_id carrying a raw ')' must not close the markdown
+      // link's `(...)` early — that would splice whatever follows straight
+      // into a notice the bridge signs and publishes to the user's chat.
+      // The link target is percent-encoded, so the closing paren in the
+      // notice is only ever the link's own.
+      const ctx4 = await armStarted();
+      const injectingConvoId = 'child-1) [click me](https://evil.example';
+      ctx4.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: injectingConvoId,
+      });
+      const text4 = ctx4.notices[0].text;
+      const linkSafeConvoId = encodeURIComponent(injectingConvoId).replace(/[()]/g, (c) => (c === '(' ? '%28' : '%29'));
+      // linkSafeConvoId itself carries no raw '(' or ')' — the exact
+      // characters Bugbot flagged as able to close the link early — so the
+      // closing paren right after it is the link's own, not a forged one.
+      expect(linkSafeConvoId).not.toMatch(/[()]/);
+      expect(text4).toContain(`[title](matron://convo/${linkSafeConvoId}).`);
       expect(ctx3.notices[0].text).toMatch(/unknown/);
     });
   });
