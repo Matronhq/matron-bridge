@@ -150,6 +150,14 @@ describe('formatItemDetail', () => {
     expect(text).toContain('- [user, 2025-09-08T10:40:00.000Z] [tapped "Go"] Go');
   });
 
+  it('marks a comment whose action lives under meta.action (an older journal)', () => {
+    const text = formatItemDetail({
+      item: { ...open, actions: ['Go', 'No'], chosen_action: 'Go' },
+      comments: [{ id: 'ic_1', author: 'user', kind: 'comment', body: 'Go', meta: { action: 'Go' }, attachments: [], created_at: 1757328000000 }],
+    });
+    expect(text).toContain('- [user, 2025-09-08T10:40:00.000Z] [tapped "Go"] Go');
+  });
+
   it('an ordinary comment with no action is unmarked', () => {
     const text = formatItemDetail({
       item: open,

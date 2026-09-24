@@ -74,6 +74,11 @@ describe('items handlers', () => {
     expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['x'.repeat(41)] })).status).toBe(400);
     expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['  '] })).status).toBe(400);
     expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['a\nb'] })).status).toBe(400);
+    // U+2028/U+2029 (line/paragraph separator) read as a line break in
+    // rendered text just like \n does, so a plain \x00-\x1f check would miss
+    // them — reject alongside ordinary control characters.
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['a b'] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['a b'] })).status).toBe(400);
     expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['Go', 'go'] })).status).toBe(400);
     expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: 'Go' })).status).toBe(400);
     expect(client.create).not.toHaveBeenCalled();
