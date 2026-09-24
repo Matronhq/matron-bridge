@@ -297,6 +297,8 @@ describe('createAgentSpawnHandlers', () => {
       const text = ctx.notices[0].text;
       expect(text).toMatch(/started/);
       expect(text).toMatch(/room-9/);
+      expect(text).toContain('Child conversation: child-1.');
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
     });
 
     it('started without room_id (detached spawn) — rooms.record NOT called, notice says detached and names the child, no literal undefined', async () => {
@@ -311,6 +313,7 @@ describe('createAgentSpawnHandlers', () => {
       expect(text).toMatch(/agent_chat_start/);
       expect(text).not.toMatch(/undefined/);
       expect(text).not.toMatch(/Chat room/);
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
     });
 
     it('declined — notifyParent text contains declined; rooms.record NOT called', async () => {

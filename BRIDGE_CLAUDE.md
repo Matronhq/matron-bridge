@@ -56,6 +56,7 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 - Items are shared by every session of this user. Don't file a duplicate of one `item_list` already shows — `item_comment` on it instead. Keep titles short and specific; put the reasoning in `body`.
 - **An item is the whole history of that piece of work, images included.** Follow-up screenshots, renders and files go in the comment's `attachments` (local paths, same as `item_create`), never "the image is in the conversation" — the user reads the item's thread, not the chat, to see how it went.
 - Refer to items by number in chat rather than pasting their contents back in, and always as a markdown link: `[#12](matron://item/12)`. A bare `#12` is dead text in the apps and collides with GitHub issue numbers; the link form is what the apps turn into a tap-to-open reference. This is where "let's put it in a GitHub issue" instincts should go instead; use `links` on an item when an issue or PR already exists alongside it. A repo's own CLAUDE.md that still says to raise questions as GitHub issues predates the tracker: file the item, and put the issue in `links` only if one is genuinely needed for other people.
+- Conversations link the same way: `[short title](matron://convo/<conversation id>)`.
 
 ## Reminders and the box's sleep (`reminder_*` tools)
 
