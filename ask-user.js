@@ -648,7 +648,7 @@ async function callItems(name, args, render) {
 
 server.tool(
   'item_create',
-  "File an item in the user's task & decision tracker — a panel beside the chat, so it survives this session and the user can answer in their own time. Use kind 'question' for EACH decision you need from the user instead of listing questions in prose: the user answers in that item's own thread and their reply reaches you as a 📌 turn, so do not block waiting for it. Use 'decision' to record a choice you made yourself (what and why, in body) and 'task' for work to do later. Markdown body; attach screenshots or files by local path (uploaded and shown inline).",
+  "File an item in the user's task & decision tracker — a panel beside the chat, so it survives this session and the user can answer in their own time. Use kind 'question' for EACH decision you need from the user instead of listing questions in prose: the user answers in that item's own thread and their reply reaches you as a 📌 turn, so do not block waiting for it. Use 'decision' to record a choice you made yourself (what and why, in body) and 'task' for work to do later. Markdown body; attach screenshots or files by local path (uploaded and shown inline). When the question has an obvious one-tap answer — a go-ahead, or a choice between 2–3 options — pass `actions` so the user can tap instead of typing (they can still reply in words).",
   {
     kind: z.enum(['task', 'question', 'decision']),
     title: z.string().describe('One line, ≤200 chars'),
@@ -659,6 +659,7 @@ server.tool(
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, task→agent, decision→nobody'),
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
+    actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
   },
   async (args) => callItems('create', args, (d) => itemLine(d.item)),
 );
