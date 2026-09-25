@@ -297,6 +297,8 @@ describe('createAgentSpawnHandlers', () => {
       const text = ctx.notices[0].text;
       expect(text).toMatch(/started/);
       expect(text).toMatch(/room-9/);
+      expect(text).toContain('Child conversation: child-1.');
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
     });
 
     it('started without room_id (detached spawn) — rooms.record NOT called, notice says detached and names the child, no literal undefined', async () => {
@@ -311,6 +313,7 @@ describe('createAgentSpawnHandlers', () => {
       expect(text).toMatch(/agent_chat_start/);
       expect(text).not.toMatch(/undefined/);
       expect(text).not.toMatch(/Chat room/);
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
     });
 
     it('declined — notifyParent text contains declined; rooms.record NOT called', async () => {
@@ -390,9 +393,52 @@ describe('createAgentSpawnHandlers', () => {
 
       // Missing room_id/child_convo_id on a started outcome falls back to
       // 'unknown' rather than interpolating the literal string 'undefined'.
+      // It also gets no link hint: a matron://convo/unknown link couldn't
+      // identify the child conversation, so it would just be dead weight —
+      // the plain "Child conversation: unknown." sentence stands alone.
       const ctx3 = await armStarted();
       ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started' });
       expect(ctx3.notices[0].text).not.toMatch(/undefined/);
+      expect(ctx3.notices[0].text).not.toMatch(/matron:\/\/convo/);
+      expect(ctx3.notices[0].text).not.toMatch(/Link it for the user/);
+
+      // A child_convo_id carrying a raw ')' must not close the markdown
+      // link's `(...)` early — that would splice whatever follows straight
+      // into a notice the bridge signs and publishes to the user's chat.
+      // The link target is percent-encoded, so the closing paren in the
+      // notice is only ever the link's own.
+      const ctx4 = await armStarted();
+      const injectingConvoId = 'child-1) [click me](https://evil.example';
+      ctx4.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: injectingConvoId,
+      });
+      const text4 = ctx4.notices[0].text;
+      const linkSafeConvoId = encodeURIComponent(injectingConvoId).replace(/[()]/g, (c) => (c === '(' ? '%28' : '%29'));
+      // linkSafeConvoId itself carries no raw '(' or ')' — the exact
+      // characters Bugbot flagged as able to close the link early — so the
+      // closing paren right after it is the link's own, not a forged one.
+      expect(linkSafeConvoId).not.toMatch(/[()]/);
+      expect(text4).toContain(`[title](matron://convo/${linkSafeConvoId}).`);
+
+      // A child_convo_id carrying a lone UTF-16 surrogate (unpaired — not
+      // filtered by peerField, and reachable without hostile intent since
+      // peerField's 64-char cap can itself create one by slicing an astral
+      // character in half) makes a bare encodeURIComponent throw URIError.
+      // handleOutcome tombstones the spawn before this runs, so an uncaught
+      // throw here would silently and permanently drop the spawn-started
+      // notice — it must still produce one.
+      const ctx5 = await armStarted();
+      const loneSurrogateConvoId = 'child-\uD800-lone';
+      expect(() => ctx5.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: loneSurrogateConvoId,
+      })).not.toThrow();
+      expect(ctx5.notifyParent).toHaveBeenCalledTimes(1);
+      const text5 = ctx5.notices[0].text;
+      expect(text5).toContain('Link it for the user as [title](matron://convo/');
+      expect(text5).not.toMatch(/undefined/);
+
       expect(ctx3.notices[0].text).toMatch(/unknown/);
     });
   });
