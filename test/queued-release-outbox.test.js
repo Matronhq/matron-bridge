@@ -167,6 +167,30 @@ describe('queued-release-outbox', () => {
     expect(reopened.pendingCount()).toBe(0);
   });
 
+  it('fsyncs the temp file before the rename (flush: true)', () => {
+    const spy = vi.spyOn(fs, 'writeFileSync');
+    try {
+      store.put(KEY, rec());
+      expect(spy).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/), expect.any(String), expect.objectContaining({ flush: true }));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('syncs the containing directory after the rename, and reports a failed directory sync as not durable', () => {
+    const fsync = vi.spyOn(fs, 'fsyncSync');
+    try {
+      expect(store.put(KEY, rec())).toBe(true);
+      expect(fsync).toHaveBeenCalled();
+      fsync.mockImplementation(() => { throw Object.assign(new Error('EIO'), { code: 'EIO' }); });
+      expect(store.put('pr_2\0pr_2::0\0cancel', rec({ promptId: 'pr_2', itemId: 'pr_2::0' }))).toBe(false);
+      // Fail-closed: the unconfirmed record is not committed in memory.
+      expect(store.list().map(r => r.key)).toEqual([KEY]);
+    } finally {
+      fsync.mockRestore();
+    }
+  });
+
   it('sweepAcked drops acked records older than retention, keeps fresh + non-acked (fake clock)', () => {
     store.put(KEY, rec());
     store.put('pr_2\0pr_2::0\0send', rec({ promptId: 'pr_2', itemId: 'pr_2::0', action: 'send' }));
