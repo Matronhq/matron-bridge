@@ -398,6 +398,12 @@ const showFileBudget = { inFlight: 0, reservedBytes: 0 };
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
+// Base URL where the matron-web client is served. Used to mint token-less
+// `${WEB_BASE_URL}/#files=<enc>` deep links into its Files pane on file
+// handovers (send_attachment, show_file, item attachments); auth is the
+// user's existing web session, so nothing is signed. Unset: links are
+// dormant and every handover keeps its plain caption.
+const WEB_BASE_URL = process.env.WEB_BASE_URL || '';
 const SHOW_FILE_ARTIFACT_ROOTS = (process.env.SHOW_FILE_ARTIFACT_ROOTS || '')
   .split(':')
   .filter(Boolean);
@@ -1011,9 +1017,25 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
+// Guarded file RPCs (read_file / edit_file). Scoped to the same root set
+// show_file already trusts, the default workdir plus any configured artifact
+// roots, pinned ONCE here at the trusted boundary and never rebuilt from
+// client-supplied strings. A root that cannot be pinned leaves both RPCs
+// failing closed (bad_workdir) rather than taking the bridge down. Both are
+// opt-in: without MATRON_FILE_EDIT=1 neither method is registered.
+let fileRpcAllowedRoots = null;
+try {
+  fileRpcAllowedRoots = pinAllowedRootsSync([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);
+} catch (e) {
+  console.warn(`[journal-rpc] file RPCs disabled: could not pin ${DEFAULT_WORKDIR} / SHOW_FILE_ARTIFACT_ROOTS (${e?.message ?? e})`);
+}
+const FILE_EDIT_ENABLED = process.env.MATRON_FILE_EDIT === '1';
+
 const journalRpcHandler = createRpcRequestHandler({
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
+  getFileAllowedRoots: () => fileRpcAllowedRoots,
+  fileEditEnabled: FILE_EDIT_ENABLED,
   // The !stop teardown for the unsupported_mode orphan: kill, drop from the
   // sessions map (keyed by room id — scan, this path is rare), evict input.
   stopSession: (session) => {
@@ -10139,6 +10161,7 @@ const handleSendAttachment = createSendAttachmentHandler({
   journalConvoIdFor,
   rooms: agentRooms,
   onLocalRoomAttachment: routeLocalRoomAttachment,
+  webBaseUrl: WEB_BASE_URL,
 });
 
 // The eight agent-chat room tools (lib/agent-chat.js), mounted below as thin
@@ -10196,6 +10219,7 @@ const itemsHandlers = createItemsHandlers({
   journalConvoIdFor,
   client: itemsClient,
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+  webBaseUrl: WEB_BASE_URL,
 });
 
 const missionsHandlers = createMissionsHandlers({
@@ -10492,6 +10516,7 @@ const apiServer = createServer(async (req, res) => {
           uploadMedia: journalPublisher.uploadMedia,
           journalPublish,
           denialToStatus,
+          webBaseUrl: WEB_BASE_URL,
         },
       });
       res.writeHead(status, { 'Content-Type': 'application/json', ...(headers || {}) });

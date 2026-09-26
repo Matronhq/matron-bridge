@@ -226,3 +226,57 @@ describe('parseShowFileUploadTimeoutMs', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 });
+
+describe('shareAgentMedia Files deep link', () => {
+  const WEB = 'https://web.example.com';
+
+  it('appends a Files deep link to the caption when webBaseUrl is set', async () => {
+    const deps = makeDeps({ realPath: '/work/report.pdf', content: Buffer.from('pdf bytes') });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'm1', content_type: 'application/pdf', size: 9, sha256: 's1' });
+    await share(deps, { filePath: '/work/report.pdf', caption: 'the report', deps: { ...deps, webBaseUrl: WEB } });
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe(
+      `the report\n\n📁 Open report.pdf in Files: ${WEB}/#files=${encodeURIComponent('/work/report.pdf')}`,
+    );
+  });
+
+  it('produces a caption from just the link when the agent passed none', async () => {
+    const deps = makeDeps({ realPath: '/work/report.pdf', content: Buffer.from('pdf bytes') });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'm1', content_type: 'application/pdf', size: 9, sha256: 's1' });
+    await share(deps, { filePath: '/work/report.pdf', caption: undefined, deps: { ...deps, webBaseUrl: WEB } });
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe(
+      `📁 Open report.pdf in Files: ${WEB}/#files=${encodeURIComponent('/work/report.pdf')}`,
+    );
+  });
+
+  it('gates the link on the pinned root that actually holds the file, not just the first', async () => {
+    const deps = makeDeps({ realPath: '/artifacts/out.pdf', content: Buffer.from('pdf bytes') });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'm1', content_type: 'application/pdf', size: 9, sha256: 's1' });
+    await share(deps, {
+      filePath: '/artifacts/out.pdf',
+      caption: 'build output',
+      pinnedRoots: { roots: [{ realPath: '/work' }, { realPath: '/artifacts' }] },
+      deps: { ...deps, webBaseUrl: WEB },
+    });
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe(
+      `build output\n\n📁 Open out.pdf in Files: ${WEB}/#files=${encodeURIComponent('/artifacts/out.pdf')}`,
+    );
+  });
+
+  it('does not treat a sibling that shares a root prefix as inside that root', async () => {
+    const deps = makeDeps({ realPath: '/work-other/x.pdf', content: Buffer.from('pdf bytes') });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'm1', content_type: 'application/pdf', size: 9, sha256: 's1' });
+    await share(deps, { filePath: '/work-other/x.pdf', caption: 'x', deps: { ...deps, webBaseUrl: WEB } });
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe('x');
+  });
+
+  it('leaves the caption untouched (plain-path fallback) when webBaseUrl is unset', async () => {
+    const deps = makeDeps();
+    await share(deps); // no webBaseUrl in deps
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe('Quarterly chart');
+  });
+});
