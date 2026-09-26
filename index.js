@@ -1021,9 +1021,8 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
 // show_file already trusts, the default workdir plus any configured artifact
 // roots, pinned ONCE here at the trusted boundary and never rebuilt from
 // client-supplied strings. A root that cannot be pinned leaves both RPCs
-// failing closed (bad_workdir) rather than taking the bridge down. edit_file
-// is a separate opt-in: without MATRON_FILE_EDIT=1 the method is not
-// registered at all.
+// failing closed (bad_workdir) rather than taking the bridge down. Both are
+// opt-in: without MATRON_FILE_EDIT=1 neither method is registered.
 let fileRpcAllowedRoots = null;
 try {
   fileRpcAllowedRoots = pinAllowedRootsSync([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);

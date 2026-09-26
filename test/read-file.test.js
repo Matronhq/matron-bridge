@@ -198,3 +198,15 @@ describe('readFileGuarded — fail closed on scope + malformed input', () => {
     expect(readFileSync(file, 'utf8')).toBe('unchanged');
   });
 });
+
+describe('readFileGuarded — credential paths', () => {
+  it('refuses credential files the shared guard lets through', async () => {
+    for (const rel of ['.git-credentials', '.pgpass', '.envrc', path.join('.config', 'gh', 'hosts.yml'), path.join('.codex', 'auth.json')]) {
+      const file = path.join(root, rel);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, 'token=abc\n');
+      await expect(readFileGuarded({ path: file }, { allowedRoots: roots }))
+        .rejects.toMatchObject({ code: 'sensitive' });
+    }
+  });
+});

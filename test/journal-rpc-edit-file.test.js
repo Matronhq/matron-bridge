@@ -104,10 +104,12 @@ describe('dispatch one-response guarantee extends to async handlers', () => {
 });
 
 describe('edit_file RPC gating', () => {
-  it('is absent (unknown_method) unless fileEditEnabled is set, while read_file stays available', async () => {
+  it('both file RPCs are absent (unknown_method) unless fileEditEnabled is set', async () => {
     const { handler, responses, calls } = harness({ fileEditEnabled: false });
     await handler(REQ('edit_file', { path: '/w/config.txt', content: 'NEW=1' }));
+    await handler(REQ('read_file', { path: '/w/config.txt' }, 'r2'));
     expect(calls).toHaveLength(0);
     expect(responses[0]).toMatchObject({ requestId: 'r1', ok: false, error: { code: 'unknown_method' } });
+    expect(responses[1]).toMatchObject({ requestId: 'r2', ok: false, error: { code: 'unknown_method' } });
   });
 });

@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, rmSync, readFileSyn
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { applyFileEdit, MAX_EDIT_BYTES } from '../lib/edit-file.js';
+import { applyFileEdit, MAX_EDIT_BYTES, writeFileReplacing } from '../lib/edit-file.js';
 import { pinAllowedRootsSync } from '../lib/file-link-guard.js';
 
 // Real temp dirs (like file-link-guard.test.js) so the fd-pinned / O_NOFOLLOW /
@@ -330,13 +330,12 @@ describe('applyFileEdit — concurrency, encoding, and permissions', () => {
     chmodSync(file, 0o600);
     const seen = [];
     const { validateAndOpen, FileLinkDenied } = await import('../lib/file-link-guard.js');
-    const { atomicWriteFileSync } = await import('../lib/atomic-write.js');
     await applyFileEdit({ path: file, content: 'k=w\n' }, {
       allowedRoots: roots,
       deps: {
         validateAndOpen,
         FileLinkDenied,
-        atomicWrite: (p, data, opts) => { seen.push(opts); atomicWriteFileSync(p, data, opts); },
+        atomicWrite: (p, data, opts) => { seen.push(opts); writeFileReplacing(p, data, opts); },
       },
     });
     expect(seen).toEqual([{ mode: 0o600 }]);
@@ -344,3 +343,25 @@ describe('applyFileEdit — concurrency, encoding, and permissions', () => {
     expect(readFileSync(file, 'utf8')).toBe('k=w\n');
   });
 });
+
+describe('applyFileEdit — credential paths and the temp file', () => {
+  it('refuses credential files the shared guard lets through', async () => {
+    for (const rel of ['.git-credentials', '.pgpass', '.envrc', path.join('.config', 'gh', 'hosts.yml'), path.join('.codex', 'auth.json')]) {
+      const file = path.join(root, rel);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, 'secret\n');
+      await expect(applyFileEdit({ path: file, content: 'x' }, { allowedRoots: roots }))
+        .rejects.toMatchObject({ code: 'sensitive' });
+      expect(readFileSync(file, 'utf8')).toBe('secret\n');
+    }
+  });
+
+  it('writes through an exclusive temp sibling and leaves no temp file behind', async () => {
+    const file = path.join(root, 'app.conf');
+    writeFileSync(file, 'a\n');
+    await applyFileEdit({ path: file, content: 'b\n' }, { allowedRoots: roots });
+    expect(readFileSync(file, 'utf8')).toBe('b\n');
+    expect(readdirSync(root).filter((n) => n.endsWith('.tmp'))).toEqual([]);
+  });
+});
+

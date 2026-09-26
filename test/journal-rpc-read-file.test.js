@@ -20,6 +20,7 @@ function harness(overrides = {}) {
     statSync: () => ({ isDirectory: () => true }),
     log: silentLog,
     getFileAllowedRoots: () => ({ roots: [{ realPath: '/w', dev: 1, ino: 2 }] }),
+    fileEditEnabled: true,
     readFileGuarded: async (input, opts) => {
       calls.push({ input, opts });
       return { path: '/w/config.txt', content: 'PORT=3000\n', sha256: 'a'.repeat(64), bytes: 10, mode: 0o644 };
