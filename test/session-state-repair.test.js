@@ -520,7 +520,7 @@ describe('planTransition (change-gate + write-ahead)', () => {
   });
 });
 
-describe('journal-publisher queuedSessionState', () => {
+describe('journal-publisher queuedSessionStates', () => {
   class ManualSocket extends EventEmitter {
     static instances = [];
     constructor() {
@@ -565,14 +565,10 @@ describe('journal-publisher queuedSessionState', () => {
       publisher.upsertConvo('c2', { sessionState: 'done' });
       await waitFor(() => sock.sent.filter((f) => f.op === 'convo_upsert').length === 4);
 
-      expect(publisher.queuedSessionState('c1')).toBe('waiting');
-      expect(publisher.queuedSessionState('c2')).toBe('done');
-      expect(publisher.queuedSessionState('nope')).toBeUndefined();
-      expect(publisher.queuedSessionState('')).toBeUndefined();
+      expect(publisher.queuedSessionStates()).toEqual(new Map([['c1', 'waiting'], ['c2', 'done']]));
 
       sock.confirmAll();
-      await waitFor(() => publisher.queuedSessionState('c1') === undefined);
-      expect(publisher.queuedSessionState('c2')).toBeUndefined();
+      await waitFor(() => publisher.queuedSessionStates().size === 0);
     } finally {
       publisher.close();
     }
@@ -580,7 +576,7 @@ describe('journal-publisher queuedSessionState', () => {
 
   it('is a safe no-op on a disabled publisher', () => {
     const publisher = createJournalPublisher({ url: '', token: '', log: { warn() {} } });
-    expect(publisher.queuedSessionState('c1')).toBeUndefined();
+    expect(publisher.queuedSessionStates()).toEqual(new Map());
   });
 });
 
@@ -648,7 +644,17 @@ describe('index.js wiring', () => {
 
   it('skips records whose state is still in flight, so capacity retries do not stack duplicates', () => {
     const body = sliceFunction('function republishSessionStates(');
-    expect(body).toContain('queuedStateFor: (convoId) => journalPublisher.queuedSessionState(convoId)');
+    // One queue scan per sweep, not one per record.
+    expect(body).toContain('const queuedStates = journalPublisher.queuedSessionStates();');
+    expect(body).toContain('queuedStateFor: (convoId) => queuedStates.get(convoId)');
+  });
+
+  it('defers (does not drop) a call that lands mid-sweep, re-running it once the sweep is done', () => {
+    // A synchronous confirmation of a frame the sweep SKIPPED as in flight arrives here while the
+    // latch is held; it is the only trigger left for that record's confirming re-offer.
+    const body = sliceFunction('function republishSessionStates(');
+    expect(body).toContain('if (_runStateRepairRunning) { _runStateRepairRerun = true; return; }');
+    expect(body).toContain('queueMicrotask(retryRunStateRepairs)');
   });
 
   it('guards the sweep against synchronous re-entry from its own send', () => {

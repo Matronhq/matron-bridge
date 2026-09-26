@@ -958,6 +958,7 @@ const sessions = new Map(); // roomId -> session
 // does not lose the record and strand the row at `running` forever.
 const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: console });
 let _runStateRepairRunning = false;
+let _runStateRepairRerun = false;
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -1417,7 +1418,10 @@ function republishSessionStates() {
   if (!JOURNAL_ENABLED) return;
   // Re-entrancy latch. A successful best-effort enqueue can pump, confirm and fire onSendCapacity
   // synchronously on an injected transport, landing right back here mid-sweep.
-  if (_runStateRepairRunning) return;
+  // A call that arrives mid-sweep is not dropped but deferred: it is typically a capacity callback
+  // for a frame this sweep SKIPPED as in flight, and that confirmation is the only trigger left to
+  // give the record its confirming re-offer. Re-run on a microtask once this sweep is done.
+  if (_runStateRepairRunning) { _runStateRepairRerun = true; return; }
   _runStateRepairRunning = true;
   try {
     // Convos a LIVE session currently owns — same signal reconcileStrandedSubagents uses.
@@ -1430,8 +1434,9 @@ function republishSessionStates() {
     // Skip any record whose state is already the newest frame in flight for that convo (the
     // original transition, or an earlier re-offer not yet confirmed): the capacity hook runs on
     // every confirmed send, so without this each confirmation stacked another duplicate.
+    const queuedStates = journalPublisher.queuedSessionStates();
     const { reoffer, retire } = selectEpochRepairs(runStateOutbox.list(), liveConvoIds, {
-      queuedStateFor: (convoId) => journalPublisher.queuedSessionState(convoId),
+      queuedStateFor: (convoId) => queuedStates.get(convoId),
     });
 
     // NON-EVICTING path throughout, deliberately: the ordinary enqueue drops the oldest queued
@@ -1480,6 +1485,10 @@ function republishSessionStates() {
     }
   } finally {
     _runStateRepairRunning = false;
+    if (_runStateRepairRerun) {
+      _runStateRepairRerun = false;
+      queueMicrotask(retryRunStateRepairs);
+    }
   }
 }
 
