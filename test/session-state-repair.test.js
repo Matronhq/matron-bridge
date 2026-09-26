@@ -654,7 +654,10 @@ describe('index.js wiring', () => {
     // latch is held; it is the only trigger left for that record's confirming re-offer.
     const body = sliceFunction('function republishSessionStates(');
     expect(body).toContain('if (_runStateRepairRunning) { _runStateRepairRerun = true; return; }');
-    expect(body).toContain('queueMicrotask(retryRunStateRepairs)');
+    expect(body).toContain('republishSessionStates({ deferred: true })');
+    // Bounded: a synchronous transport plus a settle that keeps failing must not spin forever.
+    expect(body).toContain('_runStateRepairDeferredStreak < RUN_STATE_REPAIR_MAX_DEFERRED');
+    expect(body).toContain('_runStateRepairDeferredStreak = deferred ? _runStateRepairDeferredStreak + 1 : 0');
   });
 
   it('guards the sweep against synchronous re-entry from its own send', () => {

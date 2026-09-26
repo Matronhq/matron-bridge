@@ -959,6 +959,11 @@ const sessions = new Map(); // roomId -> session
 const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: console });
 let _runStateRepairRunning = false;
 let _runStateRepairRerun = false;
+// Consecutive deferred re-runs (see republishSessionStates). Bounded so a transport that confirms
+// synchronously cannot spin on a record whose settle keeps failing (e.g. a disk error); reset by
+// the next ordinary trigger (reconnect or send capacity).
+let _runStateRepairDeferredStreak = 0;
+const RUN_STATE_REPAIR_MAX_DEFERRED = 3;
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -1414,7 +1419,7 @@ function journalSessionState(session, state) {
 // on every accepted hello_ok and re-offering the current state is the matching repair. Idempotent:
 // the server COALESCEs an unchanged session_state, so re-sending one is inert. Bounded by the
 // number of LIVE in-memory sessions plus outstanding unconfirmed records.
-function republishSessionStates() {
+function republishSessionStates({ deferred = false } = {}) {
   if (!JOURNAL_ENABLED) return;
   // Re-entrancy latch. A successful best-effort enqueue can pump, confirm and fire onSendCapacity
   // synchronously on an injected transport, landing right back here mid-sweep.
@@ -1422,6 +1427,7 @@ function republishSessionStates() {
   // for a frame this sweep SKIPPED as in flight, and that confirmation is the only trigger left to
   // give the record its confirming re-offer. Re-run on a microtask once this sweep is done.
   if (_runStateRepairRunning) { _runStateRepairRerun = true; return; }
+  _runStateRepairDeferredStreak = deferred ? _runStateRepairDeferredStreak + 1 : 0;
   _runStateRepairRunning = true;
   try {
     // Convos a LIVE session currently owns — same signal reconcileStrandedSubagents uses.
@@ -1487,7 +1493,9 @@ function republishSessionStates() {
     _runStateRepairRunning = false;
     if (_runStateRepairRerun) {
       _runStateRepairRerun = false;
-      queueMicrotask(retryRunStateRepairs);
+      if (_runStateRepairDeferredStreak < RUN_STATE_REPAIR_MAX_DEFERRED) {
+        queueMicrotask(() => { if (runStateOutbox.size() > 0) republishSessionStates({ deferred: true }); });
+      }
     }
   }
 }
