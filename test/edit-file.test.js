@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, rmSync, readFileSync, readdirSync, statSync, openSync, fchmodSync, closeSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, rmSync, readFileSync, readdirSync, statSync, openSync, fchmodSync, fstatSync, closeSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,17 @@ import { pinAllowedRootsSync } from '../lib/file-link-guard.js';
 
 // Create a file with an exact mode through one descriptor (no umask, and no
 // window between writing and chmod-ing a pathname).
+// Mode and content read through one descriptor, so the two assertions see
+// the same inode.
+function readWithMode(file) {
+  const fd = openSync(file, 'r');
+  try {
+    return { mode: fstatSync(fd).mode & 0o777, text: readFileSync(fd, 'utf8') };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function writeWithMode(file, data, mode) {
   const fd = openSync(file, 'w', 0o600);
   try {
@@ -230,8 +241,7 @@ describe('applyFileEdit — preserves file mode', () => {
     const file = path.join(root, 'secret.conf');
     writeWithMode(file, 'PASSWORD=old\n', 0o600);
     await applyFileEdit({ path: file, content: 'PASSWORD=new\n' }, { allowedRoots: roots });
-    expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(readFileSync(file, 'utf8')).toBe('PASSWORD=new\n');
+    expect(readWithMode(file)).toEqual({ mode: 0o600, text: 'PASSWORD=new\n' });
   });
 
   it('keeps an executable 0755 file executable after a targeted edit', async () => {
@@ -348,8 +358,7 @@ describe('applyFileEdit — concurrency, encoding, and permissions', () => {
       },
     });
     expect(seen).toEqual([{ mode: 0o600 }]);
-    expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(readFileSync(file, 'utf8')).toBe('k=w\n');
+    expect(readWithMode(file)).toEqual({ mode: 0o600, text: 'k=w\n' });
   });
 });
 
