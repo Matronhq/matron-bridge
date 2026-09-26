@@ -44,10 +44,11 @@ prepends its shipped `bin/shim` directory to each launched session's `PATH`, so
 the session's `codex` resolves to the redaction-aware producer shim (which
 forwards to the real `codex` found later on PATH). No manual PATH step is
 required. If stock `codex` is not resolvable on the session PATH, set
-`MATRON_CODEX_REAL_BIN` to the real `codex` binary so the shim can forward to it;
-this does **not** change who the producer is — the shim is still deployed.
+`MATRON_CODEX_REAL_BIN` to the absolute path of the real `codex` binary so the
+shim can forward to it; this does **not** change who the producer is — the shim
+is still deployed.
 
-A son-of-anton–style integration whose own launcher is a redaction-aware producer
+An external integration whose own codex launcher is a redaction-aware producer
 opts out of the shim by setting `MATRON_CODEX_PRODUCER=wrapper` in the bridge
 environment. In that mode the bridge does **not** prepend the shim (deploying it
 alongside the wrapper would make the wrapper's own bare `codex` resolve to the

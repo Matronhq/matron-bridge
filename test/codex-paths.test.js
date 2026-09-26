@@ -1,11 +1,12 @@
-import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   codexRunsDirFor,
   configureCodexSinkEnv,
   detectCodexBinary,
+  detectProducer,
   launchWithCodexSinkEnv,
   pruneStaleCodexSinks,
   SHIPPED_SHIM_DIR,
@@ -137,6 +138,47 @@ describe('configureCodexSinkEnv', () => {
       chmodSync: vi.fn(),
     });
     expect(spawnEnv.PATH.split(path.delimiter)[0]).toBe(SHIPPED_SHIM_DIR);
+  });
+
+  // The shim-only configuration with MATRON_CODEX_REAL_BIN set must never
+  // suppress the shim: without a MATRON_CODEX_PRODUCER=wrapper signal the shim
+  // is prepended, and the activation guard, evaluated on the session env, sees
+  // it. These are the review's three repro values plus a real binary.
+  it.each([
+    ['a relative path', 'codex'],
+    ['the shim itself', path.join(SHIPPED_SHIM_DIR, 'codex')],
+    ['a directory', os.tmpdir()],
+    ['a real binary', process.execPath],
+  ])('with MATRON_CODEX_REAL_BIN set to %s and no wrapper signal, deploys the shim and the guard sees a producer', (_label, realBin) => {
+    const env = { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: realBin, PATH: '/usr/bin:/bin' };
+    const spawnEnv = { ...env };
+    expect(detectProducer({ env: spawnEnv })).toBe(false);
+    const dir = configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env,
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.MATRON_CODEX_SINK_DIR).toBe(dir);
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).toBe(SHIPPED_SHIM_DIR);
+    expect(detectProducer({ env: spawnEnv })).toBe(true);
+  });
+
+  it('with MATRON_CODEX_PRODUCER=wrapper, skips the shim and the guard still sees the wrapper producer', () => {
+    const env = { MATRON_CODEX_VIZ: '1', MATRON_CODEX_PRODUCER: 'wrapper', MATRON_CODEX_REAL_BIN: process.execPath, PATH: '/usr/bin:/bin' };
+    const spawnEnv = { ...env };
+    configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env,
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.PATH).toBe('/usr/bin:/bin');
+    expect(detectProducer({ env: spawnEnv })).toBe(true);
   });
 
   it('does not touch PATH when visualization is disabled', () => {
@@ -341,26 +383,50 @@ describe('Claude spawn-path sink wiring', () => {
 // what is checked — with the shipped viz shim excluded, because a shim with
 // no real codex behind it forwards to nothing.
 describe('detectCodexBinary', () => {
-  const SHIM = '/opt/bridge/bin/shim/codex';
-  const lookup = (table) => (p) => table[p] ?? null;
+  // Real files, not a fake realpath: detectCodexBinary reuses the shim's own
+  // resolveRealCodex, which checks for an executable regular file.
+  let root;
+  const SHIM = path.join(SHIPPED_SHIM_DIR, 'codex');
+  const exe = (p) => { writeFileSync(p, '#!/bin/sh\nexit 0\n'); chmodSync(p, 0o755); return p; };
+  beforeEach(() => { root = mkdtempSync(path.join(os.tmpdir(), 'detect-codex-')); });
+  afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
-  it('is true when a non-shim codex resolves on PATH', () => {
-    const realpath = lookup({ [SHIM]: SHIM, '/usr/local/bin/codex': '/usr/local/lib/node_modules/@openai/codex/bin/codex.js' });
-    expect(detectCodexBinary({ env: { PATH: '/usr/bin:/usr/local/bin' }, shimPath: SHIM, realpath })).toBe(true);
+  it('is true when an executable non-shim codex is on PATH', () => {
+    const bin = path.join(root, 'bin'); mkdirSync(bin);
+    exe(path.join(bin, 'codex'));
+    expect(detectCodexBinary({ env: { PATH: bin } })).toBe(true);
   });
 
   it('is false when the only codex on PATH is the shipped shim', () => {
-    const realpath = lookup({ [SHIM]: SHIM, '/opt/bridge/bin/shim/codex': SHIM });
-    expect(detectCodexBinary({ env: { PATH: '/opt/bridge/bin/shim:/usr/bin' }, shimPath: SHIM, realpath })).toBe(false);
+    expect(detectCodexBinary({ env: { PATH: SHIPPED_SHIM_DIR } })).toBe(false);
   });
 
-  it('is true when MATRON_CODEX_REAL_BIN resolves, whatever PATH holds', () => {
-    const realpath = lookup({ '/srv/codex-real': '/srv/codex-real' });
-    expect(detectCodexBinary({ env: { PATH: '', MATRON_CODEX_REAL_BIN: '/srv/codex-real' }, shimPath: SHIM, realpath })).toBe(true);
+  it('is false when the only codex on PATH is a symlink to the shipped shim', () => {
+    const bin = path.join(root, 'bin'); mkdirSync(bin);
+    symlinkSync(SHIM, path.join(bin, 'codex'));
+    expect(detectCodexBinary({ env: { PATH: bin } })).toBe(false);
   });
 
-  it('is false when nothing resolves, including a set-but-missing REAL_BIN', () => {
-    const realpath = lookup({});
-    expect(detectCodexBinary({ env: { PATH: '/usr/bin', MATRON_CODEX_REAL_BIN: '/nope' }, shimPath: SHIM, realpath })).toBe(false);
+  it('is true when MATRON_CODEX_REAL_BIN is an absolute executable file, whatever PATH holds', () => {
+    const real = exe(path.join(root, 'codex-real'));
+    expect(detectCodexBinary({ env: { PATH: '', MATRON_CODEX_REAL_BIN: real } })).toBe(true);
+  });
+
+  it.each([
+    ['a missing path', (r) => path.join(r, 'nope')],
+    ['an existing directory', (r) => r],
+    ['a non-executable file', (r) => { const p = path.join(r, 'codex-noexec'); writeFileSync(p, 'x'); chmodSync(p, 0o644); return p; }],
+    ['a relative path', () => 'codex'],
+    ['the shim itself', () => SHIM],
+  ])('ignores MATRON_CODEX_REAL_BIN set to %s', (_label, make) => {
+    const realBin = make(root);
+    expect(detectCodexBinary({ env: { PATH: '', MATRON_CODEX_REAL_BIN: realBin } })).toBe(false);
+  });
+
+  it('skips a directory or non-executable `codex` on PATH', () => {
+    const dirBin = path.join(root, 'a'); mkdirSync(path.join(dirBin, 'codex'), { recursive: true });
+    const noexecBin = path.join(root, 'b'); mkdirSync(noexecBin);
+    writeFileSync(path.join(noexecBin, 'codex'), 'x'); chmodSync(path.join(noexecBin, 'codex'), 0o644);
+    expect(detectCodexBinary({ env: { PATH: [dirBin, noexecBin].join(path.delimiter) } })).toBe(false);
   });
 });
