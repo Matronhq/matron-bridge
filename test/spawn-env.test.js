@@ -11,6 +11,7 @@ const BRIDGE_ENV = Object.freeze({
   JOURNAL_TOKEN_FILE: '/etc/matron/agent-token',
   JOURNAL_WS_URL: 'wss://journal.example/ws',
   HMAC_SECRET: 'viewer-signing-key',
+  OPENAI_API_KEY: 'sk-user',
   SHOW_FILE_TOKEN: 'inherited-show-file',
   CLAUDECODE: '1',
   MCP_TOOL_TIMEOUT: '600000',
@@ -22,6 +23,7 @@ function claude(overrides = {}) {
     execPath: EXEC,
     roomId: '!room:example',
     apiPort: 8787,
+    journalProxyHeaderFile: '/tmp/matron-journal-proxy-x/header',
     pluginCacheDir: '/var/cache/plugins',
     showBashOutput: true,
     showFileToken: 'session-show-file',
@@ -36,17 +38,27 @@ describe('buildClaudeSpawnEnv', () => {
     expect(Object.values(env)).not.toContain('viewer-signing-key');
   });
 
-  it('keeps the journal token the session prompt uses for journal search', () => {
+  it('strips the journal token (search goes through the read proxy)', () => {
     const env = claude();
-    expect(env.JOURNAL_TOKEN).toBe('agent-token');
-    expect(env.JOURNAL_TOKEN_FILE).toBe('/etc/matron/agent-token');
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+    expect(Object.values(env)).not.toContain('agent-token');
+    // Non-credential journal config passes through.
     expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
+  });
+
+  it('passes the read-proxy capability as a header-file path', () => {
+    expect(claude().MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
+    expect(claude({ journalProxyHeaderFile: '' }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('');
+    expect(claude({ journalProxyHeaderFile: undefined }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('');
   });
 
   it('passes the rest of the bridge env through', () => {
     const env = claude();
     expect(env.HOME).toBe('/home/bridge');
     expect(env.MCP_TOOL_TIMEOUT).toBe('600000');
+    // The user's provider keys stay with the session.
+    expect(env.OPENAI_API_KEY).toBe('sk-user');
   });
 
   it('never mutates the base env', () => {
@@ -92,16 +104,36 @@ describe('buildClaudeSpawnEnv', () => {
 
 describe('buildCodexSpawnEnv', () => {
   const codex = (overrides = {}) => buildCodexSpawnEnv({
-    baseEnv: BRIDGE_ENV, roomId: '!room:example', apiPort: 8787, ...overrides,
+    baseEnv: BRIDGE_ENV, roomId: '!room:example', apiPort: 8787,
+    journalProxyHeaderFile: '/tmp/matron-journal-proxy-x/header', ...overrides,
   });
 
-  it('strips HMAC_SECRET', () => {
-    expect('HMAC_SECRET' in codex()).toBe(false);
+  it('strips HMAC_SECRET on both transports', () => {
+    expect('HMAC_SECRET' in codex({ appServer: true })).toBe(false);
+    expect('HMAC_SECRET' in codex({ appServer: false })).toBe(false);
   });
 
-  it('keeps the journal token (journal search and the /items HTTP fallback use it)', () => {
-    expect(codex().JOURNAL_TOKEN).toBe('agent-token');
-    expect(codex().JOURNAL_TOKEN_FILE).toBe('/etc/matron/agent-token');
+  it('app-server: strips the journal token (MCP tools for writes, read proxy for search)', () => {
+    const env = codex({ appServer: true });
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+  });
+
+  it('legacy exec: keeps the journal token for the /items HTTP fallback', () => {
+    const env = codex({ appServer: false });
+    expect(env.JOURNAL_TOKEN).toBe('agent-token');
+    expect(env.JOURNAL_TOKEN_FILE).toBe('/etc/matron/agent-token');
+  });
+
+  it('fails safe: an unspecified transport is treated as app-server', () => {
+    const env = codex();
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+  });
+
+  it('passes the read-proxy header file on both transports', () => {
+    expect(codex({ appServer: true }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
+    expect(codex({ appServer: false }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
   });
 
   it('sets the bridge wiring keys and passes the rest through', () => {
@@ -110,6 +142,8 @@ describe('buildCodexSpawnEnv', () => {
     expect(env.MATRON_BRIDGE_API_PORT).toBe('8787');
     expect(env.PATH).toBe('/usr/bin:/bin');
     expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
+    expect(codex({ appServer: true }).OPENAI_API_KEY).toBe('sk-user');
+    expect(codex({ appServer: false }).OPENAI_API_KEY).toBe('sk-user');
   });
 
   it('never mutates the base env', () => {

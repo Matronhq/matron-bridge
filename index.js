@@ -12,7 +12,7 @@ import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
 import { createServer } from 'http';
-import { createHmac, randomUUID } from 'crypto';
+import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -170,6 +170,7 @@ import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
 import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
+import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -521,6 +522,39 @@ const itemsClient = createItemsClient({
 const missionsClient = createMissionsClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
+});
+
+// Journal READ proxy (lib/journal-read-proxy.js): the loopback API forwards
+// the journal search routes under the bridge's own token, so Claude sessions
+// and app-server Codex sessions are spawned without JOURNAL_TOKEN /
+// JOURNAL_TOKEN_FILE (lib/spawn-env.js).
+//
+// The loopback port is open to every local user, so the proxy is gated by a
+// per-boot capability token. Children get it as a 0600 header FILE, never as
+// an env value or argv: `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"` reads
+// the header from the file, whereas a token on curl's command line would be
+// visible to other users in the process table. The file is `<Header>: <token>`
+// in a private mkdtemp dir, removed on exit.
+const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
+const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
+let JOURNAL_PROXY_HEADER_FILE = '';
+if (journalHttpBase) {
+  let dir = '';
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
+    const file = path.join(dir, 'header');
+    fs.writeFileSync(file, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
+    JOURNAL_PROXY_HEADER_FILE = file;
+    process.once('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
+  } catch (e) {
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
+    console.warn(`[journal] could not write the read-proxy header file; journal search is unavailable to sessions: ${e.message}`);
+  }
+}
+const journalReadProxy = createJournalReadProxy({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+  capabilityToken: JOURNAL_PROXY_CAP_TOKEN,
 });
 
 // Which conversation is the user's Coordinator (spec 2026-09-23 §2a):
@@ -1953,11 +1987,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   debug(`Spawning claude with args: ${args.join(' ')}`);
   debug(`Working directory: ${cwd}`);
 
-  // Child env (lib/spawn-env.js): bridge-only secrets stripped, node bin dir on
-  // PATH, per-session SHOW_FILE_TOKEN.
+  // Child env (lib/spawn-env.js): journal token and bridge-only secrets
+  // stripped, read-proxy header file, node bin dir on PATH, per-session
+  // SHOW_FILE_TOKEN.
   const spawnEnv = buildClaudeSpawnEnv({
     roomId,
     apiPort: API_PORT,
+    journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
@@ -2280,7 +2316,14 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sandbox: codexCoord.sandbox,
     networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
-    env: buildCodexSpawnEnv({ roomId, apiPort: API_PORT }),
+    // Journal token stripped on app-server, kept on legacy exec for its /items
+    // HTTP fallback (see buildCodexSpawnEnv).
+    env: buildCodexSpawnEnv({
+      roomId,
+      apiPort: API_PORT,
+      appServer: CODEX_APP_SERVER,
+      journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
   });
@@ -2790,6 +2833,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const interactiveEnv = buildClaudeSpawnEnv({
     roomId,
     apiPort: API_PORT,
+    journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
@@ -10322,6 +10366,22 @@ function validateShowFileBody(data) {
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
+
+  // Journal read proxy: only the allowlisted /journal/* read routes; any
+  // other path returns null and falls through to the dispatch below.
+  {
+    const proxied = await journalReadProxy.handle({
+      method: req.method,
+      pathname: url.pathname,
+      search: url.search,
+      callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
+    });
+    if (proxied) {
+      res.writeHead(proxied.status, { 'Content-Type': proxied.contentType });
+      res.end(proxied.body);
+      return;
+    }
+  }
 
   // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
   // uses it (request_secret is non-blocking since item #120); it stays so a
