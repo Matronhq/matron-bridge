@@ -724,6 +724,20 @@ describe('formatAndRoute known protocol events', () => {
     expect(ctx.state.terminalSeen).toBe(true);
   });
 
+  it('keeps the turn.failed line even when the answer takes the last durable slot', () => {
+    for (const schemaVersion of ['codex-cli 0.146.0', 'codex-cli 0.145.0']) {
+      const { calls, ctx } = makeContext({ meta: { schemaVersion }, maxDurableEvents: 1 });
+      ctx.state = { durableEvents: 0 };
+      formatAndRoute({ type: 'item.completed', item: { id: 'a1', type: 'agent_message', text: 'partial answer' } }, ctx);
+      formatAndRoute({ type: 'turn.failed' }, ctx);
+
+      const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+      expect(bodies[0], schemaVersion).toBe('partial answer');
+      expect(bodies.slice(1).some(body => body.includes('turn.failed') || body.includes('turn failed')), schemaVersion).toBe(true);
+      expect(bodies, schemaVersion).not.toContain('Additional events truncated');
+    }
+  });
+
   it('renders a bare turn.failed stub without a message', () => {
     const { calls, ctx } = makeContext();
 
