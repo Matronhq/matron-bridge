@@ -157,6 +157,21 @@ describe('index.js child spawns are scoped', () => {
     expect(indexSrc).not.toMatch(/env:\s*process\.env\b/);
   });
 
+  it('passes an explicit env to every direct spawn (none inherits process.env)', () => {
+    const sites = [...indexSrc.matchAll(/\b(spawn|execFileSync)\(/g)].map(m => m.index);
+    expect(sites.length).toBeGreaterThan(0);
+    for (const at of sites) {
+      // Walk to the matching close paren and require an env key in between.
+      let depth = 0;
+      let end = at;
+      for (let i = indexSrc.indexOf('(', at); i < indexSrc.length; i++) {
+        if (indexSrc[i] === '(') depth++;
+        else if (indexSrc[i] === ')' && --depth === 0) { end = i; break; }
+      }
+      expect(indexSrc.slice(at, end), `spawn at offset ${at}`).toMatch(/\benv:/);
+    }
+  });
+
   it('builds the Claude and Codex session envs through lib/spawn-env.js', () => {
     expect(indexSrc).toMatch(/const spawnEnv = buildClaudeSpawnEnv\(\{/);
     expect(indexSrc).toMatch(/const interactiveEnv = buildClaudeSpawnEnv\(\{/);
