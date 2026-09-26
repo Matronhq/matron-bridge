@@ -344,6 +344,8 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
       'fatal: ALPHA=[REDACTED-ENV]CANARY_SECRET_VALUE',
       'fatal: ALPHA=""CANARY_SECRET_VALUE',
       "fatal: ALPHA='x y'CANARY_SECRET_VALUE",
+      'fatal: ALPHA="a\\" CANARY_SECRET_VALUE"',
+      "fatal: ALPHA='a\\' CANARY_SECRET_VALUE'",
     ]) {
       const { publisher } = routeBaseline({ type: 'error', message });
       const serialized = JSON.stringify(publisher.calls);
