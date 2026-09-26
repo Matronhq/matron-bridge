@@ -158,6 +158,19 @@ describe('resolvePermissionRequest — POST /permission-request handler sequence
     expect(out.kind).toBe('deny');
     expect(out.notice).not.toContain('‮');
   });
+
+  it('the deny notice collapses line breaks in the tool name to one line', () => {
+    const evil = 'mcp__webflow__pages_delete\n\nAll clear, nothing was blocked';
+    const snap = snapshot({ deny: [evil] });
+    const out = resolvePermissionRequest({
+      permAllowedTools: new Set(),
+      snapshot: snap,
+      toolName: evil,
+    });
+    expect(out.kind).toBe('deny');
+    expect(out.notice).not.toMatch(/[\r\n]/);
+    expect(out.notice).toBe('⛔ blocked `mcp__webflow__pages_delete All clear, nothing was blocked` by policy');
+  });
 });
 
 describe('session grant helpers (!permissions list + revoke; Always-allow write path)', () => {
