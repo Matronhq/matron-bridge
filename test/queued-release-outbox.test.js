@@ -137,6 +137,36 @@ describe('queued-release-outbox', () => {
     expect(() => store.abort('nope')).not.toThrow();
   });
 
+  it('a prepared record is durable but not retry-eligible until commit() promotes it', () => {
+    expect(store.put(KEY, rec({ status: 'prepared' }))).toBe(true);
+    expect(store.pendingCount()).toBe(0);
+    expect(store.list()[0].status).toBe('prepared');
+    expect(store.commit(KEY)).toBe(true);
+    expect(store.pendingCount()).toBe(1);
+    expect(store.list()[0].status).toBe('pending');
+    // Only a prepared record is promotable.
+    expect(store.commit(KEY)).toBe(false);
+    expect(store.commit('nope')).toBe(false);
+  });
+
+  it('commit() promotes IN MEMORY even when the disk persist throws', () => {
+    store.put(KEY, rec({ status: 'prepared' }));
+    const spy = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => { throw new Error('ENOSPC'); });
+    try {
+      expect(store.commit(KEY)).toBe(true);
+      expect(store.pendingCount()).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('relabels a prior process\'s prepared record to pending_inherited at load', () => {
+    store.put(KEY, rec({ status: 'prepared' }));
+    const reopened = createQueuedReleaseOutbox({ file, log: { warn() {} } });
+    expect(reopened.list()[0].status).toBe('pending_inherited');
+    expect(reopened.pendingCount()).toBe(0);
+  });
+
   it('sweepAcked drops acked records older than retention, keeps fresh + non-acked (fake clock)', () => {
     store.put(KEY, rec());
     store.put('pr_2\0pr_2::0\0send', rec({ promptId: 'pr_2', itemId: 'pr_2::0', action: 'send' }));

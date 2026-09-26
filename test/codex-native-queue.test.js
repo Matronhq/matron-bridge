@@ -11,18 +11,34 @@ function sourceOf(name) {
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 function setup() {
-  let ack;
-  const session = { agent: 'codex', alive: true, busy: true, roomId: 'room', queuedMessages: [], queueNotifications: [], codex: { transport: 'app-server', steer: vi.fn(() => new Promise(resolve => { ack = resolve; })), interrupt: vi.fn() } };
-  const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, console,
+  let ack, fail;
+  const session = { agent: 'codex', alive: true, busy: true, roomId: 'room', queuedMessages: [], queueNotifications: [], codex: { transport: 'app-server', steer: vi.fn(() => new Promise((resolve, reject) => { ack = resolve; fail = reject; })), interrupt: vi.fn() } };
+  const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, console: { ...console, warn: vi.fn() },
     sessions: new Map([['room', session]]), pendingMediaMirror: () => [], journalMirrorUserMedia: vi.fn(),
-    commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), finalizeSentQueue: vi.fn(),
+    commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(),
+    // The durable release seams the steer path now drives directly.
+    writeAheadRelease: vi.fn((convoId, spec, opts) => ({ recordKey: `k:${spec.releasedIds[0]}`, convoId, itemId: spec.releasedIds[0], promptId: spec.promptId, prepared: opts?.prepared === true })),
+    publishReleaseRecord: vi.fn(), releaseOutbox: { abort: vi.fn(), commit: vi.fn(() => true) },
+    journalInputConsumer: { queueRelease: { listLive: vi.fn(() => [{ promptId: 'pr-1', itemId: 'msg-1' }]), dropItem: vi.fn() } },
     journalPublishNotice: vi.fn(), journalConvoIdFor: () => 'convo', dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
     sendToSession: vi.fn(() => true), recordUserAnswer: vi.fn(),
   });
-  vm.runInContext(['restoreQueuedBatch', 'flushQueue', 'submitCodexAsyncAnswer', 'dispatchMergedFlush', 'journalRoutePromptReply'].map(sourceOf).join('\n'), context);
+  vm.runInContext(['restoreQueuedBatch', 'writeAheadSendReleases', 'abortSendReleases', 'publishSendReleases', 'flushQueue', 'submitCodexAsyncAnswer', 'dispatchMergedFlush', 'journalRoutePromptReply'].map(sourceOf).join('\n'), context);
   const batch = [[{ type: 'text', text: 'Also check the test' }]];
   const snapshot = { convoId: 'convo', entries: [{ itemId: 'msg-1' }] };
-  return { session, context, batch, snapshot, ack: value => ack(value), flush: () => context.flushQueue(session, batch, snapshot) };
+  return { session, context, batch, snapshot, ack: value => ack(value), fail: error => fail(error), flush: () => context.flushQueue(session, batch, snapshot) };
+}
+// No `send` release may be published, and no card retired, for a batch Codex
+// has not acknowledged.
+function expectNothingPublished(h) {
+  expect(h.context.publishReleaseRecord).not.toHaveBeenCalled();
+  expect(h.context.releaseOutbox.commit).not.toHaveBeenCalled();
+  expect(h.context.journalInputConsumer.queueRelease.dropItem).not.toHaveBeenCalled();
+}
+// ...and the prepared intent written ahead of the steer is rolled back.
+function expectRolledBack(h) {
+  expectNothingPublished(h);
+  expect(h.context.releaseOutbox.abort).toHaveBeenCalledExactlyOnceWith('k:msg-1');
 }
 describe('bridge send-now steering', () => {
   it('retains messages for a parked restart without attempting native steering', () => {
@@ -30,19 +46,38 @@ describe('bridge send-now steering', () => {
     expect(h.flush()).toBe(false);
     expect(h.session.queuedMessages).toEqual(h.batch);
     expect(h.session.codex.steer).not.toHaveBeenCalled();
-    expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();
+    expect(h.context.writeAheadRelease).not.toHaveBeenCalled();
+    expectNothingPublished(h);
   });
   it('does not interrupt or retire queued cards until Codex acknowledges input', async () => {
     const h = setup(); expect(h.flush()).toBe('deferred');
-    expect(h.session.codex.interrupt).not.toHaveBeenCalled(); expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();
+    expect(h.session.codex.interrupt).not.toHaveBeenCalled();
+    // The send intent is durable BEFORE the steer, but written `prepared` (not
+    // retry-eligible), and nothing is published while the steer is in flight.
+    expect(h.context.writeAheadRelease).toHaveBeenCalledExactlyOnceWith('convo', { promptId: 'pr-1', action: 'send', releasedIds: ['msg-1'] }, { prepared: true });
+    expect(h.context.writeAheadRelease.mock.invocationCallOrder[0]).toBeLessThan(h.session.codex.steer.mock.invocationCallOrder[0]);
+    expectNothingPublished(h);
     h.ack(true); await settle();
     expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
-    expect(h.context.finalizeSentQueue).toHaveBeenCalledWith('convo', h.snapshot.entries);
+    // Confirmed: promote, then publish, then retire the card.
+    expect(h.context.releaseOutbox.commit).toHaveBeenCalledExactlyOnceWith('k:msg-1');
+    expect(h.context.publishReleaseRecord).toHaveBeenCalledTimes(1);
+    expect(h.context.journalInputConsumer.queueRelease.dropItem).toHaveBeenCalledExactlyOnceWith('convo', 'msg-1');
+    expect(h.context.releaseOutbox.commit.mock.invocationCallOrder[0]).toBeLessThan(h.context.publishReleaseRecord.mock.invocationCallOrder[0]);
+    expect(h.context.releaseOutbox.abort).not.toHaveBeenCalled();
     expect(h.session.busy).toBe(true); expect(h.session._codexSteerPending).toBe(false);
+  });
+  it('does not steer, and keeps the batch queued, when the send write-ahead faults', () => {
+    const h = setup(); h.context.writeAheadRelease.mockReturnValue(null);
+    expect(h.flush()).toBe(false);
+    expect(h.session.codex.steer).not.toHaveBeenCalled();
+    expect(h.session.queuedMessages).toEqual(h.batch);
+    expect(h.session._codexSteerPending).toBeFalsy();
+    expectNothingPublished(h);
   });
   it('retains definitely rejected messages for turn end', async () => {
     const h = setup(); h.flush(); h.ack(false); await settle();
-    expect(h.session.queuedMessages).toEqual(h.batch); expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();
+    expect(h.session.queuedMessages).toEqual(h.batch); expectRolledBack(h);
     expect(h.session._codexUncertainSteer).toBe(false);
   });
   it('holds unconfirmed messages even if the turn finishes before acknowledgement', async () => {
@@ -50,10 +85,18 @@ describe('bridge send-now steering', () => {
     h.ack(false); await settle();
     expect(h.session.queuedMessages).toEqual(h.batch); expect(h.session._codexUncertainSteer).toBe(true);
     expect(h.context.flushPendingSessionQueue).not.toHaveBeenCalled(); expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
+    // Delivery may or may not have happened; the cards stay actionable so the
+    // user decides, rather than a `send` release retiring them unconfirmed.
+    expectRolledBack(h);
+  });
+  it('emits no release and holds the batch when steering throws', async () => {
+    const h = setup(); h.flush(); h.fail(new Error('socket closed')); await settle();
+    expect(h.session.queuedMessages).toEqual(h.batch); expect(h.session._codexUncertainSteer).toBe(true);
+    expectRolledBack(h);
   });
   it('ignores an acknowledgement from a replaced session', async () => {
     const h = setup(); h.flush(); h.context.sessions.set('room', { alive: true }); h.ack(true); await settle();
-    expect(h.context.finalizeSentQueue).not.toHaveBeenCalled(); expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
+    expectRolledBack(h); expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
   });
 });
 
@@ -74,7 +117,8 @@ describe('asynchronous question answer delivery', () => {
     h.ack(true); await settle();
     expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledExactlyOnceWith(h.session, 'Which feature?\nTokens', null);
     expect(h.context.journalPublishUserItem).not.toHaveBeenCalled();
-    expect(h.context.finalizeSentQueue).toHaveBeenCalledWith('convo', []);
+    expect(h.context.writeAheadRelease).not.toHaveBeenCalled();
+    expect(h.context.publishReleaseRecord).not.toHaveBeenCalled();
     expect(h.session.queuedMessages).toBe(h.batch);
     expect(h.session.queueNotifications).toEqual([notification]);
   });

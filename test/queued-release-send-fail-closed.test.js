@@ -12,10 +12,12 @@ import { runInNewContext } from 'node:vm';
 // flushQueue lives in index.js and can't be imported, so it's extracted and
 // evaluated in a sandbox with every module-level dependency injected as a stub
 // (the same source-extraction pattern queued-release-index.test.js already uses
-// for emitRelease / finalizeSentQueue).
+// for emitRelease).
 function loadFlushQueue(overrides = {}) {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-  const start = src.indexOf('function flushQueue(session, queued, releaseSnapshot');
+  // Slice from the batch write-ahead helpers that sit directly above flushQueue
+  // so the real liveness re-resolution + rollback run, not stubs.
+  const start = src.indexOf('function writeAheadSendReleases(convoId, entries');
   const end = src.indexOf('\nfunction splitMessage', start);
   expect(start).toBeGreaterThan(-1);
   expect(end).toBeGreaterThan(start);
@@ -26,20 +28,30 @@ function loadFlushQueue(overrides = {}) {
     snapshotQueuedReleaseBatch: () => ({ convoId: 'c', entries: [] }),
     restoreQueuedBatch: () => {},
     dispatchMergedFlush: () => true,
-    // Post-delivery seam retained only so the CURRENT (pre-fix) source still
-    // evaluates; the fixed source never references it.
-    finalizeSentQueue: () => {},
     writeAheadRelease: () => ({}),
     publishReleaseRecord: () => {},
     releaseOutbox: { abort: () => {} },
-    journalInputConsumer: { queueRelease: { dropItem: () => {} } },
     journalConvoIdFor: () => 'c',
     journalPublishNotice: () => {},
     ...overrides,
   };
+  // Every test item is live in the release registry unless a test says
+  // otherwise; tests that only stub dropItem inherit this listLive.
+  sandbox.journalInputConsumer = {
+    queueRelease: {
+      listLive: () => LIVE,
+      dropItem: () => {},
+      ...(overrides.journalInputConsumer?.queueRelease || {}),
+    },
+  };
   runInNewContext(src.slice(start, end), sandbox);
   return sandbox; // exposes flushQueue
 }
+
+const LIVE = [
+  { promptId: 'pr_1', itemId: 'pr_1::0' },
+  { promptId: 'pr_2', itemId: 'pr_2::0' },
+];
 
 describe('index.js flushQueue — SEND fail-closed ordering (write-ahead before delivery)', () => {
   const twoItemSnapshot = {
@@ -178,5 +190,24 @@ describe('index.js flushQueue — SEND fail-closed ordering (write-ahead before 
     expect(publishReleaseRecord).not.toHaveBeenCalled();
     expect(dropItem).not.toHaveBeenCalled();
     expect(journalPublishNotice).toHaveBeenCalled();
+  });
+
+  it('write-aheads only items still live in the registry, resolving promptId from it', () => {
+    const writeAheadRelease = vi.fn((convoId, spec) => ({
+      recordKey: `k:${spec.releasedIds[0]}`, convoId, itemId: spec.releasedIds[0], promptId: spec.promptId,
+    }));
+    const dropItem = vi.fn();
+    const seam = loadFlushQueue({
+      // An itemId-only entry (the typed send_one path), plus one already
+      // resolved elsewhere (no longer live).
+      snapshotQueuedReleaseBatch: () => ({ convoId: 'c', entries: [{ itemId: 'pr_2::0' }, { itemId: 'gone::0' }] }),
+      writeAheadRelease,
+      journalInputConsumer: { queueRelease: { dropItem } },
+    });
+    const result = seam.flushQueue({ agent: 'claude', busy: false, alive: true }, ['m1']);
+    expect(result).toBe(true);
+    expect(writeAheadRelease).toHaveBeenCalledTimes(1);
+    expect(writeAheadRelease).toHaveBeenCalledWith('c', { promptId: 'pr_2', action: 'send', releasedIds: ['pr_2::0'] }, { prepared: false });
+    expect(dropItem).toHaveBeenCalledExactlyOnceWith('c', 'pr_2::0');
   });
 });

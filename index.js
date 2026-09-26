@@ -1177,7 +1177,9 @@ function journalOnReconnect() {
 // descriptor the caller can later publish. Returns null (fail-closed) if the
 // durable write can't persist, so a caller aborts before the irreversible step
 // (queue splice, or — on the SEND path — the merged delivery) it guards.
-function writeAheadRelease(convoId, { promptId, action, releasedIds }) {
+// `prepared` records a durable intent that is NOT retry-eligible until
+// releaseOutbox.commit promotes it (asynchronous delivery; see flushQueue).
+function writeAheadRelease(convoId, { promptId, action, releasedIds }, { prepared = false } = {}) {
   const itemId = (Array.isArray(releasedIds) && releasedIds.length)
     ? releasedIds[0]
     : `${promptId}::0`;
@@ -1189,14 +1191,14 @@ function writeAheadRelease(convoId, { promptId, action, releasedIds }) {
     itemId,
     action,
     releasedIds: Array.isArray(releasedIds) ? releasedIds : [itemId],
-    status: 'pending',
+    status: prepared ? 'prepared' : 'pending',
     at,
   });
   if (!durable) {
     console.warn(`[queued-release-outbox] write-ahead failed for ${recordKey} — aborting release (card stays actionable)`);
     return null;
   }
-  return { recordKey, convoId, promptId, itemId, action, releasedIds, at };
+  return { recordKey, convoId, promptId, itemId, action, releasedIds, at, prepared };
 }
 
 // Network phase of a release: publish the prompt_reply for an already
@@ -5478,6 +5480,56 @@ function restoreQueuedBatch(session, queued) {
   session.queuedMessages = [...queued, ...pending];
 }
 
+// Durable phase of a batch's `send` releases: write-ahead one record per flushed
+// item that is STILL live in the release registry. Liveness (and the promptId)
+// is re-resolved here against the real, unscoped registry rather than trusted
+// from the snapshot: a snapshot can be stale (an item resolved elsewhere since
+// it was taken) or carry only an itemId (the typed send_one path), and emitting
+// for either would publish a spurious or malformed release. All-or-nothing: if
+// any write-ahead faults, the ones already written are aborted and null is
+// returned, so the caller never commits a partial batch. abort (in-memory
+// authoritative), not remove: the disk is already faulting, so a persist-only
+// remove could leave an earlier write-ahead `pending` for the retry driver to
+// republish as a false `send`.
+function writeAheadSendReleases(convoId, entries, { prepared = false } = {}) {
+  const liveByItemId = new Map(
+    journalInputConsumer.queueRelease.listLive(convoId)
+      .map(entry => [entry.itemId, entry]),
+  );
+  const written = [];
+  for (const { itemId } of entries || []) {
+    const liveEntry = liveByItemId.get(itemId);
+    if (!liveEntry) continue;
+    liveByItemId.delete(itemId);
+    const rec = writeAheadRelease(convoId, {
+      promptId: liveEntry.promptId,
+      action: 'send',
+      releasedIds: [itemId],
+    }, { prepared });
+    if (!rec) {
+      abortSendReleases(written);
+      return null;
+    }
+    written.push(rec);
+  }
+  return written;
+}
+
+function abortSendReleases(written) {
+  for (const rec of written || []) releaseOutbox.abort(rec.recordKey);
+}
+
+// Network phase, run only once delivery has committed: publish each written-ahead
+// `send` release and retire its live card. A `prepared` intent is promoted to
+// retry-eligible first.
+function publishSendReleases(convoId, written) {
+  for (const rec of written || []) {
+    if (rec.prepared) releaseOutbox.commit(rec.recordKey);
+    publishReleaseRecord(rec);
+    journalInputConsumer.queueRelease.dropItem(convoId, rec.itemId);
+  }
+}
+
 function flushQueue(session, queued, releaseSnapshot = null) {
   const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
   const restore = () => {
@@ -5499,19 +5551,45 @@ function flushQueue(session, queued, releaseSnapshot = null) {
   session._codexUncertainSteer = false; // an explicit retry may release held input
   if (session.codex?.transport === 'app-server' && session.busy && !hasQueuedCompact(queued)) {
     if (session._codexSteerPending) { restore(); return false; }
+    // Fail-closed SEND for native steering, the same contract as the
+    // synchronous path below: the `send` intent is durable BEFORE the steer can
+    // deliver anything, published only once Codex confirms, and rolled back
+    // otherwise. Steering is asynchronous, so the intent is written `prepared`,
+    // a state the release retry driver never republishes; a plain `pending`
+    // record would be republished on the next confirmed outbound frame (a busy
+    // turn streams them), i.e. before Codex answers. If the write faults, the
+    // batch never reaches Codex and stays queued with its cards actionable.
+    const prepared = writeAheadSendReleases(snapshot.convoId, snapshot.entries, { prepared: true });
+    if (!prepared) {
+      restore();
+      console.log(`[QUEUE] send write-ahead faulted; kept ${queued.length} queued message(s) actionable (room ${session.roomId})`);
+      return false;
+    }
     const { blocks, mirrorText } = planQueueFlush(queued);
     const notifications = snapshot.notifications || (session.queueNotifications || []).slice(0, queued.length);
     session._codexSteerPending = { queued };
     void session.codex.steer(blocks).then(sent => {
       session._codexSteerPending = false;
-      if (!session.alive || sessions.get(session.roomId) !== session) return;
+      if (!session.alive || sessions.get(session.roomId) !== session) {
+        abortSendReleases(prepared);
+        return;
+      }
       if (sent) {
         commitDispatchedUserTurn(session, blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n'), null);
         if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
         for (const entry of queued) for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
-        finalizeSentQueue(snapshot.convoId, snapshot.entries);
+        // Confirmed: promote + publish the prepared intents and retire the
+        // cards. Promotion is an in-memory flip, so no disk fault here can
+        // strand a delivered card.
+        publishSendReleases(snapshot.convoId, prepared);
         session.queueNotifications = (session.queueNotifications || []).filter(n => !notifications.includes(n));
       } else {
+        // Rejected, or unconfirmed (steerUncertain). Either way no `send` may
+        // survive: for an uncertain steer delivery may or may not have
+        // happened, and a `send` release would retire the cards on a guess.
+        // The batch is held instead and the user resolves it from the still
+        // actionable cards (Send or Cancel), as the notice below asks.
+        abortSendReleases(prepared);
         restore();
         session._codexUncertainSteer = session.codex.steerUncertain === true;
         journalPublishNotice(snapshot.convoId, session._codexUncertainSteer
@@ -5523,6 +5601,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       }
     }).catch(() => {
       session._codexSteerPending = false;
+      abortSendReleases(prepared);
       if (!session.alive) return;
       restore();
       session._codexUncertainSteer = true;
@@ -5548,31 +5627,16 @@ function flushQueue(session, queued, releaseSnapshot = null) {
   // for this batch FIRST. If any durable write faults (ENOSPC etc.), undo the
   // partial write-aheads, keep the whole batch queued, and leave the cards
   // actionable — nothing was delivered, so the user can retap. (The old ordering
-  // delivered first and wrote-ahead in finalizeSentQueue afterward, so a disk
-  // fault between delivery and release stranded a delivered-but-unreleased,
-  // stale-actionable card.)
-  const written = [];
-  const abortWrittenReleases = () => {
-    for (const w of written) releaseOutbox.abort(w.recordKey);
-  };
-  for (const { promptId, itemId } of snapshot.entries || []) {
-    const rec = writeAheadRelease(snapshot.convoId, {
-      promptId,
-      action: 'send',
-      releasedIds: [itemId],
-    });
-    if (!rec) {
-      // Roll back via abort (in-memory authoritative), NOT remove: the disk is
-      // already faulting, so a persist-only remove could leave an earlier
-      // write-ahead `pending` for the retry driver to republish as a false
-      // `send` for an undelivered batch.
-      abortWrittenReleases();
-      restoreQueuedBatch(session, queued);
-      console.log(`[QUEUE] send write-ahead faulted; kept ${queued.length} queued message(s) actionable (room ${session.roomId})`);
-      return false;
-    }
-    written.push(rec);
+  // delivered first and wrote-ahead afterward, so a disk fault between delivery
+  // and release stranded a delivered-but-unreleased, stale-actionable card.)
+  const written = writeAheadSendReleases(snapshot.convoId, snapshot.entries);
+  if (!written) {
+    // writeAheadSendReleases already aborted any partial write-aheads.
+    restoreQueuedBatch(session, queued);
+    console.log(`[QUEUE] send write-ahead faulted; kept ${queued.length} queued message(s) actionable (room ${session.roomId})`);
+    return false;
   }
+  const abortWrittenReleases = () => abortSendReleases(written);
   let delivered;
   try {
     delivered = dispatchMergedFlush(session, queued);
@@ -5624,10 +5688,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
   // cards — the same post-commit publish ordering the cancel path uses (splice
   // under the write-ahead, publish after). A crash after this point leaves
   // durable `send` records the retry driver / boot reconcile finish.
-  for (const rec of written) {
-    publishReleaseRecord(rec);
-    journalInputConsumer.queueRelease.dropItem(snapshot.convoId, rec.itemId);
-  }
+  publishSendReleases(snapshot.convoId, written);
   return true;
 }
 

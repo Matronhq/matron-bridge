@@ -1115,8 +1115,8 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
 // destructive (the message is gone whether or not anything else succeeds), so
 // its release must be durable BEFORE the splice. send_one is a dispatch: the
 // release is a `send` release and is only true once the dispatch was accepted,
-// which is exactly what flushQueue's finalizeSentQueue does with the snapshot —
-// so the release rides that path, like every other flush.
+// which is exactly what flushQueue does with the snapshot (write-ahead before
+// delivery, publish after) — so the release rides that path, like every other flush.
 describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
   function threeSession(overrides = {}) {
     return {
@@ -1203,7 +1203,7 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
     const session = threeSession();
     tapSendOne(session, { flushQueue });
 
-    // finalizeSentQueue emits one durable `send` release per snapshot entry and
+    // flushQueue emits one durable `send` release per snapshot entry and
     // retires that card. Handed the whole live list it would retire all three,
     // killing two cards whose messages are still sitting in the queue.
     expect(flushQueue.mock.calls[0][2]).toEqual({
@@ -1866,7 +1866,7 @@ describe('index.js queued-send finalizer', () => {
       promptId: 'pr_1',
       action: 'send',
       releasedIds: ['pr_1::0'],
-    });
+    }, { prepared: false });
     expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 
