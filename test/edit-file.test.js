@@ -1,10 +1,22 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, rmSync, readFileSync, readdirSync, statSync, chmodSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, rmSync, readFileSync, readdirSync, statSync, openSync, fchmodSync, closeSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { applyFileEdit, MAX_EDIT_BYTES, writeFileReplacing } from '../lib/edit-file.js';
 import { pinAllowedRootsSync } from '../lib/file-link-guard.js';
+
+// Create a file with an exact mode through one descriptor (no umask, and no
+// window between writing and chmod-ing a pathname).
+function writeWithMode(file, data, mode) {
+  const fd = openSync(file, 'w', 0o600);
+  try {
+    fchmodSync(fd, mode);
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+}
 
 // Real temp dirs (like file-link-guard.test.js) so the fd-pinned / O_NOFOLLOW /
 // realpath containment is exercised for real, not mocked.
@@ -216,8 +228,7 @@ describe('applyFileEdit — size guard', () => {
 describe('applyFileEdit — preserves file mode', () => {
   it('keeps a private 0600 file at 0600 after a content edit', async () => {
     const file = path.join(root, 'secret.conf');
-    writeFileSync(file, 'PASSWORD=old\n');
-    chmodSync(file, 0o600);
+    writeWithMode(file, 'PASSWORD=old\n', 0o600);
     await applyFileEdit({ path: file, content: 'PASSWORD=new\n' }, { allowedRoots: roots });
     expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(readFileSync(file, 'utf8')).toBe('PASSWORD=new\n');
@@ -225,8 +236,7 @@ describe('applyFileEdit — preserves file mode', () => {
 
   it('keeps an executable 0755 file executable after a targeted edit', async () => {
     const file = path.join(root, 'run.sh');
-    writeFileSync(file, '#!/bin/sh\necho old\n');
-    chmodSync(file, 0o755);
+    writeWithMode(file, '#!/bin/sh\necho old\n', 0o755);
     await applyFileEdit({ path: file, old_string: 'echo old', new_string: 'echo new' }, { allowedRoots: roots });
     expect(statSync(file).mode & 0o777).toBe(0o755);
   });
@@ -326,8 +336,7 @@ describe('applyFileEdit — concurrency, encoding, and permissions', () => {
 
   it('hands the original mode to the atomic writer so the temp file is never looser than the target', async () => {
     const file = path.join(root, 'private.conf');
-    writeFileSync(file, 'k=v\n');
-    chmodSync(file, 0o600);
+    writeWithMode(file, 'k=v\n', 0o600);
     const seen = [];
     const { validateAndOpen, FileLinkDenied } = await import('../lib/file-link-guard.js');
     await applyFileEdit({ path: file, content: 'k=w\n' }, {
