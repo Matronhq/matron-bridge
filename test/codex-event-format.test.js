@@ -2,8 +2,9 @@ import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { formatAndRoute } from '../lib/codex-event-format.js';
+import { formatAndRoute, redactAndRoute } from '../lib/codex-event-format.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
+import { createPublishRedactor } from '../lib/redact.js';
 
 const FIXTURE_PATH = fileURLToPath(
   new URL('./fixtures/codex-json/review-run.jsonl', import.meta.url),
@@ -348,39 +349,138 @@ describe('formatAndRoute', () => {
     expect(retained.has(ctx.runId)).toBe(false);
   });
 
-  it('passes an unknown item through as text and increments unparsed', () => {
+  // An unrecognized item.completed type renders a DURABLE compact,
+  // formatted line, NOT a raw JSON dump. The line carries only a humanized
+  // label; no other item field (and not even the id) survives. It is a neutral
+  // text line, NOT a "done" tool card — see the mcp-failure rationale.
+  it('renders an unrecognized item.completed type as a compact formatted line, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.completed', item: { id: 'x', type: 'future_item', value: 42 } };
 
     formatAndRoute(unknown, ctx);
 
-    expect(ctx.state.unparsed).toBe(1);
-    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+    const nonStatus = calls.filter(call => call.method !== 'publishStatus');
+    expect(nonStatus).toEqual([
       {
         method: 'publishText',
-        args: [ctx.convoId, { body: JSON.stringify(unknown), from: 'assistant' }],
+        args: [ctx.convoId, { body: '`Future item`', from: 'assistant' }],
       },
     ]);
+    // No raw-JSON leak, and no other item field is forwarded.
+    const serialized = JSON.stringify(nonStatus);
+    expect(serialized).not.toBe(JSON.stringify(unknown));
+    expect(serialized).not.toContain('42');
+    expect(nonStatus[0].args[1].body).not.toBe(JSON.stringify(unknown));
+    // No "done" tool card is emitted (would misreport a failed tool as success).
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(1);
   });
 
-  it('passes an unknown item.started type through as text and increments unparsed', () => {
+  // An unrecognized item.started type shows an ephemeral "tool"
+  // activity indicator (like command_execution/file_change started), NOT raw
+  // JSON. Ephemeral -> no durable-cap consumption, no unparsed increment.
+  it('renders an unrecognized item.started type as a tool activity, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.started', item: { id: 'x', type: 'future_item', value: 42 } };
 
     formatAndRoute(unknown, ctx);
 
+    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Future item'] },
+    ]);
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(0);
+  });
+
+  // Web_search item.started/completed no longer
+  // leak raw `{"type":"item.started","item":{"type":"web_search",...}}` blobs
+  // between the clean bash-command cards.
+  it('renders web_search item.started as a tool activity, not a raw JSON publishText', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute(
+      { type: 'item.started', item: { id: 'exec-1', type: 'web_search' } },
+      ctx,
+    );
+
+    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Web search'] },
+    ]);
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+  });
+
+  it('renders web_search item.completed as a formatted line whose body is not the raw event', () => {
+    const { calls, ctx } = makeContext();
+    const event = { type: 'item.completed', item: { id: 'exec-1', type: 'web_search' } };
+
+    formatAndRoute(event, ctx);
+
+    const textPosts = calls.filter(call => call.method === 'publishText');
+    expect(textPosts).toEqual([
+      {
+        method: 'publishText',
+        args: [ctx.convoId, { body: '`Web search`', from: 'assistant' }],
+      },
+    ]);
+    // The published line is a formatted label, NOT a stringified raw event, and
+    // not a "done" tool card.
+    expect(textPosts[0].args[1].body).not.toBe(JSON.stringify(event));
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+  });
+
+  // Proves the fallback is GENERIC (a formatter over the item.* family), not a
+  // web_search special case: a different novel item type renders the same way.
+  it('renders a different novel item type (mcp_tool_call) generically too', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute(
+      { type: 'item.started', item: { id: 'mcp-1', type: 'mcp_tool_call' } },
+      ctx,
+    );
+    formatAndRoute(
+      { type: 'item.completed', item: { id: 'mcp-1', type: 'mcp_tool_call' } },
+      ctx,
+    );
+
+    expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual(
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Mcp tool call'] },
+    );
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([
+      {
+        method: 'publishText',
+        args: [ctx.convoId, { body: '`Mcp tool call`', from: 'assistant' }],
+      },
+    ]);
+    // Never a "done" card: a status-bearing item's real status was stripped
+    // upstream, so the bridge must not assert success.
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+  });
+
+  // A truly unstructured item (no string type) still falls to raw passthrough —
+  // the fallback keys on a string item.type, so shapeless events are unaffected.
+  it('still passes a typeless item through as raw text', () => {
+    const { calls, ctx } = makeContext();
+    const shapeless = { type: 'item.completed', item: { id: 'x' } };
+
+    formatAndRoute(shapeless, ctx);
+
     expect(ctx.state.unparsed).toBe(1);
     expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
       {
         method: 'publishText',
-        args: [ctx.convoId, { body: JSON.stringify(unknown), from: 'assistant' }],
+        args: [ctx.convoId, { body: JSON.stringify(shapeless), from: 'assistant' }],
       },
     ]);
   });
 
-  it('warns once and degrades every event to text for an out-of-band schema', () => {
+  it('warns once and degrades every event to text below the schema floor', () => {
+    // Rendering is version-tolerant (no upper band), so a NEWER
+    // version renders richly. Only versions BELOW the hardened-schema floor
+    // (0.146.0) still fail safe to the text-passthrough path.
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.148.0', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
     });
     const events = fixtureEvents().slice(0, 2);
 
@@ -394,7 +494,53 @@ describe('formatAndRoute', () => {
     expect(ctx.state.unparsed).toBe(2);
   });
 
-  it('routes in-band 0.146.x–0.147.x runs through the rich item mapping', () => {
+  it('lands the durable final answer below the schema floor (text passthrough)', () => {
+    const retained = [];
+    const delivered = [];
+    const { calls, ctx } = makeContext({
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
+      retainFinalAnswer: (runId, payload) => retained.push({ runId, payload }),
+      markFinalAnswerDelivered: runId => delivered.push(runId),
+    });
+    const agentMessage = {
+      type: 'item.completed',
+      item: { id: 'answer-1', type: 'agent_message', text: 'Review complete: LGTM' },
+    };
+
+    formatAndRoute(agentMessage, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+
+    // The final answer lands as the clean durable post with the stable idemKey,
+    // NOT as a raw JSON dump — and finalPostProduced flips so the watcher's
+    // terminal audit reports finalPostLanded truthy instead of false.
+    expect(ctx.state.finalPostProduced).toBe(true);
+    expect(ctx.log.warn).toHaveBeenCalledTimes(1);
+    const textCalls = calls.filter(call => call.method === 'publishText');
+    expect(textCalls).toEqual([
+      {
+        method: 'publishText',
+        args: [
+          ctx.convoId,
+          { body: 'Review complete: LGTM', from: 'assistant' },
+          expect.objectContaining({ idemKey: `${ctx.runId}:final` }),
+        ],
+      },
+    ]);
+    expect(retained).toEqual([
+      { runId: ctx.runId, payload: { body: 'Review complete: LGTM', from: 'assistant' } },
+    ]);
+    // turn.completed still marks the session idle under passthrough.
+    expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual({
+      method: 'publishActivity',
+      args: [ctx.convoId, 'idle'],
+    });
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('still text-passes non-lifecycle events below the schema floor', () => {
+    const { calls, ctx } = makeContext({
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
+    });
     const commandEvent = {
       type: 'item.completed',
       item: {
@@ -402,7 +548,34 @@ describe('formatAndRoute', () => {
         aggregated_output: 'ok', exit_code: 0, status: 'completed',
       },
     };
-    for (const schemaVersion of ['codex-cli 0.146.1', 'codex-cli 0.147.0']) {
+
+    formatAndRoute(commandEvent, ctx);
+
+    expect(ctx.state.unparsed).toBe(1);
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([
+      {
+        method: 'publishText',
+        args: [ctx.convoId, { body: JSON.stringify(commandEvent), from: 'assistant' }],
+      },
+    ]);
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+  });
+
+  it('routes every version at/above the floor through the rich item mapping (no upper band)', () => {
+    const commandEvent = {
+      type: 'item.completed',
+      item: {
+        id: 'item_1', type: 'command_execution', command: 'printf ok',
+        aggregated_output: 'ok', exit_code: 0, status: 'completed',
+      },
+    };
+    // Rendering keys on event shape, not an upper version band, so
+    // 0.155.1 (live) AND future majors (0.156.0, 1.0.0) all render richly with
+    // no manual band bump, reusing the hardened allowlist path unchanged.
+    for (const schemaVersion of [
+      'codex-cli 0.146.1', 'codex-cli 0.147.0', 'codex-cli 0.155.1',
+      'codex-cli 0.156.0', 'codex-cli 1.0.0',
+    ]) {
       const { calls, ctx } = makeContext({ meta: { schemaVersion } });
       formatAndRoute(commandEvent, ctx);
       expect(ctx.log.warn, schemaVersion).not.toHaveBeenCalled();
@@ -479,5 +652,108 @@ describe('formatAndRoute', () => {
 
     expect(calls.find(call => call.method === 'publishStatus')).toBeUndefined();
     expect(calls[0].args[1]).not.toHaveProperty('model');
+  });
+});
+
+// The known codex exec --json protocol events that still reached the
+// journal as raw JSON text on the SUPPORTED schema path (error, turn.failed,
+// item.updated). Every one must render as a readable line or an ephemeral
+// activity, never as a stringified event body.
+describe('formatAndRoute known protocol events', () => {
+  const isRawJsonBody = call => call.method === 'publishText'
+    && typeof call.args[1]?.body === 'string'
+    && call.args[1].body.trimStart().startsWith('{');
+
+  it('renders a top-level error as a readable warning line, not raw JSON', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'error', message: 'unexpected status 404 Not Found' }, ctx);
+
+    expect(calls.some(isRawJsonBody)).toBe(false);
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([{
+      method: 'publishText',
+      args: [ctx.convoId, { body: '⚠️ Codex error: `unexpected status 404 Not Found`', from: 'assistant' }],
+    }]);
+    expect(ctx.state.unparsed).toBe(0);
+  });
+
+  it('keeps an error message inside its code span (no markdown escape, bounded)', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'error', message: 'bad `x` [link](http://e.vil)\nsecond line' + 'y'.repeat(900) }, ctx);
+
+    const body = calls.find(call => call.method === 'publishText').args[1].body;
+    const inner = body.slice('⚠️ Codex error: `'.length, -1);
+    expect(inner).not.toContain('`');
+    expect(inner).not.toMatch(/[\r\n]/);
+    expect(inner.length).toBeLessThanOrEqual(500);
+  });
+
+  it('renders turn.failed as a failure line, lands any pending answer, and goes idle', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'item.completed', item: { id: 'a1', type: 'agent_message', text: 'partial answer' } }, ctx);
+    formatAndRoute({ type: 'turn.failed', message: 'stream disconnected' }, ctx);
+
+    expect(calls.some(isRawJsonBody)).toBe(false);
+    const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+    expect(bodies).toEqual(['partial answer', '⚠️ Codex turn failed: `stream disconnected`']);
+    expect(calls).toContainEqual({ method: 'publishActivity', args: [ctx.convoId, 'idle'] });
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('renders a bare turn.failed stub without a message', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'turn.failed' }, ctx);
+
+    expect(calls.filter(call => call.method === 'publishText').map(call => call.args[1].body))
+      .toEqual(['⚠️ Codex turn failed']);
+  });
+
+  it('carries turn.failed error.message through the allowlist (redacted), not as JSON', () => {
+    const { calls, ctx } = makeContext({ redact: value => value.replaceAll('sk-live-123', '[REDACTED]') });
+
+    redactAndRoute({ type: 'turn.failed', error: { message: 'auth failed for sk-live-123' } }, ctx);
+
+    expect(calls.some(isRawJsonBody)).toBe(false);
+    expect(calls.filter(call => call.method === 'publishText').map(call => call.args[1].body))
+      .toEqual(['⚠️ Codex turn failed: `auth failed for [REDACTED]`']);
+  });
+
+  it('scrubs an assignment behind prose in a NUL-framed turn.failed diagnostic (production redactor)', () => {
+    const { calls, ctx } = makeContext({ redact: createPublishRedactor() });
+
+    redactAndRoute({
+      type: 'turn.failed',
+      error: { message: 'fatal\nALPHA=canary-secret-value\nmore-value\0BRAVO=other-value' },
+    }, ctx);
+
+    const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).not.toContain('canary-secret-value');
+    expect(bodies[0]).not.toContain('more-value');
+    expect(bodies[0]).not.toContain('other-value');
+    expect(bodies[0]).toContain('fatal');
+  });
+
+  it('scrubs a NUL-framed top-level error diagnostic the same way', () => {
+    const { calls, ctx } = makeContext({ redact: createPublishRedactor() });
+
+    redactAndRoute({ type: 'error', message: 'boom\r\nALPHA=canary-secret-value\0tail' }, ctx);
+
+    const body = calls.find(call => call.method === 'publishText').args[1].body;
+    expect(body).not.toContain('canary-secret-value');
+    expect(body).toContain('boom');
+  });
+
+  it('routes item.updated (todo_list) to an ephemeral activity, never a durable post', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'item.updated', item: { id: 'item_1', type: 'todo_list' } }, ctx);
+
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([]);
+    expect(calls).toContainEqual({ method: 'publishActivity', args: [ctx.convoId, 'tool', 'Todo list'] });
+    expect(ctx.state.durableEvents).toBe(0);
   });
 });
