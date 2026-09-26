@@ -22,7 +22,7 @@ vi.mock('child_process', async (importOriginal) => {
 const { transcribeAudio } = await import('../lib/transcribe.js');
 const { extractVideoFrames } = await import('../lib/video-frames.js');
 
-const SECRETS = { JOURNAL_TOKEN: 'boot-token', JOURNAL_TOKEN_FILE: '/etc/matron/agent-token', HMAC_SECRET: 'boot-secret' };
+const SECRETS = { JOURNAL_TOKEN: 'boot-token', JOURNAL_TOKEN_FILE: '/etc/matron/agent-token', HMAC_SECRET: 'boot-secret', OPENAI_API_KEY: 'sk-boot', GEMINI_API_KEY: 'gemini-boot' };
 let saved;
 beforeEach(() => {
   calls.length = 0;

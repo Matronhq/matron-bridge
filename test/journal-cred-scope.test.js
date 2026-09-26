@@ -6,7 +6,7 @@ import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import {
   stripJournalCreds, stripBridgeOnlySecrets,
-  JOURNAL_CHILD_STRIPPED_KEYS, BRIDGE_ONLY_SECRET_KEYS,
+  JOURNAL_CHILD_STRIPPED_KEYS, BRIDGE_ONLY_SECRET_KEYS, PROVIDER_API_KEYS,
 } from '../lib/journal-cred-scope.js';
 import { withCodexAppServer } from '../lib/codex-account.js';
 import { runSleepCommand } from '../lib/sleep-command.js';
@@ -20,6 +20,8 @@ const SECRET_ENV = Object.freeze({
   JOURNAL_TOKEN_FILE: '/etc/matron/agent-token',
   JOURNAL_WS_URL: 'wss://journal.example/ws',
   HMAC_SECRET: 'viewer-signing-key',
+  OPENAI_API_KEY: 'sk-summary',
+  GEMINI_API_KEY: 'gemini-summary',
   MATRON_BRIDGE_API_PORT: '9812',
 });
 
@@ -40,6 +42,7 @@ describe('stripBridgeOnlySecrets', () => {
     const out = stripBridgeOnlySecrets(SECRET_ENV);
     expect('HMAC_SECRET' in out).toBe(false);
     expect(out.JOURNAL_TOKEN).toBe('agent-token');
+    expect(out.OPENAI_API_KEY).toBe('sk-summary');
     expect(out.JOURNAL_TOKEN_FILE).toBe('/etc/matron/agent-token');
     expect(out.PATH).toBe('/usr/bin');
   });
@@ -71,6 +74,8 @@ describe('stripJournalCreds', () => {
     expect('JOURNAL_TOKEN' in out).toBe(false);
     expect('JOURNAL_TOKEN_FILE' in out).toBe(false);
     expect('HMAC_SECRET' in out).toBe(false);
+    expect('OPENAI_API_KEY' in out).toBe(false);
+    expect('GEMINI_API_KEY' in out).toBe(false);
     // Non-credential config a journal-free child may still need survives.
     expect(out.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
     expect(out.MATRON_BRIDGE_API_PORT).toBe('9812');
@@ -105,6 +110,15 @@ describe('stripJournalCreds', () => {
   it('targets exactly the two journal credential keys', () => {
     expect(JOURNAL_CHILD_STRIPPED_KEYS).toEqual(['JOURNAL_TOKEN', 'JOURNAL_TOKEN_FILE']);
   });
+
+  it('keeps the provider keys only when asked', () => {
+    expect(PROVIDER_API_KEYS).toEqual(['OPENAI_API_KEY', 'GEMINI_API_KEY']);
+    const out = stripJournalCreds(SECRET_ENV, { keepProviderKeys: true });
+    expect(out.OPENAI_API_KEY).toBe('sk-summary');
+    expect(out.GEMINI_API_KEY).toBe('gemini-summary');
+    expect('JOURNAL_TOKEN' in out).toBe(false);
+    expect('HMAC_SECRET' in out).toBe(false);
+  });
 });
 
 function fakeChild() {
@@ -131,17 +145,20 @@ describe('journal-free child spawns carry no journal credential or bridge-only s
     expect('JOURNAL_TOKEN_FILE' in passedEnv).toBe(false);
     expect('HMAC_SECRET' in passedEnv).toBe(false);
     expect(passedEnv.CODEX_HOME).toBe('/home/user/.codex');
+    // Codex can authenticate with OPENAI_API_KEY: the account reader keeps it.
+    expect(passedEnv.OPENAI_API_KEY).toBe('sk-summary');
     expect(inputEnv.JOURNAL_TOKEN).toBe('agent-token');
   });
 
   it('sleep command: runSleepCommand', () => {
-    withProcessEnv({ JOURNAL_TOKEN: 'boot-token', HMAC_SECRET: 'boot-secret' }, () => {
+    withProcessEnv({ JOURNAL_TOKEN: 'boot-token', HMAC_SECRET: 'boot-secret', OPENAI_API_KEY: 'sk-boot' }, () => {
       const spawn = vi.fn(() => fakeChild());
       void runSleepCommand('poweroff', { spawn, setTimer: () => {} }).catch(() => {});
       const passedEnv = spawn.mock.calls[0][2].env;
       expect(passedEnv).toBeTypeOf('object');
       expect('JOURNAL_TOKEN' in passedEnv).toBe(false);
       expect('HMAC_SECRET' in passedEnv).toBe(false);
+      expect('OPENAI_API_KEY' in passedEnv).toBe(false);
       expect(passedEnv.PATH).toBe(process.env.PATH);
     });
   });
