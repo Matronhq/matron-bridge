@@ -10368,14 +10368,22 @@ const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
   // Journal read proxy: only the allowlisted /journal/* read routes; any
-  // other path returns null and falls through to the dispatch below.
+  // other path returns null and falls through to the dispatch below. Guarded:
+  // this listener has no outer catch, so a throw would be an unhandled
+  // rejection that takes the bridge down.
   {
-    const proxied = await journalReadProxy.handle({
-      method: req.method,
-      pathname: url.pathname,
-      search: url.search,
-      callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
-    });
+    let proxied;
+    try {
+      proxied = await journalReadProxy.handle({
+        method: req.method,
+        pathname: url.pathname,
+        search: url.search,
+        callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
+      });
+    } catch (e) {
+      console.warn(`[journal] read proxy error: ${e.message}`);
+      proxied = { status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'proxy error' }) };
+    }
     if (proxied) {
       res.writeHead(proxied.status, { 'Content-Type': proxied.contentType });
       res.end(proxied.body);

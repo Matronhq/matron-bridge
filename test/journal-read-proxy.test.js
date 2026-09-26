@@ -71,6 +71,17 @@ describe('journal read proxy', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('rejects (never throws on) a same-length token with non-ASCII characters', async () => {
+    const fetchImpl = fakeFetch(() => okRes('x'));
+    const proxy = makeProxy(fetchImpl);
+    // Header values arrive latin1-decoded: 'é' is one UTF-16 unit, two UTF-8 bytes.
+    const sameLength = CAP.slice(0, -1) + '\u00e9';
+    expect(sameLength.length).toBe(CAP.length);
+    const r = await proxy.handle({ method: 'GET', pathname: '/journal/search', search: '?q=x', callerToken: sameLength });
+    expect(r.status).toBe(401);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('fails closed when no capability token is configured (never unauthenticated)', async () => {
     const fetchImpl = fakeFetch(() => okRes('x'));
     const proxy = createJournalReadProxy({ baseUrl: BASE, token: TOKEN, capabilityToken: '', fetchImpl });
