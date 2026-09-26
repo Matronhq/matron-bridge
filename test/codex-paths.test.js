@@ -83,6 +83,62 @@ describe('configureCodexSinkEnv', () => {
     expect(spawnEnv.PATH).toBe(first);
   });
 
+  it('does NOT prepend the shim in wrapper-producer mode (MATRON_CODEX_PRODUCER=wrapper) but still sets the sink dir', () => {
+    // The wrapper is the sole producer here; if the shim were also
+    // on PATH the wrapper's internal bare `codex exec` would resolve to it and
+    // emit a duplicate card for the same run (the dual-producer bug). The guard
+    // keys on the distinct MATRON_CODEX_PRODUCER=wrapper signal, NOT on
+    // MATRON_CODEX_REAL_BIN (which a shim-only deployment sets too).
+    const spawnEnv = { PATH: '/usr/bin:/bin' };
+    const dir = configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_PRODUCER: 'wrapper' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    // Sink dir still provisioned (the wrapper writes into it)...
+    expect(spawnEnv.MATRON_CODEX_SINK_DIR).toBe(dir);
+    // ...but the shim is NOT prepended, so bare `codex` reaches the real codex.
+    expect(spawnEnv.PATH).toBe('/usr/bin:/bin');
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).not.toBe(SHIPPED_SHIM_DIR);
+  });
+
+  it('DOES prepend the shim in the documented shim-only deployment (MATRON_CODEX_REAL_BIN resolves, no wrapper signal)', () => {
+    // Regression guard for the reported bug: the shim's own error text tells
+    // operators to set MATRON_CODEX_REAL_BIN when stock codex isn't resolvable.
+    // That is a SHIM-only deployment (the shim forwards to REAL_BIN), so the shim
+    // MUST still be deployed. Keying the guard on REAL_BIN suppressed it here and
+    // left the session with no producer at all — the silent empty view.
+    // process.execPath is a stand-in REAL_BIN that always resolves.
+    const spawnEnv = { PATH: '/usr/bin:/bin' };
+    const dir = configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: process.execPath },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.MATRON_CODEX_SINK_DIR).toBe(dir);
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).toBe(SHIPPED_SHIM_DIR);
+  });
+
+  it('DOES prepend the shim when MATRON_CODEX_REAL_BIN is set but does not resolve (still no wrapper signal)', () => {
+    // No wrapper declared, so the shim is the producer regardless of REAL_BIN.
+    const spawnEnv = { PATH: '/usr/bin:/bin' };
+    configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: '/opt/real/does-not-exist' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).toBe(SHIPPED_SHIM_DIR);
+  });
+
   it('does not touch PATH when visualization is disabled', () => {
     const spawnEnv = { PATH: '/usr/bin', MATRON_CODEX_SINK_DIR: '/inherited' };
     configureCodexSinkEnv({
