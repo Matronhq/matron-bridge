@@ -298,3 +298,49 @@ describe('applyFileEdit — atomicity', () => {
     expect(readFileSync(file, 'utf8')).toBe('ORIGINAL');
   });
 });
+
+describe('applyFileEdit — concurrency, encoding, and permissions', () => {
+  it('two concurrent edits based on the same sha256: exactly one applies, the other is stale', async () => {
+    const file = path.join(root, 'race.conf');
+    writeFileSync(file, 'A=1\nB=1\n');
+    const expected = createHash('sha256').update('A=1\nB=1\n').digest('hex');
+    const results = await Promise.allSettled([
+      applyFileEdit({ path: file, old_string: 'A=1', new_string: 'A=2', expected_sha256: expected }, { allowedRoots: roots }),
+      applyFileEdit({ path: file, old_string: 'B=1', new_string: 'B=2', expected_sha256: expected }, { allowedRoots: roots }),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toMatchObject({ code: 'stale' });
+    expect(['A=2\nB=1\n', 'A=1\nB=2\n']).toContain(readFileSync(file, 'utf8'));
+  });
+
+  it('refuses a targeted edit of a file that is not valid utf-8, leaving its bytes intact', async () => {
+    const file = path.join(root, 'latin1.txt');
+    const bytes = Buffer.from([0x41, 0xff, 0x5a]);
+    writeFileSync(file, bytes);
+    await expect(applyFileEdit({ path: file, old_string: 'A', new_string: 'B' }, { allowedRoots: roots }))
+      .rejects.toMatchObject({ code: 'not_text' });
+    expect(readFileSync(file).equals(bytes)).toBe(true);
+  });
+
+  it('hands the original mode to the atomic writer so the temp file is never looser than the target', async () => {
+    const file = path.join(root, 'private.conf');
+    writeFileSync(file, 'k=v\n');
+    chmodSync(file, 0o600);
+    const seen = [];
+    const { validateAndOpen, FileLinkDenied } = await import('../lib/file-link-guard.js');
+    const { atomicWriteFileSync } = await import('../lib/atomic-write.js');
+    await applyFileEdit({ path: file, content: 'k=w\n' }, {
+      allowedRoots: roots,
+      deps: {
+        validateAndOpen,
+        FileLinkDenied,
+        atomicWrite: (p, data, opts) => { seen.push(opts); atomicWriteFileSync(p, data, opts); },
+      },
+    });
+    expect(seen).toEqual([{ mode: 0o600 }]);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(readFileSync(file, 'utf8')).toBe('k=w\n');
+  });
+});
