@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
@@ -95,12 +95,14 @@ server.tool(
         return deny(`Matron bridge rejected the permission request (HTTP ${postRes.status}).`);
       }
       const data = await postRes.json();
-      if (data.behavior === 'allow') return allow(); // session-allowlisted tool, no card
-
-      const { requestId } = data;
-      if (typeof requestId !== 'string' || requestId === '') {
-        return deny('Matron bridge returned an invalid permission request id.');
-      }
+      // The bridge is the deciding layer: a grant or classifier allow → silent
+      // allow (no card); a classifier policy deny → deny with the bridge's
+      // message (no card); otherwise poll the minted card. See
+      // classifyPermissionPostResponse (extracted for testing).
+      const mapped = classifyPermissionPostResponse(data);
+      if (mapped.action === 'allow') return allow();
+      if (mapped.action === 'deny') return deny(mapped.message);
+      const { requestId } = mapped;
       const deadline = Date.now() + PERMISSION_TIMEOUT_MS;
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
