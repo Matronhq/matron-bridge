@@ -1,4 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { EventEmitter } from 'node:events';
+import WebSocket from 'ws';
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -9,6 +11,7 @@ const require = createRequire(import.meta.url);
 
 import { planTransition, selectEpochRepairs } from '../lib/session-state-repair.js';
 import { createRunStateOutbox } from '../lib/run-state-outbox.js';
+import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
@@ -64,6 +67,102 @@ describe('selectEpochRepairs', () => {
 
   it('is inert with no entries', () => {
     expect(selectEpochRepairs(undefined, undefined)).toEqual({ reoffer: [], retire: [] });
+  });
+});
+
+describe('selectEpochRepairs skips a state whose frame is still in flight', () => {
+  it('does not re-offer a state that is already the newest queued frame for that convo', () => {
+    const queued = new Map([['c1', 'running']]);
+    const out = selectEpochRepairs(
+      [{ convoId: 'c1', state: 'running', token: 'T1' }, { convoId: 'c2', state: 'waiting', token: 'T2' }],
+      new Set(['c1', 'c2']),
+      { queuedStateFor: (id) => queued.get(id) },
+    );
+    expect(out.reoffer).toEqual([{ convoId: 'c2', state: 'waiting', token: 'T2' }]);
+  });
+
+  it('still re-offers when the newest queued frame carries a DIFFERENT state', () => {
+    const out = selectEpochRepairs(
+      [{ convoId: 'c1', state: 'waiting', token: 'T' }],
+      new Set(['c1']),
+      { queuedStateFor: () => 'running' },
+    );
+    expect(out.reoffer).toEqual([{ convoId: 'c1', state: 'waiting', token: 'T' }]);
+  });
+
+  it('skips a retirement whose `done` is already queued, but retires behind a queued `running`', () => {
+    const entries = [{ convoId: 'ghost', state: 'running', token: 'T' }];
+    expect(selectEpochRepairs(entries, new Set(), { queuedStateFor: () => 'done' }).retire).toEqual([]);
+    expect(selectEpochRepairs(entries, new Set(), { queuedStateFor: () => 'running' }).retire)
+      .toEqual([{ convoId: 'ghost', token: 'T' }]);
+  });
+});
+
+describe('send-capacity retry issues ONE confirming re-offer per transition, not one per confirmed send', () => {
+  let dir;
+  let file;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'run-state-dedupe-'));
+    file = join(dir, 'outbox.json');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // Models index.js: a FIFO outbound queue, journalSessionState (note + enqueue, no settle), and
+  // the capacity hook (sweep on every confirmed send while the outbox is non-empty).
+  function harness(live) {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    const queue = [];
+    const wire = [];
+    const queuedStateFor = (convoId) => {
+      for (let i = queue.length - 1; i >= 0; i--) {
+        if (queue[i].convoId === convoId && queue[i].state !== undefined) return queue[i].state;
+      }
+      return undefined;
+    };
+    const sweep = () => {
+      const { reoffer, retire } = selectEpochRepairs(outbox.list(), live, { queuedStateFor });
+      for (const { convoId, state, token } of reoffer) {
+        queue.push({ convoId, state, onDelivered: () => outbox.settle(convoId, token) });
+      }
+      for (const { convoId, token } of retire) {
+        queue.push({ convoId, state: 'done', onDelivered: () => outbox.settle(convoId, token) });
+      }
+    };
+    const transition = (convoId, state) => {
+      outbox.note(convoId, state);
+      queue.push({ convoId, state });
+    };
+    const other = (convoId) => queue.push({ convoId });
+    const confirmOne = () => {
+      const entry = queue.shift();
+      wire.push(entry);
+      entry.onDelivered?.();
+      if (outbox.size() > 0) sweep();
+    };
+    const drain = () => { while (queue.length) confirmOne(); };
+    return { outbox, queue, wire, transition, other, confirmOne, drain };
+  }
+
+  it('a healthy transition behind a burst of traffic is re-offered exactly once, then settles', () => {
+    const h = harness(new Set(['c1']));
+    h.other('c1');
+    h.transition('c1', 'waiting');
+    for (let i = 0; i < 10; i++) h.other('c1');
+    h.drain();
+    const stateFrames = h.wire.filter((f) => f.state !== undefined).map((f) => f.state);
+    expect(stateFrames).toEqual(['waiting', 'waiting']); // the transition + one confirming re-offer
+    expect(h.outbox.size()).toBe(0);
+  });
+
+  it('an EVICTED transition is still re-offered on the next capacity window', () => {
+    const h = harness(new Set());
+    h.transition('c1', 'done');
+    h.queue.shift(); // evicted by queue overflow: never sent, no callback
+    h.other('c2');
+    h.drain();
+    expect(h.wire.filter((f) => f.convoId === 'c1').map((f) => f.state)).toEqual(['done']);
+    expect(h.outbox.size()).toBe(0);
   });
 });
 
@@ -421,6 +520,70 @@ describe('planTransition (change-gate + write-ahead)', () => {
   });
 });
 
+describe('journal-publisher queuedSessionState', () => {
+  class ManualSocket extends EventEmitter {
+    static instances = [];
+    constructor() {
+      super();
+      this.readyState = WebSocket.OPEN;
+      this.sent = [];
+      this.pending = [];
+      ManualSocket.instances.push(this);
+      queueMicrotask(() => this.emit('open'));
+    }
+    send(data, callback) {
+      this.sent.push(JSON.parse(data));
+      this.pending.push(callback);
+    }
+    confirmAll() { for (const cb of this.pending.splice(0)) cb?.(); }
+    close() { this.readyState = WebSocket.CLOSED; this.emit('close'); }
+    terminate() { this.close(); }
+  }
+
+  async function waitFor(predicate, timeoutMs = 1000) {
+    const started = Date.now();
+    while (!predicate()) {
+      if (Date.now() - started > timeoutMs) throw new Error('waitFor timed out');
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  }
+
+  it('reports the newest unconfirmed session_state for a convo, and nothing once confirmed', async () => {
+    ManualSocket.instances.length = 0;
+    const publisher = createJournalPublisher({
+      url: 'ws://journal.test/ws', token: 't', log: { warn() {} },
+      backoffBaseMs: 1, backoffCapMs: 1, keepaliveIntervalMs: 0, WebSocketImpl: ManualSocket,
+    });
+    try {
+      await waitFor(() => ManualSocket.instances[0]?.sent.some((f) => f.op === 'hello'));
+      const sock = ManualSocket.instances[0];
+      sock.emit('message', JSON.stringify({ op: 'hello_ok' }));
+
+      publisher.upsertConvo('c1', { sessionState: 'running' });
+      publisher.upsertConvo('c1', { title: 'renamed' }); // no session_state: ignored
+      publisher.upsertConvo('c1', { sessionState: 'waiting' });
+      publisher.upsertConvo('c2', { sessionState: 'done' });
+      await waitFor(() => sock.sent.filter((f) => f.op === 'convo_upsert').length === 4);
+
+      expect(publisher.queuedSessionState('c1')).toBe('waiting');
+      expect(publisher.queuedSessionState('c2')).toBe('done');
+      expect(publisher.queuedSessionState('nope')).toBeUndefined();
+      expect(publisher.queuedSessionState('')).toBeUndefined();
+
+      sock.confirmAll();
+      await waitFor(() => publisher.queuedSessionState('c1') === undefined);
+      expect(publisher.queuedSessionState('c2')).toBeUndefined();
+    } finally {
+      publisher.close();
+    }
+  });
+
+  it('is a safe no-op on a disabled publisher', () => {
+    const publisher = createJournalPublisher({ url: '', token: '', log: { warn() {} } });
+    expect(publisher.queuedSessionState('c1')).toBeUndefined();
+  });
+});
+
 describe('index.js wiring', () => {
   // index.js starts a server at import time (main() + apiServer.listen at module top level), so
   // it cannot be imported for a behavioral test — the repo's established fallback is a
@@ -481,6 +644,11 @@ describe('index.js wiring', () => {
     const retry = sliceFunction('function retryRunStateRepairs(');
     expect(retry).toContain('runStateOutbox.size()');
     expect(retry).toContain('republishSessionStates()');
+  });
+
+  it('skips records whose state is still in flight, so capacity retries do not stack duplicates', () => {
+    const body = sliceFunction('function republishSessionStates(');
+    expect(body).toContain('queuedStateFor: (convoId) => journalPublisher.queuedSessionState(convoId)');
   });
 
   it('guards the sweep against synchronous re-entry from its own send', () => {

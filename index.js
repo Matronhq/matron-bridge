@@ -1427,7 +1427,12 @@ function republishSessionStates() {
       const convoId = journalConvoIdFor(session);
       if (convoId) liveConvoIds.add(convoId);
     }
-    const { reoffer, retire } = selectEpochRepairs(runStateOutbox.list(), liveConvoIds);
+    // Skip any record whose state is already the newest frame in flight for that convo (the
+    // original transition, or an earlier re-offer not yet confirmed): the capacity hook runs on
+    // every confirmed send, so without this each confirmation stacked another duplicate.
+    const { reoffer, retire } = selectEpochRepairs(runStateOutbox.list(), liveConvoIds, {
+      queuedStateFor: (convoId) => journalPublisher.queuedSessionState(convoId),
+    });
 
     // NON-EVICTING path throughout, deliberately: the ordinary enqueue drops the oldest queued
     // frame when the queue is full, and at reconnect that backlog is real user traffic (prompts,
@@ -1482,7 +1487,9 @@ function republishSessionStates() {
 // onReconnect BEFORE the backlog pumps, so on a connection that comes back with the queue still
 // full every re-offer is refused; without this, a healthy socket that never disconnects again
 // would leave those rows stranded forever. Gated on the map being non-empty so the common case
-// (nothing outstanding) costs one size check per confirmed send, not a sweep.
+// (nothing outstanding) costs one size check per confirmed send, not a sweep; inside the sweep a
+// record whose frame is still queued is skipped, so a healthy transition gets exactly one
+// confirming re-offer rather than one per confirmed send.
 function retryRunStateRepairs() {
   if (runStateOutbox.size() > 0) republishSessionStates();
 }
