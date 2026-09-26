@@ -12,7 +12,7 @@ import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
 import { createServer } from 'http';
-import { createHmac, randomUUID } from 'crypto';
+import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -168,6 +168,9 @@ import {
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, normalizeCodexNetworkAccess } from './lib/codex-session.js';
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
+import { stripJournalCreds } from './lib/journal-cred-scope.js';
+import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
+import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -519,6 +522,39 @@ const itemsClient = createItemsClient({
 const missionsClient = createMissionsClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
+});
+
+// Journal READ proxy (lib/journal-read-proxy.js): the loopback API forwards
+// the journal search routes under the bridge's own token, so Claude sessions
+// and app-server Codex sessions are spawned without JOURNAL_TOKEN /
+// JOURNAL_TOKEN_FILE (lib/spawn-env.js).
+//
+// The loopback port is open to every local user, so the proxy is gated by a
+// per-boot capability token. Children get it as a 0600 header FILE, never as
+// an env value or argv: `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"` reads
+// the header from the file, whereas a token on curl's command line would be
+// visible to other users in the process table. The file is `<Header>: <token>`
+// in a private mkdtemp dir, removed on exit.
+const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
+const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
+let JOURNAL_PROXY_HEADER_FILE = '';
+if (journalHttpBase) {
+  let dir = '';
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
+    const file = path.join(dir, 'header');
+    fs.writeFileSync(file, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
+    JOURNAL_PROXY_HEADER_FILE = file;
+    process.once('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
+  } catch (e) {
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
+    console.warn(`[journal] could not write the read-proxy header file; journal search is unavailable to sessions: ${e.message}`);
+  }
+}
+const journalReadProxy = createJournalReadProxy({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+  capabilityToken: JOURNAL_PROXY_CAP_TOKEN,
 });
 
 // Which conversation is the user's Coordinator (spec 2026-09-23 §2a):
@@ -1951,51 +1987,17 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   debug(`Spawning claude with args: ${args.join(' ')}`);
   debug(`Working directory: ${cwd}`);
 
-  // Ensure the node binary running the bridge is reachable from the spawned
-  // claude process. The ask-user MCP server and the matron-tee Bash hook both
-  // resolve `node` via PATH; when the bridge is launched non-interactively
-  // (e.g. launchd) nvm hasn't loaded and PATH lacks the node bin dir.
-  const nodeBinDir = path.dirname(process.execPath);
-  const existingPath = process.env.PATH || '';
-  const pathWithNode = existingPath.split(':').includes(nodeBinDir)
-    ? existingPath
-    : `${nodeBinDir}:${existingPath}`;
-
-  const spawnEnv = {
-    ...process.env,
-    PATH: pathWithNode,
-    CLAUDECODE: '',
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-    BRIDGE_ROOM_ID: roomId,
-    MATRON_BRIDGE_API_PORT: String(API_PORT),
-    // Env is fixed at spawn time; toggling the flag later requires
-    // !restart to take effect.
-    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
-    // Load every MCP tool up front instead of letting Claude Code defer
-    // them behind ToolSearch. With deferral on, the item_* tools (and the
-    // rest of ask-user) reach the model only as names in a reminder, and a
-    // tool that needs a schema lookup before its first call is a tool the
-    // model reaches for last: a fleet survey on 2026-09-09 found not one
-    // item_* call on any box other than the one whose sessions were
-    // steered to them by hand, while questions went out as prose. The
-    // cost is a larger (cached) tool prefix per request. Values: `false`
-    // loads everything; `auto:N` defers past N% of context. Operators can
-    // set it in the bridge's `.env` like any other setting (dotenv loads
-    // that with `override: true` at startup, so `.env` beats the service
-    // environment — the same rule as for every other bridge setting), and
-    // whatever `process.env` holds by now wins over the default.
-    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
-    // No MCP_TOOL_TIMEOUT default here. #254 briefly injected a 10-minute
-    // backstop so a wedged MCP server couldn't hang a turn forever, but a
-    // hard kill also cut off legitimately long calls (long builds, big test
-    // runs, patient subagents). The slow-tool notices below make a hung call
-    // visible instead and leave the cancel decision with the user. An
-    // operator who wants the hard cap can still set MCP_TOOL_TIMEOUT in the
-    // bridge's own env; it passes through via ...process.env.
-  };
-  delete spawnEnv.SHOW_FILE_TOKEN;
-  if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+  // Child env (lib/spawn-env.js): journal token and bridge-only secrets
+  // stripped, read-proxy header file, node bin dir on PATH, per-session
+  // SHOW_FILE_TOKEN.
+  const spawnEnv = buildClaudeSpawnEnv({
+    roomId,
+    apiPort: API_PORT,
+    journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    pluginCacheDir: PLUGIN_CACHE_DIR,
+    showBashOutput: showBashOutputAtSpawn,
+    showFileToken,
+  });
 
   const proc = launchWithCodexSinkEnv({
     spawnEnv,
@@ -2314,7 +2316,14 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sandbox: codexCoord.sandbox,
     networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
-    env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
+    // Journal token stripped on app-server, kept on legacy exec for its /items
+    // HTTP fallback (see buildCodexSpawnEnv).
+    env: buildCodexSpawnEnv({
+      roomId,
+      apiPort: API_PORT,
+      appServer: CODEX_APP_SERVER,
+      journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
   });
@@ -2820,26 +2829,15 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     claudeArgs.push('--model', model);
   }
 
-  const nodeBinDir = path.dirname(process.execPath);
-  const existingPath = process.env.PATH || '';
-  const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
-
-  const interactiveEnv = {
-    ...process.env,
-    PATH: pathWithNode,
-    CLAUDECODE: '',
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-    BRIDGE_ROOM_ID: roomId,
-    MATRON_BRIDGE_API_PORT: String(API_PORT),
-    // Same up-front MCP tool loading as spawnEnv above.
-    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
-    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
-    // No MCP_TOOL_TIMEOUT default, same reasoning as spawnEnv above:
-    // warn, don't kill. Operator env passes through if set.
-  };
-  delete interactiveEnv.SHOW_FILE_TOKEN;
-  if (showFileToken) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
+  // Child env (lib/spawn-env.js): same shape as the print spawn.
+  const interactiveEnv = buildClaudeSpawnEnv({
+    roomId,
+    apiPort: API_PORT,
+    journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    pluginCacheDir: PLUGIN_CACHE_DIR,
+    showBashOutput: showBashOutputAtSpawn,
+    showFileToken,
+  });
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 
@@ -6316,7 +6314,9 @@ function fetchUsageLimitsText(cwd) {
       // it doesn't replicate the rest of the session spawns' env shape
       // (BRIDGE_ROOM_ID, MATRON_BRIDGE_API_PORT, MATRON_BASH_TEE_ENABLED —
       // all meaningless here); it just needs the same CLAUDECODE treatment.
-      env: { ...process.env, CLAUDECODE: '' },
+      // A `/usage` one-shot never touches the journal: no journal credential,
+      // no bridge-only secrets (lib/journal-cred-scope.js).
+      env: stripJournalCreds({ ...process.env, CLAUDECODE: '' }),
     });
     let stdout = '';
     let stderr = '';
@@ -10367,6 +10367,30 @@ function validateShowFileBody(data) {
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
+  // Journal read proxy: only the allowlisted /journal/* read routes; any
+  // other path returns null and falls through to the dispatch below. Guarded:
+  // this listener has no outer catch, so a throw would be an unhandled
+  // rejection that takes the bridge down.
+  {
+    let proxied;
+    try {
+      proxied = await journalReadProxy.handle({
+        method: req.method,
+        pathname: url.pathname,
+        search: url.search,
+        callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
+      });
+    } catch (e) {
+      console.warn(`[journal] read proxy error: ${e.message}`);
+      proxied = { status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'proxy error' }) };
+    }
+    if (proxied) {
+      res.writeHead(proxied.status, { 'Content-Type': proxied.contentType });
+      res.end(proxied.body);
+      return;
+    }
+  }
+
   // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
   // uses it (request_secret is non-blocking since item #120); it stays so a
   // bridge upgraded under an already-running MCP server still answers.
@@ -11609,7 +11633,7 @@ function sessionChildPid(session) {
 // the idle clock rules as it did before — never the other way round.
 function readProcessTable() {
   try {
-    return parseProcessTable(execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 }));
+    return parseProcessTable(execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds() }));
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
     return [];
