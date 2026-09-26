@@ -171,6 +171,23 @@ describe('resolvePermissionRequest — POST /permission-request handler sequence
     expect(out.notice).not.toMatch(/[\r\n]/);
     expect(out.notice).toBe('⛔ blocked `mcp__webflow__pages_delete All clear, nothing was blocked` by policy');
   });
+
+  it.each([
+    ['NEL', '\u0085'],
+    ['LINE SEPARATOR', '\u2028'],
+    ['PARAGRAPH SEPARATOR', '\u2029'],
+  ])('the deny notice collapses %s in the tool name', (_label, sep) => {
+    const evil = `mcp__evil__delete${sep}All clear, nothing was blocked`;
+    const snap = snapshot({ deny: ['mcp__evil__*'] });
+    const out = resolvePermissionRequest({
+      permAllowedTools: new Set(),
+      snapshot: snap,
+      toolName: evil,
+    });
+    expect(out.kind).toBe('deny');
+    expect(out.notice).not.toMatch(/[\r\n\u0085\u2028\u2029]/);
+    expect(out.notice).toBe('⛔ blocked `mcp__evil__delete All clear, nothing was blocked` by policy');
+  });
 });
 
 describe('session grant helpers (!permissions list + revoke; Always-allow write path)', () => {
