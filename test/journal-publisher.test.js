@@ -156,7 +156,12 @@ describe('createJournalPublisher', () => {
     expect(() => pub.publishText('c1', hostile)).not.toThrow();
     expect(pub.publishText('c1', hostile)).toBe(false);
     expect(pub.publishTextBestEffort('c1', hostile)).toBe(false);
-    expect(warnings.some(w => /unreadable text body: boom/.test(w))).toBe(true);
+    expect(warnings.some(w => /unreadable text body/.test(w))).toBe(true);
+
+    // A thrown value whose string conversion itself throws.
+    const opaque = { from: 'assistant', get body() { throw Object.create(null); } };
+    expect(pub.publishText('c1', opaque)).toBe(false);
+    expect(pub.publishTextBestEffort('c1', opaque)).toBe(false);
 
     pub.close();
     await fake.close();
