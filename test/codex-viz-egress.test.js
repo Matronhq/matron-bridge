@@ -165,10 +165,11 @@ describe('codex-viz top-level error diagnostics', () => {
     expect(body).toContain('at worker.js:1');
   });
 
-  it('preserves an inline key=value mention inside prose (not a bare assignment line)', () => {
+  it('keeps the prose and the name of an inline key=value mention, but not its value', () => {
     const { publisher } = route({ type: 'error', message: 'connection failed: host=db.internal' });
     const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
-    expect(body).toContain('host=db.internal');
+    expect(body).toContain('connection failed: host=');
+    expect(body).not.toContain('db.internal');
   });
 });
 
@@ -334,10 +335,25 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
-  it('a legitimate inline key=value diagnostic is preserved (prose, not a bare line)', () => {
-    const { publisher } = routeBaseline({ type: 'error', message: 'connection failed: host=db.internal' });
-    const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
-    expect(body).toContain('host=db.internal');
+  it('an inline assignment behind prose in an error diagnostic does not egress its value', () => {
+    for (const message of [
+      'fatal: ALPHA=CANARY_SECRET_VALUE',
+      'failed to start --token=CANARY_SECRET_VALUE (exit 1)',
+      'bad config ALPHA="CANARY SECRET VALUE" near line 3',
+      "bad config ALPHA='CANARY SECRET VALUE' near line 3",
+    ]) {
+      const { publisher } = routeBaseline({ type: 'error', message });
+      const serialized = JSON.stringify(publisher.calls);
+      expect(serialized, message).not.toContain('CANARY');
+      expect(serialized, message).toMatch(/\[REDACTED/);
+    }
+  });
+
+  it('an inline assignment in a nested turn.failed error message does not egress its value', () => {
+    const { publisher } = routeBaseline({ type: 'turn.failed', error: { message: 'stream error: ALPHA=CANARY_SECRET_VALUE' } });
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('CANARY');
+    expect(serialized).toContain('stream error');
   });
 
   it('an overflow schema version fails safe to text passthrough, not rich routing', () => {

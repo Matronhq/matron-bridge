@@ -537,6 +537,28 @@ describe('formatAndRoute', () => {
     expect(ctx.state.terminalSeen).toBe(true);
   });
 
+  it('lands a pending answer before a turn.failed below the schema floor', () => {
+    const { calls, ctx } = makeContext({
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
+    });
+
+    formatAndRoute({
+      type: 'item.completed',
+      item: { id: 'answer-1', type: 'agent_message', text: 'Partial answer' },
+    }, ctx);
+    formatAndRoute({ type: 'turn.failed' }, ctx);
+
+    const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+    expect(bodies).toEqual(['Partial answer', JSON.stringify({ type: 'turn.failed' })]);
+    expect(ctx.state.finalPostProduced).toBe(true);
+    expect(ctx.state.pendingAgentMessage).toBeNull();
+    expect(ctx.state.terminalSeen).toBe(true);
+    expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual({
+      method: 'publishActivity',
+      args: [ctx.convoId, 'idle'],
+    });
+  });
+
   it('still text-passes non-lifecycle events below the schema floor', () => {
     const { calls, ctx } = makeContext({
       meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
