@@ -1011,9 +1011,26 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
+// Guarded file RPCs (read_file / edit_file). Scoped to the same root set
+// show_file already trusts, the default workdir plus any configured artifact
+// roots, pinned ONCE here at the trusted boundary and never rebuilt from
+// client-supplied strings. A root that cannot be pinned leaves both RPCs
+// failing closed (bad_workdir) rather than taking the bridge down. edit_file
+// is a separate opt-in: without MATRON_FILE_EDIT=1 the method is not
+// registered at all.
+let fileRpcAllowedRoots = null;
+try {
+  fileRpcAllowedRoots = pinAllowedRootsSync([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);
+} catch (e) {
+  console.warn(`[journal-rpc] file RPCs disabled: could not pin ${DEFAULT_WORKDIR} / SHOW_FILE_ARTIFACT_ROOTS (${e?.message ?? e})`);
+}
+const FILE_EDIT_ENABLED = process.env.MATRON_FILE_EDIT === '1';
+
 const journalRpcHandler = createRpcRequestHandler({
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
+  getFileAllowedRoots: () => fileRpcAllowedRoots,
+  fileEditEnabled: FILE_EDIT_ENABLED,
   // The !stop teardown for the unsupported_mode orphan: kill, drop from the
   // sessions map (keyed by room id — scan, this path is rare), evict input.
   stopSession: (session) => {
