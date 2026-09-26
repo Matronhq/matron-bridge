@@ -9,5 +9,6 @@ node_modules
 .mcp-config-generated*.json
 mcp-config.local.json
 journal-cursor.json
+run-state-outbox.json
 
 node_modules
