@@ -152,6 +152,12 @@ describe('createJournalPublisher', () => {
     expect(publishes.map(f => f.payload.body)).toEqual(['ok']);
     expect(warnings.some(w => /non-string text body/.test(w))).toBe(true);
 
+    const hostile = { from: 'assistant', get body() { throw new Error('boom'); } };
+    expect(() => pub.publishText('c1', hostile)).not.toThrow();
+    expect(pub.publishText('c1', hostile)).toBe(false);
+    expect(pub.publishTextBestEffort('c1', hostile)).toBe(false);
+    expect(warnings.some(w => /unreadable text body: boom/.test(w))).toBe(true);
+
     pub.close();
     await fake.close();
   });
