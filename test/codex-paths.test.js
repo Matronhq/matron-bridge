@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -421,6 +422,24 @@ describe('detectCodexBinary', () => {
   ])('ignores MATRON_CODEX_REAL_BIN set to %s', (_label, make) => {
     const realBin = make(root);
     expect(detectCodexBinary({ env: { PATH: '', MATRON_CODEX_REAL_BIN: realBin } })).toBe(false);
+  });
+
+  it('does not block on a FIFO named codex on PATH', () => {
+    const fifoDir = path.join(root, 'fifo'); mkdirSync(fifoDir);
+    const fifo = path.join(fifoDir, 'codex');
+    const mk = spawnSync('mkfifo', [fifo]);
+    expect(mk.status).toBe(0);
+    chmodSync(fifo, 0o755);
+    // Run in a child so a regression (a blocking open) fails on the timeout
+    // instead of hanging the test worker.
+    const script = `
+      import { detectCodexBinary } from ${JSON.stringify(path.resolve('lib/codex-paths.js'))};
+      process.stdout.write(String(detectCodexBinary({ env: { PATH: ${JSON.stringify(fifoDir)} } })));
+    `;
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], { encoding: 'utf8', timeout: 30_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('false');
   });
 
   it('skips a directory or non-executable `codex` on PATH', () => {
