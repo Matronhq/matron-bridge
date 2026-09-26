@@ -398,6 +398,12 @@ const showFileBudget = { inFlight: 0, reservedBytes: 0 };
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
+// Base URL where the matron-web client is served. Used to mint token-less
+// `${WEB_BASE_URL}/#files=<enc>` deep links into its Files pane on file
+// handovers (send_attachment, show_file, item attachments); auth is the
+// user's existing web session, so nothing is signed. Unset: links are
+// dormant and every handover keeps its plain caption.
+const WEB_BASE_URL = process.env.WEB_BASE_URL || '';
 const SHOW_FILE_ARTIFACT_ROOTS = (process.env.SHOW_FILE_ARTIFACT_ROOTS || '')
   .split(':')
   .filter(Boolean);
@@ -10156,6 +10162,7 @@ const handleSendAttachment = createSendAttachmentHandler({
   journalConvoIdFor,
   rooms: agentRooms,
   onLocalRoomAttachment: routeLocalRoomAttachment,
+  webBaseUrl: WEB_BASE_URL,
 });
 
 // The eight agent-chat room tools (lib/agent-chat.js), mounted below as thin
@@ -10213,6 +10220,7 @@ const itemsHandlers = createItemsHandlers({
   journalConvoIdFor,
   client: itemsClient,
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+  webBaseUrl: WEB_BASE_URL,
 });
 
 const missionsHandlers = createMissionsHandlers({
@@ -10509,6 +10517,7 @@ const apiServer = createServer(async (req, res) => {
           uploadMedia: journalPublisher.uploadMedia,
           journalPublish,
           denialToStatus,
+          webBaseUrl: WEB_BASE_URL,
         },
       });
       res.writeHead(status, { 'Content-Type': 'application/json', ...(headers || {}) });

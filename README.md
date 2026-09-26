@@ -162,6 +162,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `MATRON_FILE_EDIT` | Set to `1` to register the `edit_file` agent RPC, which lets a signed-in client app edit an existing file under `DEFAULT_WORKDIR` or `SHOW_FILE_ARTIFACT_ROOTS` (sensitive paths refused, atomic write, optional `expected_sha256` compare-and-swap). The read-only `read_file` RPC is always available over the same roots | `0` |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
+| `WEB_BASE_URL` | Where the matron-web client is served. When set, files handed over via `send_attachment`, `show_file` or item attachments get an extra `Open in Files` line linking to `${WEB_BASE_URL}/#files=<path>` (no token: the web session authenticates). Unset keeps plain captions | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
