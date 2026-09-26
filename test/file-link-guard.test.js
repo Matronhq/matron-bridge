@@ -359,7 +359,7 @@ describe('buildFilesDeepLink', () => {
   it('mints a token-less #files= hash link for an in-root, non-sensitive file', () => {
     const link = buildFilesDeepLink(`${WORK}/offer.md`, WORK, WEB);
     expect(link).toBe(`${WEB}/#files=${encodeURIComponent(`${WORK}/offer.md`)}`);
-    // No token/HMAC in the URL — auth is the operator's web session.
+    // No token/HMAC in the URL — auth is the user's web session.
     expect(link).not.toContain('token=');
   });
 
