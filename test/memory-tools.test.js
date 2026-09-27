@@ -54,13 +54,17 @@ describe('memory handlers', () => {
     expect((await h.save({ roomId: '!r:s', name: 'ok', description: 'd', body: 'é'.repeat(4096) })).status).toBe(201);
   });
 
-  it('save: journal 409 → the max-200 message; status 0 → 502; 404 → no memory named', async () => {
+  it('save: journal 409 → the max-200 message; status 0 → 502; 404 → refused (routes or not writable)', async () => {
     expect(await fixture({ save: vi.fn(async () => ({ status: 409, data: { error: 'too_many' } })) }).h.save({ roomId: '!r:s', name: 'x', description: 'd' }))
       .toEqual({ status: 409, body: { error: 'the journal holds the maximum of 200 memories — delete one first' } });
     expect(await fixture({ save: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) }).h.save({ roomId: '!r:s', name: 'x', description: 'd' }))
       .toEqual({ status: 502, body: { error: 'journal unreachable' } });
-    expect(await fixture({ save: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) }).h.save({ roomId: '!r:s', name: 'x', description: 'd' }))
-      .toEqual({ status: 404, body: { error: 'no memory named "x"' } });
+    const refused = await fixture({ save: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) }).h.save({ roomId: '!r:s', name: 'x', description: 'd' });
+    expect(refused.status).toBe(404);
+    // An upsert cannot 404 on the name: say routes-not-deployed / not writable, never "no memory named".
+    expect(refused.body.error).toMatch(/does not have the \/memories routes yet.*PR #94/);
+    expect(refused.body.error).toMatch(/not writable by this session/);
+    expect(refused.body.error).not.toMatch(/no memory named/);
   });
 
   it('list: passes the journal answer through; a 404 names the missing deploy', async () => {
