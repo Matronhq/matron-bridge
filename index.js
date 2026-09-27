@@ -116,7 +116,7 @@ import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
@@ -1848,27 +1848,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--include-partial-messages',
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
-    '--settings', JSON.stringify({
-      permissions: {
-        allow: ['mcp__ask-user', 'mcp__show-file'],
-      },
-      hooks: {
-        PreCompact: [{
-          hooks: [{
-            type: 'command',
-            command: path.join(__dirname, 'hooks', 'compact-notify.sh'),
-            timeout: 5,
-          }],
-        }],
-        PreToolUse: [{
-          matcher: 'Bash',
-          hooks: [{
-            type: 'command',
-            command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh'),
-          }],
-        }],
-      },
-    }),
+    // Additive inline settings: the bridge's hooks (and, when gated, the MCP
+    // permission gate hook) merge with the on-disk settings, which all load.
+    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks') })),
   ];
   const printModel = options.model === null
     ? undefined
@@ -10353,6 +10335,34 @@ const apiServer = createServer(async (req, res) => {
         const { secretId, itemNum, itemError } = created;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId, itemNum, itemError }));
+        return;
+      } else if (url.pathname === '/permission-check') {
+        // The gated-session PreToolUse hook (hooks/permission-gate.mjs) asks
+        // here before every non-infra MCP call. Never mints a card: allow and
+        // deny are final (deny also posts the visible room notice); anything
+        // that needs the user answers `ask`, and the CLI then routes the call to
+        // the permission_request tool, which mints the card via
+        // /permission-request below. The hook fails closed to `ask` on any error.
+        const { roomId, toolName } = data;
+        if (!roomId || typeof toolName !== 'string' || toolName === '') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and toolName are required' }));
+          return;
+        }
+        const checkSession = sessions.get(roomId);
+        if (!checkSession) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No session for roomId' }));
+          return;
+        }
+        const check = resolvePermissionCheck({
+          permAllowedTools: checkSession.permAllowedTools,
+          snapshot: checkSession.permissionSnapshot,
+          toolName,
+        });
+        if (check.notice) Promise.resolve(sendToRoom(roomId, check.notice)).catch(() => {});
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(check.body));
         return;
       } else if (url.pathname === '/permission-request') {
         const { roomId, toolName, input } = data;
