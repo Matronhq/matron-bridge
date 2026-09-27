@@ -361,6 +361,46 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('stream error');
   });
 
+  it('inline redaction leaves URL query parameters and short numeric/duration values readable', () => {
+    // A real upstream diagnostic: `word=value` tokens that are not secrets.
+    // Assignments inside a URL query (after `?`/`&` in a `scheme://` token)
+    // and short numeric/duration values must survive so the line stays
+    // actionable; `model=gpt-5` is still redacted (fail closed on an unknown
+    // alphanumeric value).
+    const MSG = 'status 429 for model=gpt-5 (retry-after=30s) code=429, n=3 after 1.5h'
+      + ' url https://api.example.test/v1/y?stream=true&limit=10 see http://docs.test/x?a=1';
+    for (const schemaVersion of [SUPPORTED, 'codex-cli 0.145.0']) {
+      const { publisher } = route({ type: 'error', message: MSG }, { redact: baseline, schemaVersion });
+      const serialized = JSON.stringify(publisher.calls);
+      expect(serialized, schemaVersion).toContain('(retry-after=30s)');
+      expect(serialized, schemaVersion).toContain('code=429,');
+      expect(serialized, schemaVersion).toContain('n=3 after 1.5h');
+      expect(serialized, schemaVersion).toContain('https://api.example.test/v1/y?stream=true&limit=10');
+      expect(serialized, schemaVersion).toContain('http://docs.test/x?a=1');
+      expect(serialized, schemaVersion).toContain('model=[REDACTED-ENV]');
+      expect(serialized, schemaVersion).not.toContain('gpt-5');
+    }
+  });
+
+  it('inline redaction still fails closed on secret-shaped and non-URL assignments', () => {
+    for (const message of [
+      'auth failed: OPENAI_API_KEY=sk-CANARY0123456789abcdef',
+      'TOKEN=abc123defCANARY456ghi789 rejected',
+      'login failed for password=hunter2CANARY',
+      // A URL as a VALUE is not an assignment inside a URL: the value goes.
+      'fetching url=https://x.test/y?token=CANARY',
+      // `?`/`&` without a scheme:// token is not a URL query.
+      'bad ?token=CANARY here',
+      // Too long to be a short numeric value (6-digit OTP shape).
+      'sent otp=123456CANARY',
+    ]) {
+      const { publisher } = routeBaseline({ type: 'error', message });
+      const serialized = JSON.stringify(publisher.calls);
+      expect(serialized, message).not.toContain('CANARY');
+      expect(serialized, message).toMatch(/\[REDACTED/);
+    }
+  });
+
   it('an overflow schema version fails safe to text passthrough, not rich routing', () => {
     const overflowVersion = `codex-cli ${'9'.repeat(400)}.0.0`;
     const { publisher, state } = route({
