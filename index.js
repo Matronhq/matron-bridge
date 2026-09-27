@@ -9652,44 +9652,64 @@ function journalInjectInviteRequest(frame) {
   // Remote guest invites only. A join_request is answered by the room OWNER
   // (a third party asking in), and the same-bridge path keeps its loopback
   // ask: there the "answer" is a local state flip, not a journal op, and its
-  // owner-side waiter semantics are different enough to leave alone. Fire-
-  // and-forget answer(), not answerAwait(): the invite was delivered by this
-  // very frame, so the one failure answerAwait guards against (a server-
-  // expired invite) cannot apply, and this function is synchronous. The
-  // boolean is the socket write — if it did not leave, the room stays
-  // pending and the agent gets the accept/refuse ask as before.
-  const joined = !isJoin && !frame.local && agentInvites.answer({ roomId: frame.room_id, peerDeviceId: null, accept: true });
-  if (joined) agentRooms.setState(frame.room_id, 'joined');
-  // The USER's copy of the request, published BEFORE the agent is woken so it
-  // sits above whatever the agent decides. Two separate texts on purpose: the
-  // one above instructs the agent (tool syntax and all), this one just tells
-  // Dan who is asking and why — otherwise he sees "I'll accept that chat
-  // request" with nothing above it explaining what was requested.
+  // owner-side waiter semantics are different enough to leave alone.
   //
-  // journalPublishNotice, NOT the ordinary sendToSession mirror: that mirror
-  // publishes from:'user' (journalPublishUserItem), and every field of this
-  // text is written by a REMOTE agent — rendering it as Dan's own message
-  // would let a peer put words in his mouth in his own chat. A notice is
-  // from:'assistant', i.e. the bridge's own voice, which is what it is.
-  // formatInviteRequestNotice sanitises each interpolated field.
-  //
-  // Only when the request was actually ADDRESSED here. An unaddressed one
-  // (pre-3.5 caller) reached this session by a guess among several live
-  // ones, and publishing a stranger's request into a conversation it was
-  // never meant for is exactly the visible half of the 2026-08-08 incident.
-  // The agent still gets the ask as a turn below — it can accept, and any
-  // room it accepts gets its own conversation — but the user's chat is not
-  // written to on a guess. Logged, because a silently dropped notice would
-  // otherwise look like the feature simply not working.
+  // The accept is AWAITED (answerAwait, the accept-path contract in
+  // lib/agent-invites.js), which is why it lives in the async helper rather
+  // than in this synchronous function: the socket-write boolean answer()
+  // returns is not the journal's answer. The op is queued behind the ack
+  // and, if the socket drops before the pump sends them, retried on the next
+  // connect — where the journal rejects it with not_ready between hello_ok
+  // and registration. Marking the binding joined on the write alone would
+  // then leave the journal row 'invited' while the local room said 'joined':
+  // every send refused, and the owner told 'expired' 30 minutes later. The
+  // helper flips the binding only once the journal has let the answer stand;
+  // otherwise the room stays pending and the agent gets the accept/refuse
+  // ask below, whose agent_chat_accept retries the answer properly.
+  if (!isJoin && !frame.local) {
+    deliverAutoJoinedRequest(session, frame, room, { addressed })
+      .catch((e) => { try { console.warn(`[agent-invites] joined-room delivery for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+    return;
+  }
+  publishInviteRequestNotice(session, frame, room, { addressed, joined: false });
+  deliverInviteAsk(session, frame, room);
+}
+
+// The USER's copy of an inbound request, published BEFORE the agent is woken
+// so it sits above whatever the agent decides. Two separate texts on
+// purpose: the agent's (deliverInviteAsk / formatAutoJoinedRequest)
+// instructs the agent, tool syntax and all; this one just tells Dan who is
+// asking and why — otherwise he sees "I'll accept that chat request" with
+// nothing above it explaining what was requested. `joined`: the bridge
+// accepted on delivery, so the line states a fact rather than a request.
+//
+// journalPublishNotice, NOT the ordinary sendToSession mirror: that mirror
+// publishes from:'user' (journalPublishUserItem), and every field of this
+// text is written by a REMOTE agent — rendering it as Dan's own message
+// would let a peer put words in his mouth in his own chat. A notice is
+// from:'assistant', i.e. the bridge's own voice, which is what it is.
+// formatInviteRequestNotice sanitises each interpolated field.
+//
+// Only when the request was actually ADDRESSED here. An unaddressed one
+// (pre-3.5 caller) reached this session by a guess among several live
+// ones, and publishing a stranger's request into a conversation it was
+// never meant for is exactly the visible half of the 2026-08-08 incident.
+// The agent still gets its turn — it can accept, and any room it accepts
+// gets its own conversation — but the user's chat is not written to on a
+// guess. Logged, because a silently dropped notice would otherwise look
+// like the feature simply not working.
+function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {
   if (addressed) {
     journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }));
   } else {
     console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
   }
-  if (joined) {
-    deliverAutoJoinedRequest(session, frame, room);
-    return;
-  }
+}
+
+// The agent's accept/refuse turn: join_requests, same-bridge invites, and a
+// remote invite whose accept-on-delivery the journal did not let stand.
+function deliverInviteAsk(session, frame, room) {
+  const isJoin = frame.event === 'join_request';
   const who = frame.from_name ? `"${frame.from_name}"` : `device ${frame.from_device_id}`;
   const ask = isJoin
     ? `Agent ${who} asks to join your room ${frame.room_id}: ${frame.justification}`
@@ -9702,22 +9722,40 @@ function journalInjectInviteRequest(frame) {
   roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now() });
 }
 
-// The agent's turn for an invite joined on delivery. Async because it
-// backfills first: the inviter published its opening message into the room
-// BEFORE the invite went out, and fan-out is participation-gated at publish
-// time, so the guest never received it — without this read the agent would
-// know why the peer asked but not what it said (the same backfill
+// Accept-on-delivery for a remote guest invite, then the agent's turn. Async
+// because it awaits two things: first the accept itself (answerAwait — the
+// journal answers agent_invite_answer only on failure, so silence within its
+// window is the answer having taken; up to DEFAULT_DELIVER_WAIT_MS of
+// latency, the same cost agent_chat_accept pays), and only on that does the
+// guest binding flip to 'joined'. A rejected accept (journal_unreachable,
+// not_ready on a reconnect retry, a server-expired invite) leaves the
+// binding pending — no terminal state is latched here: 'not_ready' is a
+// plain reconnect race and the invite is still live, and agent_chat_accept
+// already knows which codes prove an invite dead — and hands the agent the
+// ordinary accept/refuse ask instead, whose accept retries the answer.
+//
+// Then the backfill: the inviter published its opening message into the
+// room BEFORE the invite went out, and fan-out is participation-gated at
+// publish time, so the guest never received it — without this read the agent
+// would know why the peer asked but not what it said (the same backfill
 // agent_chat_accept does). Best-effort: the join already took, so a failed
 // read degrades to a pointer at agent_chat_read inside the text. Delivery
 // goes through the same per-recipient path as the ask it replaces (busy
-// coalescing, resume-hold flush), just a fetch later.
-function deliverAutoJoinedRequest(session, frame, room) {
-  journalPublisher.fetchMessages(frame.room_id, { limit: 20 })
-    .catch(() => null)
-    .then((res) => {
-      roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: res ? res.events : null }), at: Date.now() });
-    })
-    .catch((e) => { try { console.warn(`[agent-invites] joined-room delivery for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+// coalescing, resume-hold flush), just a round-trip or two later. The
+// user's notice is published between the two, once the outcome is known,
+// so it sits above the agent's turn as for any request.
+async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
+  const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });
+  const joined = res.kind === 'answered';
+  if (joined) {
+    agentRooms.setState(frame.room_id, 'joined');
+  } else {
+    console.warn(`[agent-invites] accept on delivery for ${frame.room_id} did not take (${res.code || res.kind}); room stays pending, asking the agent instead`);
+  }
+  publishInviteRequestNotice(session, frame, room, { addressed, joined });
+  if (!joined) { deliverInviteAsk(session, frame, room); return; }
+  const backlog = await journalPublisher.fetchMessages(frame.room_id, { limit: 20 }).catch(() => null);
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog ? backlog.events : null }), at: Date.now() });
 }
 
 // Room-lifecycle FYI (late answers, peer left) surfaced to the bound session

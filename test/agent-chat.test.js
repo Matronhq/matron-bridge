@@ -1276,33 +1276,45 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(start).toBeGreaterThan(-1);
     const end = indexSrc.indexOf('\nfunction ', start + 1);
     const body = indexSrc.slice(start, end);
-    // journalPublishNotice = from:'assistant' (the bridge's own voice). The
-    // ordinary sendToSession mirror publishes from:'user', which would render
-    // a REMOTE agent's text as though Dan had typed it — text forgery, so it
-    // must never be the path used here.
-    const notice = body.indexOf('journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }))');
-    expect(notice).toBeGreaterThan(-1);
-    // Comments stripped: the ones in this function NAME the forbidden path to
-    // explain why it is forbidden.
-    const code = body.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
-    expect(code).not.toContain('journalPublishUserItem');
-    expect(code).not.toContain("from: 'user'");
-    // Published BEFORE the agent is woken, so the request sits above the
-    // agent's answer to it.
-    expect(notice).toBeLessThan(body.indexOf('roomDelivery.deliver('));
+    // The notice lives in ONE helper both the ask path and the joined-on-
+    // delivery path go through. journalPublishNotice = from:'assistant' (the
+    // bridge's own voice). The ordinary sendToSession mirror publishes
+    // from:'user', which would render a REMOTE agent's text as though Dan had
+    // typed it — text forgery, so it must never be the path used here.
+    const nStart = indexSrc.indexOf('function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {');
+    expect(nStart).toBeGreaterThan(-1);
+    const noticeFn = indexSrc.slice(nStart, indexSrc.indexOf('\nfunction ', nStart + 1));
+    expect(noticeFn).toContain('journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }))');
+    expect((noticeFn.match(/journalPublishNotice\(/g) || [])).toHaveLength(1);
+    // Comments stripped: the ones in these functions NAME the forbidden path
+    // to explain why it is forbidden.
+    const strip = (src) => src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    for (const code of [strip(body), strip(noticeFn)]) {
+      expect(code).not.toContain('journalPublishUserItem');
+      expect(code).not.toContain("from: 'user'");
+    }
     // The no-session branch auto-refuses and returns without a notice: an
     // INBOUND room is not ours to write into (authorizeAgentWrite rejects).
-    expect((body.match(/journalPublishNotice\(/g) || [])).toHaveLength(1);
-    expect(notice).toBeGreaterThan(body.indexOf("reason: 'no active session on this box'"));
+    // Only the helper publishes; the injector itself never does.
+    expect(strip(body)).not.toContain('journalPublishNotice(');
+    const askNotice = body.indexOf('publishInviteRequestNotice(session, frame, room, { addressed, joined: false })');
+    expect(askNotice).toBeGreaterThan(body.indexOf("reason: 'no active session on this box'"));
+    // Published BEFORE the agent is woken, so the request sits above the
+    // agent's answer to it.
+    expect(askNotice).toBeLessThan(body.indexOf('deliverInviteAsk(session, frame, room)'));
     // The AGENT's copy is a different text and keeps the tool syntax (for
     // the join_request and same-bridge paths, which still ask)…
-    expect(body).toMatch(/Accept with agent_chat_accept\(/);
+    const aStart = indexSrc.indexOf('function deliverInviteAsk(session, frame, room) {');
+    expect(aStart).toBeGreaterThan(-1);
+    const askFn = indexSrc.slice(aStart, indexSrc.indexOf('\nfunction ', aStart + 1));
+    expect(askFn).toMatch(/Accept with agent_chat_accept\(/);
+    expect(askFn).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{ roomId: frame\.room_id/);
     // …which the user's copy must not inherit (it lives in lib, pinned there,
     // alongside the wake notice the reaped-target path publishes).
     expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
   });
 
-  it('joins an approved remote invite on delivery: accept answer after the ack, guest binding joined, agent told it is in the room', () => {
+  it('joins an approved remote invite on delivery: accept AWAITED after the ack, guest binding joined only on the journal\'s answer, agent told it is in the room', () => {
     // The user's consent card is the gate. Before this, the target agent had
     // to call agent_chat_accept itself — and a target mid-turn for the whole
     // 30-minute invite window never could, so both sides opened new rooms.
@@ -1310,28 +1322,50 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(start).toBeGreaterThan(-1);
     const end = indexSrc.indexOf('\nfunction ', start + 1);
     const body = indexSrc.slice(start, end);
+    const strip = (src) => src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
     // Remote guest invites ONLY: a join_request is answered by the owner, and
-    // the same-bridge path keeps its loopback ask.
-    const answer = body.indexOf("const joined = !isJoin && !frame.local && agentInvites.answer({ roomId: frame.room_id, peerDeviceId: null, accept: true })");
-    expect(answer).toBeGreaterThan(-1);
+    // the same-bridge path keeps its loopback ask. The injector is
+    // synchronous, so the accept is handed to the async helper — never a
+    // fire-and-forget answer() whose boolean is only the socket write: the
+    // journal rejects ops with not_ready between hello_ok and registration,
+    // so a reconnect retry could leave the journal row 'invited' while the
+    // local binding said 'joined' (answerAwait's contract in lib/agent-invites.js).
+    const hand = body.indexOf('deliverAutoJoinedRequest(session, frame, room, { addressed })');
+    expect(hand).toBeGreaterThan(-1);
+    expect(body).toMatch(/if \(!isJoin && !frame\.local\) \{[\s\S]{0,1200}deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)/);
+    expect(strip(body)).not.toMatch(/agentInvites\.answer\(\{ roomId: frame\.room_id, peerDeviceId: null, accept: true/);
+    expect(strip(body)).not.toContain("setState(frame.room_id, 'joined')");
     // Ack first (unchanged, it settles the inviter's chatStart waiter), then
     // the accept — the same answer agent_chat_accept would have sent.
-    expect(answer).toBeGreaterThan(body.indexOf('agentInvites.ack({'));
-    // The binding is only marked joined when the answer actually left.
-    expect(body).toMatch(/if \(joined\) agentRooms\.setState\(frame\.room_id, 'joined'\);/);
-    // …and the agent's turn is the joined-room text with the room backlog,
-    // never the accept/refuse instruction. The user's notice is published
-    // BEFORE it, as for any request.
-    const joinedDeliver = body.indexOf('deliverAutoJoinedRequest(session, frame, room)');
-    expect(joinedDeliver).toBeGreaterThan(body.indexOf('journalPublishNotice('));
-    expect(joinedDeliver).toBeLessThan(body.indexOf('Accept with agent_chat_accept('));
-    // The helper fetches the backlog (the opening message was published before
-    // the guest joined, so fan-out never reached it) and delivers the text.
-    const hStart = indexSrc.indexOf('function deliverAutoJoinedRequest(');
+    expect(hand).toBeGreaterThan(body.indexOf('agentInvites.ack({'));
+    // The async helper: a rejected promise must not escape onInviteFrame's
+    // synchronous try/catch as an unhandled rejection.
+    expect(body).toMatch(/deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)\s*\n?\s*\.catch\(/);
+    const hStart = indexSrc.indexOf('async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {');
     expect(hStart).toBeGreaterThan(-1);
     const helper = indexSrc.slice(hStart, indexSrc.indexOf('\nfunction ', hStart + 1));
-    expect(helper).toMatch(/journalPublisher\.fetchMessages\(frame\.room_id, \{ limit: 20 \}\)/);
+    const answer = helper.indexOf("const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });");
+    expect(answer).toBeGreaterThan(-1);
+    // The binding flips to joined ONLY on the journal's answer (silence
+    // within the error window), never on the write boolean…
+    expect(helper).toMatch(/const joined = res\.kind === 'answered';\s*\n\s*if \(joined\) \{?\s*\n?\s*agentRooms\.setState\(frame\.room_id, 'joined'\)/);
+    expect((strip(helper).match(/setState\(frame\.room_id, 'joined'\)/g) || [])).toHaveLength(1);
+    // …the user's notice carries the outcome and is published BEFORE the
+    // agent's turn, as for any request…
+    const notice = helper.indexOf('publishInviteRequestNotice(session, frame, room, { addressed, joined })');
+    expect(notice).toBeGreaterThan(answer);
+    // …and on a rejected accept the room stays pending and the agent gets
+    // the old accept/refuse ask (its agent_chat_accept retries the answer).
+    const fallback = helper.indexOf('if (!joined) { deliverInviteAsk(session, frame, room); return; }');
+    expect(fallback).toBeGreaterThan(notice);
+    expect(strip(helper)).not.toMatch(/setState\(frame\.room_id, '(expired|refused|left)'\)/);
+    // Otherwise the agent's turn is the joined-room text with the room
+    // backlog (the opening message was published before the guest joined,
+    // so fan-out never reached it), never the accept/refuse instruction.
+    const fetch = helper.indexOf('journalPublisher.fetchMessages(frame.room_id, { limit: 20 })');
+    expect(fetch).toBeGreaterThan(fallback);
     expect(helper).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{[^}]*body: formatAutoJoinedRequest\(frame, \{ events/);
+    expect(helper).not.toMatch(/Accept with agent_chat_accept\(/);
   });
 
   it('terminal teardown keeps joined rooms; only an unresumable binding is left, lazily, by orphanRoomBinding', () => {
