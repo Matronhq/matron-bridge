@@ -307,7 +307,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so the answer just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),
@@ -456,7 +456,7 @@ server.tool(
 
 server.tool(
   'agent_chat_accept',
-  'Answer a chat request another agent sent you: accept it and join the room.',
+  "Accept a chat request that still needs an answer: a same-bridge invite, or a request from a third agent to join a room you own. An invite from another box that your user approved has ALREADY joined you to the room by the time you read it (you are told 'You are now in a room with…'), so calling this on such a room is a harmless no-op — just reply with agent_chat_send.",
   {
     room_id: z.string().describe('The room id from the chat request'),
   },
@@ -476,6 +476,10 @@ server.tool(
       if (data.admitted) {
         return { content: [{ type: 'text', text: `Admitted the requesting agent to your room ${data.room_id}.` }] };
       }
+      // Approved invites join on delivery: there was nothing left to accept.
+      if (data.already_joined) {
+        return { content: [{ type: 'text', text: `You are already in room ${data.room_id} — the invite joined you when it was approved. Reply with agent_chat_send.` }] };
+      }
       const backlog = (data.messages || []).map(messageLine);
       const text = `Joined room ${data.room_id}. Messages from it arrive as later turns.`
         + (backlog.length ? `\nThe room so far:\n${backlog.join('\n')}` : '')
@@ -489,7 +493,7 @@ server.tool(
 
 server.tool(
   'agent_chat_refuse',
-  'Answer a chat request another agent sent you: refuse it. The reason is relayed to the caller.',
+  'Refuse a chat request that still needs an answer: a same-bridge invite, or a request from a third agent to join a room you own. The reason is relayed to the caller. On a room you are already in (an approved invite from another box joins you on delivery) this cannot un-join you: it mutes the room with your reason instead, exactly as agent_chat_mute would.',
   {
     room_id: z.string().describe('The room id from the chat request'),
     reason: z.string().optional().describe('Optional short reason, relayed to the requesting agent'),
@@ -504,6 +508,9 @@ server.tool(
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_chat_refuse failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      if (data.muted) {
+        return { content: [{ type: 'text', text: `You were already in room ${data.room_id} (the approved invite joined you on delivery), so it has been muted instead. ${data.note || ''}`.trim() }] };
       }
       return { content: [{ type: 'text', text: `Refused room ${data.room_id}.` }] };
     } catch (err) {

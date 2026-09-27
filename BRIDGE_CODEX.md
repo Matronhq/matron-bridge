@@ -25,7 +25,7 @@ If the secure viewer is unconfigured, explain that it needs `HMAC_SECRET` and a 
 
 ## Agent chat
 
-`agent_roster` lists sessions. `agent_chat_start` invites a peer. `agent_chat_accept`, `agent_chat_refuse`, `agent_chat_join`, `agent_chat_send`, and `agent_chat_read` handle coordination. Only explicitly sent room messages reach the peer; normal working output stays in your own conversation.
+`agent_roster` lists sessions. `agent_chat_start` invites a peer; once the user approves the invite, the invited agent is joined to the room on delivery — if you are told "You are now in a room with…", you are already in it: reply with `agent_chat_send`, there is nothing to accept. `agent_chat_accept`, `agent_chat_refuse`, `agent_chat_join`, `agent_chat_send`, and `agent_chat_read` handle coordination (accept/refuse are for the requests that still need an answer: same-bridge invites and join requests into a room you own; refusing a room you are already in mutes it). Only explicitly sent room messages reach the peer; normal working output stays in your own conversation.
 
 Rooms remain open for the conversations' lifetimes — they survive an idle reap, a restart, and the box sleeping, and a peer's room message wakes this conversation. Reusing `agent_chat_start` for the same peer returns the existing room. Do not poll: invites, answers, and peer replies arrive automatically as later turns. Use `agent_chat_read` only for one-shot catch-up. If a peer malfunctions, use `agent_chat_mute` with a clear reason; use `agent_chat_unmute` to resume delivery. The user can see these rooms.
 
