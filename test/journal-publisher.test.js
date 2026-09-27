@@ -377,6 +377,47 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
+  it('overflow eviction invokes the frame\'s onEvicted hook with the dropped frame (convo + session_state)', async () => {
+    const port = await getFreePort(); // never connected: everything queues
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const pub = createJournalPublisher({ url, token: 'tok', log: silentLog, queueLimit: 2, ...FAST_BACKOFF });
+
+    const evicted = [];
+    pub.upsertConvo('c1', { sessionState: 'running' }, { onEvicted: (frame) => evicted.push(frame) });
+    pub.publishText('c1', { body: 'm1', from: 'user' });
+    expect(evicted).toEqual([]); // at the limit, not over it
+
+    pub.publishText('c1', { body: 'm2', from: 'user' }); // pushes the upsert out
+    expect(evicted).toHaveLength(1);
+    expect(evicted[0]).toMatchObject({ op: 'convo_upsert', convo_id: 'c1', session_state: 'running' });
+
+    pub.close();
+  });
+
+  it('onEvicted never fires for a frame that is delivered, and a throwing hook is contained', async () => {
+    const port = await getFreePort();
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url, token: 'tok', log, queueLimit: 2, ...FAST_BACKOFF });
+
+    let deliveredHookFired = false;
+    // Two frames: the first is evicted by the third enqueue and its hook throws;
+    // the second survives and is delivered, so its hook must stay silent.
+    pub.upsertConvo('c1', { sessionState: 'running' }, { onEvicted: () => { throw new Error('boom'); } });
+    pub.upsertConvo('c2', { sessionState: 'waiting' }, { onEvicted: () => { deliveredHookFired = true; } });
+    expect(() => pub.publishText('c1', { body: 'm', from: 'user' })).not.toThrow();
+    expect(warnings.some(w => /evict/i.test(w) && /boom/.test(w))).toBe(true);
+
+    const fake = await startFakeServer({}, port);
+    await waitFor(() => fake.received.length >= 2);
+    expect(fake.received.map(f => f.convo_id)).toEqual(['c2', 'c1']);
+    expect(deliveredHookFired).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('disabled mode (no url/token): every method is a safe no-op, nothing throws', async () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };

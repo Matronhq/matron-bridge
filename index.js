@@ -107,6 +107,7 @@ import {
 } from './lib/show-file.js';
 import { processShowFile } from './lib/show-file-handler.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
+import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
@@ -690,7 +691,7 @@ const journalPublisher = createJournalPublisher({
   onReconnect: handleJournalReconnect,
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => republishPendingReleases(),
+  onSendCapacity: () => { republishPendingReleases(); sessionStateLatch.onCapacity(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -1139,7 +1140,7 @@ function findSessionByClaudeSessionId(claudeSessionId) {
 // scope.
 const JOURNAL_BUFFER_LIMIT = 100;
 
-function journalBufferPush(session, method, payload) {
+function journalBufferPush(session, method, payload, options) {
   if (!session._journalBuffer) session._journalBuffer = [];
   if (session._journalBuffer.length >= JOURNAL_BUFFER_LIMIT) {
     session._journalBuffer.shift();
@@ -1148,11 +1149,14 @@ function journalBufferPush(session, method, payload) {
       console.warn(`[journal] pre-session-id buffer overflow for room ${session.roomId} — dropping oldest`);
     }
   }
-  session._journalBuffer.push({ method, payload });
+  session._journalBuffer.push({ method, payload, options });
 }
 
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
-function journalPublish(session, method, payload) {
+// `options` is the publisher's per-frame options bag ({onDelivered,
+// onEvicted, idemKey}); it rides the buffer too, so a hook attached to a
+// pre-session-id frame still fires once the flushed frame is delivered/evicted.
+function journalPublish(session, method, payload, options) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
   if (convoId) {
@@ -1169,9 +1173,9 @@ function journalPublish(session, method, payload) {
         journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
       }
     }
-    journalPublisher[method](convoId, payload);
+    journalPublisher[method](convoId, payload, options);
   } else {
-    journalBufferPush(session, method, payload);
+    journalBufferPush(session, method, payload, options);
   }
 }
 
@@ -1331,7 +1335,7 @@ function scheduleReleaseReconcile() {
   }
 }
 
-function journalUpsertConvo(session, opts) {
+function journalUpsertConvo(session, opts, options) {
   if (opts.title !== undefined && opts.title !== session._journalTitleHint) {
     session._journalTitleHint = opts.title;
     // Mirror the hint into the session record: the in-memory carry
@@ -1341,7 +1345,7 @@ function journalUpsertConvo(session, opts) {
     persistSession(session.roomId, session.claudeSessionId, session.workdir,
       session.originRoomId, { journalTitleHint: opts.title });
   }
-  journalPublish(session, 'upsertConvo', opts);
+  journalPublish(session, 'upsertConvo', opts, options);
 }
 
 // opts.incomingHint: the title carried across a restart/resume (see
@@ -1377,11 +1381,21 @@ function journalPublishUserItem(session, method, payload) {
 }
 
 // Mirror a session_state transition, but only on actual change — busy/prompt/
-// turn-end events fire far more often than the state actually flips.
+// turn-end events fire far more often than the state actually flips. The
+// change-dedup latch (session._journalState) lives in
+// lib/journal-session-state.js: it is released when the publisher evicts the
+// frame under overflow (a state that never left the box must not count as
+// sent, or the row sits at `running` and every client shows "Thinking"
+// forever) and the convo's current state is re-offered once the publisher
+// has headroom again — `done` when the session is gone by then.
+const sessionStateLatch = createSessionStateLatch({
+  publish: (session, state, options) => journalUpsertConvo(session, { sessionState: state }, options),
+  upsertConvoDirect: (convoId, state, options) => journalPublisher.upsertConvo(convoId, { sessionState: state }, options),
+  resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
+  warn: (m) => console.warn(m),
+});
 function journalSessionState(session, state) {
-  if (session._journalState === state) return;
-  session._journalState = state;
-  journalUpsertConvo(session, { sessionState: state });
+  sessionStateLatch.offer(session, state);
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
@@ -1770,8 +1784,8 @@ function journalFlushForSession(session) {
   const buffered = session._journalBuffer;
   session._journalBuffer = null;
   if (!buffered) return;
-  for (const { method, payload } of buffered) {
-    journalPublisher[method](convoId, payload);
+  for (const { method, payload, options } of buffered) {
+    journalPublisher[method](convoId, payload, options);
   }
 }
 
