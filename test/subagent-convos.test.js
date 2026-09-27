@@ -374,6 +374,26 @@ describe('createSubagentConvoTracker', () => {
       expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
     });
 
+    it('a never-resumed child completes on a mismatched tool_use_id (FIFO mispairing never corrected)', () => {
+      // Two refs queued FIFO; only agent-B is discovered, and it provisionally
+      // takes ref-A (wrong). Its corrective task_started never arrives (a
+      // producer that does not emit one). Its completion carries the TRUE ref.
+      // A never-resumed child has exactly one incarnation, so the mismatch
+      // cannot be a stale prior-run notification: it must finish by task_id, as
+      // on master — otherwise the child strands at running until teardown.
+      tracker.noteTaskStarted('ref-A');
+      tracker.noteTaskStarted('ref-B');
+      const b = tracker.discover('agent-B', { label: 'B', agentType: null });
+      expect(b.taskRef).toBe('ref-A');
+      expect(b.retiredRefs ?? new Set()).toHaveProperty('size', 0);
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-B', 'ref-B');
+
+      expect(b.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+
     it('ignores an uncorrelated (id-less) notification for a RESUMED run — cannot risk killing the live incarnation', () => {
       // For a producer that omits tool_use_id, a stale run-N
       // notification arriving after run N+1 has started must not blindly finish
