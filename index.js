@@ -1850,7 +1850,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     // Additive inline settings: the bridge's hooks (and, when gated, the MCP
     // permission gate hook) merge with the on-disk settings, which all load.
-    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks') })),
+    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId })),
   ];
   const printModel = options.model === null
     ? undefined

@@ -11,9 +11,17 @@ import {
   PERMISSION_GATE_FETCH_TIMEOUT_MS,
 } from '../lib/permission-prompt.js';
 
-function bridgeApiBase(env) {
-  if (env.BRIDGE_API_URL) return env.BRIDGE_API_URL.replace(/\/+$/, '');
-  return `http://127.0.0.1:${env.MATRON_BRIDGE_API_PORT || '9802'}`;
+// The bridge bakes `--port <n> --room <id>` into the hook command at spawn.
+// Deliberately NOT read from the environment: a settings `env` block reaches
+// hooks and must not be able to point the gate at another server. The target is
+// always loopback.
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length - 1; i += 1) {
+    if (argv[i] === '--port') out.port = argv[i + 1];
+    if (argv[i] === '--room') out.room = argv[i + 1];
+  }
+  return out;
 }
 
 async function readStdin() {
@@ -31,11 +39,16 @@ async function main() {
     return permissionGateHookOutput(null);
   }
   if (!isGatedMcpTool(toolName)) return null;
+  const { port, room } = parseArgs(process.argv.slice(2));
+  const portNum = Number(port);
+  if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535 || !room) {
+    return permissionGateHookOutput(null);
+  }
   try {
-    const res = await fetch(`${bridgeApiBase(process.env)}/permission-check`, {
+    const res = await fetch(`http://127.0.0.1:${portNum}/permission-check`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId: process.env.BRIDGE_ROOM_ID || null, toolName }),
+      body: JSON.stringify({ roomId: room, toolName }),
       signal: AbortSignal.timeout(PERMISSION_GATE_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) return permissionGateHookOutput(null);

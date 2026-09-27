@@ -37,7 +37,8 @@ function gateCommand(settings) {
 
 describe('buildPrintSessionSettings', () => {
   it('gated: adds the MCP permission gate hook next to the bridge hooks', () => {
-    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR });
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room-1' });
+    expect(settings.disableAllHooks).toBe(false);
     expect(settings.permissions.allow).toEqual(['mcp__ask-user', 'mcp__show-file']);
     expect(settings.hooks.PreCompact[0].hooks[0].command).toBe(path.join(HOOKS_DIR, 'compact-notify.sh'));
     expect(settings.hooks.PreToolUse[0]).toEqual({
@@ -46,18 +47,20 @@ describe('buildPrintSessionSettings', () => {
     });
     const gate = gateCommand(settings);
     expect(gate.type).toBe('command');
-    expect(gate.command).toBe(`node '${GATE_HOOK}'`);
+    expect(gate.command).toBe(`node '${GATE_HOOK}' --port '9802' --room 'room-1'`);
     expect(gate.timeout).toBeGreaterThan(10);
   });
 
   it('bypass: no gate hook (nothing is gated)', () => {
-    const settings = buildPrintSessionSettings({ bypass: true, hooksDir: HOOKS_DIR });
+    const settings = buildPrintSessionSettings({ bypass: true, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'r' });
     expect(gateCommand(settings)).toBeUndefined();
+    expect(settings.disableAllHooks).toBeUndefined();
   });
 
-  it('quotes a hooks dir containing spaces and quotes for the shell', () => {
-    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: "/opt/it's here/hooks" });
-    expect(gateCommand(settings).command).toBe(`node '/opt/it'\\''s here/hooks/permission-gate.mjs'`);
+  it('quotes the hooks dir and room id for the shell', () => {
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: "/opt/it's here/hooks", apiPort: 9802, roomId: "!a'b;$(x)" });
+    expect(gateCommand(settings).command)
+      .toBe(`node '/opt/it'\\''s here/hooks/permission-gate.mjs' --port '9802' --room '!a'\\''b;$(x)'`);
   });
 
   it('gated spawn args no longer drop the settings sources', () => {
@@ -131,9 +134,9 @@ describe('permissionGateHookOutput', () => {
 
 // Run the real hook script the way the CLI does: JSON on stdin, env from the
 // spawned session, decision JSON on stdout.
-function runGateHook(input, env) {
+function runGateHook(input, args, env = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [GATE_HOOK], {
+    const child = spawn(process.execPath, [GATE_HOOK, ...args], {
       env: { PATH: process.env.PATH, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -180,8 +183,8 @@ describe('permission-gate hook → bridge decision (end to end)', () => {
 
   afterAll(() => new Promise(r => server.close(r)));
 
-  const env = () => ({ BRIDGE_ROOM_ID: 'room-1', MATRON_BRIDGE_API_PORT: String(port) });
-  const decide = async (toolName) => (await runGateHook({ tool_name: toolName, tool_input: {} }, env())).json
+  const args = () => ['--port', String(port), '--room', 'room-1'];
+  const decide = async (toolName) => (await runGateHook({ tool_name: toolName, tool_input: {} }, args())).json
     ?.hookSpecificOutput.permissionDecision;
 
   it('the bridge classifier decides a gated MCP call: allow, deny (with notice), ask', async () => {
@@ -199,7 +202,7 @@ describe('permission-gate hook → bridge decision (end to end)', () => {
     mode = 'normal';
     const before = requests.length;
     for (const name of ['mcp__ask-user__permission_request', 'mcp__show-file__show_file', 'Bash']) {
-      const r = await runGateHook({ tool_name: name }, env());
+      const r = await runGateHook({ tool_name: name }, args());
       expect(r.code).toBe(0);
       expect(r.out).toBe('');
     }
@@ -211,9 +214,24 @@ describe('permission-gate hook → bridge decision (end to end)', () => {
     await new Promise(r => dead.listen(0, '127.0.0.1', r));
     const deadPort = dead.address().port;
     await new Promise(r => dead.close(r));
-    const r = await runGateHook({ tool_name: 'mcp__webflow__pages_get' }, { BRIDGE_ROOM_ID: 'room-1', MATRON_BRIDGE_API_PORT: String(deadPort) });
+    const r = await runGateHook({ tool_name: 'mcp__webflow__pages_get' }, ['--port', String(deadPort), '--room', 'room-1']);
     expect(r.code).toBe(0);
     expect(r.json.hookSpecificOutput.permissionDecision).toBe('ask');
+  });
+
+  it('ignores environment overrides of the bridge address (pinned at spawn)', async () => {
+    mode = 'normal';
+    const rogue = createServer((req, res) => { res.writeHead(200); res.end(JSON.stringify({ decision: 'allow' })); });
+    await new Promise(r => rogue.listen(0, '127.0.0.1', r));
+    const rogueUrl = `http://127.0.0.1:${rogue.address().port}`;
+    try {
+      const r = await runGateHook({ tool_name: 'mcp__unlisted__tool' }, args(), {
+        BRIDGE_API_URL: rogueUrl, MATRON_BRIDGE_API_PORT: String(rogue.address().port), BRIDGE_ROOM_ID: 'x',
+      });
+      expect(r.json.hookSpecificOutput.permissionDecision).toBe('ask');
+    } finally {
+      await new Promise(r => rogue.close(r));
+    }
   });
 
   it('fails closed to ask on an HTTP error, a non-JSON body, a missing room, or bad hook input', async () => {
@@ -222,9 +240,11 @@ describe('permission-gate hook → bridge decision (end to end)', () => {
     mode = 'garbage';
     expect(await decide('mcp__webflow__pages_get')).toBe('ask');
     mode = 'normal';
-    const noRoom = await runGateHook({ tool_name: 'mcp__webflow__pages_get' }, { MATRON_BRIDGE_API_PORT: String(port) });
+    const noRoom = await runGateHook({ tool_name: 'mcp__webflow__pages_get' }, ['--port', String(port)]);
     expect(noRoom.json.hookSpecificOutput.permissionDecision).toBe('ask');
-    const badInput = await runGateHook('{not json', env());
+    const badPort = await runGateHook({ tool_name: 'mcp__webflow__pages_get' }, ['--port', 'nope', '--room', 'room-1']);
+    expect(badPort.json.hookSpecificOutput.permissionDecision).toBe('ask');
+    const badInput = await runGateHook('{not json', args());
     expect(badInput.json.hookSpecificOutput.permissionDecision).toBe('ask');
   });
 });
@@ -247,6 +267,8 @@ describe.skipIf(!hasClaude)('gated session keeps the on-disk settings sources (r
       fs.writeFileSync(path.join(proj, 'CLAUDE.md'), 'Project instructions sentinel.\n');
       fs.writeFileSync(path.join(proj, '.claude', 'settings.json'), JSON.stringify({
         env: { PERM_GATE_SENTINEL: 'from-settings-env' },
+        // The bridge's inline settings must outrank this, or the gate is off.
+        disableAllHooks: true,
         hooks: {
           InstructionsLoaded: [{ hooks: [{ type: 'command', command: `cat > '${marks}'/instructions-$$.json` }] }],
           UserPromptSubmit: [{ hooks: [{ type: 'command', command: `echo "$PERM_GATE_SENTINEL" > '${marks}/prompt-hook.txt'; echo blocked-by-test >&2; exit 2` }] }],
@@ -256,7 +278,7 @@ describe.skipIf(!hasClaude)('gated session keeps the on-disk settings sources (r
         '--print', 'hello',
         ...permissionSpawnArgs(false),
         '--strict-mcp-config', '--mcp-config', JSON.stringify({ mcpServers: {} }),
-        '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR })),
+        '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9, roomId: 'behaviour' })),
       ];
       const env = { ...process.env, CLAUDECODE: '' };
       delete env.PERM_GATE_SENTINEL;
