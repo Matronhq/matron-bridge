@@ -1218,6 +1218,17 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(wiring.slice(0, wiringEnd)).toMatch(/\bjournalConvoIdFor,/);
   });
 
+  it('records the inviter\'s conversation on the guest binding so a call-back reuses the room', () => {
+    // findLivePair keys a remote room on peer device + peer conversation. The
+    // owner records both at chatStart; the guest must record the inviter's
+    // conversation from the request frame's from_convo_id, or its later
+    // agent_chat_start at the inviter finds nothing and opens a reverse room.
+    const start = indexSrc.indexOf('function journalInjectInviteRequest(');
+    const end = indexSrc.indexOf('\nfunction ', start + 1);
+    const body = indexSrc.slice(start, end);
+    expect(body).toMatch(/role: 'guest',[\s\S]{0,900}targetConvoId: frame\.from_convo_id \|\| null,/);
+  });
+
   it('publishes the user-facing request notice as a NOTICE, above the agent\'s turn', () => {
     const start = indexSrc.indexOf('function journalInjectInviteRequest(');
     expect(start).toBeGreaterThan(-1);
