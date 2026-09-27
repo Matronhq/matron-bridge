@@ -189,10 +189,21 @@ describe('index.js child spawns are scoped', () => {
     }
   });
 
-  it('builds the Claude and Codex session envs through lib/spawn-env.js', () => {
-    expect(indexSrc).toMatch(/const spawnEnv = buildClaudeSpawnEnv\(\{/);
-    expect(indexSrc).toMatch(/const interactiveEnv = buildClaudeSpawnEnv\(\{/);
-    expect(indexSrc).toMatch(/env: buildCodexSpawnEnv\(\{/);
+  it('builds the Claude and Codex session envs through lib/spawn-env.js, with the read-proxy header file', () => {
+    for (const re of [/const spawnEnv = buildClaudeSpawnEnv\(\{([^}]*)\}\)/, /const interactiveEnv = buildClaudeSpawnEnv\(\{([^}]*)\}\)/]) {
+      const m = indexSrc.match(re);
+      expect(m).not.toBeNull();
+      expect(m[1]).toMatch(/journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE/);
+    }
+    const codex = indexSrc.match(/env: buildCodexSpawnEnv\(\{([^}]*)\}\)/);
+    expect(codex).not.toBeNull();
+    expect(codex[1]).toMatch(/appServer: CODEX_APP_SERVER/);
+    expect(codex[1]).toMatch(/journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE/);
+  });
+
+  it('writes the proxy capability to a 0600 header file, never into an env value', () => {
+    expect(indexSrc).toMatch(/fs\.writeFileSync\(file, `X-Matron-Journal-Proxy-Token: \$\{JOURNAL_PROXY_CAP_TOKEN\}\\n`, \{ mode: 0o600 \}\)/);
+    expect(indexSrc).not.toMatch(/MATRON_JOURNAL_PROXY_TOKEN/);
   });
 
   it('scopes the `claude -p /usage` one-shot and the ps read', () => {
