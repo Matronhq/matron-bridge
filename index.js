@@ -9585,6 +9585,13 @@ function journalInjectInviteRequest(frame) {
       peerDeviceId: frame.from_device_id, peerName: frame.from_name || null,
       topic: frame.topic || null,
       title: room?.title || null,
+      // The inviter's conversation, so this room is what findLivePair hands
+      // back when THIS session later calls the inviter back: the reuse key is
+      // peer device + peer conversation, and the owner already records both.
+      // Recording only the device here is why a guest calling back used to
+      // open a second room in the other direction. Null from a journal that
+      // predates the field on the request frame — fails safe into a new room.
+      targetConvoId: frame.from_convo_id || null,
     });
   }
   if (frame.local) {
