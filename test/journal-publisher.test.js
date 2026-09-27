@@ -130,6 +130,43 @@ function startFakeHttpServer(handler) {
 const FAST_BACKOFF = { backoffBaseMs: 15, backoffCapMs: 60 };
 
 describe('createJournalPublisher', () => {
+  // A text frame whose body is not a string reached the journal as
+  // `{"body":{"username":"alice"}}` (the auto-resume notice slot was fed the
+  // router ctx). The sink refuses a non-string body instead of rendering
+  // an object as chat text.
+  it('refuses a text publish whose body is not a string', async () => {
+    const fake = await startFakeServer();
+    const warnings = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: m => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+    });
+
+    pub.upsertConvo('c1', { title: 'Room', sessionState: 'running' });
+    expect(pub.publishText('c1', { body: { username: 'alice' }, from: 'assistant' })).toBe(false);
+    expect(pub.publishTextBestEffort('c1', { body: ['x'], from: 'assistant' })).toBe(false);
+    pub.publishText('c1', { body: 'ok', from: 'assistant' });
+
+    await waitFor(() => fake.received.some(f => f.op === 'publish'));
+    await delay(30);
+    const publishes = fake.received.filter(f => f.op === 'publish');
+    expect(publishes.map(f => f.payload.body)).toEqual(['ok']);
+    expect(warnings.some(w => /non-string text body/.test(w))).toBe(true);
+
+    const hostile = { from: 'assistant', get body() { throw new Error('boom'); } };
+    expect(() => pub.publishText('c1', hostile)).not.toThrow();
+    expect(pub.publishText('c1', hostile)).toBe(false);
+    expect(pub.publishTextBestEffort('c1', hostile)).toBe(false);
+    expect(warnings.some(w => /unreadable text body/.test(w))).toBe(true);
+
+    // A thrown value whose string conversion itself throws.
+    const opaque = { from: 'assistant', get body() { throw Object.create(null); } };
+    expect(pub.publishText('c1', opaque)).toBe(false);
+    expect(pub.publishTextBestEffort('c1', opaque)).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('handshake then publish: convo_upsert precedes the first publish', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });

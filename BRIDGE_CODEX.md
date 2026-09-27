@@ -37,12 +37,18 @@ If browser tools are needed but unavailable, ask the user to run `/restart --bro
 
 ## Journal history
 
-- To find something the user said in a past session on any of their boxes, query the journal's search API rather than grepping local transcripts: `GET <https base of JOURNAL_WS_URL, /ws stripped>/search?q=<url-encoded terms>&limit=50` with `Authorization: Bearer <agent token>` (the contents of `JOURNAL_TOKEN_FILE`, or `JOURNAL_TOKEN` when the file variable is unset). Never print or paste the token — your commands and output are mirrored into the journal — read it inside the request (`-H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"`) and never use `curl -v`/`--trace`. Read context around a hit with `GET /convo/:id/messages?around_seq=<seq>` (works across boxes, prose only). `GET /help` on the same base URL returns the full API digest; the spec is `docs/protocol.md` in matron-journal.
-- Make these calls with `curl` (its default `User-Agent` is fine). The journal sits behind Cloudflare, whose Browser Integrity Check rejects Python's default `Python-urllib/…` User-Agent with `403` and the body `error code: 1010` before the request ever reaches the journal — so a Python `urllib` call without an explicit `User-Agent` header always 403s here, on `/search` and `/items` alike. If you must use Python, set `User-Agent` explicitly (e.g. `curl/8`). Pace request bursts.
+The journal has a full-text search API over every one of the user's conversations, across all their boxes. To find something the user said or did in a past session, use it rather than grepping local transcripts (they only cover this box).
+
+- Base URL: the bridge-local journal proxy on the loopback API, `http://127.0.0.1:$MATRON_BRIDGE_API_PORT/journal` (`MATRON_BRIDGE_API_PORT` is in your env). The bridge adds the journal credential server-side, so do not call the remote journal host directly for search.
+- Auth: pass the capability header from its file with `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"` (the variable is in your env; the file holds the whole `X-Matron-Journal-Proxy-Token:` header line). Always the `@file` form, never an inline `-H "…: <value>"`: a value on the command line is visible in the process table. Never `cat` the file or use `curl -v`/`--trace`; your commands and output are mirrored into the journal.
+- If `MATRON_JOURNAL_PROXY_HEADER_FILE` is empty or unset, the bridge could not set up the proxy and journal search is unavailable in this session: say so once rather than retrying or looking for a token.
+- `GET /journal/search?q=<url-encoded terms>&limit=<n>&convo_id=<id>` → `{hits: [{convo_id, title, seq, ts, sender, snippet, live}]}`. Terms are ANDed literals, ranked best-match first; `limit` defaults to 20 and clamps at 50. `live: true` means that conversation's agent is running now. Only prose is indexed.
+- `GET /journal/convo/:id/messages?around_seq=<seq>&limit=<n>` — context around a hit, on any of the user's conversations (foreign reads return prose only, `limit` clamped to 30). The spec is `docs/protocol.md` in matron-journal.
+- Use `curl`; the proxy is plain loopback HTTP. Pace request bursts: the journal's rate limiter still applies to forwarded requests.
 
 ## Tasks & decisions (`/items` HTTP API)
 
-The user has a task & decision tracker beside the chat — a persistent, shared list, not another chat message. **Before you end a turn with a question for the user, file it there (`kind: "question"`, options and your recommendation in `body`), say in chat which item you're waiting on as a markdown link — `[#12](matron://item/12)`, never a bare `#12` — and carry on with whatever doesn't depend on it.** A call you made is a `decision`; work you're deferring is a `task`. When the question has an obvious one-tap answer — a go-ahead, or a choice between 2–3 options — add `actions` like `["Go"]` or `["Option A","Option B"]` (at most 4, ≤40 chars each) so the user can tap instead of typing; they can still reply in words, and a tap reaches you as an ordinary `📌` reply, tagged as tapped rather than typed. Do not file these as GitHub issues instead — the tracker is the user's list; a repo CLAUDE.md that still says otherwise predates it. Use the tracker's MCP tools on the `ask-user` server — `item_create`, `item_list`, `item_get`, `item_comment`, `item_close`, `item_reopen`, `item_reorder`, `item_move` — they are ordinary tools in this session and fill in this conversation's id for you. Only if those tools are absent from your tool list, fall back to the journal's `/items` HTTP routes below, with the same base URL and token discipline as journal search above (`Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")`, read inside the request, never printed, no `-v`/`--trace`, `curl` not Python `urllib`). Below, `$BASE` is that same https base (`JOURNAL_WS_URL` with `wss://` → `https://`, trailing `/ws` stripped).
+The user has a task & decision tracker beside the chat — a persistent, shared list, not another chat message. **Before you end a turn with a question for the user, file it there (`kind: "question"`, options and your recommendation in `body`), say in chat which item you're waiting on as a markdown link — `[#12](matron://item/12)`, never a bare `#12` — and carry on with whatever doesn't depend on it.** A call you made is a `decision`; work you're deferring is a `task`. When the question has an obvious one-tap answer — a go-ahead, or a choice between 2–3 options — add `actions` like `["Go"]` or `["Option A","Option B"]` (at most 4, ≤40 chars each) so the user can tap instead of typing; they can still reply in words, and a tap reaches you as an ordinary `📌` reply, tagged as tapped rather than typed. Do not file these as GitHub issues instead — the tracker is the user's list; a repo CLAUDE.md that still says otherwise predates it. Use the tracker's MCP tools on the `ask-user` server — `item_create`, `item_list`, `item_get`, `item_comment`, `item_close`, `item_reopen`, `item_reorder`, `item_move` — they are ordinary tools in this session and fill in this conversation's id for you. Only if those tools are absent from your tool list, fall back to the journal's `/items` HTTP routes below (the legacy exec transport). That transport, and only that one, has the journal agent token in its env: feed curl the header through a process substitution, `-H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")")` (use `"$JOURNAL_TOKEN"` in place of the `cat` when the file variable is unset). Never build an inline `-H` header with `$(cat …)` (it expands the token into curl's argv, visible in the process table), never print the token, no `-v`/`--trace`. Use `curl`, not Python `urllib`: the journal sits behind Cloudflare, whose Browser Integrity Check rejects Python's default `User-Agent` with `403` and the body `error code: 1010`. `$BASE` is the journal's https base (`JOURNAL_WS_URL` with `wss://` → `https://`, trailing `/ws` stripped). The read proxy above does not cover these routes.
 
 - Conversations link the same way: `[short title](matron://convo/<conversation id>)`.
 - `GET $BASE/items?convo=<id>&state=open` — list items for one conversation. `state` is `open` or `closed` — there is no `any`, and the raw route has no default; omit `state` to get both. Add `kind=task|question|decision`, `awaiting=user|agent`, or `label=<name>` to narrow further. Omit `convo` to list across every conversation of this user instead — there is no "current conversation" default here (see below).
@@ -52,7 +58,7 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 - `POST $BASE/items/:id/close` — `{"resolution":"done"|"answered"|"decided"|"reversed"|"cancelled","comment":"..."}`. `POST $BASE/items/:id/reopen` with an optional `{"comment":"..."}` undoes it.
 - Give every `POST` an `Idempotency-Key` header (any string unique to that intent — set `KEY=$(uuidgen)` once and reuse the same `$KEY` when you retry) so a retried request can't file or comment twice.
 
-**Your own `convo_id`:** for listing, prefer omitting `convo` — see every open item across this user's conversations — rather than chasing this conversation's id. `POST /items` has no such escape hatch (`convo_id` is required to file), so when you do need the real id: `GET $BASE/search?q=<terms>&limit=1` returns hits from *any* of the user's conversations, so a short or common phrase can resolve to the wrong one. Use a long, unusual phrase from something you just said, and check the hit's `ts` is from this turn (not an old conversation that happened to reuse similar words) before trusting its `convo_id`.
+**Your own `convo_id`:** for listing, prefer omitting `convo` — see every open item across this user's conversations — rather than chasing this conversation's id. `POST /items` has no such escape hatch (`convo_id` is required to file), so when you do need the real id: a journal search (`/journal/search?q=<terms>&limit=1` through the proxy above) returns hits from *any* of the user's conversations, so a short or common phrase can resolve to the wrong one. Use a long, unusual phrase from something you just said, and check the hit's `ts` is from this turn (not an old conversation that happened to reuse similar words) before trusting its `convo_id`.
 
 ```bash
 BASE=<https base, as above>
@@ -60,16 +66,16 @@ CONVO_ID=<this conversation's id — see above>
 KEY=$(uuidgen)   # one key per intent; reuse it if you retry this exact request
 
 curl -sS -X POST "$BASE/items" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")") \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: $KEY" \
   -d "{\"kind\":\"question\",\"title\":\"Which auth flow?\",\"body\":\"OAuth vs API key — recommend OAuth.\",\"convo_id\":\"$CONVO_ID\"}"
 
 curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")")
 ```
 
-If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header (see Journal history above). If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
+If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header. If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
 
 ## Reminders and the box's sleep (`reminder_*` tools)
 
@@ -77,7 +83,7 @@ Nothing you schedule inside your own process survives the bridge's idle reap (ab
 
 ## Missions & milestones
 
-A mission is the human-readable record of one piece of work; milestones are its checkpoints and jump targets back into the transcript. The `ask-user` server exposes these as MCP tools too — `mission_start`, `mission_update`, `mission_join`, `mission_get`, `mission_close`, `milestone_post`, `item_move` — prefer them; the HTTP routes below are the fallback when the tools are absent, same base URL and token discipline as the items routes above. **Start the mission as soon as you know what the work is; milestones are refused until the conversation has one.** Post a milestone with `kind:"user_input"` whenever an input from the user starts or redirects work, and `kind:"progress"` as often as useful. Close it when the work is done, not when the session ends.
+A mission is the human-readable record of one piece of work; milestones are its checkpoints and jump targets back into the transcript. The `ask-user` server exposes these as MCP tools too — `mission_start`, `mission_update`, `mission_join`, `mission_get`, `mission_close`, `milestone_post`, `item_move` — prefer them; the HTTP routes below are the fallback when the tools are absent (legacy exec transport only), same base URL and token discipline as the items routes above. **Start the mission as soon as you know what the work is; milestones are refused until the conversation has one.** Post a milestone with `kind:"user_input"` whenever an input from the user starts or redirects work, and `kind:"progress"` as often as useful. Close it when the work is done, not when the session ends.
 
 - `POST $BASE/missions` — `{"title":"...","body":"goal","convo_id":"<id>"}` → 201 mission (`num` is its number); 200 with `existing:true` if the conversation already has one.
 - Same route with `"attach":false` — `{"title":"...","body":"goal","convo_id":"<id>","attach":false}` → 201 mission created WITHOUT joining this conversation (unassigned; the `mission_create` tool). Give it to another session with `agent_session_start` and `mission: N`.
@@ -90,13 +96,13 @@ A mission is the human-readable record of one piece of work; milestones are its 
 ```bash
 KEY=$(uuidgen)   # one key per REQUEST, reused verbatim on every retry of it
 curl -sS -X POST "$BASE/missions" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")") \
   -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
   -d "{\"title\":\"Missions & milestones\",\"body\":\"Ship the journal half\",\"convo_id\":\"$CONVO_ID\"}"
 
 KEY=$(uuidgen)
 curl -sS -X POST "$BASE/milestones" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")") \
   -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
   -d "{\"convo_id\":\"$CONVO_ID\",\"kind\":\"user_input\",\"title\":\"Dan asked for missions\"}"
 ```
