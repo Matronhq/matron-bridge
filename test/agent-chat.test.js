@@ -653,12 +653,54 @@ describe('createAgentChatHandlers', () => {
       expect((await handlers.chatAccept({ roomId: '!sess', room_id: 'room-other' })).status).toBe(404);
     });
 
-    it('409s a room that is not pending', async () => {
+    it('409s a room that went terminal (refused/left/expired)', async () => {
       const { handlers, rooms } = makeFixture();
-      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      rooms.record('room-1', { role: 'guest', state: 'refused', sessionRoomId: '!sess' });
       const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
       expect(res.status).toBe(409);
       expect(res.body.error).toMatch(/nothing to answer/i);
+    });
+
+    // Approved invites join on delivery (2026-09-27): the bridge accepts on
+    // the agent's behalf when the request frame lands, so by the time the
+    // agent reads the request the room is already joined. accept/refuse on
+    // such a room must not read as failures.
+    it('accept on an already-joined guest room is a calm 200 no-op — no journal op, state untouched', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      const res = await handlers.chatAccept({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, room_id: 'room-1', already_joined: true });
+      expect(res.body.note).toMatch(/already joined/i);
+      expect(invites.answer).not.toHaveBeenCalled();
+      expect(invites.answerAwait).not.toHaveBeenCalled();
+      expect(rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('refuse on an already-joined guest room mutes it with the reason instead of answering a dead invite', async () => {
+      const { handlers, rooms, invites, calls } = makeFixture();
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'D:ab ↔️ M:cd' });
+      const res = await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1', reason: 'not my area' });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, room_id: 'room-1', muted: true, refused: true });
+      expect(res.body.note).toMatch(/muted/i);
+      expect(rooms.isMuted('room-1', '!sess')).toBe(true);
+      // The room stays joined — a mute is per-side and reversible; nothing is
+      // sent to the journal as an answer to an invite that no longer exists.
+      expect(rooms.get('room-1').state).toBe('joined');
+      expect(invites.answer).not.toHaveBeenCalled();
+      expect(invites.answerAwait).not.toHaveBeenCalled();
+      // The mute is as loud as any other: said in the room, with the reason.
+      expect(calls.find((c) => c.call === 'publishText' && c.convoId === 'room-1')?.payload.body).toMatch(/muted .*not my area/);
+    });
+
+    it('refuse on a joined room with no reason still mutes, with a default reason', async () => {
+      const { handlers, rooms } = makeFixture();
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+      const res = await handlers.chatRefuse({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ muted: true, refused: true });
+      expect(rooms.get('room-1').mutedReason).toMatch(/refused/i);
     });
 
     it('guest accept omits peer_device_id, joins the room, and backfills the room so far (I1)', async () => {
@@ -1238,7 +1280,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // ordinary sendToSession mirror publishes from:'user', which would render
     // a REMOTE agent's text as though Dan had typed it — text forgery, so it
     // must never be the path used here.
-    const notice = body.indexOf('journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null }))');
+    const notice = body.indexOf('journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }))');
     expect(notice).toBeGreaterThan(-1);
     // Comments stripped: the ones in this function NAME the forbidden path to
     // explain why it is forbidden.
@@ -1252,11 +1294,44 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // INBOUND room is not ours to write into (authorizeAgentWrite rejects).
     expect((body.match(/journalPublishNotice\(/g) || [])).toHaveLength(1);
     expect(notice).toBeGreaterThan(body.indexOf("reason: 'no active session on this box'"));
-    // The AGENT's copy is a different text and keeps the tool syntax…
+    // The AGENT's copy is a different text and keeps the tool syntax (for
+    // the join_request and same-bridge paths, which still ask)…
     expect(body).toMatch(/Accept with agent_chat_accept\(/);
     // …which the user's copy must not inherit (it lives in lib, pinned there,
     // alongside the wake notice the reaped-target path publishes).
-    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
+    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
+  });
+
+  it('joins an approved remote invite on delivery: accept answer after the ack, guest binding joined, agent told it is in the room', () => {
+    // The user's consent card is the gate. Before this, the target agent had
+    // to call agent_chat_accept itself — and a target mid-turn for the whole
+    // 30-minute invite window never could, so both sides opened new rooms.
+    const start = indexSrc.indexOf('function journalInjectInviteRequest(');
+    expect(start).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\nfunction ', start + 1);
+    const body = indexSrc.slice(start, end);
+    // Remote guest invites ONLY: a join_request is answered by the owner, and
+    // the same-bridge path keeps its loopback ask.
+    const answer = body.indexOf("const joined = !isJoin && !frame.local && agentInvites.answer({ roomId: frame.room_id, peerDeviceId: null, accept: true })");
+    expect(answer).toBeGreaterThan(-1);
+    // Ack first (unchanged, it settles the inviter's chatStart waiter), then
+    // the accept — the same answer agent_chat_accept would have sent.
+    expect(answer).toBeGreaterThan(body.indexOf('agentInvites.ack({'));
+    // The binding is only marked joined when the answer actually left.
+    expect(body).toMatch(/if \(joined\) agentRooms\.setState\(frame\.room_id, 'joined'\);/);
+    // …and the agent's turn is the joined-room text with the room backlog,
+    // never the accept/refuse instruction. The user's notice is published
+    // BEFORE it, as for any request.
+    const joinedDeliver = body.indexOf('deliverAutoJoinedRequest(session, frame, room)');
+    expect(joinedDeliver).toBeGreaterThan(body.indexOf('journalPublishNotice('));
+    expect(joinedDeliver).toBeLessThan(body.indexOf('Accept with agent_chat_accept('));
+    // The helper fetches the backlog (the opening message was published before
+    // the guest joined, so fan-out never reached it) and delivers the text.
+    const hStart = indexSrc.indexOf('function deliverAutoJoinedRequest(');
+    expect(hStart).toBeGreaterThan(-1);
+    const helper = indexSrc.slice(hStart, indexSrc.indexOf('\nfunction ', hStart + 1));
+    expect(helper).toMatch(/journalPublisher\.fetchMessages\(frame\.room_id, \{ limit: 20 \}\)/);
+    expect(helper).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{[^}]*body: formatAutoJoinedRequest\(frame, \{ events/);
   });
 
   it('terminal teardown keeps joined rooms; only an unresumable binding is left, lazily, by orphanRoomBinding', () => {
@@ -1390,11 +1465,27 @@ describe('local (same-bridge) rooms', () => {
       expect(f.invites.answer).not.toHaveBeenCalled();
     });
 
-    it('409s a non-pending guest binding', async () => {
+    it('409s a terminal guest binding', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'refused' });
+      const res = await f.handlers.chatAccept({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(409);
+    });
+
+    it('accept on a joined guest binding is a 200 no-op; refuse on it mutes the guest side', async () => {
       const f = makeFixture();
       const id = localRoom(f, { guestState: 'joined' });
       const res = await f.handlers.chatAccept({ roomId: '!guest', room_id: id });
-      expect(res.status).toBe(409);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, room_id: id, already_joined: true });
+      expect(f.localAnswer).not.toHaveBeenCalled();
+      const refuse = await f.handlers.chatRefuse({ roomId: '!guest', room_id: id, reason: 'wrong room' });
+      expect(refuse.status).toBe(200);
+      expect(refuse.body).toMatchObject({ muted: true, refused: true });
+      expect(f.rooms.isMuted(id, '!guest')).toBe(true);
+      expect(f.rooms.isMuted(id, '!sess')).toBe(false);
+      expect(f.rooms.get(id).guestState).toBe('joined');
+      expect(f.localAnswer).not.toHaveBeenCalled();
     });
 
     it('409s an accept whose inviting session is gone — no joined room bound to a dead key', async () => {
