@@ -130,7 +130,7 @@ import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServe
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
-import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
+import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
@@ -9315,9 +9315,32 @@ function awaitRoomMessage(chatRoomId, ms, sessionKey) {
 // device's own echoes, dropped upstream, and delivered locally instead by
 // routeLocalRoomMessage).
 function journalOnRoomFrame(room, frame) {
+  reconcilePendingGuestOnFrame(room, frame);
   deliverRoomFrameTo(room, frame);
   if (room.guestSessionRoomId != null && room.guestSessionRoomId !== room.sessionRoomId) {
     deliverRoomFrameTo({ ...room, sessionRoomId: room.guestSessionRoomId }, frame);
+  }
+}
+
+// First-use membership reconciliation for a REMOTE guest binding stranded
+// 'pending'. Approved invites join on delivery and that accept is awaited
+// (deliverAutoJoinedRequest): the binding is persisted pending before the
+// accept is sent and flips to joined only on the journal's answer, so a
+// bridge restart or crash in that gap leaves the journal row joined and the
+// local binding pending — and the request frame is ephemeral, so nothing
+// ever retries the flip. The journal has no op that lists this device's
+// memberships (hello_ok carries none), but it does not need one: room
+// fan-out is participation-gated server-side (the recorded owner plus
+// JOINED rows — journal agentTargetsFor), so a frame reaching this bridge for
+// a room where it is a pending guest is itself proof the journal has it
+// joined. Flip the binding so the agent's replies are not refused as "not
+// joined". Same-bridge rooms are excluded (guestSessionRoomId set): there
+// this device is the room's owner and receives every frame regardless.
+// setState refuses terminal states, so a refused/left binding stays put.
+function reconcilePendingGuestOnFrame(room, frame) {
+  if (room.role !== 'guest' || room.state !== 'pending' || room.guestSessionRoomId != null) return;
+  if (agentRooms.setState(frame.convo_id, 'joined')) {
+    console.warn(`[agent-chat] room ${frame.convo_id}: guest binding was pending but the journal fans this room to us — reconciled to joined`);
   }
 }
 
@@ -9760,7 +9783,20 @@ function deliverInviteAsk(session, frame, room) {
 // so it sits above the agent's turn as for any request.
 async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
   const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });
-  const joined = res.kind === 'answered';
+  let joined = res.kind === 'answered';
+  let backlog = null;
+  // A conflict can mean the row is ALREADY joined: the guest binding is
+  // persisted 'pending' before the accept is sent and flips only on the
+  // answer, so a restart in that gap leaves the journal row joined with
+  // nothing to retry the local flip — and a peer re-inviting into the same
+  // room lands here again. The journal's detail is 'no pending invite' for
+  // every non-invited state, so a membership probe (one transcript read the
+  // journal 404s for a non-member) decides; a positive also serves as the
+  // backlog below.
+  if (!joined && res.code === 'conflict') {
+    const probe = await probeJoinedRoom(journalPublisher, frame.room_id);
+    if (probe.joined) { joined = true; backlog = probe.events; }
+  }
   if (joined) {
     agentRooms.setState(frame.room_id, 'joined');
   } else {
@@ -9768,8 +9804,11 @@ async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
   }
   publishInviteRequestNotice(session, frame, room, { addressed, joined });
   if (!joined) { deliverInviteAsk(session, frame, room); return; }
-  const backlog = await journalPublisher.fetchMessages(frame.room_id, { limit: 20 }).catch(() => null);
-  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog ? backlog.events : null }), at: Date.now() });
+  if (!backlog) {
+    const page = await journalPublisher.fetchMessages(frame.room_id, { limit: 20 }).catch(() => null);
+    backlog = page ? page.events : null;
+  }
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog }), at: Date.now() });
 }
 
 // Room-lifecycle FYI (late answers, peer left) surfaced to the bound session
