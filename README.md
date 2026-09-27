@@ -152,6 +152,8 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `MATRON_DEFAULT_MODEL` | Claude model for fresh starts when none is picked (New Chat picker, `/start` without `--model`); an alias such as `fable`, `opus`, `sonnet` or a full `claude-*` name. The `default` alias resolves to this too. Resumed rooms keep their own model. Claude only; reported to the picker as `default_model`. | `fable` |
 | `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
 | `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
+| `BASH_DEFAULT_TIMEOUT_MS` | Default timeout for a bridge-spawned Claude session's Bash tool call when the model sets none. Raises Claude Code's 120000 (2 min) built-in so long Codex reviews / test suites aren't SIGTERM'd mid-run. Positive integer ms; out-of-range (>`3600000` = 1h) is clamped, malformed is ignored. Applies at session spawn — restart to take effect. | `1200000` (20 min) |
+| `BASH_MAX_TIMEOUT_MS` | Ceiling for an explicit per-call Bash timeout in a bridge-spawned Claude session. Same parsing/clamping/restart semantics as `BASH_DEFAULT_TIMEOUT_MS`; raised to the resolved default if set lower. | `1800000` (30 min) |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `BRIDGE_CODEX_MD_PATH` | Optional developer-instructions markdown injected into bridge-spawned Codex turns | `BRIDGE_CODEX.md` |
 | `CODEX_SANDBOX_MODE` | Sandbox for Codex programmatic turns: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
@@ -170,7 +172,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
 | `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
 | `WHISPER_LANGUAGE` | Voice-note transcription language | `en` |
-| `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-5.6-luna` by default) | — |
+| `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-6-luna` by default) | — |
 | `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
 | `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |
 

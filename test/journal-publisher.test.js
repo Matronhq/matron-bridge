@@ -130,6 +130,43 @@ function startFakeHttpServer(handler) {
 const FAST_BACKOFF = { backoffBaseMs: 15, backoffCapMs: 60 };
 
 describe('createJournalPublisher', () => {
+  // A text frame whose body is not a string reached the journal as
+  // `{"body":{"username":"alice"}}` (the auto-resume notice slot was fed the
+  // router ctx). The sink refuses a non-string body instead of rendering
+  // an object as chat text.
+  it('refuses a text publish whose body is not a string', async () => {
+    const fake = await startFakeServer();
+    const warnings = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: m => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+    });
+
+    pub.upsertConvo('c1', { title: 'Room', sessionState: 'running' });
+    expect(pub.publishText('c1', { body: { username: 'alice' }, from: 'assistant' })).toBe(false);
+    expect(pub.publishTextBestEffort('c1', { body: ['x'], from: 'assistant' })).toBe(false);
+    pub.publishText('c1', { body: 'ok', from: 'assistant' });
+
+    await waitFor(() => fake.received.some(f => f.op === 'publish'));
+    await delay(30);
+    const publishes = fake.received.filter(f => f.op === 'publish');
+    expect(publishes.map(f => f.payload.body)).toEqual(['ok']);
+    expect(warnings.some(w => /non-string text body/.test(w))).toBe(true);
+
+    const hostile = { from: 'assistant', get body() { throw new Error('boom'); } };
+    expect(() => pub.publishText('c1', hostile)).not.toThrow();
+    expect(pub.publishText('c1', hostile)).toBe(false);
+    expect(pub.publishTextBestEffort('c1', hostile)).toBe(false);
+    expect(warnings.some(w => /unreadable text body/.test(w))).toBe(true);
+
+    // A thrown value whose string conversion itself throws.
+    const opaque = { from: 'assistant', get body() { throw Object.create(null); } };
+    expect(pub.publishText('c1', opaque)).toBe(false);
+    expect(pub.publishTextBestEffort('c1', opaque)).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('handshake then publish: convo_upsert precedes the first publish', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
@@ -335,6 +372,47 @@ describe('createJournalPublisher', () => {
     expect(fake.received.length).toBe(5);
     expect(fake.received.map(f => f.payload.body)).toEqual(['m7', 'm8', 'm9', 'm10', 'm11']);
     expect(warnings.filter(w => /overflow/i.test(w)).length).toBe(1);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('overflow eviction invokes the frame\'s onEvicted hook with the dropped frame (convo + session_state)', async () => {
+    const port = await getFreePort(); // never connected: everything queues
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const pub = createJournalPublisher({ url, token: 'tok', log: silentLog, queueLimit: 2, ...FAST_BACKOFF });
+
+    const evicted = [];
+    pub.upsertConvo('c1', { sessionState: 'running' }, { onEvicted: (frame) => evicted.push(frame) });
+    pub.publishText('c1', { body: 'm1', from: 'user' });
+    expect(evicted).toEqual([]); // at the limit, not over it
+
+    pub.publishText('c1', { body: 'm2', from: 'user' }); // pushes the upsert out
+    expect(evicted).toHaveLength(1);
+    expect(evicted[0]).toMatchObject({ op: 'convo_upsert', convo_id: 'c1', session_state: 'running' });
+
+    pub.close();
+  });
+
+  it('onEvicted never fires for a frame that is delivered, and a throwing hook is contained', async () => {
+    const port = await getFreePort();
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url, token: 'tok', log, queueLimit: 2, ...FAST_BACKOFF });
+
+    let deliveredHookFired = false;
+    // Two frames: the first is evicted by the third enqueue and its hook throws;
+    // the second survives and is delivered, so its hook must stay silent.
+    pub.upsertConvo('c1', { sessionState: 'running' }, { onEvicted: () => { throw new Error('boom'); } });
+    pub.upsertConvo('c2', { sessionState: 'waiting' }, { onEvicted: () => { deliveredHookFired = true; } });
+    expect(() => pub.publishText('c1', { body: 'm', from: 'user' })).not.toThrow();
+    expect(warnings.some(w => /evict/i.test(w) && /boom/.test(w))).toBe(true);
+
+    const fake = await startFakeServer({}, port);
+    await waitFor(() => fake.received.length >= 2);
+    expect(fake.received.map(f => f.convo_id)).toEqual(['c2', 'c1']);
+    expect(deliveredHookFired).toBe(false);
 
     pub.close();
     await fake.close();
