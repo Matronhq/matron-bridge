@@ -38,8 +38,10 @@ function gateCommand(settings) {
 describe('buildPrintSessionSettings', () => {
   it('gated: adds the MCP permission gate hook next to the bridge hooks', () => {
     const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room-1' });
-    // Never forces disableAllHooks off (that would re-enable hooks a user disabled).
-    expect(settings).not.toHaveProperty('disableAllHooks');
+    // Pinned on: the inline --settings layer outranks the project and user
+    // settings files, so an on-disk `disableAllHooks: true` cannot switch the
+    // gate off (verified against the real CLI below).
+    expect(settings.disableAllHooks).toBe(false);
     expect(settings.permissions.allow).toEqual(['mcp__ask-user', 'mcp__show-file']);
     expect(settings.hooks.PreCompact[0].hooks[0].command).toBe(path.join(HOOKS_DIR, 'compact-notify.sh'));
     expect(settings.hooks.PreToolUse[0]).toEqual({
@@ -55,6 +57,7 @@ describe('buildPrintSessionSettings', () => {
   it('bypass: no gate hook (nothing is gated)', () => {
     const settings = buildPrintSessionSettings({ bypass: true, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'r' });
     expect(gateCommand(settings)).toBeUndefined();
+    // Nothing to protect in a bypass session: leave the user's hooks setting alone.
     expect(settings).not.toHaveProperty('disableAllHooks');
   });
 
@@ -268,6 +271,9 @@ describe.skipIf(!hasClaude)('gated session keeps the on-disk settings sources (r
       fs.writeFileSync(path.join(proj, 'CLAUDE.md'), 'Project instructions sentinel.\n');
       fs.writeFileSync(path.join(proj, '.claude', 'settings.json'), JSON.stringify({
         env: { PERM_GATE_SENTINEL: 'from-settings-env' },
+        // The bridge's inline settings must outrank this, or the gate is off.
+        // (The hooks below only run if they do.)
+        disableAllHooks: true,
         hooks: {
           InstructionsLoaded: [{ hooks: [{ type: 'command', command: `cat > '${marks}'/instructions-$$.json` }] }],
           UserPromptSubmit: [{ hooks: [{ type: 'command', command: `echo "$PERM_GATE_SENTINEL" > '${marks}/prompt-hook.txt'; echo blocked-by-test >&2; exit 2` }] }],

@@ -7,6 +7,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import {
   buildPermissionSnapshot,
@@ -31,8 +32,17 @@ function writeSettings(filename, permissions) {
 }
 
 beforeEach(() => {
-  fixtureDir = mkdtempSync(path.resolve('test/fixtures/permission-eval-'));
+  // Under the OS temp dir, outside any git repository: the default source
+  // lookup resolves the git toplevel of the workdir, and a fixture inside this
+  // repository would resolve to the bridge's own .claude directory.
+  fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'permission-eval-'));
 });
+
+function gitInit(dir) {
+  const result = spawnSync('git', ['-C', dir, 'init', '-q'], { encoding: 'utf8' });
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(0);
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -58,7 +68,7 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
   });
 
-  it('discovers workspace, local, and user permission layers by default', () => {
+  it('discovers workspace, local, and user permission layers by default (workdir not in a repository)', () => {
     const workdir = path.join(fixtureDir, 'workspace');
     const homeDir = path.join(fixtureDir, 'home');
     mkdirSync(path.join(workdir, '.claude'), { recursive: true });
@@ -79,6 +89,61 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__workspace__settings_tool')).toBe('allow');
     expect(classifyPermission(snapshot, 'mcp__workspace__local_tool')).toBe('allow');
     expect(classifyPermission(snapshot, 'mcp__user__settings_tool')).toBe('allow');
+  });
+
+  it('reads settings.local.json from the git toplevel when the workdir is inside a repository', () => {
+    // Claude Code loads the project settings.local.json from the git root of
+    // the working directory (settings.json from the cwd). The classifier must
+    // see the same allow/deny rules the CLI does, or a rule the CLI honours is
+    // invisible to the gate.
+    const repo = path.join(fixtureDir, 'repo');
+    const workdir = path.join(repo, 'packages', 'app');
+    const homeDir = path.join(fixtureDir, 'home');
+    mkdirSync(path.join(repo, '.claude'), { recursive: true });
+    mkdirSync(path.join(workdir, '.claude'), { recursive: true });
+    mkdirSync(homeDir, { recursive: true });
+    gitInit(repo);
+    writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({
+      permissions: { allow: ['mcp__root__local_tool'], deny: ['mcp__root__denied_tool'] },
+    }));
+    writeFileSync(path.join(workdir, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__settings_tool'] },
+    }));
+    writeFileSync(path.join(workdir, '.claude', 'settings.local.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__local_tool'] },
+    }));
+    vi.stubEnv('HOME', homeDir);
+
+    const snapshot = buildPermissionSnapshot({ workdir });
+
+    expect(classifyPermission(snapshot, 'mcp__root__local_tool')).toBe('allow');
+    expect(classifyPermission(snapshot, 'mcp__root__denied_tool')).toBe('deny');
+    expect(classifyPermission(snapshot, 'mcp__workspace__settings_tool')).toBe('allow');
+    // The CLI does not read a subdirectory's settings.local.json, so neither do we.
+    expect(classifyPermission(snapshot, 'mcp__workspace__local_tool')).toBe('default-gated');
+    expect(snapshot.uncertain).toBe(false);
+  });
+
+  it('fails closed when the git-toplevel settings.local.json is malformed', () => {
+    const repo = path.join(fixtureDir, 'repo');
+    const workdir = path.join(repo, 'sub');
+    const homeDir = path.join(fixtureDir, 'home');
+    mkdirSync(path.join(repo, '.claude'), { recursive: true });
+    mkdirSync(path.join(workdir, '.claude'), { recursive: true });
+    mkdirSync(homeDir, { recursive: true });
+    gitInit(repo);
+    writeFileSync(path.join(repo, '.claude', 'settings.local.json'), '{ not json');
+    writeFileSync(path.join(workdir, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__settings_tool'] },
+    }));
+    vi.stubEnv('HOME', homeDir);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const snapshot = buildPermissionSnapshot({ workdir });
+
+    expect(snapshot.uncertain).toBe(true);
+    expect(classifyPermission(snapshot, 'mcp__workspace__settings_tool')).toBe('default-gated');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(path.join(repo, '.claude', 'settings.local.json')));
   });
 
   it('ignores non-MCP permission rules in every rule list', () => {
