@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Tool signature: `mission_status({ status: string, mission?: number })` → `PATCH /missions/:id {status, convo_id}`, `convo_id` = the calling conversation, always.
-- Tool description is the spec's text VERBATIM: "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for Dan at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this)."
+- Tool description is the spec's text VERBATIM: "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this)."
 - Status limit: 1–600 characters after trimming, counted in UTF-16 code units (JS `String.length`), as the journal counts.
 - Errors read `mission_status failed: …` (the existing `callMissions` shape). No mission and no `mission` argument → an instruction to start or join a mission first.
 - The exact app refresh message the Coordinator must recognise: "Refresh the status of every open mission from its latest milestones, sessions and open items."
@@ -495,7 +495,7 @@ const TOOL_CALLS = {
   item_move: "callItems('move', args, (d) => itemLine(d.item))",
 };
 // Spec 2026-09-28 missions dashboard §2 — the agent reads exactly this.
-const MISSION_STATUS_DESCRIPTION = "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for Dan at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).";
+const MISSION_STATUS_DESCRIPTION = "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).";
 ```
 
 Rename the test at (old) line 24 to `'mounts all nine /missions routes through the shared handler map'` and the one at (old) line 31 to `'registers the nine mission tools and item_move, each pinned to its exact renderer'` (bodies unchanged).
@@ -535,7 +535,7 @@ After the `mission_update` registration (the `);` at line 815) insert:
 
 server.tool(
   'mission_status',
-  "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for Dan at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).",
+  "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).",
   {
     status: z.string().describe('One short paragraph, ≤600 characters'),
     mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission"),
