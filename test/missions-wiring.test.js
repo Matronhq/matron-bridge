@@ -134,9 +134,13 @@ describe('missions wiring', () => {
     expect(coord).toContain('"Refresh the status of every open mission from its latest milestones, sessions and open items."');
     expect(coord).toMatch(/`mission_list` for the open missions, then for each one `mission_get N` and `mission_status` with `mission: N`/);
     // Fix round 1 (#1): the journal has no idle state — skip only on running
-    // conversations and items newer than the status, not a fictional "idle".
-    expect(coord).toMatch(/You may skip a mission whose status is newer than its last milestone, none of whose conversations is `running`, and with no open item newer than the status \(the status time is on the `Status \(…\)` line\)/);
+    // conversations, not a fictional "idle".
+    // Fix round 2: neither mission_get nor item_list prints an item
+    // timestamp, so "no open item newer than the status" isn't checkable —
+    // skip only when every listed open item is already reflected in it.
+    expect(coord).toMatch(/You may skip a mission whose status is newer than its last milestone, none of whose conversations is `running`, and where every open item `mission_get` lists is already reflected in the status/);
     expect(coord).not.toMatch(/whose sessions are all idle/);
+    expect(coord).not.toMatch(/no open item newer than the status/);
     // Fix round 1 (#4): a status the user wrote themselves (", by the user")
     // is left alone unless clearly stale, and a replacement is called out.
     expect(coord).toContain('A status `mission_list` marks ", by the user" is one they wrote themselves: leave it unless it is clearly out of date against newer milestones or items, and if you do replace it, say so in that mission\'s reply line.');
