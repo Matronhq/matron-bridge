@@ -1,17 +1,21 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-const OPS = ['start', 'create', 'post', 'update', 'join', 'get', 'close'];
+const OPS = ['start', 'create', 'post', 'update', 'status', 'join', 'get', 'list', 'close'];
 const TOOL_CALLS = {
   mission_start: "callMissions('start', args, formatStartAck)",
   mission_create: "callMissions('create', args, formatCreateAck)",
   milestone_post: "callMissions('post', args, formatMilestoneAck)",
   mission_update: "callMissions('update', args, (d) => missionLine(d.mission))",
+  mission_status: "callMissions('status', args, formatStatusAck)",
   mission_join: "callMissions('join', args, (d) => missionLine(d.mission))",
   mission_get: "callMissions('get', args, formatMissionDetail)",
+  mission_list: "callMissions('list', args, formatMissionList)",
   mission_close: "callMissions('close', args, (d) => missionLine(d.mission))",
   item_move: "callItems('move', args, (d) => itemLine(d.item))",
 };
+// Spec 2026-09-28 missions dashboard §2 — the agent reads exactly this.
+const MISSION_STATUS_DESCRIPTION = "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).";
 
 describe('missions wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
@@ -19,7 +23,7 @@ describe('missions wiring', () => {
   const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
   const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
 
-  it('mounts all seven /missions routes through the shared handler map', () => {
+  it('mounts all nine /missions routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/missions\\\/\(([a-z|]+)\)\$\/\)/);
     expect(m, 'the /missions route matcher is missing from index.js').toBeTruthy();
     expect(m[1].split('|').sort()).toEqual([...OPS].sort());
@@ -27,7 +31,7 @@ describe('missions wiring', () => {
     expect(index).toMatch(/createMissionsHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: missionsClient,?\s*\}\)/);
   });
 
-  it('registers the seven mission tools and item_move, each pinned to its exact renderer', () => {
+  it('registers the nine mission tools and item_move, each pinned to its exact renderer', () => {
     for (const [tool, call] of Object.entries(TOOL_CALLS)) {
       expect(askUser, `${tool} is not registered`).toContain(`'${tool}',`);
       expect(askUser, `${tool} does not go through ${call}`).toContain(call);
@@ -97,5 +101,16 @@ describe('missions wiring', () => {
     expect(codexMd).toMatch(/`mission_create`/);
     expect(codexMd).toMatch(/`mission: N`/);
     expect(codexMd).toMatch(/"attach":false/);
+  });
+
+  it('mission_status carries the spec description verbatim and its schema; mission_list takes only state', () => {
+    const tool = askUser.slice(askUser.indexOf("'mission_status',"), askUser.indexOf("'mission_list',"));
+    expect(tool).toContain(JSON.stringify(MISSION_STATUS_DESCRIPTION));
+    expect(tool).toMatch(/status: z\.string\(\)/);
+    expect(tool).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    const listStart = askUser.indexOf("'mission_list',");
+    const list = askUser.slice(listStart, askUser.indexOf("'mission_join',", listStart));
+    expect(list).toMatch(/state: z\.enum\(\['open', 'closed'\]\)\.optional\(\)/);
+    expect(askUser).toMatch(/import \{[^}]*\bformatStatusAck\b[^}]*\bformatMissionList\b[^}]*\} from '\.\/lib\/missions-format\.js'/);
   });
 });

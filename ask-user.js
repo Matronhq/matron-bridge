@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
-import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList } from './lib/missions-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
@@ -812,6 +812,23 @@ server.tool(
     body: z.string().optional().describe('Markdown ≤32 KiB'),
   },
   async (args) => callMissions('update', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'mission_status',
+  "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).",
+  {
+    status: z.string().describe('One short paragraph, ≤600 characters'),
+    mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission"),
+  },
+  async (args) => callMissions('status', args, formatStatusAck),
+);
+
+server.tool(
+  'mission_list',
+  "List the user's missions — open by default, state: 'closed' for closed ones — each with its counts, its status (when and by whom) and its last milestone. The Coordinator uses it to find every mission whose status to refresh.",
+  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
+  async (args) => callMissions('list', args, formatMissionList),
 );
 
 server.tool(
