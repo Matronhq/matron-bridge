@@ -113,4 +113,27 @@ describe('missions wiring', () => {
     expect(list).toMatch(/state: z\.enum\(\['open', 'closed'\]\)\.optional\(\)/);
     expect(askUser).toMatch(/import \{[^}]*\bformatStatusAck\b[^}]*\bformatMissionList\b[^}]*\} from '\.\/lib\/missions-format\.js'/);
   });
+
+  it('both prompt files teach mission_status: after a progress milestone, blocked, handing off — one status, overwritten', () => {
+    for (const [name, md] of [['BRIDGE_CLAUDE.md', claudeMd], ['BRIDGE_CODEX.md', codexMd]]) {
+      const section = md.slice(md.indexOf('## Missions & milestones'));
+      expect(section, name).toMatch(/`mission_status`/);
+      expect(section, name).toMatch(/after a `progress` milestone, when you become blocked, and when you hand off/);
+      expect(section, name).toMatch(/one status, overwritten, not a second milestone log/);
+    }
+    expect(codexMd).toMatch(/`mission_close`, `milestone_post`, `mission_status`, `mission_list`, `item_move`/);
+    expect(codexMd).toContain('`{"status":"...","convo_id":"<id>"}` sets the status');
+    expect(codexMd).toContain('`GET $BASE/missions?state=open`');
+  });
+
+  it('the Coordinator brief carries the refresh procedure and the exact app message', () => {
+    const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    expect(coord).toContain("## Keep every mission's status current");
+    expect(coord).toContain('"Refresh the status of every open mission from its latest milestones, sessions and open items."');
+    expect(coord).toMatch(/`mission_list` for the open missions, then for each one `mission_get N` and `mission_status` with `mission: N`/);
+    expect(coord).toMatch(/status is newer than its last milestone and whose sessions are all idle/);
+    expect(coord).toMatch(/one line per mission you changed/);
+    expect(coord).toContain('Never call `mission_status` without `mission`');
+    expect(coord).toMatch(/`mission_list` for every open mission/);
+  });
 });
