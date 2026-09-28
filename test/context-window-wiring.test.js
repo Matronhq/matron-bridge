@@ -19,4 +19,8 @@ describe('context window wiring (source inspection)', () => {
     expect(index.match(/sessionContextWindow\(\{ model: session\.currentModel \|\| session\.initData\?\.model, alias: session\._modelAlias, contextTokens: session\._lastContextTokens \}\)/g)).toHaveLength(2);
     expect(index).not.toMatch(/contextWindowFor\(/);
   });
+  it('a subagent child reads its parent\'s settled window and model', () => {
+    expect(index).toContain('getParentWindow: () => contextWindowForSession(session),');
+    expect(index).toContain('getParentModel: () => session.currentModel || session.initData?.model,');
+  });
 });

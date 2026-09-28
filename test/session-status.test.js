@@ -5,6 +5,8 @@ import { fileURLToPath } from 'url';
 import {
   sessionContextWindow,
   contextWindowFor,
+  sameModelFamily,
+  subagentContextWindow,
   contextTokensFromUsage,
   contextTokensFromAssistantEvent,
   postCompactContextTokens,
@@ -22,6 +24,43 @@ import {
   startCpuSampler,
   stopCpuSampler,
 } from '../lib/session-status.js';
+
+describe('sameModelFamily', () => {
+  it('matches by family word, ignoring version and [1m]', () => {
+    expect(sameModelFamily('claude-opus-5-5', 'claude-opus-5-5[1m]')).toBe(true);
+    expect(sameModelFamily('claude-opus-4-8', 'opus[1m]')).toBe(true);
+    expect(sameModelFamily('claude-haiku-4-5', 'claude-opus-5-5[1m]')).toBe(false);
+  });
+  it('does not match two different explicit revisions of a family', () => {
+    expect(sameModelFamily('claude-opus-4-1', 'claude-opus-5-5[1m]')).toBe(false);
+    expect(subagentContextWindow({ childModel: 'claude-opus-4-1', parentModel: 'claude-opus-5-5', parentWindow: 1_000_000, contextTokens: 150_000 })).toBe(200_000);
+  });
+  it('falls back to normalized id equality when no family word is present', () => {
+    expect(sameModelFamily('foo-model-20250101', 'foo-model[1m]')).toBe(true);
+    expect(sameModelFamily('foo-model', 'bar-model')).toBe(false);
+    expect(sameModelFamily(null, 'claude-opus-5-5')).toBe(false);
+  });
+});
+
+describe('subagentContextWindow', () => {
+  it('a same-model child inherits the parent session\'s settled 1M window', () => {
+    // The parent's transcript id is bare too: its 1M comes from its alias.
+    const parentWindow = sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus[1m]' });
+    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', parentModel: 'claude-opus-5-5', parentWindow, contextTokens: 10 })).toBe(1_000_000);
+    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', parentModel: 'opus[1m]', parentWindow, contextTokens: 10 })).toBe(1_000_000);
+  });
+  it('keeps a different-family child at its own window', () => {
+    expect(subagentContextWindow({ childModel: 'claude-haiku-4-5', parentModel: 'claude-opus-5-5', parentWindow: 1_000_000, contextTokens: 50_000 })).toBe(200_000);
+  });
+  it('stays 200k when the parent\'s window is 200k', () => {
+    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', parentModel: 'claude-opus-5-5', parentWindow: 200_000, contextTokens: 100_000 })).toBe(200_000);
+  });
+  it('reads the child\'s own id and gauge like any session: [1m], a 1M family, or a footprint above 200k', () => {
+    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', contextTokens: 250_000 })).toBe(1_000_000);
+    expect(subagentContextWindow({ childModel: 'claude-fable-5', parentModel: 'claude-opus-5-5', parentWindow: 200_000 })).toBe(1_000_000);
+    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', parentModel: 'claude-opus-5-5' })).toBe(200_000);
+  });
+});
 
 describe('contextWindowFor', () => {
   it('gives 1m-class models their full window', () => {
