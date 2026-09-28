@@ -394,6 +394,21 @@ describe('missions handlers', () => {
     expect(client.update).toHaveBeenCalledTimes(2);
   });
 
+  it('status: folds CRLF to LF before counting and trimming, and sends the folded text', async () => {
+    const { h, client, session } = fixture();
+    session.missionId = 'ms_1';
+    // 50 "x\r\n" pairs (150 raw chars) plus 499 "y"s: 649 raw chars — over
+    // 600 unfolded, and would be refused if CRLF counted as two chars each.
+    // Folded to "x\n" pairs it is 599 chars, under the limit — the journal
+    // folds CRLF the same way before it counts, so this must be accepted.
+    const raw = 'x\r\n'.repeat(50) + 'y'.repeat(499);
+    const folded = 'x\n'.repeat(50) + 'y'.repeat(499);
+    expect(folded.length).toBe(599);
+    const r = await h.status({ roomId: '!r:s', status: raw });
+    expect(r.status).toBe(200);
+    expect(client.update.mock.calls[0]).toEqual(['ms_1', { status: folded, convo_id: 'c1' }]);
+  });
+
   it('status: 409 closed passes through with blocked_by; unreachable → 502; session guards apply', async () => {
     const closed = fixture({ update: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'closed' } })) });
     closed.session.missionId = 'ms_1';

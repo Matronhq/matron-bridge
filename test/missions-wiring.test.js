@@ -118,7 +118,7 @@ describe('missions wiring', () => {
     for (const [name, md] of [['BRIDGE_CLAUDE.md', claudeMd], ['BRIDGE_CODEX.md', codexMd]]) {
       const section = md.slice(md.indexOf('## Missions & milestones'));
       expect(section, name).toMatch(/`mission_status`/);
-      expect(section, name).toMatch(/after a `progress` milestone that changes the picture on the card — where it is, what's next, what's blocked — not after every checkpoint, and when you become blocked or hand off/);
+      expect(section, name).toMatch(/Set it when you become blocked or hand off, when the user redirects the work, and after a `progress` milestone that changes the picture on the card \(where it is, what's next, what's blocked\) — not after every checkpoint/);
       expect(section, name).toMatch(/one status, overwritten, not a second milestone log/);
     }
     expect(codexMd).toMatch(/`mission_close`, `milestone_post`, `mission_status`, `mission_list`, `item_move`/);
@@ -141,6 +141,11 @@ describe('missions wiring', () => {
     expect(coord).toMatch(/You may skip a mission whose status is newer than its last milestone, none of whose conversations is `running`, and where every open item `mission_get` lists is already reflected in the status/);
     expect(coord).not.toMatch(/whose sessions are all idle/);
     expect(coord).not.toMatch(/no open item newer than the status/);
+    // Fix round 3 (final review #4): an agent-written status on a mission
+    // with a running conversation must not be skipped by the FIRST rule
+    // (it requires no conversation running) — a second rule covers it, so
+    // the Coordinator does not overwrite a status the working agent just set.
+    expect(coord).toContain('Also skip a mission whose status `mission_list` marks ", by an agent" when that status is newer than its last milestone, even if a conversation is running: the working agent that wrote it is keeping it current.');
     // Fix round 1 (#4): a status the user wrote themselves (", by the user")
     // is left alone unless clearly stale, and a replacement is called out.
     expect(coord).toContain('A status `mission_list` marks ", by the user" is one they wrote themselves: leave it unless it is clearly out of date against newer milestones or items, and if you do replace it, say so in that mission\'s reply line.');
