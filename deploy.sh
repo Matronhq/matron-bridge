@@ -99,6 +99,13 @@ git pull --ff-only origin master
 #    one step a bare restart can't do. This is where sharp/native deps land.
 step "npm install"
 npm install --no-audit --no-fund
+# npm 10 strips the `libc` fields npm 11 wrote into the committed lockfile,
+# leaving ` M package-lock.json` behind; the fleet updater (yearbook-infra
+# scripts/update-bridges) then skips this checkout as locally modified on
+# every later pass (tracker #3956). The lockfile is the repo's, so put it back.
+if [ -f package-lock.json ] && ! git checkout -q -- package-lock.json; then
+  fail "could not restore package-lock.json after npm install — refusing to restart on a modified lockfile"
+fi
 
 # 3. PREFLIGHT — prove the new code boots BEFORE we kill the working process.
 step "preflight (old process still serving)"
