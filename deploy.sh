@@ -103,7 +103,9 @@ npm install --no-audit --no-fund
 # leaving ` M package-lock.json` behind; the fleet updater (yearbook-infra
 # scripts/update-bridges) then skips this checkout as locally modified on
 # every later pass (tracker #3956). The lockfile is the repo's, so put it back.
-git checkout -q -- package-lock.json 2>/dev/null || true
+if [ -f package-lock.json ] && ! git checkout -q -- package-lock.json; then
+  fail "could not restore package-lock.json after npm install — refusing to restart on a modified lockfile"
+fi
 
 # 3. PREFLIGHT — prove the new code boots BEFORE we kill the working process.
 step "preflight (old process still serving)"
