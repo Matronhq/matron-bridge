@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { missionLine, formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, formatBlocked, formatJournalError } from '../lib/missions-format.js';
+import { missionLine, formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, formatBlocked, formatJournalError, formatStatusAck, formatMissionList } from '../lib/missions-format.js';
 
 // Real journal response bodies (see the file's _source): these renderers are
 // the only place the bridge reads the mission JSON, so the contract is
@@ -108,5 +108,58 @@ describe('missions-format against real journal response bodies', () => {
   it('renders the real 409 bodies as instructions', () => {
     expect(formatBlocked(shapes.blocked_409_no_mission)).toMatch(/call mission_start\(title, body\) first/);
     expect(formatBlocked(shapes.blocked_409_user_items)).toBe('blocked by items awaiting the user: #3 Which bucket for idem keys? — only the user can clear those');
+  });
+
+  it('status ack names the mission', () => {
+    expect(formatStatusAck({ mission })).toBe('Status set on mission #61 "Missions"');
+    expect(formatStatusAck({})).toBe('Status set.');
+  });
+
+  it('detail shows the status with when and by whom, only when one is set', () => {
+    const withStatus = { ...mission, status: 'PR #12 open; waiting on review.', status_by: 'agent', status_updated_at: 1700000000000 };
+    expect(formatMissionDetail({ mission: withStatus, milestones: [], items: [], conversations: [] }).split('\n')).toEqual([
+      '#61 Missions — open, 2 open items (1 need you), 3 conversations, 5 milestones (id ms_1)',
+      'Ship it',
+      'Status (2023-11-14T22:13:20.000Z, by an agent): PR #12 open; waiting on review.',
+      '',
+      'Milestones (newest first):', '- (none yet)',
+      'Open items:', '- (none)',
+      'Conversations:', '- (none)',
+    ]);
+    expect(formatMissionDetail({ mission: { ...withStatus, status_by: 'user' } })).toContain('Status (2023-11-14T22:13:20.000Z, by the user): PR #12');
+    expect(formatMissionDetail({ mission: { ...mission, status: null, status_by: null, status_updated_at: null } })).not.toContain('Status');
+    expect(formatMissionDetail({ mission: { ...mission, status: '   ' } })).not.toContain('Status');
+  });
+
+  it('mission list: one block per mission — line, status or none, last milestone or none', () => {
+    const [open, closed] = shapes.list_200.missions;
+    const out = formatMissionList({ missions: [
+      { ...open, status: 'Journal half deployed; bridge next.', status_by: 'agent', status_updated_at: 1789057300000 },
+      closed,
+      { ...mission, last_milestone: null },
+    ] });
+    expect(out.split('\n')).toEqual([
+      '#1 Missions & milestones — open, 2 open items (1 need you), 2 conversations, 2 milestones (id ms_7Kq2XwvN)',
+      '  Status (2026-09-10T16:21:40.000Z, by an agent): Journal half deployed; bridge next.',
+      '  Last milestone: #5 [progress] Journal half deployed — 2026-09-10T16:20:00.000Z',
+      '#6 Items tracker — closed by agent, 0 open items, 1 conversation, 4 milestones (id ms_0Fh4Ly)',
+      '  Status: (none yet)',
+      '  Last milestone: #12 [progress] All PRs merged — 2026-09-09T18:00:00.000Z',
+      '#61 Missions — open, 2 open items (1 need you), 3 conversations, 5 milestones (id ms_1)',
+      '  Status: (none yet)',
+      '  Last milestone: (none yet)',
+    ]);
+    expect(out).not.toContain('[object Object]');
+    expect(out).not.toContain('undefined');
+    expect(formatMissionList({ missions: [] })).toBe('No missions.');
+    expect(formatMissionList({})).toBe('No missions.');
+  });
+
+  it('status errors: bad_request names the limits AND an old journal; forbidden and closed are sentences', () => {
+    expect(formatJournalError('status', shapes.error_400_bad_request)).toBe('the journal rejected the status — it must be 1–600 characters after trimming, with no control characters other than newlines and tabs (a journal older than mission status rejects every status: deploy the journal update)');
+    // Every other op keeps the existing sentence.
+    expect(formatJournalError('update', shapes.error_400_bad_request)).toMatch(/^the journal rejected it — check the number and the limits/);
+    expect(formatJournalError('status', { error: 'forbidden' })).toBe("that mission is shared with you by another user — only its owner's sessions can change it");
+    expect(formatBlocked({ error: 'conflict', blocked_by: 'closed' })).toBe('mission is closed — no more milestones, joins or status changes');
   });
 });
