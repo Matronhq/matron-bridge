@@ -691,9 +691,9 @@ describe('stallFromAssistantEvent', () => {
 
 describe('stallResetsAt', () => {
   it('prefers the session meter, then the first line with a reset time', () => {
-    expect(stallResetsAt([{ id: 'week', label: 'Weekly', percent: 60, resets_at: '2026-10-02T00:00:00.000Z' }, { id: '5h', label: 'Current session', percent: 100, resets_at: '2026-09-29T15:00:00.000Z' }])).toBe('2026-09-29T15:00:00.000Z');
-    expect(stallResetsAt([{ id: 'week', label: 'Weekly', percent: 60, resets_at: '2026-10-02T00:00:00.000Z' }])).toBe('2026-10-02T00:00:00.000Z');
-    expect(stallResetsAt([{ id: '5h', label: 'Current session', percent: 100 }])).toBeUndefined();
+    expect(stallResetsAt([{ id: 'week_all', label: 'Weekly', percent: 60, resets_at: '2026-10-02T00:00:00.000Z' }, { id: 'session', label: 'Current session', percent: 100, resets_at: '2026-09-29T15:00:00.000Z' }])).toBe('2026-09-29T15:00:00.000Z');
+    expect(stallResetsAt([{ id: 'week_all', label: 'Weekly', percent: 60, resets_at: '2026-10-02T00:00:00.000Z' }])).toBe('2026-10-02T00:00:00.000Z');
+    expect(stallResetsAt([{ id: 'session', label: 'Current session', percent: 100 }])).toBeUndefined();
     expect(stallResetsAt(undefined)).toBeUndefined();
   });
 });
@@ -708,7 +708,7 @@ describe('buildSessionStatus stall', () => {
 });
 ```
 
-Check the real id of the 5-hour meter line in `lib/usage-limits.js` (`grep -n "id:" lib/usage-limits.js`) and use it in the test and in `stallResetsAt`.
+The 5-hour meter's id is `session` (`deriveLimitId` in `lib/usage-limits.js`); weekly meters are `week_all` / `week_<model>`.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -745,7 +745,7 @@ export function stallFromAssistantEvent(event) {
 // one, else the first line carrying a reset. Undefined when nothing says.
 export function stallResetsAt(lines) {
   if (!Array.isArray(lines)) return undefined;
-  const session = lines.find((l) => l && l.id === '5h' && typeof l.resets_at === 'string');
+  const session = lines.find((l) => l && l.id === 'session' && typeof l.resets_at === 'string');
   if (session) return session.resets_at;
   const any = lines.find((l) => l && typeof l.resets_at === 'string');
   return any ? any.resets_at : undefined;

@@ -28,11 +28,24 @@ describe('usage-limit stall wiring (source inspection)', () => {
     expect(c).toContain('const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);');
     expect(c).toContain('session._stall = null;');
   });
+  it('sidechain (subagent) records never reach the assistant case, so they cannot clear a parent stall', () => {
+    const fn = body('function handleClaudeEvent(session, event) {', "    case 'assistant': {");
+    expect(fn).toContain('if (isSidechainEvent(event)) return;');
+  });
   it('journalStatus publishes the stall and applyModelSwitch clears it', () => {
     const js = body('function journalStatus(session) {', '\nfunction ');
     expect(js).toContain('stall: session._stall || undefined,');
     const ams = body('function applyModelSwitch(', '\nfunction ');
-    expect(ams.indexOf('session._stall = null;')).toBeLessThan(ams.indexOf('if (session.agent === AGENT_CODEX) {'));
+    // Cleared only on an ACCEPTED switch: after switchModelInSession returns
+    // true (interactive) and in the print branch past defer/refusal — never
+    // before validation, where a refused switch would erase a real stall.
+    expect(ams.match(/session\._stall = null;/g)).toHaveLength(2);
+    const iv = ams.slice(ams.indexOf('if (switched) {'), ams.indexOf('const decision = planPrintModelSwitch'));
+    expect(iv).toContain('session._stall = null;');
+    expect(iv).toContain('journalStatus(session);');
+    const accepted = ams.slice(ams.indexOf('if (!decision.ok) {'));
+    expect(accepted).toContain('session._stall = null;');
+    expect(ams.slice(0, ams.indexOf('if (switched) {'))).not.toContain('session._stall = null;');
   });
   it('Claude sessions restore a persisted stall on resume; Codex starts unstalled; persistSession carries it', () => {
     const cs = body('function createSession(roomId, workdir, resumeSessionId, options = {}) {', '\nfunction createCodexSessionForRoom(');

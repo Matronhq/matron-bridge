@@ -11625,9 +11625,6 @@ function switchEffortAndTrack(session, arg, send) {
 // §2e): same path, but persisted as modelExplicit:false so a later
 // assignment may change it again.
 function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true }) {
-  // A switch away from the exhausted model lifts a usage-limit stall; if the
-  // new model is out of allowance too, its next record re-flags it.
-  session._stall = null;
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
@@ -11665,10 +11662,15 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
       // A person's pick replaces any Coordinator model still pending on the
       // session: a later restart must carry what they chose.
       if (explicit) session._coordinatorModel = null;
+      // An ACCEPTED switch away from the exhausted model lifts a usage-limit
+      // stall (a refused one must not); if the new model is out of allowance
+      // too, its next record re-flags it. Published so the roster clears.
+      session._stall = null;
       persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
         ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),
         ...(explicit ? {} : { model: normalizeModelArg(arg) }),
       });
+      journalStatus(session);
     }
     return;
   }
@@ -11702,6 +11704,10 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     return;
   }
   sendReply(decision.message);
+  // Accepted: the stall lifts with the model (see the interactive branch);
+  // persisted as null here so the recreated session resumes unstalled and
+  // its spawn frame clears the roster.
+  session._stall = null;
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
     { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
   const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });

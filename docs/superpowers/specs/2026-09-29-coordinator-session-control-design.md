@@ -120,8 +120,12 @@ conversation rows (`src/missions.js` SELECT) gain the same block. Both are
 scoped by the existing privacy predicate. `GET /snapshot` is unchanged.
 
 **Bridge.** `agent_roster` and `mission_get` render the block:
-`(ang, waiting · opus[1m] · 87k/1M 9% · reported 2 min ago)`; a Codex or
-never-reported row shows `context unknown`. The status frame itself gains
+`(ang, waiting · opus[1m] · 87k/1M 9% · reported 2 min ago)`. A row whose
+status has a model but no gauge (a Codex session before its first turn, a
+bridge that has only sent its spawn header) shows `context unknown`; a row
+with **no** status at all (an old journal, a session that has never
+reported) keeps the unchanged pre-feature line rather than repeating
+"context unknown" down a whole roster. The status frame itself gains
 `stall` (§3) and, for Codex, nothing new: Codex reports `context` only when
 `modelContextWindow` is known, which stays "unknown" otherwise. No new
 tool; the Coordinator already calls both.
@@ -167,14 +171,33 @@ like spawn, with a card and a tracker item, and counted.
 **Target bridge** (`lib/journal-rpc.js` → new `lib/session-control.js`,
 pure planner + thin wiring):
 
-- resolve the session by conversation id (`not_found` if this bridge no
-  longer runs it; `gone` if it ended);
+- resolve the session by conversation id. The sessions this feature is for
+  are mostly **not live**: the idle reaper ends a session's process after
+  about an hour of silence and a box that was woken has no sessions running
+  at all, only persisted ones. So a conversation that this bridge owns but
+  does not currently run is **resumed on demand** (the same path a user's
+  message into an idle conversation takes — `journalRouteTextToSession`
+  respawns from the persisted session), and the action is then parked for
+  its first idle point. `not_found` only when the conversation is not this
+  bridge's; `gone` when its persisted state is absent or the session ended
+  (`session_state: done`);
 - **never act mid-turn**: if `session.busy` or otherwise occupied
   (`_awaitingInputReady`, `waitingForAnswer`, `pendingInteractivePrompt`),
-  park the action in a new per-session `deferredControls` list drained at
-  the three turn-end points before `dispatchDeferredCommand`, and answer
-  `{ok:true, applied:'deferred'}`; otherwise apply now and answer
-  `{ok:true, applied:'now'}`;
+  park the action and answer `{ok:true, applied:'deferred'}`; otherwise
+  apply now and answer `{ok:true, applied:'now'}`. Parking is one slot per
+  action kind on the session (`deferredControls: {set_model?, compact?,
+  carry_on?}`, a later request of the same kind replaces the earlier one),
+  drained by one `drainDeferredControls(session)` call at **every** point
+  where the session becomes free: the three turn-end hooks (before
+  `dispatchDeferredCommand`), and the moments the occupied flags clear
+  (`_awaitingInputReady` on terminal ready, `waitingForAnswer` /
+  `pendingInteractivePrompt` when the prompt is answered) — an occupied
+  session is already past its turn end, so a turn-end-only drain would wait
+  a whole extra turn. Drain order: `set_model` last, because a print-mode
+  switch recreates the process: `compact` and `carry_on` are applied (or
+  queued into `queuedMessages`, which `recreateSession` carries across)
+  first, and the slot object itself is carried to the replacement session
+  the way `queuedMessages` is, so nothing parked is lost to a recreate;
 - `set_model`: validate with `isValidModelArg` (Claude) or against the
   Codex model catalogue; apply through the existing `applyModelSwitch`
   path (iv: typed switch; print: recreate with `--model`; Codex: in-process).
@@ -190,8 +213,12 @@ pure planner + thin wiring):
   parked until the session's `stall.resets_at` (§3) has passed (timer,
   persisted in the session's state file so a bridge restart re-arms it; a
   box that sleeps fires it on the next boot's resume). If the session is
-  not stalled, `after_limit_reset` is answered `not_stalled`. A `carry_on`
-  never resets the self-restart budget (it is not user input).
+  not stalled, `after_limit_reset` is answered `not_stalled`; if it is
+  stalled but no meter gave a reset time (`stall.resets_at` absent), it is
+  answered `no_reset_time` with the stall block, so the Coordinator can
+  choose `when: now` later or switch the model instead of a timer that can
+  never fire. A `carry_on` never resets the self-restart budget (it is not
+  user input).
 - **Visible record** in the target chat, whatever the outcome: a notice
   `🛠 Coordinator: compacting this session once this turn finishes — context at 92%`
   / `… switched model to Sonnet` / `… carry on (after the Fable limit resets at 15:00)`,
@@ -218,17 +245,28 @@ and never to act on a `running` session expecting an immediate effect.
 
 ### 3. Recognising a limit stall
 
-The bridge sets `stall` in the status frame when a turn ends on an
-assistant text matching `/reached your .* limit/i` (or the record's
-`isApiErrorMessage`), or when a `/compact` fails with the same text:
+The bridge sets `stall` in the status frame when a parent assistant record
+whose only content is one text block is a usage-limit error: structurally,
+`isApiErrorMessage: true` together with `error: 'rate_limit'` or
+`apiErrorStatus: 429` (the record observed on this box; its `message.model`
+is the placeholder `<synthetic>`, which is never adopted), or, for stream
+shapes that strip those fields, a sole text matching
+`/^(error during compaction: )?(you've reached your … limit|claude ai usage limit reached)/i`.
+An `isApiErrorMessage` record for any other error (a 500, an overload) is
+not a stall. The frame carries:
 
 ```json
 "stall": { "kind": "usage_limit", "model": "claude-fable-5-1",
            "resets_at": "2026-09-29T15:00:00Z", "since": 1790690000000 }
 ```
 
-`resets_at` comes from the matching `limits[]` line (the "session" meter's
-`resets_at`, else the weekly one); omitted when unknown. Cleared on the
+`resets_at` comes from the `limits[]` line that filled: the fullest meter
+(100% first) that carries a reset time — the message names a model
+("Fable limit"), which is often the weekly per-model meter, not the 5-hour
+session one — else the session meter, else any line with a reset; omitted
+when no meter can say. The bridge refreshes the meters at the moment of the
+stall and republishes once the reset time is known, since the shared cache
+can be minutes old. Cleared on the
 next successful assistant record or model switch. Codex: its rate-limit
 text differs and is not matched in v1 — reported as unknown. The journal
 persists it (§1) so the roster shows `stalled: Fable limit, resets 15:00`
