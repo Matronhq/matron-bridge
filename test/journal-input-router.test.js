@@ -2172,7 +2172,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
     // return means it consumed the ref) before falling through to invites.
     expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
-    expect(args).toMatch(/onOpError: \(e\) => \{ if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+    expect(args).toMatch(/onOpError: \(e\) => \{ if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
   });
 });
 

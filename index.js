@@ -151,8 +151,11 @@ import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summar
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, contextWindowFor, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
+import { planSessionControl, validateControlParams, controlNotice, CONTROL_KINDS } from './lib/session-control.js';
+import { createSessionControlHandlers } from './lib/session-control-client.js';
+import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -644,6 +647,9 @@ let agentInvites = null;
 // pattern as agentInvites above; constructed next to agentChatHandlers, well
 // after journalPublisher and agentRooms exist.
 let agentSpawnHandlers = null;
+// Coordinator session control, calling side (lib/session-control-client.js);
+// constructed beside agentSpawnHandlers.
+let sessionControlHandlers = null;
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -732,12 +738,14 @@ const journalPublisher = createJournalPublisher({
   // Agent-spawn ephemeral frames (kind:'spawn') — thunked for the same
   // reason as onInviteFrame: agentSpawnHandlers is constructed later.
   onSpawnFrame: (frame) => agentSpawnHandlers?.onSpawnFrame(frame),
+  // Coordinator session-control relay frames (kind:'session_control').
+  onSessionControlFrame: (frame) => sessionControlHandlers?.onSessionControlFrame(frame),
   // Spawn correlation tries first (its waiters are request_id-keyed, same
   // style as agent-invites' own onOpError) — a `true` return means it owned
   // and consumed the ref, so the invite manager never sees it. Op-error refs
   // are never shared between the two managers, so this ordering is not a
   // race, just "ask the spawn side first."
-  onOpError: (e) => { if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
+  onOpError: (e) => { if (sessionControlHandlers?.onOpError?.(e)) return; if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -891,6 +899,11 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   // when a stalled session is idle): carried here, restored on resume, and
   // cleared by the next real assistant record.
   if (live) derived._stall = live._stall || null;
+  // Parked Coordinator controls and the automatic carry-on survive a restart
+  // the same way (spec 2026-09-29 coordinator session control, Decisions).
+  if (live) derived._deferredControls = live._deferredControls || null;
+  if (live) derived._autoResume = live._autoResume || null;
+  if (live) derived._badModelRecovered = !!live._badModelRecovered;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
   const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
   const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
@@ -1133,6 +1146,10 @@ const journalRpcHandler = createRpcRequestHandler({
   },
   unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
   injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  // Coordinator session control (lib/session-control.js): resolve or resume
+  // the target, park while occupied, apply through the /model, /switch,
+  // /compact and turn-injection paths. Late-bound like joinMission.
+  controlSession: (params) => journalControlSession(params),
   // Spawn onto a mission: join the new conversation before its opening turn
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
@@ -2109,6 +2126,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     initData: null,
     currentModel: printModel || null,
     _stall: resumeSessionId ? (persistedMode?._stall || null) : null,
+    _deferredControls: resumeSessionId ? (persistedMode?._deferredControls || null) : null,
+    _autoResume: resumeSessionId ? (persistedMode?._autoResume || null) : null,
+    _badModelRecovered: resumeSessionId ? !!persistedMode?._badModelRecovered : false,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -2415,6 +2435,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     initData: null,
     currentModel: model || null,
     _stall: null,
+    _deferredControls: null,
+    _autoResume: null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -2945,6 +2967,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     initData: null,
     currentModel: model || null,
     _stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,
+    _deferredControls: resumeSessionId ? (persistedForRoom?._deferredControls || null) : null,
+    _autoResume: resumeSessionId ? (persistedForRoom?._autoResume || null) : null,
+    _badModelRecovered: resumeSessionId ? !!persistedForRoom?._badModelRecovered : false,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -4182,6 +4207,17 @@ function handleClaudeEvent(session, event) {
           resets_at: stallResetsAt(usageLimitsCache.lines),
         };
         journalStatus(session);
+        if (stall.kind === 'bad_model') {
+          // §4: one automatic recovery — default model, then carry on.
+          recoverBadModel(session);
+        } else {
+          // §4: the bridge carries the session on by itself once the meter
+          // resets (armFromStall keeps a Coordinator's message for the same
+          // stall). Re-armed below when the forced refresh brings the real
+          // reset time.
+          session._autoResume = armFromStall(session._stall, session._autoResume);
+          persistControlState(session);
+        }
         // The cached meters predate the stall by definition — fetch fresh
         // ones past the cache TTL and republish once the reset time is known.
         const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR, { force: true });
@@ -4189,6 +4225,10 @@ function handleClaudeEvent(session, event) {
           refresh.then((updated) => {
             if (!updated || !session.alive || !session._stall) return;
             session._stall.resets_at = stallResetsAt(usageLimitsCache.lines);
+            if (session._stall.kind === 'usage_limit') {
+              session._autoResume = armFromStall(session._stall, session._autoResume);
+              persistControlState(session);
+            }
             journalStatus(session);
           });
         }
@@ -4200,6 +4240,11 @@ function handleClaudeEvent(session, event) {
         // (a resume-time filler that reaches the API counts, because it
         // could only have been served past the limit).
         session._stall = null;
+        if (session._autoResume || session._badModelRecovered) {
+          session._autoResume = null;
+          session._badModelRecovered = false;
+          persistControlState(session);
+        }
       }
       if (assistantCtxTokens) {
         session._lastContextTokens = assistantCtxTokens;
@@ -9395,8 +9440,224 @@ function sessionOccupiedForRoomDelivery(session) {
 // journalOnRoomFrame self-heal): flush the coalesced room inbox ONLY when
 // the session is genuinely free, by the SAME composite predicate that routes
 // deliver()'s busy/idle branches — so the two can never disagree.
+// --- Automatic carry-on (lib/auto-resume.js, spec §4, decision D) ---
+//
+// A Claude session stalled on a usage limit carries itself on when the
+// meter resets: the stall arms `session._autoResume` (persisted), a
+// one-minute sweep fires due slots on live sessions and on persisted ones
+// with no live session (a box the journal woke for exactly this), and the
+// delivery is a resume if needed, a /compact when the last gauge was high,
+// then the carry-on text as a turn. A session whose model became
+// unavailable gets one recovery: the default model, then carry on.
+const AUTO_RESUME_SWEEP_MS = 60_000;
+
+function contextWindowForSession(session) {
+  if (session.agent === AGENT_CODEX) return session._codexContextWindow || null;
+  return contextWindowFor(session.currentModel || session.initData?.model);
+}
+
+async function fireAutoResume(roomId, convoId, slot) {
+  let session = sessions.get(roomId);
+  if (!session || !session.alive) session = convoId ? journalResumeConvo(convoId, '⏳ The usage limit has reset — resuming this session to carry on.') : null;
+  if (!session) {
+    debug(`auto-resume: ${roomId} could not be resumed`);
+    return;
+  }
+  session._autoResume = null;
+  persistControlState(session);
+  postControlNotice(session, slot.source === 'coordinator'
+    ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
+    : '🕒 The usage limit has reset — carrying on automatically.');
+  try {
+    if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
+      await journalRouteTextToSession(session, '/compact');
+    }
+    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || BAD_MODEL_RECOVERY_TEXT);
+  } catch (e) {
+    console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
+  }
+}
+
+function runAutoResumeSweep(now = Date.now()) {
+  const seen = new Set();
+  for (const [roomId, session] of sessions) {
+    if (!session.alive || !session._autoResume) continue;
+    seen.add(roomId);
+    if (autoResumeDue(session._autoResume, now)) void fireAutoResume(roomId, journalConvoIdFor(session), session._autoResume);
+  }
+  let records;
+  try { records = loadPersistedSessions(); } catch { return; }
+  for (const due of dueResumes(records, now)) {
+    if (seen.has(due.roomId) || sessions.get(due.roomId)?.alive) continue;
+    void fireAutoResume(due.roomId, due.convoId, due.slot);
+  }
+}
+
+function startAutoResumeSweep() {
+  const timer = setInterval(() => { try { runAutoResumeSweep(); } catch (e) { console.warn(`[auto-resume] sweep failed: ${e.message}`); } }, AUTO_RESUME_SWEEP_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
+// §4: the model this session was on is unavailable here. Once per stall:
+// switch to the default model (explicit:false — a later assignment may
+// change it again) and carry on; a second failure is left for a human.
+function recoverBadModel(session) {
+  if (session.agent === AGENT_CODEX) return;
+  if (session._badModelRecovered) {
+    postControlNotice(session, '⚠️ The default model is not available either — this session needs a person (or the Coordinator) to pick a model with /model.');
+    return;
+  }
+  session._badModelRecovered = true;
+  persistControlState(session);
+  postControlNotice(session, '🛠 The model this session was on is no longer available — switching to the default model and carrying on.');
+  const ctx = journalSessionCommandCtx(session);
+  applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+  const next = sessions.get(session.roomId) || session;
+  void journalRouteTextToSession(next, BAD_MODEL_RECOVERY_TEXT).catch((e) => console.warn(`[auto-resume] recovery carry-on failed: ${e.message}`));
+}
+
+// --- Coordinator session control, target side (lib/session-control.js) ---
+//
+// The journal relays a session_control RPC only from the user's Coordinator.
+// The session it aims at is usually NOT live (idle-reaped, or on a box that
+// was just woken), so it is resumed on demand exactly as a user's message
+// would resume it; then the planner decides: apply now, park until the
+// session is free (one slot per action kind, persisted, drained from
+// maybeFlushRoomDelivery — the shared "session is free" gate), schedule a
+// carry-on for the usage-limit reset, or refuse. Every outcome leaves a
+// notice in the session's own chat (decision B).
+function boxLabelForControl() {
+  try { return journalPublisher.identity?.()?.name || SERVER_LABEL || os.hostname(); } catch { return SERVER_LABEL || 'this box'; }
+}
+
+function postControlNotice(session, text) {
+  const n = notice('info', text);
+  if (session && typeof session.sendHtml === 'function') {
+    try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
+  }
+  journalPublishNotice(journalConvoIdFor(session), text);
+}
+
+function persistControlState(session) {
+  if (!session?.roomId) return;
+  try { persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId); } catch (e) { debug(`session-control: persist failed: ${e.message}`); }
+}
+
+async function journalControlSession(rawParams) {
+  const v = validateControlParams(rawParams);
+  if (!v.ok) return { ok: false, error: { code: v.code, ...(v.detail ? { detail: v.detail } : {}) } };
+  const params = v.params;
+  let session = findSessionByClaudeSessionId(params.convoId);
+  if (!session || !session.alive) session = journalResumeConvo(params.convoId, JOURNAL_RESUME_NOTICE);
+  if (!session) {
+    const known = Object.values(loadPersistedSessions()).some((p) => p && (p.journalConvoId === params.convoId || p.sessionId === params.convoId));
+    return { ok: false, error: { code: known ? 'gone' : 'not_found' } };
+  }
+  const box = boxLabelForControl();
+  const plan = planSessionControl({ params, session, canSwitch: canSwitchAgent });
+  switch (plan.kind) {
+    case 'error':
+      postControlNotice(session, controlNotice(params, { error: plan.detail || plan.code, agent: session.agent }));
+      return { ok: false, error: { code: plan.code, ...(plan.detail ? { detail: plan.detail } : {}) } };
+    case 'park':
+      session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: plan.slot };
+      persistControlState(session);
+      postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }));
+      return { ok: true, result: { applied: 'deferred', box } };
+    case 'schedule':
+      session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+      persistControlState(session);
+      postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }));
+      return { ok: true, result: { applied: 'scheduled', at: plan.at, box } };
+    case 'apply': {
+      postControlNotice(session, controlNotice(params, { phase: 'now', agent: session.agent }));
+      const r = await applyControlSteps(session, plan.steps);
+      if (!r.ok) {
+        postControlNotice(sessions.get(session.roomId) || session, controlNotice(params, { error: r.error.detail || r.error.code, agent: session.agent }));
+        return { ok: false, error: r.error };
+      }
+      return { ok: true, result: { applied: 'now', box, ...(r.detail ? { detail: r.detail } : {}) } };
+    }
+    default:
+      return { ok: false, error: { code: 'internal' } };
+  }
+}
+
+// Runs the planner's steps through the existing paths: /switch
+// (switchAgentSession, idle-only), /model (applyModelSwitch — a print-mode
+// switch recreates the process, so later steps re-read the room's session),
+// /compact (journalRouteTextToSession: Codex native, Claude typed/stdin) and
+// a Coordinator-attributed turn (sendTextToSession). Replies these paths
+// make land in the session chat via its command context.
+async function applyControlSteps(session, steps) {
+  let current = session;
+  const ctx = journalSessionCommandCtx(current);
+  for (const step of steps) {
+    if (!current || !current.alive) return { ok: false, error: { code: 'gone', detail: 'the session ended mid-action' } };
+    if (step.op === 'switch_agent') {
+      const next = await switchAgentSession(current.roomId, step.agent, { sendReply: ctx.sendReply });
+      if (!next) return { ok: false, error: { code: 'unsupported', detail: 'the agent switch was refused' } };
+      current = next;
+    } else if (step.op === 'set_model') {
+      applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true });
+      current = sessions.get(current.roomId) || current;
+    } else if (step.op === 'compact') {
+      await journalRouteTextToSession(current, '/compact');
+    } else if (step.op === 'carry_on') {
+      if (!sendTextToSession(current, step.text, { skipJournalMirror: true })) {
+        return { ok: false, error: { code: 'gone', detail: 'the session would not take a turn' } };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+// Parked slots, drained at the shared free gate (maybeFlushRoomDelivery) in
+// CONTROL_KINDS order — a turn and a compact first (they ride the queue a
+// print-mode recreate carries), the model/agent switch last. Returns true
+// when something was started, so the caller leaves room delivery to the
+// next seam rather than injecting into a turn this drain just began.
+function drainDeferredControls(session) {
+  const slots = session?._deferredControls;
+  if (!slots || typeof slots !== 'object') return false;
+  const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);
+  if (!kinds.length) { session._deferredControls = null; return false; }
+  session._deferredControls = null;
+  persistControlState(session);
+  void (async () => {
+    let current = session;
+    for (const kind of kinds) {
+      const { params } = slots[kind];
+      current = sessions.get(current.roomId) || current;
+      const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
+      if (plan.kind === 'apply') {
+        postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }));
+        const r = await applyControlSteps(current, plan.steps);
+        current = sessions.get(current.roomId) || current;
+        if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }));
+      } else if (plan.kind === 'park') {
+        // Still not free for this one (an agent switch needs a fully idle
+        // session): back in its slot for the next seam.
+        current._deferredControls = { ...(current._deferredControls || {}), [kind]: slots[kind] };
+        persistControlState(current);
+      } else if (plan.kind === 'error') {
+        postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }));
+      } else if (plan.kind === 'schedule') {
+        current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+        persistControlState(current);
+        postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }));
+      }
+    }
+  })().catch((e) => { try { console.warn(`[session-control] drain failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ } });
+  return true;
+}
+
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
+  // A parked Coordinator control goes first; it may start a turn, in which
+  // case the room inbox waits for the next seam (see drainDeferredControls).
+  if (drainDeferredControls(session)) return;
   // Counted BEFORE the flush, which clears the inbox either way — this is the
   // number the ⏳ line left outstanding, and the number Dan is owed an outcome
   // for. Zero means there was no queued batch, so there is nothing to close
@@ -10563,6 +10824,17 @@ const reminderHandlers = createReminderHandlers({
 // frames. Constructed exactly once, here — the factory starts an unref'd
 // hourly tombstone sweep with no dispose hook, so a second instantiation
 // would leak a duplicate timer.
+// Coordinator session control, calling side: the three tools' handlers.
+// Results (which can take minutes when the target box has to wake) land
+// as a notice in the Coordinator's own chat.
+sessionControlHandlers = createSessionControlHandlers({
+  sessions,
+  publisher: journalPublisher,
+  journalConvoIdFor,
+  notify: (convoId, text) => journalPublishNotice(convoId, text),
+  log: console,
+});
+
 agentSpawnHandlers = createAgentSpawnHandlers({
   sessions,
   publisher: journalPublisher,
@@ -11039,6 +11311,15 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-boxes') {
         await respondAgentChatRoute(res, data, agentSpawnHandlers.boxes,
           (status, b) => debug(`agent-boxes ${status} ${(b.boxes || []).length ?? ''} ${b.error || ''}`));
+        return;
+      }
+
+      if (url.pathname === '/session-set-model' || url.pathname === '/session-compact' || url.pathname === '/session-carry-on') {
+        const handler = url.pathname === '/session-set-model' ? (d) => sessionControlHandlers.setModel(d)
+          : url.pathname === '/session-compact' ? (d) => sessionControlHandlers.compact(d)
+            : (d) => sessionControlHandlers.carryOn(d);
+        await respondAgentChatRoute(res, data, handler,
+          (status, b) => debug(`${url.pathname} ${status} ${b.request_id || b.error || ''}`));
         return;
       }
 
@@ -12190,6 +12471,7 @@ async function main() {
   if (SESSION_IDLE_TIMEOUT_MS > 0) {
     console.log(`Session idle timeout: ${SESSION_IDLE_TIMEOUT_MS}ms (check every ${SESSION_IDLE_CHECK_MS}ms)`);
     startIdleReaper();
+startAutoResumeSweep();
   } else {
     console.log('Session idle timeout: disabled');
   }

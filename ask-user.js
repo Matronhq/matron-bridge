@@ -388,6 +388,62 @@ server.tool(
   }
 );
 
+const SESSION_CONTROL_WHAT = "Session control is for the user's Coordinator only (the journal refuses anyone else): it acts on ANOTHER session, found by its conversation id from agent_roster or mission_get. The target bridge resumes the session if it is idle-reaped, parks the action while the session is mid-turn or waiting on a prompt, applies it at the session's next idle point, and writes a one-line notice into that session's chat saying the Coordinator did it and why. The tool returns as soon as the journal has taken the request; the outcome (applied / parked / failed) arrives in this chat as a later notice, minutes later if the target box had to be woken. Never expect an immediate effect on a running session.";
+
+server.tool(
+  'session_set_model',
+  `Switch another session's model, or move it between Claude and Codex. ${SESSION_CONTROL_WHAT} Use it when a session is stalled on a usage limit for its current model (agent_roster shows "stalled: usage limit") and waiting for the reset is not acceptable, or when the user asks for a different model on a session. A print-mode Claude session restarts to apply the switch (history kept); an interactive one applies it on its next message.`,
+  {
+    target_convo_id: z.string().describe('The target conversation id (from agent_roster or mission_get) — never this conversation'),
+    model: z.string().max(64).optional().describe('Claude: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable, or a full claude-* name. Codex: a Codex model id, or "default". Optional when only `agent` changes.'),
+    agent: z.enum(['claude', 'codex']).optional().describe('Move the session to this backend first (the bridge hands the unseen transcript over on the next turn). Omit to keep the current one.'),
+    reason: z.string().max(200).optional().describe('One line shown in the target chat, e.g. "Fable limit reached, resets 15:00 UTC"'),
+  },
+  async ({ target_convo_id, model, agent, reason }) => sessionControlCall('/session-set-model', { target_convo_id, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(reason ? { reason } : {}) }, 'session_set_model')
+);
+
+server.tool(
+  'session_compact',
+  `Compact another session's context (/compact at its next idle point). ${SESSION_CONTROL_WHAT} Use it when agent_roster or mission_get shows a session above about 80% of its window and it is still working; a compact goes ahead of anything else queued for that session.`,
+  {
+    target_convo_id: z.string().describe('The target conversation id (from agent_roster or mission_get) — never this conversation'),
+    reason: z.string().max(200).optional().describe('One line shown in the target chat, e.g. "context at 92%"'),
+  },
+  async ({ target_convo_id, reason }) => sessionControlCall('/session-compact', { target_convo_id, ...(reason ? { reason } : {}) }, 'session_compact')
+);
+
+server.tool(
+  'session_carry_on',
+  `Tell another session to carry on: the message is sent into it as a turn attributed to the Coordinator. ${SESSION_CONTROL_WHAT} A session stalled on a usage limit is carried on automatically by its own bridge when the limit resets (and moved to the default model if its model became unavailable), so use this for what the automatic path cannot know: a session with no reset time, one you want continued with different instructions, or one that simply stopped. With when: "after_limit_reset" the message replaces the automatic carry-on's default text and fires at the reset time (refused as not_stalled / no_reset_time when that does not apply).`,
+  {
+    target_convo_id: z.string().describe('The target conversation id (from agent_roster or mission_get) — never this conversation'),
+    message: z.string().max(2000).describe('What the session should do next, written to the agent in that session'),
+    when: z.enum(['now', 'after_limit_reset']).optional().describe('Default now. after_limit_reset: hold it until the usage-limit stall the session reported has reset.'),
+    reason: z.string().max(200).optional().describe('One line shown in the target chat'),
+  },
+  async ({ target_convo_id, message, when, reason }) => sessionControlCall('/session-carry-on', { target_convo_id, message, ...(when ? { when } : {}), ...(reason ? { reason } : {}) }, 'session_carry_on')
+);
+
+async function sessionControlCall(route, body, name) {
+  try {
+    const postRes = await fetch(`${BRIDGE_API}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...body }),
+    });
+    const data = await postRes.json().catch(() => ({}));
+    if (!postRes.ok) {
+      return { content: [{ type: 'text', text: `${name} failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+    }
+    const waking = data.target_waking === true
+      ? ' The target box is asleep and is being woken; the action applies once it is up, which takes a few minutes.'
+      : '';
+    return { content: [{ type: 'text', text: `Sent to the target session's bridge.${waking} It applies at that session's next idle point (parked if it is mid-turn); the outcome arrives here as a later notice — do not poll, and do not send it again.` }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+  }
+}
+
 server.tool(
   'restart_session',
   "Restart THIS session's own agent process — the way to get browser tools (chrome-devtools MCP) mid-conversation, or to move onto a different model, without asking the user to do it. The conversation, workdir and history are kept; only the underlying process is respawned. continue_with is a message the bridge sends back into the restarted session as its first turn, so the work carries on unattended — write it as an instruction to your future self, including whatever context the restart is about to cost you. The restart does NOT happen instantly: it is parked until your current turn ends, so finish up and stop working rather than starting anything new after calling this. There is a small budget of consecutive self-restarts; once it runs out you must ask the user. Never call this in a loop.",
