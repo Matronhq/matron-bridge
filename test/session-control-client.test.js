@@ -25,7 +25,7 @@ describe('session control client', () => {
     const p = h.setModel({ roomId: '!coord', target_convo_id: 'tgt', model: 'sonnet', agent: 'claude', reason: 'limit hit' });
     await new Promise((r) => setTimeout(r, 5));
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toMatchObject({ op: 'session_control', from_convo_id: 'coord-convo', target_target_convo_id: 'tgt', action: 'set_model', model: 'sonnet', agent: 'claude', reason: 'limit hit' });
+    expect(sent[0]).toMatchObject({ op: 'session_control', from_convo_id: 'coord-convo', target_convo_id: 'tgt', action: 'set_model', model: 'sonnet', agent: 'claude', reason: 'limit hit' });
     const rid = sent[0].request_id;
     h.onSessionControlFrame({ kind: 'session_control', event: 'sent', request_id: rid, target_waking: true });
     const res = await p;
