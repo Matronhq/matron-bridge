@@ -207,10 +207,25 @@ describe('claudeCoordinatorArgs', () => {
   });
 });
 
-describe('memory block plumbing (spec 2026-09-27 memories)', () => {
-  it('an ordinary session is byte-identical with a memoryBlock given', () => {
-    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE');
-    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' }).developerInstructions).toBe('B');
+describe('memory block plumbing (spec 2026-09-27 memories; every session since 2026-09-29)', () => {
+  it('an ordinary session gets the memory block after the base prompt on all three spawn paths', () => {
+    const r = claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', baseDisallowed: ['AskUserQuestion'], memoryBlock: 'MEM' });
+    expect(r.appendSystemPrompt).toBe('BASE\n\nMEM');
+    expect(r.disallowedTools).toEqual(['AskUserQuestion']);
+    const c = codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' });
+    expect(c.developerInstructions).toBe('B\n\nMEM');
+    expect(c.sandbox).toBe('x');
+  });
+  it('an ordinary session never sees the Coordinator brief, with or without a memory block', () => {
+    for (const memoryBlock of ['MEM', '', undefined]) {
+      expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', memoryBlock }).appendSystemPrompt).not.toContain('BLOCK');
+      expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock }).developerInstructions).not.toContain('K');
+    }
+  });
+  it('an empty memory block appends nothing, so a prompt without memories is byte-identical to before', () => {
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: '' }).appendSystemPrompt).toBe('BASE');
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK' }).appendSystemPrompt).toBe('BASE');
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: '' }).developerInstructions).toBe('B');
   });
   it('the Coordinator gets the memory block after the brief on all three paths; an empty block appends nothing', () => {
     expect(claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE\n\nBLOCK\n\nMEM');

@@ -77,9 +77,10 @@ describe('memory tools wiring (source inspection)', () => {
     expect(fn).toContain('body: JSON.stringify({ roomId: ROOM_ID, ...args })');
   });
 
-  it('memory_save tells the model the description is the injected line and that an update must send the body back', () => {
+  it('memory_save tells the model the description is the line every session sees and that an update must send the body back', () => {
     const tool = askUser.slice(askUser.indexOf("'memory_save'"), askUser.indexOf("'memory_list'"));
-    expect(tool).toMatch(/one line the Coordinator sees at spawn/);
+    expect(tool).toMatch(/one line every session sees at spawn/);
+    expect(askUser).not.toMatch(/read by the Coordinator/);
     expect(tool).toMatch(/send the body back/);
     expect(tool).toMatch(/one memory per rule/);
   });
@@ -92,5 +93,14 @@ describe('memory tools wiring (source inspection)', () => {
     const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
     expect(coord).toContain('## Remember what the user tells you');
     expect(coord).toMatch(/Do not park rules in decision items/);
+  });
+
+  it('the Claude and Codex instruction files tell every session its memories are listed at the end and to follow them', () => {
+    for (const file of ['BRIDGE_CLAUDE.md', 'BRIDGE_CODEX.md']) {
+      const md = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
+      expect(md, `${file} does not point at the injected index`).toMatch(/listed under "Your memories" at the end of these instructions/);
+      expect(md, `${file} does not say to follow them`).toMatch(/follow them without being asked/);
+      expect(md, `${file} still says only the Coordinator reads memories`).not.toMatch(/read by the Coordinator/);
+    }
   });
 });
