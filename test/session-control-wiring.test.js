@@ -87,8 +87,9 @@ describe('automatic carry-on wiring (source inspection)', () => {
     const c = body("    case 'assistant': {", "    case 'result': {");
     expect(c).toContain("if (stall.kind === 'bad_model') {");
     expect(c).toContain('recoverBadModel(session);');
-    expect(c).toContain('session._autoResume = armFromStall(session._stall, session._autoResume);');
-    expect(c.match(/session\._autoResume = armFromStall\(session\._stall, session\._autoResume\);/g)).toHaveLength(2);
+    expect(c.match(/session\._autoResume = armFromStall\(session\._stall, session\._autoResume, Date\.now\(\), session\._autoResumeRetries \|\| 0\);/g)).toHaveLength(2);
+    expect(c.match(/if \(session\._autoResume\?\.retry\) session\._autoResumeRetries = session\._autoResume\.retry;/g)).toHaveLength(2);
+    expect(c).toContain('session._autoResumeRetries = 0;');
     expect(c).toContain('session._autoResume = null;');
     expect(c).toContain('session._badModelRecovered = false;');
   });
