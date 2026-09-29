@@ -1,7 +1,7 @@
 # Coordinator session control: context size, /model, /compact, carry on
 
 **Date:** 2026-09-29
-**Status:** §1 read path and §3 stall reporting implemented (this PR + matron-journal PR #96), after Dan chose journal persistence over a live RPC (29 Sep). §2 control path: design questions filed for Dan, not built yet
+**Status:** §1 read path and §3 stall reporting implemented (this PR + matron-journal PR #96). §2 control path and §4 automatic carry-on: all six design questions answered by Dan on 29 Sep (see "Decisions" at the end, which supersede §2 where they differ); being built
 **Depends on:** 2026-07-15 agent RPC design (journal-originated requests), 2026-08-09 agent spawns design (the `spawn_request` relay shape), 2026-09-23 Coordinator redesign, 2026-06-10 `/model` design, 2026-08-06 compact/queue design
 
 ## Problem
@@ -327,3 +327,130 @@ bridge tools report verbatim), then bridges via the usual fleet pass. Old
 bridges ignore the roster's `status` block and answer `unknown_method` to
 the RPC, which the Coordinator sees as "that box's bridge predates session
 control".
+
+## Decisions (Dan, 29 Sep 2026) and the final control-path design
+
+Dan's answers to the six questions: **A** standing permission, no consent
+card. **B** a one-line notice in the target session's chat. **C** Codex
+sessions get all three actions, and the Coordinator must also be able to
+switch a session **between Codex and Claude**. **D** automatic: the bridge
+itself carries on when the limit resets, and when a resumed session comes
+back on an unknown or unavailable model the bridge switches it to a known
+model, then carries on, compacting when the context is high. **E** park
+everything that lands mid-turn. **F** persist the status header in the
+journal (built, §1).
+
+### Journal: `session_control` op
+
+```json
+{ "op": "session_control", "request_id": "…",
+  "from_convo_id": "<the Coordinator conversation>", "target_convo_id": "<session>",
+  "action": "set_model" | "compact" | "carry_on",
+  "model": "sonnet",                 // set_model: Claude alias / claude-* name, or a Codex model id; optional when `agent` is given
+  "agent": "claude" | "codex",       // set_model: switch the session's backend first (bridge /switch), optional
+  "message": "carry on with …",      // carry_on: ≤ 2000 chars, peer-text sanitised
+  "when": "now" | "after_limit_reset", // carry_on, default now
+  "reason": "context at 92%" }       // optional, ≤ 200 chars, shown in the target chat
+```
+
+Checks, in order, every failure a `{kind:'control', op:'error', code, ref, request_id}`
+frame: agent connection (`forbidden`); registered (`not_ready`); `request_id`
+(`bad_request`); `from_convo_id` is a top-level conversation this device owns
+(`not_found`) **and** equals `user_settings.coordinator_convo_id`
+(`forbidden`, detail `not_coordinator`) — the one route the Coordinator role
+gates; `action`/`agent`/`when` in their vocabularies, `model` ≤ 64,
+`message` ≤ 2000 after sanitising (required for `carry_on`), `reason` ≤ 200
+(`bad_request`); `target_convo_id` exists, same user, top-level, has an
+`agent_device_id`, and its box is not a private device hidden from this
+caller (`not_found`, indistinguishable); target is not `from_convo_id`
+(`bad_request`). Then: if the box is offline and cannot be woken →
+`agent_unreachable`; otherwise ack at once with
+`{kind:'session_control', event:'sent', request_id, target_waking?}`, wake
+the box if needed and wait up to `MATRON_SPAWN_WAKE_WAIT_MS` for it
+(`hub.waitForDevice`), issue a journal-originated RPC `session_control
+{convo_id, action, model?, agent?, message?, when?, reason?, from_convo_id,
+from_name}` (30 s), and deliver the reply to every socket of the caller's
+device as `{kind:'session_control', event:'result', request_id, ok,
+result?|error?}`. Nothing is journaled by the journal; not counted against
+the pending-ask cap (nothing awaits the user).
+
+**Stall wake sweep.** Once a minute the journal scans `conversation_status`
+for rows whose `stall.resets_at` has passed and whose box has no live
+socket, and calls `wakeIfOffline` on that box (debounced by the waker), so
+the bridge below can perform its automatic carry-on even when the box went
+to sleep while stalled. The bridge's next status frame drops the stall and
+ends the loop.
+
+### Target bridge
+
+`lib/session-control.js` is the pure planner (validate params, decide
+`apply` vs `park`, name the notice and the reply); `lib/journal-rpc.js`
+gains the `session_control` method; `index.js` wires it.
+
+- **Resolve or resume.** `findSessionByClaudeSessionId(convo_id)`; when
+  there is no live session, `journalResumeConvo(convo_id)` respawns it from
+  the persisted record exactly as a user's message would (the sessions this
+  feature manages are mostly idle-reaped or on a just-woken box). Neither
+  → `not_found` (not this bridge's) or `gone` (persisted state absent).
+- **Park or apply.** Occupied is `sessionOccupiedForRoomDelivery(session)`
+  (busy, resume hold, open question, open prompt); an agent switch
+  additionally needs `canSwitchAgent` to agree (no queue, no pending plan).
+  When occupied, the action is stored in `session._deferredControls`
+  (`{set_model?, compact?, carry_on?}`, one slot per kind, latest wins,
+  carried by `persistSession` and restored on resume/recreate so a restart
+  does not lose it) and the reply is `{ok:true, applied:'deferred'}`.
+  `drainDeferredControls(session)` runs from `maybeFlushRoomDelivery`, the
+  shared "session is free" gate every turn-end and every prompt-clear seam
+  already passes through, in the order `carry_on` (queued as a turn),
+  `compact` (queue front), `set_model` last (a print-mode switch recreates
+  the process, which carries `queuedMessages`).
+- **set_model.** `agent` given and different → `switchAgentSession(roomId,
+  agent, …)` first (idle-only; occupied → parked); then `model` →
+  `applyModelSwitch(roomId, session, model, {explicit: true})`, whose own
+  validation yields `bad_model` (a refused alias is never typed anywhere).
+  Codex model ids go to the same function's Codex branch.
+- **compact.** `journalRouteTextToSession(session, '/compact')` — Codex
+  native compact, Claude typed/stdin — only ever at idle.
+- **carry_on.** `when: now` → notice, then
+  `sendTextToSession(session, '[from the Coordinator] ' + message)`.
+  `when: after_limit_reset` → `not_stalled` unless `session._stall`, else
+  `no_reset_time` unless it has `resets_at`, else the message replaces the
+  automatic carry-on's default text (§4) and the reply says when it fires.
+- **Notice** (decision B): `🛠 Coordinator: compacting this session once
+  this turn finishes — context at 92%`, `🛠 Coordinator: switching this
+  session to Sonnet`, `🛠 Coordinator: carry on once the usage limit resets
+  at 15:00 UTC`, posted with `notice()` into the target chat when received
+  and, for a parked action, again when it applies. Errors are notices too.
+- **Coordinator's bridge.** Three tools in ask-user.js — `session_set_model
+  (convo_id, model?, agent?, reason?)`, `session_compact(convo_id, reason?)`,
+  `session_carry_on(convo_id, message, when?, reason?)` — POST to bridge
+  routes that refuse a non-Coordinator caller (`session.coordinator`) with a
+  clear message before the journal does, send the op, return on the `sent`
+  ack ("sent to <box>; applies at the session's next idle point"), and
+  publish the `result` frame into the Coordinator's chat as a notice when
+  it lands (as spawn outcomes do).
+
+### §4 Automatic carry-on and bad-model recovery (decision D)
+
+Bridge-only, no Coordinator involved, on every Claude session:
+
+1. **Usage limit.** When a stall (§3) has `resets_at`, the bridge arms
+   `session._autoResume = {at, kind:'usage_limit'}` (persisted). A one-minute
+   sweep over live and persisted sessions fires due entries: resume the
+   session if needed (`journalResumeConvo`), queue `/compact` first when the
+   last gauge was ≥ 80 % of the window, then send
+   `[auto-continue after usage limit reset] The usage limit that stopped you has reset. Carry on with what you were doing.`
+   (or the Coordinator's `carry_on … after_limit_reset` message). The
+   journal's stall wake sweep brings a sleeping box back for this.
+2. **Unknown / unavailable model.** Claude Code answers with an
+   `isApiErrorMessage` record, `error: 'model_not_found'` / HTTP 404, text
+   `The model <m> is not available on your <deployment> deployment. Try /model … to switch to <l>, or ask your admin to enable this model.`
+   or `There's an issue with the selected model (<m>). It may not exist or you may not have access to it.`
+   (verified in the Claude Code 2.1.280 bundle). The detector reports it as
+   `stall.kind = 'bad_model'`; the bridge then runs `applyModelSwitch(…,
+   'default', {explicit:false})`, posts a notice, and sends the carry-on
+   above with a "switched to the default model" preface. At most one
+   automatic recovery per stall: if the default model is refused too, the
+   session stays flagged and the notice says so, for the Coordinator or Dan.
+3. A real answer (non-zero usage) clears the stall and disarms the
+   auto-resume, as §3 already does.
