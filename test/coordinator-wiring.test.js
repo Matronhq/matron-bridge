@@ -200,7 +200,7 @@ describe('spawn mission join (source inspection)', () => {
 describe('pending Coordinator model (final review #1/#2)', () => {
   it('recreateSession prefers the pending Coordinator model over the observed live model, and overrides still win', () => {
     const fn = body('function recreateSession(', '\nfunction ');
-    const modelAt = fn.indexOf('model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),');
+    const modelAt = fn.indexOf('model: recreateSpawnModel({ agent: existing.agent, currentModel: existing._modelAlias || existing.currentModel, pendingModel: existing._coordinatorModel }),');
     expect(modelAt).toBeGreaterThan(-1);
     expect(fn.indexOf('...overrides,', modelAt)).toBeGreaterThan(modelAt);
     expect(fn).not.toContain('? existing.currentModel');
