@@ -103,6 +103,16 @@ describe('missions wiring', () => {
     expect(codexMd).toMatch(/"attach":false/);
   });
 
+  it('mission_close takes an optional mission number for the Coordinator, and the Coordinator prompt teaches it', () => {
+    const tool = askUser.slice(askUser.indexOf("'mission_close',"), askUser.indexOf("'item_move',"));
+    expect(tool).toContain("mission: z.number().int().min(1).optional()");
+    expect(tool).toMatch(/Coordinator/);
+    const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    expect(coord).toMatch(/^## Close finished missions/m);
+    expect(coord).toContain('`mission_close` with `mission: N`');
+    expect(coord).toContain('Never call `mission_close` without `mission`');
+  });
+
   it('mission_status carries the spec description verbatim and its schema; mission_list takes only state', () => {
     const tool = askUser.slice(askUser.indexOf("'mission_status',"), askUser.indexOf("'mission_list',"));
     expect(tool).toContain(JSON.stringify(MISSION_STATUS_DESCRIPTION));
