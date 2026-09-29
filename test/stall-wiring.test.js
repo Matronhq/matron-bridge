@@ -22,8 +22,11 @@ describe('usage-limit stall wiring (source inspection)', () => {
   it('the assistant case sets or clears session._stall from every parent assistant record and publishes a stall at once', () => {
     const c = body("    case 'assistant': {", "    case 'result': {");
     expect(c).toContain('const stall = stallFromAssistantEvent(event);');
-    expect(c).toContain('session._stall = stall ? { ...stall, since: Date.now(), resets_at: stallResetsAt(usageLimitsCache.lines) } : null;');
-    expect(c).toContain('if (stall) journalStatus(session);');
+    expect(c).toContain('model: stall.model || session.currentModel || undefined,');
+    expect(c).toContain('since: session._stall?.since ?? Date.now(),');
+    expect(c).toContain('resets_at: stallResetsAt(usageLimitsCache.lines),');
+    expect(c).toContain('const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);');
+    expect(c).toContain('session._stall = null;');
   });
   it('journalStatus publishes the stall and applyModelSwitch clears it', () => {
     const js = body('function journalStatus(session) {', '\nfunction ');
@@ -31,7 +34,14 @@ describe('usage-limit stall wiring (source inspection)', () => {
     const ams = body('function applyModelSwitch(', '\nfunction ');
     expect(ams.indexOf('session._stall = null;')).toBeLessThan(ams.indexOf('if (session.agent === AGENT_CODEX) {'));
   });
-  it('every session literal starts unstalled', () => {
-    expect(index.match(/^ {4}_stall: null,$/gm)).toHaveLength(3);
+  it('Claude sessions restore a persisted stall on resume; Codex starts unstalled; persistSession carries it', () => {
+    const cs = body('function createSession(roomId, workdir, resumeSessionId, options = {}) {', '\nfunction createCodexSessionForRoom(');
+    expect(cs).toContain('_stall: resumeSessionId ? (persistedMode?._stall || null) : null,');
+    const codex = body('function createCodexSessionForRoom(', '\nfunction ');
+    expect(codex).toContain('_stall: null,');
+    const iv = body('function createInteractiveSessionForRoom(', '\nfunction ');
+    expect(iv).toContain('_stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,');
+    const ps = body('function persistSession(roomId, sessionId, workdir, originRoomId, extra) {', '\nfunction ');
+    expect(ps).toContain('if (live) derived._stall = live._stall || null;');
   });
 });

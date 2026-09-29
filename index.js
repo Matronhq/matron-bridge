@@ -886,6 +886,10 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (typeof live?.bypassMode === 'boolean') derived.bypassMode = live.bypassMode;
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
+  // A usage-limit stall must survive a restart (a fleet deploy lands exactly
+  // when a stalled session is idle): carried here, restored on resume, and
+  // cleared by the next real assistant record.
+  if (live) derived._stall = live._stall || null;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
   const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
   const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
@@ -2100,7 +2104,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Captured from system init event
     initData: null,
     currentModel: printModel || null,
-    _stall: null,
+    _stall: resumeSessionId ? (persistedMode?._stall || null) : null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -2936,7 +2940,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
-    _stall: null,
+    _stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -4162,8 +4166,30 @@ function handleClaudeEvent(session, event) {
       // filled); published at once so the roster shows the stall without
       // waiting for a turn end that may not come.
       const stall = stallFromAssistantEvent(event);
-      session._stall = stall ? { ...stall, since: Date.now(), resets_at: stallResetsAt(usageLimitsCache.lines) } : null;
-      if (stall) journalStatus(session);
+      if (stall) {
+        // The error record's own model is a placeholder; the session's
+        // current model is the one that hit the limit. `since` is the first
+        // stall, not the latest retry while still limited.
+        session._stall = {
+          ...stall,
+          model: stall.model || session.currentModel || undefined,
+          since: session._stall?.since ?? Date.now(),
+          resets_at: stallResetsAt(usageLimitsCache.lines),
+        };
+        journalStatus(session);
+        // The cached meters may predate the stall (5-minute cache) — refresh
+        // them and republish once the reset time is known.
+        const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
+        if (refresh) {
+          refresh.then((updated) => {
+            if (!updated || !session.alive || !session._stall) return;
+            session._stall.resets_at = stallResetsAt(usageLimitsCache.lines);
+            journalStatus(session);
+          });
+        }
+      } else {
+        session._stall = null;
+      }
       const assistantCtxTokens = contextTokensFromAssistantEvent(event);
       if (assistantCtxTokens) {
         session._lastContextTokens = assistantCtxTokens;

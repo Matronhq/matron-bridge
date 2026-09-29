@@ -109,8 +109,11 @@ CREATE TABLE conversation_status (
 ```
 
 written from the same `status` handler (`ws.js` ~1803) with the same
-ownership check, latest-wins, throttled to one write per conversation per
-~5 s (the bridge already repaints at that rate mid-turn). `GET /roster`
+ownership check, latest-wins, one write per accepted frame (no journal-side
+throttle: the bridge's own 5 s mid-turn repaint throttle bounds the rate,
+and the write is one SQLite upsert). Implemented as a JSON-per-row table
+(`convo_id, user_id, reported_at, status`) like `device_status`, not the
+column layout sketched above. `GET /roster`
 conversations gain `status: {model, context:{tokens,window,pct}, stall?,
 limits?, reported_at}` (omitted until first report); `mission_get`'s
 conversation rows (`src/missions.js` SELECT) gain the same block. Both are
