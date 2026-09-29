@@ -151,6 +151,7 @@ import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfter
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
+import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -1638,6 +1639,7 @@ function journalStatus(session) {
     // Codex supplies its real window; an unknown window must not use Claude's fallback.
     contextWindow: isCodex ? session._codexContextWindow || null : undefined,
     limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || []),
+    stall: session._stall || undefined,
     modelOptions: isCodex ? codexOptions.modelOptions : modelOptions(),
     effortLevels: isCodex ? codexOptions.effortLevels : effortOptions(),
     effort: isCodex ? codexOptions.effort : trackedEffort(session),
@@ -2098,6 +2100,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Captured from system init event
     initData: null,
     currentModel: printModel || null,
+    _stall: null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -2403,6 +2406,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
+    _stall: null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -2932,6 +2936,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
+    _stall: null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -4149,6 +4154,16 @@ function handleClaudeEvent(session, event) {
       // own usage is deliberately NOT used: it's cumulative across all the
       // turn's API calls (see lib/session-status.js), which is how the gauge
       // once read 2m/1m.
+      // Usage-limit stall (spec 2026-09-29 coordinator session control §3):
+      // the record Claude writes when the account meter is exhausted ends
+      // the turn with nothing else, so every parent assistant record either
+      // sets or clears the flag. The reset time is read from the shared
+      // limits cache at the moment of the stall (the meter that just
+      // filled); published at once so the roster shows the stall without
+      // waiting for a turn end that may not come.
+      const stall = stallFromAssistantEvent(event);
+      session._stall = stall ? { ...stall, since: Date.now(), resets_at: stallResetsAt(usageLimitsCache.lines) } : null;
+      if (stall) journalStatus(session);
       const assistantCtxTokens = contextTokensFromAssistantEvent(event);
       if (assistantCtxTokens) {
         session._lastContextTokens = assistantCtxTokens;
@@ -11584,6 +11599,9 @@ function switchEffortAndTrack(session, arg, send) {
 // §2e): same path, but persisted as modelExplicit:false so a later
 // assignment may change it again.
 function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true }) {
+  // A switch away from the exhausted model lifts a usage-limit stall; if the
+  // new model is out of allowance too, its next record re-flags it.
+  session._stall = null;
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');

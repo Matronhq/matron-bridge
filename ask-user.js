@@ -12,6 +12,7 @@ import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetai
 import { missionIdemKey } from './lib/missions-idem.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
+import { rosterLine } from './lib/roster-format.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -265,7 +266,7 @@ const messageLine = (m) => `${senderLabel(m.sender)}: ${m.body}${m.caption ? ` �
 
 server.tool(
   'agent_roster',
-  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start. Excludes yourself.",
+  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start, plus each session's model, context gauge (tokens used of its window, e.g. `870k/1m 87%`) and any usage-limit stall (`stalled: usage limit, resets HH:MM UTC`), as last reported by its bridge — so you can also see which sessions are near full or out of allowance. Excludes yourself.",
   {},
   async () => {
     try {
@@ -285,16 +286,10 @@ server.tool(
         .slice()
         .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0))
         .slice(0, 30)
-        .map((c) => {
-          // Rows owned by this bridge are valid targets too (same-bridge
-          // rooms): the invite is delivered locally instead of via the
-          // journal. Only the caller's OWN conversation is refused.
-          const agent = c.agent_device_id == null ? ' (no agent)'
-            : (mine != null && c.agent_device_id === mine) ? ' (this bridge)'
-              : ` (agent ${c.agent_device_id})`;
-          const summary = c.summary ? `: ${String(c.summary).slice(0, 200)}` : '';
-          return `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${agent}${summary}`;
-        });
+        // Rows owned by this bridge are valid targets too (same-bridge
+        // rooms): the invite is delivered locally instead of via the
+        // journal. Only the caller's OWN conversation is refused.
+        .map((c) => rosterLine(c, mine));
       // `connected`/`wakeable` are journal-composed. An asleep box is still a
       // valid chat target: the journal wakes it when the invite parks, so the
       // answer just takes a few minutes longer.

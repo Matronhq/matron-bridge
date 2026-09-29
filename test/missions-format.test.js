@@ -32,8 +32,11 @@ describe('missions-format', () => {
       mission,
       milestones: [{ num: 63, kind: 'progress', title: 'Landed', created_at: 1700000000000, convo_id: 'c1' }],
       items: [{ num: 64, title: 'Q?', awaiting: 'user' }, { num: 65, title: 'T', awaiting: 'agent' }],
-      conversations: [{ id: 'c1', title: 'Session', box: 'dev-2', state: 'running' }],
-    });
+      conversations: [
+        { id: 'c1', title: 'Session', box: 'dev-2', state: 'running' },
+        { id: 'c2', title: 'Full', box: 'ang', state: 'waiting', status: { model: 'claude-opus-5-5', context: { tokens: 870000, window: 1000000, pct: 87 }, reported_at: 1700000000000 } },
+      ],
+    }, { now: 1700000120000 });
     expect(out.split('\n')).toEqual([
       '#61 Missions — open, 2 open items (1 need you), 3 conversations, 5 milestones (id ms_1)',
       'Ship it', '',
@@ -44,6 +47,7 @@ describe('missions-format', () => {
       '- #65 T — awaiting agent',
       'Conversations:',
       '- c1 Session (dev-2, running)',
+      '- c2 Full (ang, waiting · opus-5-5 · 870k/1m 87% · reported 2 min ago)',
     ]);
   });
   it('blocked renders every 409 reason as an instruction', () => {
