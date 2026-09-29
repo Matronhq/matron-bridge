@@ -35,9 +35,13 @@ describe('consent wiring (source inspection)', () => {
     const fn = body('function journalHandleConsentFrame(frame) {', '\n}');
     expect(fn).toContain("if (!frame || frame.event !== 'pending') return;");
     expect(fn).toContain('formatConsentNudge(frame)');
-    expect(fn).toContain('s.coordinator === true && s.alive');
-    expect(fn).toContain('coordinatorLookup.snapshot()');
-    expect(fn).toContain('journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE)');
+    // The journal's current role holder, never a session's spawn-time flag
+    // (Bugbot: a session that just gained the role is still flagged false,
+    // one that just lost it still true).
+    expect(fn).toContain('const { convoId } = coordinatorLookup.snapshot();');
+    expect(fn).toContain('let session = findSessionByClaudeSessionId(convoId);');
+    expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);');
+    expect(fn).not.toMatch(/s\.coordinator === true/);
     expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text)');
     expect(fn).toContain('deliverCoordinatorTurn(session, text)');
   });

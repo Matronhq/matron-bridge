@@ -10933,23 +10933,27 @@ const consentHandlers = createConsentHandlers({
 // session as a turn — resumed from its persisted record when it was
 // idle-reaped, the same wake a user's message gives it, so a parked ask is
 // decided promptly rather than at the next sweep — and leave the same text
-// as a notice in its chat so the user sees what it was told. The frame is
-// dropped when this box has no Coordinator (a stale route: the journal
-// re-reads the role on every ask) or its session cannot be brought back.
+// as a notice in its chat so the user sees what it was told. The
+// Coordinator is the journal's CURRENT role holder (coordinatorLookup, kept
+// fresh by every `coordinator` event), never a session's spawn-time flag: a
+// session that just gained the role carries `coordinator: false` until it
+// respawns, and one that just lost it still carries true (Bugbot). The
+// frame is dropped when this box has no Coordinator (a stale route: the
+// journal re-reads the role on every ask) or its session cannot be brought
+// back.
 function journalHandleConsentFrame(frame) {
   if (!frame || frame.event !== 'pending') return;
   const text = formatConsentNudge(frame);
   if (!text) return;
-  let session = null;
-  for (const s of sessions.values()) {
-    if (s.coordinator === true && s.alive) { session = s; break; }
+  const { convoId } = coordinatorLookup.snapshot();
+  if (!convoId) {
+    console.warn('[consent] a consent nudge arrived but the journal lists no Coordinator on this box');
+    return;
   }
+  let session = findSessionByClaudeSessionId(convoId);
+  if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);
   if (!session) {
-    const { convoId } = coordinatorLookup.snapshot();
-    if (convoId) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);
-  }
-  if (!session) {
-    console.warn('[consent] a consent nudge arrived but this box has no Coordinator session to give it to');
+    console.warn(`[consent] a consent nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
     return;
   }
   journalPublishNotice(journalConvoIdFor(session), text);
