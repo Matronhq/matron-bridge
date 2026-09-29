@@ -328,4 +328,113 @@ describe('missions handlers', () => {
     const noConvo = fixture({ create: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
     expect((await noConvo.h.create({ roomId: '!r:s', title: 'X' })).body.error).toMatch(/did not accept this conversation/);
   });
+
+  it('status: own mission — trims, carries convo_id, PATCHes the cached mission', async () => {
+    const { h, client, session } = fixture();
+    session.missionId = 'ms_1';
+    const r = await h.status({ roomId: '!r:s', status: '  PR #12 open, waiting on review.  ' });
+    expect(r.status).toBe(200);
+    expect(client.update.mock.calls[0]).toEqual(['ms_1', { status: 'PR #12 open, waiting on review.', convo_id: 'c1' }]);
+  });
+
+  it('status: cold resolve finds the conversation mission, PATCHes it and caches it', async () => {
+    const { h, client, session, mission } = fixture({ list: vi.fn(async () => ({ status: 200, data: { missions: [mission] } })) });
+    const r = await h.status({ roomId: '!r:s', status: 'Diagnosed; fixing next.' });
+    expect(r.status).toBe(200);
+    expect(client.list.mock.calls[0]).toEqual([]);
+    expect(client.update.mock.calls[0]).toEqual(['ms_1', { status: 'Diagnosed; fixing next.', convo_id: 'c1' }]);
+    expect(session.missionId).toBe('ms_1');
+  });
+
+  it('status: explicit mission goes by number, never resolves or touches the cache, still carries convo_id', async () => {
+    const { h, client, session } = fixture();
+    session.missionId = 'ms_1';
+    const r = await h.status({ roomId: '!r:s', status: 'Blocked on #64', mission: 7 });
+    expect(r.status).toBe(200);
+    expect(client.list).not.toHaveBeenCalled();
+    expect(client.update.mock.calls[0]).toEqual([7, { status: 'Blocked on #64', convo_id: 'c1' }]);
+    expect(session.missionId).toBe('ms_1');
+  });
+
+  it("status: explicit mission 404 passes through and leaves this conversation's cache alone", async () => {
+    const { h, session } = fixture({ update: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+    session.missionId = 'ms_1';
+    const r = await h.status({ roomId: '!r:s', status: 'x', mission: 99 });
+    expect(r.status).toBe(404);
+    expect(r.body).toEqual({ error: 'not_found' });
+    expect(session.missionId).toBe('ms_1');
+  });
+
+  it('status: no mission and no mission argument → 404 naming mission_start AND the mission argument', async () => {
+    const { h, client } = fixture();
+    const r = await h.status({ roomId: '!r:s', status: 'x' });
+    expect(r.status).toBe(404);
+    expect(r.body.error).toBe("this conversation has no mission yet — call mission_start(title, body) first, or pass mission: N to set another mission's status");
+    expect(client.update).not.toHaveBeenCalled();
+  });
+
+  it('status: validates status (non-empty after trim, ≤600 UTF-16 units, as the journal counts) and mission', async () => {
+    const { h, client, session } = fixture();
+    session.missionId = 'ms_1';
+    for (const bad of [undefined, '', '   \n ', 42, 'x'.repeat(601)]) {
+      const r = await h.status({ roomId: '!r:s', status: bad });
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe('status must be a non-empty string of at most 600 characters');
+    }
+    // 600 after trimming passes even with surrounding whitespace.
+    expect((await h.status({ roomId: '!r:s', status: ` ${'x'.repeat(600)} ` })).status).toBe(200);
+    // Each emoji is 2 UTF-16 units: 300 = 600 passes, 301 = 602 is refused.
+    expect((await h.status({ roomId: '!r:s', status: '😀'.repeat(300) })).status).toBe(200);
+    expect((await h.status({ roomId: '!r:s', status: '😀'.repeat(301) })).status).toBe(400);
+    for (const m of [0, -1, 1.5, '7', null]) {
+      const r = await h.status({ roomId: '!r:s', status: 'ok', mission: m });
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe('mission must be a positive integer');
+    }
+    expect(client.update).toHaveBeenCalledTimes(2);
+  });
+
+  it('status: folds CRLF to LF before counting and trimming, and sends the folded text', async () => {
+    const { h, client, session } = fixture();
+    session.missionId = 'ms_1';
+    // 50 "x\r\n" pairs (150 raw chars) plus 499 "y"s: 649 raw chars — over
+    // 600 unfolded, and would be refused if CRLF counted as two chars each.
+    // Folded to "x\n" pairs it is 599 chars, under the limit — the journal
+    // folds CRLF the same way before it counts, so this must be accepted.
+    const raw = 'x\r\n'.repeat(50) + 'y'.repeat(499);
+    const folded = 'x\n'.repeat(50) + 'y'.repeat(499);
+    expect(folded.length).toBe(599);
+    const r = await h.status({ roomId: '!r:s', status: raw });
+    expect(r.status).toBe(200);
+    expect(client.update.mock.calls[0]).toEqual(['ms_1', { status: folded, convo_id: 'c1' }]);
+  });
+
+  it('status: 409 closed passes through with blocked_by; unreachable → 502; session guards apply', async () => {
+    const closed = fixture({ update: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'closed' } })) });
+    closed.session.missionId = 'ms_1';
+    const r = await closed.h.status({ roomId: '!r:s', status: 'x' });
+    expect(r.status).toBe(409);
+    expect(r.body.blocked_by).toBe('closed');
+    expect(closed.session.missionId).toBe('ms_1');
+    const down = fixture({ update: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
+    expect((await down.h.status({ roomId: '!r:s', status: 'x', mission: 3 })).status).toBe(502);
+    expect((await down.h.status({ status: 'x' })).status).toBe(400);
+    expect((await down.h.status({ roomId: '!other:s', status: 'x' })).status).toBe(404);
+  });
+
+  it('list: open by default, closed on request, bad state 400, a 404 is the missing-routes sentence', async () => {
+    const { h, client } = fixture();
+    expect((await h.list({ roomId: '!r:s' })).status).toBe(200);
+    expect(client.list.mock.calls[0]).toEqual([{ state: 'open' }]);
+    expect((await h.list({ roomId: '!r:s', state: 'closed' })).status).toBe(200);
+    expect(client.list.mock.calls[1]).toEqual([{ state: 'closed' }]);
+    const bad = await h.list({ roomId: '!r:s', state: 'all' });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toBe("state must be 'open' or 'closed'");
+    expect((await h.list({})).status).toBe(400);
+    const old = fixture({ list: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+    expect((await old.h.list({ roomId: '!r:s' })).body.error).toMatch(/does not have the \/missions routes/);
+    const down = fixture({ list: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
+    expect((await down.h.list({ roomId: '!r:s' })).status).toBe(502);
+  });
 });

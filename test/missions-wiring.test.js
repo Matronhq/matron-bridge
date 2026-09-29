@@ -1,17 +1,21 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-const OPS = ['start', 'create', 'post', 'update', 'join', 'get', 'close'];
+const OPS = ['start', 'create', 'post', 'update', 'status', 'join', 'get', 'list', 'close'];
 const TOOL_CALLS = {
   mission_start: "callMissions('start', args, formatStartAck)",
   mission_create: "callMissions('create', args, formatCreateAck)",
   milestone_post: "callMissions('post', args, formatMilestoneAck)",
   mission_update: "callMissions('update', args, (d) => missionLine(d.mission))",
+  mission_status: "callMissions('status', args, formatStatusAck)",
   mission_join: "callMissions('join', args, (d) => missionLine(d.mission))",
   mission_get: "callMissions('get', args, formatMissionDetail)",
+  mission_list: "callMissions('list', args, formatMissionList)",
   mission_close: "callMissions('close', args, (d) => missionLine(d.mission))",
   item_move: "callItems('move', args, (d) => itemLine(d.item))",
 };
+// Spec 2026-09-28 missions dashboard §2 — the agent reads exactly this.
+const MISSION_STATUS_DESCRIPTION = "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).";
 
 describe('missions wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
@@ -19,7 +23,7 @@ describe('missions wiring', () => {
   const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
   const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
 
-  it('mounts all seven /missions routes through the shared handler map', () => {
+  it('mounts all nine /missions routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/missions\\\/\(([a-z|]+)\)\$\/\)/);
     expect(m, 'the /missions route matcher is missing from index.js').toBeTruthy();
     expect(m[1].split('|').sort()).toEqual([...OPS].sort());
@@ -27,7 +31,7 @@ describe('missions wiring', () => {
     expect(index).toMatch(/createMissionsHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: missionsClient,?\s*\}\)/);
   });
 
-  it('registers the seven mission tools and item_move, each pinned to its exact renderer', () => {
+  it('registers the nine mission tools and item_move, each pinned to its exact renderer', () => {
     for (const [tool, call] of Object.entries(TOOL_CALLS)) {
       expect(askUser, `${tool} is not registered`).toContain(`'${tool}',`);
       expect(askUser, `${tool} does not go through ${call}`).toContain(call);
@@ -97,5 +101,56 @@ describe('missions wiring', () => {
     expect(codexMd).toMatch(/`mission_create`/);
     expect(codexMd).toMatch(/`mission: N`/);
     expect(codexMd).toMatch(/"attach":false/);
+  });
+
+  it('mission_status carries the spec description verbatim and its schema; mission_list takes only state', () => {
+    const tool = askUser.slice(askUser.indexOf("'mission_status',"), askUser.indexOf("'mission_list',"));
+    expect(tool).toContain(JSON.stringify(MISSION_STATUS_DESCRIPTION));
+    expect(tool).toMatch(/status: z\.string\(\)/);
+    expect(tool).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    const listStart = askUser.indexOf("'mission_list',");
+    const list = askUser.slice(listStart, askUser.indexOf("'mission_join',", listStart));
+    expect(list).toMatch(/state: z\.enum\(\['open', 'closed'\]\)\.optional\(\)/);
+    expect(askUser).toMatch(/import \{[^}]*\bformatStatusAck\b[^}]*\bformatMissionList\b[^}]*\} from '\.\/lib\/missions-format\.js'/);
+  });
+
+  it('both prompt files teach mission_status: after a progress milestone that changes the card, blocked, handing off — one status, overwritten', () => {
+    for (const [name, md] of [['BRIDGE_CLAUDE.md', claudeMd], ['BRIDGE_CODEX.md', codexMd]]) {
+      const section = md.slice(md.indexOf('## Missions & milestones'));
+      expect(section, name).toMatch(/`mission_status`/);
+      expect(section, name).toMatch(/Set it when you become blocked or hand off, when the user redirects the work, and after a `progress` milestone that changes the picture on the card \(where it is, what's next, what's blocked\) — not after every checkpoint/);
+      expect(section, name).toMatch(/one status, overwritten, not a second milestone log/);
+    }
+    expect(codexMd).toMatch(/`mission_close`, `milestone_post`, `mission_status`, `mission_list`, `item_move`/);
+    expect(codexMd).toContain('`{"status":"...","convo_id":"<id>"}` sets the status');
+    expect(codexMd).toContain('`GET $BASE/missions?state=open`');
+    // Fix round 1 (#2): "Close it" read as closing the status, not the mission.
+    expect(codexMd).toContain('Close the mission when the work is done, not when the session ends.');
+  });
+
+  it('the Coordinator brief carries the refresh procedure and the exact app message', () => {
+    const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    expect(coord).toContain("## Keep every mission's status current");
+    expect(coord).toContain('"Refresh the status of every open mission from its latest milestones, sessions and open items."');
+    expect(coord).toMatch(/`mission_list` for the open missions, then for each one `mission_get N` and `mission_status` with `mission: N`/);
+    // Fix round 1 (#1): the journal has no idle state — skip only on running
+    // conversations, not a fictional "idle".
+    // Fix round 2: neither mission_get nor item_list prints an item
+    // timestamp, so "no open item newer than the status" isn't checkable —
+    // skip only when every listed open item is already reflected in it.
+    expect(coord).toMatch(/You may skip a mission whose status is newer than its last milestone, none of whose conversations is `running`, and where every open item `mission_get` lists is already reflected in the status/);
+    expect(coord).not.toMatch(/whose sessions are all idle/);
+    expect(coord).not.toMatch(/no open item newer than the status/);
+    // Fix round 3 (final review #4): an agent-written status on a mission
+    // with a running conversation must not be skipped by the FIRST rule
+    // (it requires no conversation running) — a second rule covers it, so
+    // the Coordinator does not overwrite a status the working agent just set.
+    expect(coord).toContain('Also skip a mission whose status `mission_list` marks ", by an agent" when that status is newer than its last milestone, even if a conversation is running: the working agent that wrote it is keeping it current.');
+    // Fix round 1 (#4): a status the user wrote themselves (", by the user")
+    // is left alone unless clearly stale, and a replacement is called out.
+    expect(coord).toContain('A status `mission_list` marks ", by the user" is one they wrote themselves: leave it unless it is clearly out of date against newer milestones or items, and if you do replace it, say so in that mission\'s reply line.');
+    expect(coord).toMatch(/one line per mission you changed/);
+    expect(coord).toContain('Never call `mission_status` without `mission`');
+    expect(coord).toMatch(/`mission_list` for every open mission/);
   });
 });
