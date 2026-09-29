@@ -581,7 +581,8 @@ const coordinatorLookup = createCoordinatorLookup({
 // The user's memories, cached for every session's spawn (spec 2026-09-27
 // memories, "The index at spawn"; every session, not only the Coordinator,
 // since 2026-09-29): lib/memory-lookup.js, refreshed on every hello_ok, on
-// every `coordinator` and `memory` event, and throttled behind every spawn.
+// every `memory` event, on every `coordinator` event with role `assigned`,
+// and throttled behind every spawn.
 // memoryBlockNow() renders whatever the cache holds for the three spawn
 // builders (a resume goes through the same builders) and the live
 // `assigned` turn. One user per bridge token, so this is the session
