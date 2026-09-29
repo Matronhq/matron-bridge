@@ -112,6 +112,7 @@ import { processShowFile } from './lib/show-file-handler.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createSelfRestartHandler } from './lib/self-restart.js';
@@ -1130,6 +1131,10 @@ const journalRpcHandler = createRpcRequestHandler({
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
   joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),
+  // Read-only `local_memories` / `local_memory_get`: this box's CLAUDE.md
+  // files and ~/.claude/projects/*/memory/ (lib/local-memories.js). The
+  // repo list is the picker's own folder history.
+  localMemories: createLocalMemories({ homeDir: os.homedir() }),
   serverLabel: SERVER_LABEL,
   log: console,
 });
