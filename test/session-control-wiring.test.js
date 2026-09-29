@@ -53,7 +53,10 @@ describe('session control wiring (source inspection)', () => {
     expect(fn).toContain('const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);');
     // A slot stays parked and persisted until it is settled (applied,
     // refused or scheduled); it is removed only if still the same object.
-    expect(fn).toContain('if (target._deferredControls && target._deferredControls[kind] === slots[kind]) {');
+    // Settled by id (a recreate rebuilds the slot object from persisted JSON).
+    expect(fn).toContain('if (held && (held === slots[kind] || (held.id && held.id === slots[kind].id))) {');
+    const jcs = body('async function journalControlSession(rawParams) {', '\nasync function applyControlSteps(');
+    expect(jcs).toContain('[plan.slot.kind]: { ...plan.slot, id: randomUUID() } };');
     expect(fn.indexOf('session._drainingControls = true;')).toBeLessThan(fn.indexOf('void (async () => {'));
     expect(fn.slice(0, fn.indexOf('void (async () => {'))).not.toContain('session._deferredControls = null;\n  session._drainingControls');
     // A slot that started a turn ends the drain; the rest wait for the next

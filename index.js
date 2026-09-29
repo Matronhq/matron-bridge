@@ -9621,7 +9621,10 @@ async function journalControlSession(rawParams) {
       postControlNotice(session, controlNotice(params, { error: plan.detail || plan.code, agent: session.agent }));
       return { ok: false, error: { code: plan.code, ...(plan.detail ? { detail: plan.detail } : {}) } };
     case 'park':
-      session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: plan.slot };
+      // The id is what the drain settles by: a print-mode recreate rebuilds
+      // the session (and its restored slots) from persisted JSON, so object
+      // identity cannot tell "the slot I applied" from "a newer one".
+      session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...plan.slot, id: randomUUID() } };
       persistControlState(session);
       postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }));
       return { ok: true, result: { applied: 'deferred', box } };
@@ -9706,7 +9709,8 @@ function drainDeferredControls(session) {
   // next seam (latest wins, never double-applied).
   session._drainingControls = true;
   const settle = (target, kind) => {
-    if (target._deferredControls && target._deferredControls[kind] === slots[kind]) {
+    const held = target._deferredControls && target._deferredControls[kind];
+    if (held && (held === slots[kind] || (held.id && held.id === slots[kind].id))) {
       const rest = { ...target._deferredControls };
       delete rest[kind];
       target._deferredControls = Object.keys(rest).length ? rest : null;
