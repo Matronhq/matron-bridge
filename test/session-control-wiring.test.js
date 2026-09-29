@@ -29,7 +29,7 @@ describe('session control wiring (source inspection)', () => {
     expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(params.convoId, JOURNAL_RESUME_NOTICE);');
     expect(fn).toContain("code: known ? 'gone' : 'not_found'");
     expect(fn).toContain('planSessionControl({ params, session, canSwitch: canSwitchAgent })');
-    expect(fn).toContain("session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: plan.slot };");
+    expect(fn).toContain("session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...plan.slot, id: randomUUID() } };");
     expect(fn).toContain("session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };");
   });
   it('applies steps through the existing switch, model, compact and turn paths', () => {
