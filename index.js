@@ -152,6 +152,7 @@ import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfter
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
+import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -886,6 +887,10 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (typeof live?.bypassMode === 'boolean') derived.bypassMode = live.bypassMode;
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
+  // A usage-limit stall must survive a restart (a fleet deploy lands exactly
+  // when a stalled session is idle): carried here, restored on resume, and
+  // cleared by the next real assistant record.
+  if (live) derived._stall = live._stall || null;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
   const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
   const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
@@ -1566,12 +1571,15 @@ async function refreshCodexTelemetry(session, { force = false } = {}) {
 // in-flight promise (resolving true when the cache gained fresh lines) when
 // a fetch is running, or null when the cache is still fresh — callers use
 // the promise to repaint the status frame once new numbers land.
-function refreshUsageLimits(cwd) {
+// `force` skips the freshness check (never the in-flight dedupe): a
+// usage-limit stall means the cached meters are wrong by definition, and
+// the reset time the roster shows must come from a fetch made after it.
+function refreshUsageLimits(cwd, { force = false } = {}) {
   // The cache exists solely to feed status frames — with the journal
   // disabled nothing consumes it, and each refresh boots a claude process.
   if (!JOURNAL_ENABLED) return null;
   if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
-  if (Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
+  if (!force && Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
   usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
     .then((raw) => {
       const parsed = parseUsageLimits(raw);
@@ -1639,6 +1647,7 @@ function journalStatus(session) {
     // Codex supplies its real window; an unknown window must not use Claude's fallback.
     contextWindow: isCodex ? session._codexContextWindow || null : undefined,
     limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || []),
+    stall: session._stall || undefined,
     modelOptions: isCodex ? codexOptions.modelOptions : modelOptions(),
     effortLevels: isCodex ? codexOptions.effortLevels : effortOptions(),
     effort: isCodex ? codexOptions.effort : trackedEffort(session),
@@ -2099,6 +2108,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Captured from system init event
     initData: null,
     currentModel: printModel || null,
+    _stall: resumeSessionId ? (persistedMode?._stall || null) : null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -2404,6 +2414,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
+    _stall: null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -2933,6 +2944,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
+    _stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -4150,7 +4162,45 @@ function handleClaudeEvent(session, event) {
       // own usage is deliberately NOT used: it's cumulative across all the
       // turn's API calls (see lib/session-status.js), which is how the gauge
       // once read 2m/1m.
+      // Usage-limit stall (spec 2026-09-29 coordinator session control §3):
+      // the record Claude writes when the account meter is exhausted ends
+      // the turn with nothing else, so every parent assistant record either
+      // sets or clears the flag. The reset time is read from the shared
+      // limits cache at the moment of the stall (the meter that just
+      // filled); published at once so the roster shows the stall without
+      // waiting for a turn end that may not come.
+      const stall = stallFromAssistantEvent(event);
       const assistantCtxTokens = contextTokensFromAssistantEvent(event);
+      if (stall) {
+        // The error record's own model is a placeholder; the session's
+        // current model is the one that hit the limit. `since` is the first
+        // stall, not the latest retry while still limited.
+        session._stall = {
+          ...stall,
+          model: stall.model || session.currentModel || undefined,
+          since: session._stall?.since ?? Date.now(),
+          resets_at: stallResetsAt(usageLimitsCache.lines),
+        };
+        journalStatus(session);
+        // The cached meters predate the stall by definition — fetch fresh
+        // ones past the cache TTL and republish once the reset time is known.
+        const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR, { force: true });
+        if (refresh) {
+          refresh.then((updated) => {
+            if (!updated || !session.alive || !session._stall) return;
+            session._stall.resets_at = stallResetsAt(usageLimitsCache.lines);
+            journalStatus(session);
+          });
+        }
+      } else if (assistantCtxTokens) {
+        // Only a record with real usage — an answer the API accepted, which
+        // proves the limit has lifted — clears a stall. A stall record has
+        // zero usage, and so does anything synthetic; a restored stall on a
+        // resumed session therefore survives until Claude really answers
+        // (a resume-time filler that reaches the API counts, because it
+        // could only have been served past the limit).
+        session._stall = null;
+      }
       if (assistantCtxTokens) {
         session._lastContextTokens = assistantCtxTokens;
         // Live header: repaint mid-turn so a long tool-heavy turn doesn't
@@ -11634,10 +11684,15 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
       // A person's pick replaces any Coordinator model still pending on the
       // session: a later restart must carry what they chose.
       if (explicit) session._coordinatorModel = null;
+      // An ACCEPTED switch away from the exhausted model lifts a usage-limit
+      // stall (a refused one must not); if the new model is out of allowance
+      // too, its next record re-flags it. Published so the roster clears.
+      session._stall = null;
       persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
         ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),
         ...(explicit ? {} : { model: normalizeModelArg(arg) }),
       });
+      journalStatus(session);
     }
     return;
   }
@@ -11671,6 +11726,10 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     return;
   }
   sendReply(decision.message);
+  // Accepted: the stall lifts with the model (see the interactive branch);
+  // persisted as null here so the recreated session resumes unstalled and
+  // its spawn frame clears the roster.
+  session._stall = null;
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
     { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
   const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });

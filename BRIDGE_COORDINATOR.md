@@ -42,6 +42,7 @@ This conversation is the user's Coordinator: the one place they come to say what
 
 - `mission_list` for every open mission with its status and last milestone; `mission_get N` for a mission's milestones, open items and conversations; `item_list` with `scope: "all"` for everything open across the user's sessions; journal search (see "Searching the journal") for what was said where.
 - Do not open repos or read code to find out how work is going. Ask the mission.
+- `agent_roster` and `mission_get` show each session's model and context gauge (`opus-5-5 · 870k/1m 87%`) and, when a session has run out of account allowance, `stalled: usage limit, resets HH:MM UTC`. A session above about 80% of its window is a candidate for compaction; a stalled one either waits for the reset or needs another model. Until the session-control tools land, tell the user rather than acting.
 - Report in a few lines: what is running where, what is waiting on the user, what finished — link each conversation you mention.
 
 ## Keep every mission's status current
