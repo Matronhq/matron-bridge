@@ -9489,14 +9489,16 @@ async function fireAutoResume(roomId, convoId, slot) {
   // A deferred model recovery is retried as a recovery, not as a turn on
   // the still-unavailable model.
   if (slot.kind === 'bad_model') { recoverBadModel(session); return; }
-  postControlNotice(session, slot.source === 'coordinator'
-    ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
-    : '🕒 The usage limit has reset — carrying on automatically.');
+  postControlNotice(session, slot.kind === 'model_recovery'
+    ? '🕒 Model switched — carrying on.'
+    : slot.source === 'coordinator'
+      ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
+      : '🕒 The usage limit has reset — carrying on automatically.');
   try {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
       await journalRouteTextToSession(session, '/compact');
     }
-    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'bad_model' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));
+    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
   }
@@ -9560,19 +9562,15 @@ function recoverBadModel(session) {
   // carry-on.
   const next = sessions.get(session.roomId) || session;
   next._badModelRecovered = true;
-  // This path sends the carry-on itself: a slot armed earlier must not
-  // send a second one.
-  next._autoResume = null;
+  // The carry-on (with a /compact first when the gauge is high) goes
+  // through the sweep, not now: an interactive switch has just typed
+  // /model into the PTY and a second line on its heels would land on top
+  // of it (Bugbot), and a print-mode switch has just recreated the
+  // process. The slot replaces any earlier one, so exactly one carry-on
+  // follows, once the session is settled and free.
+  next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: BAD_MODEL_RECOVERY_TEXT };
   persistControlState(next);
-  postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on.');
-  // Same delivery as the limit-reset path: a /compact first when the last
-  // gauge was high, then the carry-on (queued behind it).
-  void (async () => {
-    if (shouldCompactBefore(next._lastContextTokens, contextWindowForSession(next))) {
-      await journalRouteTextToSession(next, '/compact');
-    }
-    await journalRouteTextToSession(sessions.get(next.roomId) || next, BAD_MODEL_RECOVERY_TEXT);
-  })().catch((e) => console.warn(`[auto-resume] recovery carry-on failed: ${e.message}`));
+  postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on once the switch has settled.');
 }
 
 // --- Coordinator session control, target side (lib/session-control.js) ---

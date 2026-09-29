@@ -105,14 +105,16 @@ describe('automatic carry-on wiring (source inspection)', () => {
     expect(fire).toContain('session._autoResume = null;');
     expect(fire).toContain("if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {");
     expect(fire).toContain("await journalRouteTextToSession(session, '/compact');");
-    expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'bad_model' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));");
+    expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));");
+    expect(fire).toContain("slot.kind === 'model_recovery'");
   });
   it('recovers a bad model once with the default model, then carries on; a second failure is left for a person', () => {
     const fn = body('function recoverBadModel(session) {', '\n// --- Coordinator session control');
     expect(fn).toContain('if (session._badModelRecovered) {');
     expect(fn).toContain("&& applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });");
-    expect(fn).toContain("if (shouldCompactBefore(next._lastContextTokens, contextWindowForSession(next))) {");
-    expect(fn).toContain('await journalRouteTextToSession(sessions.get(next.roomId) || next, BAD_MODEL_RECOVERY_TEXT);');
+    // Delivery goes through the sweep: nothing is typed on the heels of /model.
+    expect(fn).toContain("next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: BAD_MODEL_RECOVERY_TEXT };");
+    expect(fn).not.toContain('journalRouteTextToSession(');
     // The one recovery is spent only by an ACCEPTED switch; a refusal retries.
     expect(fn.indexOf('next._badModelRecovered = true;')).toBeGreaterThan(fn.indexOf("applyModelSwitch("));
     expect(fn).toContain("kind: 'bad_model', text: BAD_MODEL_RECOVERY_TEXT };");
@@ -125,7 +127,7 @@ describe('automatic carry-on wiring (source inspection)', () => {
     const rec = body('function recoverBadModel(session) {', '\n// --- Coordinator session control');
     // State lands on the REPLACEMENT session after a print-mode recreate.
     expect(rec).toContain('const next = sessions.get(session.roomId) || session;\n  next._badModelRecovered = true;');
-    expect(rec.indexOf('next._autoResume = null;')).toBeGreaterThan(rec.indexOf('next._badModelRecovered = true;'));
+    expect(rec.indexOf("kind: 'model_recovery'")).toBeGreaterThan(rec.indexOf('next._badModelRecovered = true;'));
     const fire = body('async function fireAutoResume(roomId, convoId, slot) {', '\nfunction runAutoResumeSweep(');
     expect(fire).toContain("if (slot.kind === 'bad_model') { recoverBadModel(session); return; }");
     expect(index).toContain('if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;');
