@@ -51,6 +51,11 @@ describe('session control client', () => {
     const p3 = h.compact({ roomId: '!coord', target_convo_id: 'tgt' });
     expect((await p3).status).toBe(504);
     expect(h.onOpError({ code: 'x', ref: 'spawn_request' })).toBe(false);
+    // an older journal keys the error by ref alone
+    const p4 = h.compact({ roomId: '!coord', target_convo_id: 'tgt' });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.onOpError({ code: 'not_found', ref: sent[3].request_id })).toBe(true);
+    expect((await p4).status).toBe(404);
   });
   it('answers 502 when the journal socket is down', async () => {
     const { h } = fixture({ send: false });

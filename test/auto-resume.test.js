@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { armFromStall, autoResumeDue, shouldCompactBefore, dueResumes, AUTO_RESUME_TEXT, RESUME_GRACE_MS } from '../lib/auto-resume.js';
+import { armFromStall, autoResumeDue, shouldCompactBefore, dueResumes, AUTO_RESUME_TEXT, RESUME_GRACE_MS, RESUME_RETRY_MS, RESUME_MAX_RETRIES } from '../lib/auto-resume.js';
 import { stallFromAssistantEvent } from '../lib/stall-detector.js';
 
 const AT = '2026-09-29T15:00:00.000Z';
@@ -8,8 +8,14 @@ const T = Date.parse(AT);
 describe('armFromStall', () => {
   it('arms the default carry-on from a usage-limit stall with a reset time', () => {
     expect(armFromStall({ kind: 'usage_limit', resets_at: AT }, null, T - 1000)).toEqual({ at: AT, kind: 'usage_limit', text: AUTO_RESUME_TEXT });
-    expect(armFromStall({ kind: 'usage_limit', resets_at: AT }, null, T)).toBeNull();
-    expect(armFromStall({ kind: 'usage_limit', resets_at: AT }, null, T + 1)).toBeNull();
+    // A reset already past arms a bounded retry instead of firing at once.
+    const r1 = armFromStall({ kind: 'usage_limit', resets_at: AT }, null, T);
+    expect(r1).toEqual({ at: new Date(T + RESUME_RETRY_MS).toISOString(), kind: 'usage_limit', text: AUTO_RESUME_TEXT, retry: 1 });
+    const r2 = armFromStall({ kind: 'usage_limit', resets_at: AT }, r1, T + RESUME_RETRY_MS + 1);
+    expect(r2.retry).toBe(2);
+    let last = r2;
+    for (let i = 0; i < 5; i++) last = armFromStall({ kind: 'usage_limit', resets_at: AT }, last, T + 1e9);
+    expect(last.retry).toBe(RESUME_MAX_RETRIES);
     expect(armFromStall({ kind: 'usage_limit' })).toBeNull();
     expect(armFromStall({ kind: 'usage_limit', resets_at: 'soon' })).toBeNull();
     expect(armFromStall({ kind: 'bad_model', model: 'x' })).toBeNull();

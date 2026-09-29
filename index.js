@@ -153,9 +153,9 @@ import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, contextWindowFor, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
-import { planSessionControl, validateControlParams, controlNotice, CONTROL_KINDS } from './lib/session-control.js';
+import { planSessionControl, validateControlParams, controlNotice, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
-import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
+import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -904,6 +904,9 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live) derived._deferredControls = live._deferredControls || null;
   if (live) derived._autoResume = live._autoResume || null;
   if (live) derived._badModelRecovered = !!live._badModelRecovered;
+  // The last gauge, so a resumed session knows whether to compact before it
+  // carries on (lib/auto-resume.js shouldCompactBefore).
+  if (live && Number.isFinite(live._lastContextTokens)) derived._lastContextTokens = live._lastContextTokens;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
   const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
   const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
@@ -2126,9 +2129,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     initData: null,
     currentModel: printModel || null,
     _stall: resumeSessionId ? (persistedMode?._stall || null) : null,
-    _deferredControls: resumeSessionId ? (persistedMode?._deferredControls || null) : null,
-    _autoResume: resumeSessionId ? (persistedMode?._autoResume || null) : null,
-    _badModelRecovered: resumeSessionId ? !!persistedMode?._badModelRecovered : false,
+    // Parked controls, the armed carry-on and the recovery flag belong to
+    // the ROOM (conversation), not to one process: restored whether this is
+    // a resume or a fresh process for the same room (a recreate, a first
+    // spawn of a switched-to agent).
+    _deferredControls: persistedMode?._deferredControls || null,
+    _autoResume: persistedMode?._autoResume || null,
+    _badModelRecovered: !!persistedMode?._badModelRecovered,
+    _lastContextTokens: Number.isFinite(persistedMode?._lastContextTokens) ? persistedMode._lastContextTokens : undefined,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -2435,8 +2443,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     initData: null,
     currentModel: model || null,
     _stall: null,
-    _deferredControls: null,
-    _autoResume: null,
+    // A control parked on a Codex session survives a restart too (decision C).
+    _deferredControls: persisted?._deferredControls || null,
+    _autoResume: persisted?._autoResume || null,
+    _lastContextTokens: Number.isFinite(persisted?._lastContextTokens) ? persisted._lastContextTokens : undefined,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -2967,9 +2977,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     initData: null,
     currentModel: model || null,
     _stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,
-    _deferredControls: resumeSessionId ? (persistedForRoom?._deferredControls || null) : null,
-    _autoResume: resumeSessionId ? (persistedForRoom?._autoResume || null) : null,
-    _badModelRecovered: resumeSessionId ? !!persistedForRoom?._badModelRecovered : false,
+    _deferredControls: persistedForRoom?._deferredControls || null,
+    _autoResume: persistedForRoom?._autoResume || null,
+    _badModelRecovered: !!persistedForRoom?._badModelRecovered,
+    _lastContextTokens: Number.isFinite(persistedForRoom?._lastContextTokens) ? persistedForRoom._lastContextTokens : undefined,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -9463,6 +9474,10 @@ async function fireAutoResume(roomId, convoId, slot) {
     debug(`auto-resume: ${roomId} could not be resumed`);
     return;
   }
+  // A resume hold, a running turn or an open prompt: not now. The slot
+  // stays armed and the next sweep tries again — routing into a hold would
+  // merge the /compact and the carry-on into one typed line.
+  if (controlOccupied(session)) return;
   session._autoResume = null;
   persistControlState(session);
   postControlNotice(session, slot.source === 'coordinator'
@@ -9472,7 +9487,7 @@ async function fireAutoResume(roomId, convoId, slot) {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
       await journalRouteTextToSession(session, '/compact');
     }
-    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || BAD_MODEL_RECOVERY_TEXT);
+    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'bad_model' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
   }
@@ -9499,6 +9514,16 @@ function startAutoResumeSweep() {
   return timer;
 }
 
+// A session that was waiting for its limit to reset has just been moved to
+// another model: the reason to wait is gone, so the armed carry-on fires at
+// the next sweep instead of at the old reset time (Bugbot: it would
+// otherwise inject a turn hours later into a session that had moved on).
+function bringAutoResumeForward(session) {
+  if (!session?._autoResume) return;
+  session._autoResume = { ...session._autoResume, at: new Date().toISOString() };
+  persistControlState(session);
+}
+
 // §4: the model this session was on is unavailable here. Once per stall:
 // switch to the default model (explicit:false — a later assignment may
 // change it again) and carry on; a second failure is left for a human.
@@ -9508,11 +9533,24 @@ function recoverBadModel(session) {
     postControlNotice(session, '⚠️ The default model is not available either — this session needs a person (or the Coordinator) to pick a model with /model.');
     return;
   }
-  session._badModelRecovered = true;
-  persistControlState(session);
-  postControlNotice(session, '🛠 The model this session was on is no longer available — switching to the default model and carrying on.');
   const ctx = journalSessionCommandCtx(session);
-  applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+  const switched = !controlOccupied(session)
+    && applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+  if (!switched) {
+    // Refused (a resume hold, a busy turn, a TUI not ready): the one
+    // recovery is NOT spent. Retry through the sweep in a minute — the
+    // carry-on will hit the bad model again and land back here, free.
+    session._autoResume = { at: new Date(Date.now() + 60_000).toISOString(), kind: 'bad_model', text: BAD_MODEL_RECOVERY_TEXT };
+    persistControlState(session);
+    postControlNotice(session, '🛠 The model this session was on is no longer available — the switch to the default model will be retried in a minute.');
+    return;
+  }
+  session._badModelRecovered = true;
+  // This path sends the carry-on itself: a slot armed earlier must not
+  // send a second one.
+  session._autoResume = null;
+  persistControlState(session);
+  postControlNotice(session, '🛠 The model this session was on is no longer available — switched to the default model; carrying on.');
   const next = sessions.get(session.roomId) || session;
   void journalRouteTextToSession(next, BAD_MODEL_RECOVERY_TEXT).catch((e) => console.warn(`[auto-resume] recovery carry-on failed: ${e.message}`));
 }
@@ -9593,24 +9631,39 @@ async function journalControlSession(rawParams) {
 async function applyControlSteps(session, steps) {
   let current = session;
   const ctx = journalSessionCommandCtx(current);
+  let startedTurn = false;
   for (const step of steps) {
     if (!current || !current.alive) return { ok: false, error: { code: 'gone', detail: 'the session ended mid-action' } };
     if (step.op === 'switch_agent') {
+      // The model rides INTO the switch: switchAgentSession creates the new
+      // backend's session on agentSessions[target].model, so write it there
+      // first rather than typing /model into a session still starting up.
+      if (step.model) {
+        const persisted = getPersistedSession(current.roomId) || {};
+        const historyLength = Array.isArray(current.chatHistory) ? current.chatHistory.length : 0;
+        const targetState = { ...getPersistedAgentState(persisted, step.agent, historyLength), model: step.agent === AGENT_CLAUDE ? normalizeModelArg(step.model) : step.model };
+        persistSession(current.roomId, current.claudeSessionId, current.workdir, current.originRoomId,
+          { agentSessions: mergeAgentStates(persisted.agentSessions, { [step.agent]: targetState }) });
+      }
       const next = await switchAgentSession(current.roomId, step.agent, { sendReply: ctx.sendReply });
       if (!next) return { ok: false, error: { code: 'unsupported', detail: 'the agent switch was refused' } };
       current = next;
     } else if (step.op === 'set_model') {
-      applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true });
+      if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true })) {
+        return { ok: false, error: { code: 'unsupported', detail: 'the model switch was refused' } };
+      }
       current = sessions.get(current.roomId) || current;
     } else if (step.op === 'compact') {
       await journalRouteTextToSession(current, '/compact');
+      startedTurn = true;
     } else if (step.op === 'carry_on') {
       if (!sendTextToSession(current, step.text, { skipJournalMirror: true })) {
         return { ok: false, error: { code: 'gone', detail: 'the session would not take a turn' } };
       }
+      startedTurn = true;
     }
   }
-  return { ok: true };
+  return { ok: true, startedTurn };
 }
 
 // Parked slots, drained at the shared free gate (maybeFlushRoomDelivery) in
@@ -9620,34 +9673,51 @@ async function applyControlSteps(session, steps) {
 // next seam rather than injecting into a turn this drain just began.
 function drainDeferredControls(session) {
   const slots = session?._deferredControls;
-  if (!slots || typeof slots !== 'object') return false;
+  if (!slots || typeof slots !== 'object' || session._drainingControls) return false;
   const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);
   if (!kinds.length) { session._deferredControls = null; return false; }
   session._deferredControls = null;
+  session._drainingControls = true;
   persistControlState(session);
+  // Back into its slot for the next seam — a slot parked meanwhile by a
+  // newer request wins over the one being re-parked (latest wins).
+  const repark = (target, kind) => {
+    target._deferredControls = { [kind]: slots[kind], ...(target._deferredControls || {}) };
+  };
   void (async () => {
     let current = session;
-    for (const kind of kinds) {
-      const { params } = slots[kind];
-      current = sessions.get(current.roomId) || current;
-      const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
-      if (plan.kind === 'apply') {
-        postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }));
-        const r = await applyControlSteps(current, plan.steps);
+    let startedTurn = false;
+    try {
+      for (let i = 0; i < kinds.length; i++) {
+        const kind = kinds[i];
         current = sessions.get(current.roomId) || current;
-        if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }));
-      } else if (plan.kind === 'park') {
-        // Still not free for this one (an agent switch needs a fully idle
-        // session): back in its slot for the next seam.
-        current._deferredControls = { ...(current._deferredControls || {}), [kind]: slots[kind] };
-        persistControlState(current);
-      } else if (plan.kind === 'error') {
-        postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }));
-      } else if (plan.kind === 'schedule') {
-        current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
-        persistControlState(current);
-        postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }));
+        if (startedTurn) { repark(current, kind); continue; }
+        const { params } = slots[kind];
+        const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
+        if (plan.kind === 'apply') {
+          postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }));
+          const r = await applyControlSteps(current, plan.steps);
+          current = sessions.get(current.roomId) || current;
+          if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }));
+          else if (r.startedTurn || plan.steps.some((st) => TURN_STARTING_OPS.has(st.op))) startedTurn = true;
+        } else if (plan.kind === 'park') {
+          // Still not free for this one (an agent switch needs a fully idle
+          // session): back in its slot for the next seam.
+          repark(current, kind);
+        } else if (plan.kind === 'error') {
+          postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }));
+        } else if (plan.kind === 'schedule') {
+          current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+          postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }));
+        }
       }
+    } finally {
+      current._drainingControls = false;
+      session._drainingControls = false;
+      persistControlState(current);
+      // Nothing started a turn, so no seam follows: give room delivery the
+      // gate it was refused above (the re-parked slots are left alone here).
+      if (!startedTurn && !sessionOccupiedForRoomDelivery(current)) flushRoomInbox(current);
     }
   })().catch((e) => { try { console.warn(`[session-control] drain failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ } });
   return true;
@@ -9656,8 +9726,15 @@ function drainDeferredControls(session) {
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
   // A parked Coordinator control goes first; it may start a turn, in which
-  // case the room inbox waits for the next seam (see drainDeferredControls).
+  // case the room inbox waits for the next seam — and when it does not,
+  // drainDeferredControls calls flushRoomInbox itself once it is done.
   if (drainDeferredControls(session)) return;
+  flushRoomInbox(session);
+}
+
+// The room-delivery half of the free gate (lib/room-delivery.js flush +
+// the outcome notice), callable on its own by the control drain above.
+function flushRoomInbox(session) {
   // Counted BEFORE the flush, which clears the inbox either way — this is the
   // number the ⏳ line left outstanding, and the number Dan is owed an outcome
   // for. Zero means there was no queued batch, so there is nothing to close
@@ -11931,12 +12008,12 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
-      return;
+      return false;
     }
     const requested = String(arg || '').trim();
     if (!requested || /\s/.test(requested)) {
       sendReply('Usage: /model <model-id> (or /model default)');
-      return;
+      return false;
     }
     const model = requested.toLowerCase() === 'default' ? null : requested;
     session.currentModel = model;
@@ -11951,7 +12028,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     sendReply(model
       ? `Codex model set to ${model}; it will apply on the next turn.`
       : 'Codex model reset to the local config default; it will apply on the next turn.');
-    return;
+    return true;
   }
   if (session.iv) {
     // Interactive: type /model into the live TUI. The MODEL is not persisted
@@ -11969,13 +12046,14 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
       // stall (a refused one must not); if the new model is out of allowance
       // too, its next record re-flags it. Published so the roster clears.
       session._stall = null;
+      bringAutoResumeForward(session);
       persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
         ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),
         ...(explicit ? {} : { model: normalizeModelArg(arg) }),
       });
       journalStatus(session);
     }
-    return;
+    return switched;
   }
   const decision = planPrintModelSwitch(session, arg);
   if (decision.defer) {
@@ -12000,21 +12078,23 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     } else {
       sendReply(decision.message);
     }
-    return;
+    return true;
   }
   if (!decision.ok) {
     sendReply(decision.message);
-    return;
+    return false;
   }
   sendReply(decision.message);
   // Accepted: the stall lifts with the model (see the interactive branch);
   // persisted as null here so the recreated session resumes unstalled and
   // its spawn frame clears the roster.
   session._stall = null;
+  bringAutoResumeForward(session);
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
     { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
   const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
   if (next) next.currentModel = decision.normalized;
+  return true;
 }
 
 // Apply a /mode switch (interactive <-> print) for a room: gate via
@@ -12471,10 +12551,11 @@ async function main() {
   if (SESSION_IDLE_TIMEOUT_MS > 0) {
     console.log(`Session idle timeout: ${SESSION_IDLE_TIMEOUT_MS}ms (check every ${SESSION_IDLE_CHECK_MS}ms)`);
     startIdleReaper();
-startAutoResumeSweep();
   } else {
     console.log('Session idle timeout: disabled');
   }
+  // Independent of the idle reaper: armed carry-ons must fire either way.
+  startAutoResumeSweep();
   // Re-arm persisted /timer schedules (overdue ones fire after a short
   // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
   const rearmed = timerStore.init();

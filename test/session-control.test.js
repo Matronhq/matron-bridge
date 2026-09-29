@@ -11,6 +11,14 @@ describe('validateControlParams', () => {
     expect(validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go', when: 'after_limit_reset' }).params).toEqual({ convoId: 'c1', action: 'carry_on', message: 'go', when: 'after_limit_reset' });
     expect(validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go', when: 'whenever' }).params.when).toBe('now');
   });
+  it('flattens relayed strings that end up in bridge-signed lines', () => {
+    const v = validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go\nnow', reason: 'two\nlines\u0007', from_name: 'dan)] evil [(' });
+    expect(v.params.reason).toBe('two ⏎ lines');
+    expect(v.params.fromName).toBe('dan evil');
+    expect(v.params.message).toBe('go\nnow');
+    expect(controlNotice(v.params, { phase: 'now' })).toBe('🛠 Coordinator (dan evil): carry on: “go ⏎ now” — two ⏎ lines');
+    expect(coordinatorTurnText('go', v.params.fromName)).toBe('[from the Coordinator (dan evil)] go');
+  });
   it('refuses bad shapes with the wire codes', () => {
     expect(validateControlParams(null).code).toBe('bad_request');
     expect(validateControlParams({ convo_id: 'c1', action: 'reboot' }).code).toBe('bad_request');
@@ -54,10 +62,12 @@ describe('planSessionControl', () => {
     // different agent: switch first, then model (validated against the target backend)
     const canSwitch = (s, a) => ({ ok: !s.queuedMessages?.length, target: a });
     expect(planSessionControl({ params: P('set_model', { agent: 'codex', model: 'gpt-5-codex' }), session: idle(), canSwitch }))
-      .toEqual({ kind: 'apply', steps: [{ op: 'switch_agent', agent: 'codex' }, { op: 'set_model', model: 'gpt-5-codex' }] });
+      .toEqual({ kind: 'apply', steps: [{ op: 'switch_agent', agent: 'codex', model: 'gpt-5-codex' }] });
+    expect(planSessionControl({ params: P('set_model', { agent: 'codex' }), session: idle(), canSwitch }))
+      .toEqual({ kind: 'apply', steps: [{ op: 'switch_agent', agent: 'codex' }] });
     expect(planSessionControl({ params: P('set_model', { agent: 'codex' }), session: idle({ queuedMessages: ['q'] }), canSwitch })).toMatchObject({ kind: 'park' });
     expect(planSessionControl({ params: P('set_model', { agent: 'claude', model: 'sonnet' }), session: idle({ agent: 'codex' }), canSwitch }))
-      .toEqual({ kind: 'apply', steps: [{ op: 'switch_agent', agent: 'claude' }, { op: 'set_model', model: 'sonnet' }] });
+      .toEqual({ kind: 'apply', steps: [{ op: 'switch_agent', agent: 'claude', model: 'sonnet' }] });
     // a Codex session gets any one-token model id
     expect(planSessionControl({ params: P('set_model', { model: 'gpt-5-codex' }), session: idle({ agent: 'codex' }) })).toEqual({ kind: 'apply', steps: [{ op: 'set_model', model: 'gpt-5-codex' }] });
   });
@@ -65,8 +75,8 @@ describe('planSessionControl', () => {
     expect(planSessionControl({ params: P('compact'), session: null })).toMatchObject({ kind: 'error', code: 'not_found' });
     expect(planSessionControl({ params: P('compact'), session: { alive: false } })).toMatchObject({ kind: 'error', code: 'gone' });
   });
-  it('drains carry_on, then compact, then set_model', () => {
-    expect(CONTROL_KINDS).toEqual(['carry_on', 'compact', 'set_model']);
+  it('drains compact first (it must shrink the context before the next turn), then carry_on, then set_model', () => {
+    expect(CONTROL_KINDS).toEqual(['compact', 'carry_on', 'set_model']);
   });
 });
 
@@ -77,7 +87,7 @@ describe('notices', () => {
     expect(controlNotice(P('set_model', { agent: 'codex', model: 'gpt-5-codex' }), { phase: 'now', agent: 'claude' })).toBe('🛠 Coordinator (dan-mac): switching this session to Codex, then switching the model to gpt-5-codex');
     expect(controlNotice(P('carry_on', { message: 'x', when: 'after_limit_reset' }), { phase: 'scheduled', resetsAt: '2026-09-29T15:00:00Z' })).toBe('🛠 Coordinator (dan-mac): carry on once the usage limit resets at 15:00 UTC: “x”');
     expect(controlNotice(P('carry_on', { message: 'x', when: 'now' }), { phase: 'applied' })).toBe('🛠 Coordinator (dan-mac): carry on: “x” (now that the session is free)');
-    expect(controlNotice(P('carry_on', { message: 'y'.repeat(200), when: 'now' }), { phase: 'now' })).toBe(`🛠 Coordinator (dan-mac): carry on: “${'y'.repeat(157)}…”`);
+    expect(controlNotice(P('carry_on', { message: 'y'.repeat(200), when: 'now' }), { phase: 'now' })).toBe(`🛠 Coordinator (dan-mac): carry on: “${'y'.repeat(159)}…”`);
     expect(controlNotice({ convoId: 'c', action: 'compact' }, { error: 'the session has ended' })).toBe('⚠️ Coordinator: compacting this session — refused: the session has ended');
     expect(coordinatorTurnText('go', undefined)).toBe('[from the Coordinator] go');
   });

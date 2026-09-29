@@ -2120,7 +2120,9 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     });
 
     it('closes the ⏳ at the flush seam, counting BEFORE flush clears the inbox', () => {
-      const start = src.indexOf('function maybeFlushRoomDelivery(');
+      // The counting/flushing half lives in flushRoomInbox since the
+      // Coordinator control drain took the gate's first slot.
+      const start = src.indexOf('function flushRoomInbox(');
       const body = src.slice(start, src.indexOf('\n}', start));
       const count = body.indexOf('roomDelivery.pendingCount(');
       const flush = body.indexOf('roomDelivery.flush(');
