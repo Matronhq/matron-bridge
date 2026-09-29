@@ -16,6 +16,10 @@ describe('armFromStall', () => {
     let last = r2;
     for (let i = 0; i < 5; i++) last = armFromStall({ kind: 'usage_limit', resets_at: AT }, last, T + 1e9);
     expect(last.retry).toBe(RESUME_MAX_RETRIES);
+    // The bound holds across fire/stall cycles: a fired slot is gone, but the
+    // session's count carries into the next arm.
+    expect(armFromStall({ kind: 'usage_limit', resets_at: AT }, null, T, 2).retry).toBe(3);
+    expect(armFromStall({ kind: 'usage_limit', resets_at: AT }, null, T, RESUME_MAX_RETRIES)).toBeNull();
     expect(armFromStall({ kind: 'usage_limit' })).toBeNull();
     expect(armFromStall({ kind: 'usage_limit', resets_at: 'soon' })).toBeNull();
     expect(armFromStall({ kind: 'bad_model', model: 'x' })).toBeNull();

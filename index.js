@@ -904,6 +904,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live) derived._deferredControls = live._deferredControls || null;
   if (live) derived._autoResume = live._autoResume || null;
   if (live) derived._badModelRecovered = !!live._badModelRecovered;
+  if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;
   // The last gauge, so a resumed session knows whether to compact before it
   // carries on (lib/auto-resume.js shouldCompactBefore).
   if (live && Number.isFinite(live._lastContextTokens)) derived._lastContextTokens = live._lastContextTokens;
@@ -2136,6 +2137,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     _deferredControls: persistedMode?._deferredControls || null,
     _autoResume: persistedMode?._autoResume || null,
     _badModelRecovered: !!persistedMode?._badModelRecovered,
+    _autoResumeRetries: persistedMode?._autoResumeRetries || 0,
     _lastContextTokens: Number.isFinite(persistedMode?._lastContextTokens) ? persistedMode._lastContextTokens : undefined,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
@@ -2980,6 +2982,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     _deferredControls: persistedForRoom?._deferredControls || null,
     _autoResume: persistedForRoom?._autoResume || null,
     _badModelRecovered: !!persistedForRoom?._badModelRecovered,
+    _autoResumeRetries: persistedForRoom?._autoResumeRetries || 0,
     _lastContextTokens: Number.isFinite(persistedForRoom?._lastContextTokens) ? persistedForRoom._lastContextTokens : undefined,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -4226,7 +4229,8 @@ function handleClaudeEvent(session, event) {
           // resets (armFromStall keeps a Coordinator's message for the same
           // stall). Re-armed below when the forced refresh brings the real
           // reset time.
-          session._autoResume = armFromStall(session._stall, session._autoResume);
+          session._autoResume = armFromStall(session._stall, session._autoResume, Date.now(), session._autoResumeRetries || 0);
+          if (session._autoResume?.retry) session._autoResumeRetries = session._autoResume.retry;
           persistControlState(session);
         }
         // The cached meters predate the stall by definition — fetch fresh
@@ -4237,7 +4241,8 @@ function handleClaudeEvent(session, event) {
             if (!updated || !session.alive || !session._stall) return;
             session._stall.resets_at = stallResetsAt(usageLimitsCache.lines);
             if (session._stall.kind === 'usage_limit') {
-              session._autoResume = armFromStall(session._stall, session._autoResume);
+              session._autoResume = armFromStall(session._stall, session._autoResume, Date.now(), session._autoResumeRetries || 0);
+              if (session._autoResume?.retry) session._autoResumeRetries = session._autoResume.retry;
               persistControlState(session);
             }
             journalStatus(session);
@@ -4251,9 +4256,10 @@ function handleClaudeEvent(session, event) {
         // (a resume-time filler that reaches the API counts, because it
         // could only have been served past the limit).
         session._stall = null;
-        if (session._autoResume || session._badModelRecovered) {
+        if (session._autoResume || session._badModelRecovered || session._autoResumeRetries) {
           session._autoResume = null;
           session._badModelRecovered = false;
+          session._autoResumeRetries = 0;
           persistControlState(session);
         }
       }
@@ -9480,6 +9486,9 @@ async function fireAutoResume(roomId, convoId, slot) {
   if (controlOccupied(session)) return;
   session._autoResume = null;
   persistControlState(session);
+  // A deferred model recovery is retried as a recovery, not as a turn on
+  // the still-unavailable model.
+  if (slot.kind === 'bad_model') { recoverBadModel(session); return; }
   postControlNotice(session, slot.source === 'coordinator'
     ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
     : '🕒 The usage limit has reset — carrying on automatically.');
@@ -9545,13 +9554,17 @@ function recoverBadModel(session) {
     postControlNotice(session, '🛠 The model this session was on is no longer available — the switch to the default model will be retried in a minute.');
     return;
   }
-  session._badModelRecovered = true;
+  // A print-mode switch recreated the process: the state must land on the
+  // REPLACEMENT session (it restored the persisted slot and flag), not on
+  // the dead object, or the replacement recovers again and fires a second
+  // carry-on.
+  const next = sessions.get(session.roomId) || session;
+  next._badModelRecovered = true;
   // This path sends the carry-on itself: a slot armed earlier must not
   // send a second one.
-  session._autoResume = null;
-  persistControlState(session);
-  postControlNotice(session, '🛠 The model this session was on is no longer available — switched to the default model; carrying on.');
-  const next = sessions.get(session.roomId) || session;
+  next._autoResume = null;
+  persistControlState(next);
+  postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on.');
   void journalRouteTextToSession(next, BAD_MODEL_RECOVERY_TEXT).catch((e) => console.warn(`[auto-resume] recovery carry-on failed: ${e.message}`));
 }
 

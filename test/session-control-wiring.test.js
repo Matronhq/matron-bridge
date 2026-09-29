@@ -112,7 +112,7 @@ describe('automatic carry-on wiring (source inspection)', () => {
     expect(fn).toContain("&& applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });");
     expect(fn).toContain('void journalRouteTextToSession(next, BAD_MODEL_RECOVERY_TEXT)');
     // The one recovery is spent only by an ACCEPTED switch; a refusal retries.
-    expect(fn.indexOf('session._badModelRecovered = true;')).toBeGreaterThan(fn.indexOf("applyModelSwitch("));
+    expect(fn.indexOf('next._badModelRecovered = true;')).toBeGreaterThan(fn.indexOf("applyModelSwitch("));
     expect(fn).toContain("kind: 'bad_model', text: BAD_MODEL_RECOVERY_TEXT };");
   });
   it('an accepted model switch brings a pending automatic carry-on forward; a bad-model recovery replaces it', () => {
@@ -121,7 +121,12 @@ describe('automatic carry-on wiring (source inspection)', () => {
     const fn = body('function bringAutoResumeForward(session) {', '\n}');
     expect(fn).toContain('session._autoResume = { ...session._autoResume, at: new Date().toISOString() };');
     const rec = body('function recoverBadModel(session) {', '\n// --- Coordinator session control');
-    expect(rec.indexOf('session._autoResume = null;')).toBeGreaterThan(rec.indexOf('session._badModelRecovered = true;'));
+    // State lands on the REPLACEMENT session after a print-mode recreate.
+    expect(rec).toContain('const next = sessions.get(session.roomId) || session;\n  next._badModelRecovered = true;');
+    expect(rec.indexOf('next._autoResume = null;')).toBeGreaterThan(rec.indexOf('next._badModelRecovered = true;'));
+    const fire = body('async function fireAutoResume(roomId, convoId, slot) {', '\nfunction runAutoResumeSweep(');
+    expect(fire).toContain("if (slot.kind === 'bad_model') { recoverBadModel(session); return; }");
+    expect(index).toContain('if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;');
   });
   it('persists the recovery flag', () => {
     expect(index).toContain('if (live) derived._badModelRecovered = !!live._badModelRecovered;');

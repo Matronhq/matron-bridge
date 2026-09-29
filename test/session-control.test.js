@@ -57,8 +57,9 @@ describe('planSessionControl', () => {
     expect(planSessionControl({ params: P('set_model', { model: 'gpt-5' }), session: idle() })).toMatchObject({ kind: 'error', code: 'bad_model' });
     expect(planSessionControl({ params: P('set_model', { model: 'sonnet' }), session: idle() })).toEqual({ kind: 'apply', steps: [{ op: 'set_model', model: 'sonnet' }] });
     expect(planSessionControl({ params: P('set_model', { model: 'sonnet' }), session: idle({ busy: true }) }).kind).toBe('park');
-    // same agent as running: no switch step
+    // same agent as running: no switch step; and nothing to do without a model
     expect(planSessionControl({ params: P('set_model', { agent: 'claude', model: 'opus' }), session: idle() })).toEqual({ kind: 'apply', steps: [{ op: 'set_model', model: 'opus' }] });
+    expect(planSessionControl({ params: P('set_model', { agent: 'claude' }), session: idle() })).toMatchObject({ kind: 'error', code: 'bad_request' });
     // different agent: switch first, then model (validated against the target backend)
     const canSwitch = (s, a) => ({ ok: !s.queuedMessages?.length, target: a });
     expect(planSessionControl({ params: P('set_model', { agent: 'codex', model: 'gpt-5-codex' }), session: idle(), canSwitch }))
