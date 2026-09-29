@@ -9501,6 +9501,10 @@ async function fireAutoResume(roomId, convoId, slot) {
     await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
+    // A thrown delivery must not lose the carry-on: put the slot back for
+    // the next sweep unless something newer was armed meanwhile.
+    const live = sessions.get(roomId) || session;
+    if (!live._autoResume) { live._autoResume = slot; persistControlState(live); }
   }
 }
 
@@ -9694,13 +9698,20 @@ function drainDeferredControls(session) {
   if (!slots || typeof slots !== 'object' || session._drainingControls) return false;
   const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);
   if (!kinds.length) { session._deferredControls = null; return false; }
-  session._deferredControls = null;
+  // A slot stays parked (and persisted) until it has been applied, refused
+  // or scheduled — a bridge that stops mid-drain restores it and drains it
+  // again rather than losing it (CodeRabbit). The in-memory flag keeps the
+  // seams from starting a second drain meanwhile. A slot a newer request
+  // parks during the drain replaces the old object and is left for the
+  // next seam (latest wins, never double-applied).
   session._drainingControls = true;
-  persistControlState(session);
-  // Back into its slot for the next seam — a slot parked meanwhile by a
-  // newer request wins over the one being re-parked (latest wins).
-  const repark = (target, kind) => {
-    target._deferredControls = { [kind]: slots[kind], ...(target._deferredControls || {}) };
+  const settle = (target, kind) => {
+    if (target._deferredControls && target._deferredControls[kind] === slots[kind]) {
+      const rest = { ...target._deferredControls };
+      delete rest[kind];
+      target._deferredControls = Object.keys(rest).length ? rest : null;
+    }
+    persistControlState(target);
   };
   void (async () => {
     let current = session;
@@ -9709,23 +9720,26 @@ function drainDeferredControls(session) {
       for (let i = 0; i < kinds.length; i++) {
         const kind = kinds[i];
         current = sessions.get(current.roomId) || current;
-        if (startedTurn) { repark(current, kind); continue; }
+        // Once a slot has started a turn the rest wait for the next seam.
+        if (startedTurn) continue;
         const { params } = slots[kind];
         const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
         if (plan.kind === 'apply') {
           postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }));
           const r = await applyControlSteps(current, plan.steps);
           current = sessions.get(current.roomId) || current;
+          settle(current, kind);
           if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }));
           else if (r.startedTurn || plan.steps.some((st) => TURN_STARTING_OPS.has(st.op))) startedTurn = true;
         } else if (plan.kind === 'park') {
           // Still not free for this one (an agent switch needs a fully idle
-          // session): back in its slot for the next seam.
-          repark(current, kind);
+          // session): it simply stays in its slot for the next seam.
         } else if (plan.kind === 'error') {
+          settle(current, kind);
           postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }));
         } else if (plan.kind === 'schedule') {
           current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+          settle(current, kind);
           postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }));
         }
       }
@@ -9734,7 +9748,7 @@ function drainDeferredControls(session) {
       session._drainingControls = false;
       persistControlState(current);
       // Nothing started a turn, so no seam follows: give room delivery the
-      // gate it was refused above (the re-parked slots are left alone here).
+      // gate it was refused above (still-parked slots are left alone here).
       if (!startedTurn && !sessionOccupiedForRoomDelivery(current)) flushRoomInbox(current);
     }
   })().catch((e) => { try { console.warn(`[session-control] drain failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ } });

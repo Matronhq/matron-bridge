@@ -51,12 +51,15 @@ describe('session control wiring (source inspection)', () => {
     expect(flush).toBeGreaterThan(drain);
     const fn = body('function drainDeferredControls(session) {', '\nfunction maybeFlushRoomDelivery(');
     expect(fn).toContain('const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);');
-    expect(fn).toContain('session._deferredControls = null;');
+    // A slot stays parked and persisted until it is settled (applied,
+    // refused or scheduled); it is removed only if still the same object.
+    expect(fn).toContain('if (target._deferredControls && target._deferredControls[kind] === slots[kind]) {');
+    expect(fn.indexOf('session._drainingControls = true;')).toBeLessThan(fn.indexOf('void (async () => {'));
+    expect(fn.slice(0, fn.indexOf('void (async () => {'))).not.toContain('session._deferredControls = null;\n  session._drainingControls');
     // A slot that started a turn ends the drain; the rest wait for the next
     // seam. Nothing started -> room delivery gets its gate back.
-    expect(fn).toContain('if (startedTurn) { repark(current, kind); continue; }');
+    expect(fn).toContain('if (startedTurn) continue;');
     expect(fn).toContain('if (!startedTurn && !sessionOccupiedForRoomDelivery(current)) flushRoomInbox(current);');
-    expect(fn).toContain("target._deferredControls = { [kind]: slots[kind], ...(target._deferredControls || {}) };");
     expect(index).toContain('function flushRoomInbox(session) {');
   });
   it('parked controls and the automatic carry-on persist and are restored on resume', () => {
@@ -107,6 +110,8 @@ describe('automatic carry-on wiring (source inspection)', () => {
     expect(fire).toContain("await journalRouteTextToSession(session, '/compact');");
     expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));");
     expect(fire).toContain("slot.kind === 'model_recovery'");
+    // A thrown delivery puts the slot back unless something newer was armed.
+    expect(fire).toContain('if (!live._autoResume) { live._autoResume = slot; persistControlState(live); }');
   });
   it('recovers a bad model once with the default model, then carries on; a second failure is left for a person', () => {
     const fn = body('function recoverBadModel(session) {', '\n// --- Coordinator session control');
