@@ -62,7 +62,7 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 
 ## Memories (`memory_*` tools)
 
-The user's memories are their standing rules and facts about how they want their agents to work — which boxes to avoid, which model to use, how to report — saved in the journal, shared by every session on every box, and read by the Coordinator at the start of each of its sessions. When the user states such a rule, save it with `memory_save` (one memory per rule; the one-line `description` is the rule as the Coordinator should read it, the why and the how go in `body`; the same `name` overwrites the whole memory, so send the body back when updating). `memory_list`, `memory_get` and `memory_delete` read and retire them. Project and code facts belong in your own Claude Code memory directory, not here.
+The user's memories are their standing rules and facts about how they want their agents to work — which boxes to avoid, which model to use, how to report — saved in the journal and shared by every session on every box. They are listed under "Your memories" at the end of these instructions, as they are for every session at spawn: follow them without being asked, and call `memory_get` for the why and the how behind a line before acting against it. When the user states such a rule, save it with `memory_save` (one memory per rule; the one-line `description` is the rule as every session should read it, the why and the how go in `body`; the same `name` overwrites the whole memory, so send the body back when updating). `memory_list`, `memory_get` and `memory_delete` read and retire them. Project and code facts belong in your own Claude Code memory directory, not here.
 
 ## Reminders and the box's sleep (`reminder_*` tools)
 

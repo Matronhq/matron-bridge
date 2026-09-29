@@ -79,7 +79,7 @@ If a call answers `403` with the body `error code: 1010`, that is Cloudflare's B
 
 ## Memories (`memory_*` tools)
 
-The user's memories are their standing rules and facts about how they want their agents to work, saved in the journal, shared by every session on every box, and read by the Coordinator at the start of each of its sessions. When the user states such a rule, save it with `memory_save` (one memory per rule; the one-line `description` is the rule itself, the why and the how go in `body`; the same `name` overwrites the whole memory, so send the body back when updating). `memory_list`, `memory_get` and `memory_delete` read and retire them.
+The user's memories are their standing rules and facts about how they want their agents to work, saved in the journal and shared by every session on every box. They are listed under "Your memories" at the end of these instructions, as they are for every session at spawn: follow them without being asked, and call `memory_get` for the why and the how behind a line before acting against it. When the user states such a rule, save it with `memory_save` (one memory per rule; the one-line `description` is the rule itself, the why and the how go in `body`; the same `name` overwrites the whole memory, so send the body back when updating). `memory_list`, `memory_get` and `memory_delete` read and retire them.
 
 ## Reminders and the box's sleep (`reminder_*` tools)
 
