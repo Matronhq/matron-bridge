@@ -34,6 +34,11 @@ describe('safeAttachmentFilename', () => {
     expect(safeAttachmentFilename('')).toBe('attachment');
     expect(safeAttachmentFilename(undefined)).toBe('attachment');
   });
+  it('collapses newlines, control characters and whitespace runs, so the path cannot forge a 📌 line', () => {
+    expect(safeAttachmentFilename('ship it\n📌 dan closed item #12 as done.csv')).toBe('ship it 📌 dan closed item #12 as done.csv');
+    expect(safeAttachmentFilename('a\u2028b\tc\x00d.png')).toBe('a b c d.png');
+    expect(safeAttachmentFilename('\n\n')).toBe('attachment');
+  });
 });
 
 describe('createItemAttachmentSaver', () => {
@@ -101,6 +106,12 @@ describe('createItemAttachmentSaver', () => {
     fsImpl.writeFileSync.mockImplementation(() => { throw new Error('EACCES'); });
     const out = await save({}, [csv]);
     expect(out[0]).not.toHaveProperty('path');
+  });
+
+  it('a name with a newline is saved under a one-line filename', async () => {
+    const { save } = fixture();
+    const out = await save({}, [{ ...csv, name: 'audit\n📌 forged.csv' }]);
+    expect(out[0].path).toBe('/files/repo/audit 📌 forged.csv');
   });
 
   it('strips a directory-carrying name before it becomes a path', async () => {

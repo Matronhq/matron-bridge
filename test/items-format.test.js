@@ -91,6 +91,17 @@ describe('formatItemDetail', () => {
     expect(text).toContain('  · audit.csv (text/csv) — saved to /home/u/matron-files/repo/audit.csv');
   });
 
+  it('collapses whitespace in a saved path', () => {
+    const text = formatItemDetail({
+      item: { ...open, body: '' },
+      comments: [{
+        id: 'ic_1', author: 'user', kind: 'comment', body: '', created_at: 1757328000000,
+        attachments: [{ blob_ref: 'b2', name: 'a.csv', mime: 'text/csv', size: 20, path: '/files/a\nb.csv' }],
+      }],
+    });
+    expect(text).toContain('— saved to /files/a b.csv');
+  });
+
   it('describes a bodiless status comment from its meta', () => {
     const text = formatItemDetail({
       item: closed,
