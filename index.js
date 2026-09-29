@@ -138,6 +138,7 @@ import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
+import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
@@ -8568,8 +8569,19 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
 // journal — the marker IS the durable record, so injecting passes
 // skipJournalMirror and the queued entry passes mirrorToJournal:false; a
 // mirror would show the user their own reply back as a second message.
+// A file attached to a tracker item is downloaded for the agent — by the 📌
+// turn and by item_get — into the same place a file sent in chat lands (iv
+// upload dir for a PTY session, ~/matron-files/<repo>/ otherwise), so the
+// user never has to send an item's attachment a second time in chat.
+const saveItemAttachments = createItemAttachmentSaver({
+  fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
+  dirFor: (session) => (session?.iv ? ivUploadDir(session.roomId) : matronFilesDir(session?.workdir)),
+  log: console,
+});
+
 const itemTurnRouter = createItemTurnRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
+  saveAttachments: saveItemAttachments,
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
   queueText: (session, { text, preview }) => journalQueueMedia(session, {
@@ -10455,6 +10467,7 @@ const itemsHandlers = createItemsHandlers({
   journalConvoIdFor,
   client: itemsClient,
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+  saveAttachments: saveItemAttachments,
 });
 
 const missionsHandlers = createMissionsHandlers({

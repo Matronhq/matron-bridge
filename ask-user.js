@@ -691,7 +691,7 @@ server.tool(
 
 server.tool(
   'item_get',
-  "Read one item in full: its body and its whole comment thread — the user's answers, attachments, voice-note transcripts and status changes.",
+  "Read one item in full: its body and its whole comment thread — the user's answers, attachments, voice-note transcripts and status changes. File attachments are downloaded to disk and each is listed with the absolute path to Read it from.",
   { id: z.string().describe("Item id ('it_…') or '#12'") },
   async (args) => callItems('get', args, formatItemDetail),
 );
