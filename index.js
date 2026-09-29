@@ -2262,7 +2262,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           session._sessionConfirmed ? session.claudeSessionId : null,
           {
             agent: session.agent,
-            model: session.currentModel || undefined,
+            // The alias the session was started with, not the transcript's
+            // plain id: `opus[1m]` must survive a crash restart.
+            model: session._modelAlias || session.currentModel || undefined,
             mcpExtras: session.mcpExtras,
             // Same not-yet-persisted rationale as mcpExtras above: carry the
             // live --bypass/--auto choice explicitly so a crash restart can't
@@ -12235,7 +12237,9 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     // A Coordinator model still pending on the session (journalOnCoordinator
     // could not respawn it) beats the live model, which in iv mode keeps
     // reading as the old one — see recreateSpawnModel.
-    model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),
+    // The started-with alias beats the transcript id (which never carries
+    // [1m]) so a recreate keeps a 1M session's window.
+    model: recreateSpawnModel({ agent: existing.agent, currentModel: existing._modelAlias || existing.currentModel, pendingModel: existing._coordinatorModel }),
     ...overrides,
   });
   next.sendCallback = sendReply;

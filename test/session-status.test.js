@@ -48,7 +48,12 @@ describe('sessionContextWindow', () => {
     expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus' })).toBe(200_000);
     expect(sessionContextWindow({ model: 'claude-fable-5-1', alias: 'fable' })).toBe(1_000_000);
   });
-  it('treats a gauge above 200k as proof of a 1M window', () => {
+  it('a named alias is decisive: a stale gauge from the old window does not keep a switched-to 200k model at 1M', () => {
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus', contextTokens: 291_000 })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'default', contextTokens: 291_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ model: 'claude-fable-5-1', alias: 'default' })).toBe(1_000_000);
+  });
+  it('treats a gauge above 200k as proof of a 1M window when nothing names a size', () => {
     expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: 291_000 })).toBe(1_000_000);
     expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: 200_000 })).toBe(200_000);
     expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: NaN })).toBe(200_000);
