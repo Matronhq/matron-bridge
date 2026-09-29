@@ -454,3 +454,34 @@ Bridge-only, no Coordinator involved, on every Claude session:
    session stays flagged and the notice says so, for the Coordinator or Dan.
 3. A real answer (non-zero usage) clears the stall and disarms the
    auto-resume, as §3 already does.
+
+## Coordinator mission close (item #4901, 29 Sep 2026)
+
+Dan chose a standing rule (agents close their own missions, memory
+`agents-close-finished-missions`) plus a Coordinator tool for the missions
+whose sessions have gone. No new tool: `mission_close` gains an optional
+`mission: N`, the shape `mission_status` already uses.
+
+- **Bridge** (`lib/missions-tools.js close`): with `mission`, the session
+  must be the Coordinator (`session.coordinator`, 403 with a sentence
+  otherwise, before any journal call); the close goes by number, is never
+  cached as the session's own mission, and its 404 does not clear that
+  cache. With or without `mission`, the closing conversation now rides
+  along as `convo_id`. A journal 403 `not_coordinator` is rendered as "the
+  journal does not list this conversation as the Coordinator".
+- **Journal** (`POST /missions/:id/close {summary, convo_id?}`): an agent
+  that names its conversation is held to one rule — the conversation is
+  this device's own (404), and either on the mission (origin or attached,
+  a child included) or the user's Coordinator
+  (`user_settings.coordinator_convo_id`); anyone else is 403
+  `{error:'forbidden', detail:'not_coordinator'}`. A client's `convo_id`
+  is ignored; a bridge that sends none keeps the old contract. Both item
+  tiers still block (`user_items`, then `agent_items`, each with the
+  list), so the Coordinator resolves or moves items first and a mission
+  never closes over one awaiting the user. The row records
+  `closed_convo_id` and the `closed` marker carries `by_convo_id`, the
+  audit line behind "closed by the Coordinator".
+- **Instructions**: BRIDGE_COORDINATOR.md "Close finished missions" —
+  close only when the milestones show the work done; items awaiting the
+  user mean the mission stays open; never without `mission`.
+

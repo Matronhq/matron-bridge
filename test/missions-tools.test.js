@@ -86,7 +86,7 @@ describe('missions handlers', () => {
     expect(client.update.mock.calls[0]).toEqual(['ms_1', { title: 'New' }]);
     expect((await h.close({ roomId: '!r:s' })).status).toBe(400);
     expect((await h.close({ roomId: '!r:s', summary: 'done' })).status).toBe(200);
-    expect(client.close.mock.calls[0]).toEqual(['ms_1', { summary: 'done' }]);
+    expect(client.close.mock.calls[0]).toEqual(['ms_1', { summary: 'done', convo_id: 'c1' }]);
     expect((await h.join({ roomId: '!r:s' })).status).toBe(400);
     expect((await h.join({ roomId: '!r:s', num: 61 })).status).toBe(200);
     expect(client.join.mock.calls[0]).toEqual([61, { convo_id: 'c1' }]);
@@ -436,5 +436,56 @@ describe('missions handlers', () => {
     expect((await old.h.list({ roomId: '!r:s' })).body.error).toMatch(/does not have the \/missions routes/);
     const down = fixture({ list: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
     expect((await down.h.list({ roomId: '!r:s' })).status).toBe(502);
+  });
+
+  // Coordinator mission close (#4901, spec 2026-09-29 coordinator session
+  // control "Coordinator mission close"): `mission: N` closes ANOTHER
+  // mission by number, Coordinator only, never cached, both item tiers
+  // still block. The journal gates it too (403 not_coordinator on
+  // convo_id); the bridge refuses first with the clearer sentence.
+  describe('close with mission: N (the Coordinator)', () => {
+    it('refuses a non-Coordinator session before any journal call', async () => {
+      const { h, client } = fixture();
+      const r = await h.close({ roomId: '!r:s', summary: 's', mission: 61 });
+      expect(r.status).toBe(403);
+      expect(r.body.error).toBe("only the Coordinator may close another session's mission — this conversation is not the Coordinator");
+      expect(client.close).not.toHaveBeenCalled();
+      expect(client.list).not.toHaveBeenCalled();
+    });
+
+    it('validates mission and summary, then posts by number with convo_id and does not touch the cached own-mission id', async () => {
+      const { h, client, session } = fixture();
+      session.coordinator = true;
+      expect((await h.close({ roomId: '!r:s', summary: 's', mission: 0 })).status).toBe(400);
+      expect((await h.close({ roomId: '!r:s', summary: 's', mission: '61' })).status).toBe(400);
+      expect((await h.close({ roomId: '!r:s', summary: '', mission: 61 })).status).toBe(400);
+      const r = await h.close({ roomId: '!r:s', summary: 'done by the Coordinator', mission: 61 });
+      expect(r.status).toBe(200);
+      expect(client.close.mock.calls[0]).toEqual([61, { summary: 'done by the Coordinator', convo_id: 'c1' }]);
+      expect(session.missionId).toBeUndefined();
+      expect(client.list).not.toHaveBeenCalled();
+    });
+
+    it('passes the journal 409s through (user_items with the list, agent_items, closed) and maps not_found', async () => {
+      const blocked = fixture({ close: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'user_items', items: [{ num: 64, title: 'Q?' }] } })) });
+      blocked.session.coordinator = true;
+      const r = await blocked.h.close({ roomId: '!r:s', summary: 's', mission: 61 });
+      expect(r.status).toBe(409); expect(r.body.blocked_by).toBe('user_items'); expect(r.body.items).toEqual([{ num: 64, title: 'Q?' }]);
+      const gone = fixture({ close: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+      gone.session.coordinator = true;
+      const g = await gone.h.close({ roomId: '!r:s', summary: 's', mission: 61 });
+      expect(g.status).toBe(404); expect(g.body.error).toBe('not_found');
+    });
+
+    it('a journal that does not list this conversation as the Coordinator answers 403 in a sentence; an unreachable journal is 502', async () => {
+      const refused = fixture({ close: vi.fn(async () => ({ status: 403, data: { error: 'forbidden', detail: 'not_coordinator' } })) });
+      refused.session.coordinator = true;
+      const r = await refused.h.close({ roomId: '!r:s', summary: 's', mission: 61 });
+      expect(r.status).toBe(403);
+      expect(r.body.error).toBe('the journal does not list this conversation as the Coordinator');
+      const down = fixture({ close: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
+      down.session.coordinator = true;
+      expect((await down.h.close({ roomId: '!r:s', summary: 's', mission: 61 })).status).toBe(502);
+    });
   });
 });
