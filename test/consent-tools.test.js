@@ -30,6 +30,16 @@ describe('consent handlers', () => {
     expect((await noConvo.h.list({ roomId: '!r:s' })).status).toBe(409);
   });
 
+  it('isCoordinator lets the wiring count the journal\'s current role holder, so a live assignment is not refused', async () => {
+    const session = { roomId: '!r:s', coordinator: false, journalConvoId: 'c-coord' };
+    const sessions = new Map([['!r:s', session]]);
+    const client = { pending: vi.fn(async () => ({ status: 200, data: { pending: [] } })), answer: vi.fn() };
+    const h = createConsentHandlers({ sessions, journalConvoIdFor: (s) => s.journalConvoId, client, isCoordinator: (s, convoId) => s.coordinator === true || convoId === 'c-coord' });
+    expect((await h.list({ roomId: '!r:s' })).status).toBe(200);
+    session.journalConvoId = 'c-other';
+    expect((await h.list({ roomId: '!r:s' })).status).toBe(403);
+  });
+
   it('list asks the journal with the Coordinator convo id and passes the pending rows through', async () => {
     const { h, client } = fixture();
     const r = await h.list({ roomId: '!r:s' });

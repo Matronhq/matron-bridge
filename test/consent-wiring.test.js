@@ -20,7 +20,9 @@ function body(startMarker, endMarker) {
 describe('consent wiring (source inspection)', () => {
   it('builds the client on the journal HTTP base and the handlers on the shared session map', () => {
     expect(index).toMatch(/const consentClient = createConsentClient\(\{\s*baseUrl: journalHttpBase,\s*token: _journalToken,\s*\}\)/);
-    expect(index).toMatch(/const consentHandlers = createConsentHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: consentClient,\s*\}\)/);
+    expect(index).toMatch(/const consentHandlers = createConsentHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: consentClient,/);
+    // The journal's current role holder counts too, not only the spawn-time flag (Bugbot).
+    expect(index).toContain("isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),");
   });
 
   it('mounts /consent/list and /consent/decide through the shared handler map', () => {

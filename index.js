@@ -10925,6 +10925,9 @@ const consentHandlers = createConsentHandlers({
   sessions,
   journalConvoIdFor,
   client: consentClient,
+  // The journal's current role holder counts too (Bugbot): a session that
+  // gained the role live keeps coordinator:false until it respawns.
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
 // A journal `{kind:'consent', event:'pending'}` frame (spec 2026-09-29
