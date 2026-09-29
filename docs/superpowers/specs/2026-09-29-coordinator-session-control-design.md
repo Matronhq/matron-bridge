@@ -1,7 +1,7 @@
 # Coordinator session control: context size, /model, /compact, carry on
 
 **Date:** 2026-09-29
-**Status:** Draft — design questions filed for Dan on mission #4644; nothing built yet
+**Status:** §1 read path and §3 stall reporting implemented (this PR + matron-journal PR #96), after Dan chose journal persistence over a live RPC (29 Sep). §2 control path: design questions filed for Dan, not built yet
 **Depends on:** 2026-07-15 agent RPC design (journal-originated requests), 2026-08-09 agent spawns design (the `spawn_request` relay shape), 2026-09-23 Coordinator redesign, 2026-06-10 `/model` design, 2026-08-06 compact/queue design
 
 ## Problem
