@@ -101,6 +101,18 @@ Full spec: `docs/protocol.md` ("Journal search") in the matron-journal repo.
 
 Secure viewer links require the bridge to have `HMAC_SECRET` and `VIEWER_BASE_URL` configured. If `share_sensitive_data` or file-view links report that the viewer is not configured, tell the user that the local viewer service is running but needs a public `VIEWER_BASE_URL`, usually via Cloudflare Tunnel.
 
+## Screenshots on GitHub (`gh --attach`)
+
+To put an image or video on a GitHub issue, pull request or comment, use the GitHub CLI's own `--attach` flag. It needs `gh` 2.99.0 or later (`gh --version`); it exists on `gh issue create`, `gh issue edit`, `gh issue comment`, `gh pr create`, `gh pr edit` and `gh pr comment`.
+
+- `gh pr comment 123 --attach './before.png#Settings page, empty state'` — the text after `#` is the image's alt text. Repeat the flag for several files (up to 50 per command).
+- A body that already references the local path, such as `![before](./before.png)`, has that reference rewritten to the uploaded URL, so you control where the image sits in the text. A file the body does not mention is appended to the end.
+- It accepts PNG, JPEG, GIF, WebP, SVG, MP4, MOV and WebM, up to 10 MB per image. It does not take PDFs or logs: rasterise a PDF page to PNG first.
+- It needs push access to the repository and the token from `gh auth login` or a classic personal access token. If `gh` is older than 2.99.0 or the upload is refused, say so and hand the image over with `send_attachment` or an item's `attachments` instead.
+- An attachment is as visible as the repository it is posted to: private on a private repository, readable by anyone on a public one. Before attaching to a public repository, check the image shows no secrets, customer data or private code.
+- Do not use third-party uploaders (gitshot, gh-image, image hosts) or a browser session cookie for this, and do not commit screenshots to a branch just to link them.
+- The tracker still gets the images too: an item's thread is the record of the work, so attach them there as well as on GitHub when an item exists.
+
 ## Browser tools (chrome-devtools MCP)
 
 Browser-automation MCPs are off by default in bridge sessions because each one keeps a full headless Chrome + Xvfb alive (~400 MB) for the entire session, and most sessions don't need them. If you decide you need browser tools — e.g. to take a screenshot, drive a page, inspect network traffic, run a Lighthouse-style trace — call `restart_session` with `browser: true` and a `continue_with` message. You do not need to ask the user first.
