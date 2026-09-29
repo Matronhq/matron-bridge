@@ -151,7 +151,7 @@ import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summar
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, contextWindowFor, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { planSessionControl, validateControlParams, controlNotice, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
@@ -1665,8 +1665,11 @@ function journalStatus(session) {
   const status = buildSessionStatus({
     model: isCodex ? codexOptions.model : session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
-    // Codex supplies its real window; an unknown window must not use Claude's fallback.
-    contextWindow: isCodex ? session._codexContextWindow || null : undefined,
+    // Codex supplies its real window; an unknown window must not use Claude's
+    // fallback. Claude's is settled from the chosen alias, the id and the
+    // gauge (lib/session-status.js sessionContextWindow).
+    contextWindow: isCodex ? session._codexContextWindow || null
+      : sessionContextWindow({ model: session.currentModel || session.initData?.model, alias: session._modelAlias, contextTokens: session._lastContextTokens }),
     limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || []),
     stall: session._stall || undefined,
     modelOptions: isCodex ? codexOptions.modelOptions : modelOptions(),
@@ -2129,6 +2132,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Captured from system init event
     initData: null,
     currentModel: printModel || null,
+    // The alias this session was started with (`opus[1m]`), kept because
+    // currentModel is overwritten by the transcript's plain model id.
+    _modelAlias: printModel || null,
     _stall: resumeSessionId ? (persistedMode?._stall || null) : null,
     // Parked controls, the armed carry-on and the recovery flag belong to
     // the ROOM (conversation), not to one process: restored whether this is
@@ -2978,6 +2984,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
+    _modelAlias: model || null,
     _stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,
     _deferredControls: persistedForRoom?._deferredControls || null,
     _autoResume: persistedForRoom?._autoResume || null,
@@ -9470,7 +9477,7 @@ const AUTO_RESUME_SWEEP_MS = 60_000;
 
 function contextWindowForSession(session) {
   if (session.agent === AGENT_CODEX) return session._codexContextWindow || null;
-  return contextWindowFor(session.currentModel || session.initData?.model);
+  return sessionContextWindow({ model: session.currentModel || session.initData?.model, alias: session._modelAlias, contextTokens: session._lastContextTokens });
 }
 
 async function fireAutoResume(roomId, convoId, slot) {
@@ -12082,6 +12089,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
       // stall (a refused one must not); if the new model is out of allowance
       // too, its next record re-flags it. Published so the roster clears.
       session._stall = null;
+      session._modelAlias = normalizeModelArg(arg);
       bringAutoResumeForward(session);
       persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
         ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),

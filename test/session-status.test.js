@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
 import { fileURLToPath } from 'url';
 import {
+  sessionContextWindow,
   contextWindowFor,
   contextTokensFromUsage,
   contextTokensFromAssistantEvent,
@@ -38,6 +39,20 @@ describe('contextWindowFor', () => {
   it('handles a missing model', () => {
     expect(contextWindowFor(null)).toBe(200_000);
     expect(contextWindowFor(undefined)).toBe(200_000);
+  });
+});
+
+describe('sessionContextWindow', () => {
+  it('trusts the [1m] alias the session was started with over the plain transcript id', () => {
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus[1m]' })).toBe(1_000_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus' })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-fable-5-1', alias: 'fable' })).toBe(1_000_000);
+  });
+  it('treats a gauge above 200k as proof of a 1M window', () => {
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: 291_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: 200_000 })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: NaN })).toBe(200_000);
+    expect(sessionContextWindow({})).toBe(200_000);
   });
 });
 
