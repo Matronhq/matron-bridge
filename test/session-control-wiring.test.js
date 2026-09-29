@@ -111,7 +111,8 @@ describe('automatic carry-on wiring (source inspection)', () => {
     const fn = body('function recoverBadModel(session) {', '\n// --- Coordinator session control');
     expect(fn).toContain('if (session._badModelRecovered) {');
     expect(fn).toContain("&& applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });");
-    expect(fn).toContain('void journalRouteTextToSession(next, BAD_MODEL_RECOVERY_TEXT)');
+    expect(fn).toContain("if (shouldCompactBefore(next._lastContextTokens, contextWindowForSession(next))) {");
+    expect(fn).toContain('await journalRouteTextToSession(sessions.get(next.roomId) || next, BAD_MODEL_RECOVERY_TEXT);');
     // The one recovery is spent only by an ACCEPTED switch; a refusal retries.
     expect(fn.indexOf('next._badModelRecovered = true;')).toBeGreaterThan(fn.indexOf("applyModelSwitch("));
     expect(fn).toContain("kind: 'bad_model', text: BAD_MODEL_RECOVERY_TEXT };");

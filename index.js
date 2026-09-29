@@ -9565,7 +9565,14 @@ function recoverBadModel(session) {
   next._autoResume = null;
   persistControlState(next);
   postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on.');
-  void journalRouteTextToSession(next, BAD_MODEL_RECOVERY_TEXT).catch((e) => console.warn(`[auto-resume] recovery carry-on failed: ${e.message}`));
+  // Same delivery as the limit-reset path: a /compact first when the last
+  // gauge was high, then the carry-on (queued behind it).
+  void (async () => {
+    if (shouldCompactBefore(next._lastContextTokens, contextWindowForSession(next))) {
+      await journalRouteTextToSession(next, '/compact');
+    }
+    await journalRouteTextToSession(sessions.get(next.roomId) || next, BAD_MODEL_RECOVERY_TEXT);
+  })().catch((e) => console.warn(`[auto-resume] recovery carry-on failed: ${e.message}`));
 }
 
 // --- Coordinator session control, target side (lib/session-control.js) ---
