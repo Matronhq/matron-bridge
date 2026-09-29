@@ -35,6 +35,18 @@ Rooms remain open for the conversations' lifetimes — they survive an idle reap
 
 If browser tools are needed but unavailable, ask the user to run `/restart --browser`; this preserves the native thread. `--browser` also works with `/start`, `/resume`, and `/workdir`. Do not install or reconfigure a browser MCP behind the user's back. `/restart --share` adds the scoped file-viewer tool. File sharing is restricted to the session's pinned allowed roots.
 
+## Screenshots on GitHub (`gh --attach`)
+
+To put an image or video on a GitHub issue, pull request or comment, use the GitHub CLI's own `--attach` flag. It needs `gh` 2.99.0 or later (`gh --version`); it exists on `gh issue create`, `gh issue edit`, `gh issue comment`, `gh pr create`, `gh pr edit` and `gh pr comment`.
+
+- `gh pr comment 123 --attach './before.png#Settings page, empty state'` — the text after `#` is the image's alt text. Repeat the flag for several files (up to 50 per command).
+- A body that already references the local path, such as `![before](./before.png)`, has that reference rewritten to the uploaded URL, so you control where the image sits in the text. A file the body does not mention is appended to the end.
+- It accepts PNG, JPEG, GIF, WebP, SVG, MP4, MOV and WebM, up to 10 MB per image. It does not take PDFs or logs: rasterise a PDF page to PNG first.
+- It needs push access to the repository and the token from `gh auth login` or a classic personal access token. If `gh` is older than 2.99.0 or the upload is refused, say so and hand the image over with `send_attachment` or as an attachment on a tracker item instead.
+- An attachment is as visible as the repository it is posted to: private on a private repository, readable by anyone on a public one. Before attaching to a public repository, check the image shows no secrets, customer data or private code.
+- Do not use third-party uploaders (gitshot, gh-image, image hosts) or a browser session cookie for this, and do not commit screenshots to a branch just to link them.
+- The tracker still gets the images too: an item's thread is the record of the work, so attach them there as well as on GitHub when an item exists.
+
 ## Journal history
 
 The journal has a full-text search API over every one of the user's conversations, across all their boxes. To find something the user said or did in a past session, use it rather than grepping local transcripts (they only cover this box).
