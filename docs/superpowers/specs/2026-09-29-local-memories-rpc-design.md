@@ -51,11 +51,14 @@ Times are ms since the epoch.
   `.claude/CLAUDE.md` of every **known folder** — the picker's folder
   history (persisted sessions + the durable folders store) plus the default
   workdir, the same sources `recent_folders` uses. Missing files are left
-  out; a file reachable two ways is listed once.
+  out; a file reachable two ways is listed once. A single-project page
+  (`project` given) omits `claude_md` — the full reply already carried it.
 - `projects`: every `~/.claude/projects/*/memory/` that has at least one
   `.md` file or a `MEMORY.md`, newest activity first. `path` is the folder
-  a known folder encodes to (Claude Code's dir name is the folder path with
-  every non-alphanumeric character replaced by `-`; lossy, so it is only
+  a known folder encodes to (Claude Code's dir name is the folder's
+  realpath with every non-alphanumeric character replaced by `-` and a hash
+  suffix past 200 chars — `lib/transcript-dir.js` `encodeProjectSegment`,
+  matched against each folder as resolved and as given; lossy, so it is only
   ever matched, never decoded) or `null`. `index` is the `MEMORY.md` entry
   or `null`. Memories are newest first; `name`/`description`/`type` come
   from the frontmatter (falling back to the file stem and the first body
@@ -63,10 +66,16 @@ Times are ms since the epoch.
   the humanized name). Each memory's own path is `memory_dir + "/" + file`.
   `description`, `title` and `hook` are capped (200 / 120 / 200 chars).
 - **Frame cap.** The journal caps an `agent_response` at 16 KiB. The result
-  is kept under 15 KiB by dropping the oldest memory of the fullest project
-  until it fits; each drop adds one to that project's `more`. To read past
-  it: `{project: dir, offset: offset + memories.length}` until `more` is 0
-  (`offset` skips that many newest-first memories; the reply echoes it).
+  is kept under 15 KiB in three stages, each only once the previous is
+  exhausted: (1) drop the oldest memory of the fullest project, adding one
+  to that project's `more` — read past it with `{project: dir, offset:
+  offset + memories.length}` until `more` is 0 (`offset` skips that many
+  newest-first memories; the reply echoes it); (2) drop whole projects,
+  least recently active first, naming each in `more_projects: [dir]` so
+  the client fetches it with `project: dir`; (3) drop `claude_md` entries
+  from the end, counted in `more_claude_md` (needs ~90 CLAUDE.md files on
+  one box). `more_projects` / `more_claude_md` are absent when nothing was
+  dropped.
 - Errors: `bad_request` for a non-string `project` or a non-integer /
   negative `offset`. An unknown `project` answers `projects: []`.
 
@@ -91,8 +100,10 @@ Times are ms since the epoch.
 - **Size cap.** Files over 512 KiB are `too_large` (with `detail`). The
   body is **paged**: a page's JSON form stays within ~13 KiB so the frame
   fits; `offset` / `next_offset` are indices into the decoded text (UTF-16
-  code units), never split a surrogate pair, and `next_offset` is `null`
-  on the last page. An `offset` past the end answers an empty last page.
+  code units), never split a surrogate pair (an `offset` landing on the
+  trail half of a pair steps back one, and the reply's `offset` says so),
+  and `next_offset` is `null` on the last page. An `offset` past the end
+  answers an empty last page.
 - Errors: `bad_request` (malformed path or offset), `forbidden`,
   `not_found` (allow-listed but missing, or not a regular file),
   `too_large`.

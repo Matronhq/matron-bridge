@@ -6,9 +6,9 @@ import {
   createLocalMemories,
   parseMemoryFrontmatter,
   parseMemoryIndex,
-  projectDirFor,
   LOCAL_MEMORIES_RESULT_MAX_BYTES,
 } from '../lib/local-memories.js';
+import { encodeProjectSegment } from '../lib/transcript-dir.js';
 
 // Real temp directories: the allow-list, traversal and symlink rules are
 // about what the filesystem actually resolves, so a fake fs would only test
@@ -69,13 +69,6 @@ describe('parseMemoryIndex', () => {
   });
 });
 
-describe('projectDirFor', () => {
-  it('encodes a folder the way Claude Code names its project directories', () => {
-    expect(projectDirFor('/home/dan/matron-bridge')).toBe('-home-dan-matron-bridge');
-    expect(projectDirFor('/tmp/perm.gate_x/proj')).toBe('-tmp-perm-gate-x-proj');
-  });
-});
-
 describe('index()', () => {
   it('lists the global CLAUDE.md and each known folder\'s CLAUDE.md files with size and mtime', () => {
     write(path.join(home, '.claude', 'CLAUDE.md'), '# global\n', 1_700_000_000_000);
@@ -97,7 +90,7 @@ describe('index()', () => {
   it('lists each project\'s memories with frontmatter fields, index title/hook, newest first', () => {
     const repo = path.join(root, 'work', 'matron-bridge');
     fs.mkdirSync(repo, { recursive: true });
-    const dir = memDir(projectDirFor(repo));
+    const dir = memDir(encodeProjectSegment(repo));
     write(path.join(dir, 'older.md'), memory('older-rule', 'The older rule'), 1_700_000_000_000);
     write(path.join(dir, 'newer.md'), memory('newer-rule', '"Quoted \\"desc\\""'), 1_700_000_005_000);
     write(path.join(dir, 'MEMORY.md'), '- [Older rule](older.md) — its hook\n- [Gone](gone.md) — stale line\n', 1_700_000_006_000);
@@ -106,7 +99,7 @@ describe('index()', () => {
     const result = make().index({ folders: [repo] });
     expect(result.projects).toHaveLength(1);
     const p = result.projects[0];
-    expect(p.dir).toBe(projectDirFor(repo));
+    expect(p.dir).toBe(encodeProjectSegment(repo));
     expect(p.path).toBe(repo);
     expect(p.memory_dir).toBe(dir);
     expect(p.index).toEqual({ path: path.join(dir, 'MEMORY.md'), size: fs.statSync(path.join(dir, 'MEMORY.md')).size, mtime: 1_700_000_006_000 });
@@ -122,6 +115,24 @@ describe('index()', () => {
     write(path.join(home, '.claude', 'CLAUDE.md'), 'g');
     const result = make().index({ folders: [home, home] });
     expect(result.claude_md).toEqual([{ path: path.join(home, '.claude', 'CLAUDE.md'), size: 1, mtime: expect.any(Number) }]);
+  });
+
+  it('matches a known folder to its project dir by realpath (symlinked folder) and with the long-path hash suffix', () => {
+    const real = path.join(root, 'real-repo');
+    fs.mkdirSync(real);
+    const link = path.join(root, 'link-repo');
+    fs.symlinkSync(real, link);
+    write(path.join(memDir(encodeProjectSegment(real)), 'a.md'), memory('a', 'A'));
+    const long = path.join(root, 'x'.repeat(210));
+    fs.mkdirSync(long);
+    expect(encodeProjectSegment(long)).toMatch(/-[0-9a-z]+$/);
+    expect(encodeProjectSegment(long).length).toBeGreaterThan(200);
+    write(path.join(memDir(encodeProjectSegment(long)), 'b.md'), memory('b', 'B'));
+    const result = make().index({ folders: [link, long] });
+    expect(result.projects.map((p) => [p.dir, p.path])).toEqual(expect.arrayContaining([
+      [encodeProjectSegment(real), link],
+      [encodeProjectSegment(long), long],
+    ]));
   });
 
   it('leaves path null for a project dir no known folder encodes to, and omits empty memory dirs', () => {
@@ -196,6 +207,42 @@ describe('index()', () => {
     expect(past).toMatchObject({ offset: 80, memories: [], more: 0 });
     // A junk offset reads as 0.
     expect(lm.index({ folders: [], project: '-big', offset: -3 }).projects[0].offset).toBe(0);
+  });
+
+  it('a single-project page carries no claude_md (the full reply already did)', () => {
+    write(path.join(home, '.claude', 'CLAUDE.md'), 'g');
+    write(path.join(memDir('-a'), 'a.md'), memory('a', 'A'));
+    const lm = make();
+    expect(lm.index({ folders: [] }).claude_md).toHaveLength(1);
+    expect(lm.index({ folders: [], project: '-a' }).claude_md).toEqual([]);
+  });
+
+  it('when memories alone cannot fit, drops whole projects by name, then CLAUDE.md entries by count', () => {
+    // 40 projects with only a MEMORY.md each (~250 bytes of record apiece)
+    // and 30 folders with a CLAUDE.md, against a 4 KiB budget.
+    for (let i = 0; i < 40; i++) write(path.join(memDir(`-proj-${String(i).padStart(2, '0')}`), 'MEMORY.md'), '- index', 1_700_000_000_000 + i * 1000);
+    const folders = [];
+    for (let i = 0; i < 30; i++) {
+      const f = path.join(root, `repo-${String(i).padStart(2, '0')}`);
+      write(path.join(f, 'CLAUDE.md'), 'r');
+      folders.push(f);
+    }
+    const budget = 4 * 1024;
+    const result = make({ maxResultBytes: budget }).index({ folders });
+    expect(Buffer.byteLength(JSON.stringify(result), 'utf8')).toBeLessThanOrEqual(budget);
+    // Every project is either listed or named as omitted — nothing vanishes.
+    expect(result.projects.length + result.more_projects.length).toBe(40);
+    const all = [...result.projects.map((p) => p.dir), ...result.more_projects].sort();
+    expect(all).toEqual(Array.from({ length: 40 }, (_, i) => `-proj-${String(i).padStart(2, '0')}`));
+    // Least recently active projects go first; each omitted one is fetchable alone.
+    expect(result.more_projects[0]).toBe('-proj-00');
+    const single = make({ maxResultBytes: budget }).index({ folders, project: result.more_projects[0] });
+    expect(single.projects.map((p) => p.dir)).toEqual(['-proj-00']);
+    // Every project had to go before a CLAUDE.md entry did.
+    expect(result.projects).toEqual([]);
+    expect(result.claude_md.length + result.more_claude_md).toBe(30);
+    expect(result.more_claude_md).toBeGreaterThan(0);
+    expect(result.claude_md[0].folder).toBe(folders[0]);
   });
 
   it('caps description, title and hook lengths', () => {
@@ -338,6 +385,15 @@ describe('get()', () => {
       next = page.result.next_offset;
     }
     expect(assembled).toBe(body);
+  });
+
+  it('an offset on the trail half of a surrogate pair steps back so the pair goes whole', () => {
+    const dir = memDir('-p');
+    write(path.join(dir, 'p.md'), 'a😀b');
+    const out = make().get({ path: path.join(dir, 'p.md'), folders: [], offset: 2 });
+    expect(out.result).toMatchObject({ offset: 1, body: '😀b', next_offset: null });
+    // A well-formed offset is untouched.
+    expect(make().get({ path: path.join(dir, 'p.md'), folders: [], offset: 3 }).result).toMatchObject({ offset: 3, body: 'b' });
   });
 
   it('rejects a bad offset and clamps one past the end to an empty last page', () => {
