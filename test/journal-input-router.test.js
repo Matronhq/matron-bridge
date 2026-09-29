@@ -2120,7 +2120,9 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     });
 
     it('closes the ⏳ at the flush seam, counting BEFORE flush clears the inbox', () => {
-      const start = src.indexOf('function maybeFlushRoomDelivery(');
+      // The counting/flushing half lives in flushRoomInbox since the
+      // Coordinator control drain took the gate's first slot.
+      const start = src.indexOf('function flushRoomInbox(');
       const body = src.slice(start, src.indexOf('\n}', start));
       const count = body.indexOf('roomDelivery.pendingCount(');
       const flush = body.indexOf('roomDelivery.flush(');
@@ -2172,7 +2174,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
     // return means it consumed the ref) before falling through to invites.
     expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
-    expect(args).toMatch(/onOpError: \(e\) => \{ if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+    expect(args).toMatch(/onOpError: \(e\) => \{ if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
   });
 });
 
