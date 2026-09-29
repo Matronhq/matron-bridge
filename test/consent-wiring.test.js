@@ -1,0 +1,70 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+// index.js cannot be imported in-process (top-level side effects), so the
+// consent wiring is pinned by source inspection — same approach as
+// test/missions-wiring.test.js. The handlers themselves are unit-tested in
+// test/consent-tools.test.js.
+const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
+const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+
+function body(startMarker, endMarker) {
+  const start = index.indexOf(startMarker);
+  const end = index.indexOf(endMarker, start + startMarker.length);
+  expect(start, `${startMarker} not found`).toBeGreaterThan(-1);
+  expect(end, `${endMarker} not found after ${startMarker}`).toBeGreaterThan(start);
+  return index.slice(start, end);
+}
+
+describe('consent wiring (source inspection)', () => {
+  it('builds the client on the journal HTTP base and the handlers on the shared session map', () => {
+    expect(index).toMatch(/const consentClient = createConsentClient\(\{\s*baseUrl: journalHttpBase,\s*token: _journalToken,\s*\}\)/);
+    expect(index).toMatch(/const consentHandlers = createConsentHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: consentClient,\s*\}\)/);
+  });
+
+  it('mounts /consent/list and /consent/decide through the shared handler map', () => {
+    const m = index.match(/url\.pathname\.match\(\/\^\\\/consent\\\/\(([a-z|]+)\)\$\/\)/);
+    expect(m, 'the /consent route matcher is missing').toBeTruthy();
+    expect(m[1].split('|').sort()).toEqual(['decide', 'list']);
+    expect(index).toContain('consentHandlers[name]');
+  });
+
+  it('hands consent frames to journalHandleConsentFrame, which finds or resumes the Coordinator session and delivers the nudge as a turn plus a notice', () => {
+    expect(index).toContain('onConsentFrame: (frame) => journalHandleConsentFrame(frame),');
+    const fn = body('function journalHandleConsentFrame(frame) {', '\n}');
+    expect(fn).toContain("if (!frame || frame.event !== 'pending') return;");
+    expect(fn).toContain('formatConsentNudge(frame)');
+    expect(fn).toContain('s.coordinator === true && s.alive');
+    expect(fn).toContain('coordinatorLookup.snapshot()');
+    expect(fn).toContain('journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE)');
+    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text)');
+    expect(fn).toContain('deliverCoordinatorTurn(session, text)');
+  });
+
+  it('registers consent_list and consent_decide, each through callConsent with its renderer', () => {
+    expect(askUser).toMatch(/import \{[^}]*\bformatPendingList\b[^}]*\bformatDecideAck\b[^}]*\} from '\.\/lib\/consent-tools\.js'/);
+    expect(askUser).toContain("'consent_list',");
+    expect(askUser).toContain("callConsent('list', {}, formatPendingList)");
+    expect(askUser).toContain("'consent_decide',");
+    expect(askUser).toContain("callConsent('decide', args, (d) => formatDecideAck(d, args))");
+    const decide = askUser.slice(askUser.indexOf("'consent_decide',"), askUser.indexOf('async function sessionControlCall'));
+    expect(decide).toContain("kind: z.enum(['chat', 'spawn'])");
+    expect(decide).toContain("decision: z.enum(['approve', 'decline'])");
+    expect(decide).toContain('reason: z.string().min(1).max(200)');
+    // Both descriptions carry the scope and the guardrails the user approved.
+    expect(askUser).toMatch(/never tool permission prompts or secret requests/);
+    expect(askUser).toMatch(/never into an offline box/);
+  });
+
+  it('the Coordinator prompt teaches the rules: own asks, box rules, reasons, the cap and the off switch', () => {
+    expect(coord).toMatch(/^## Approve chats and spawns on the user's behalf/m);
+    expect(coord).toContain('`consent_list` and `consent_decide(kind, id, decision, reason)`');
+    expect(coord).toMatch(/approve them yourself when they follow the rules/);
+    expect(coord).toMatch(/never into a box that is offline/);
+    expect(coord).toMatch(/last-resort boxes only when every other box is busy/);
+    expect(coord).toMatch(/Always give a reason/);
+    expect(coord).toMatch(/Approvals are capped per day/);
+    expect(coord).toMatch(/Tool permission prompts and secret requests are never yours to answer/);
+  });
+});

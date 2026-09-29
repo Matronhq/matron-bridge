@@ -13,6 +13,7 @@ import { missionIdemKey } from './lib/missions-idem.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
+import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -422,6 +423,46 @@ server.tool(
     reason: z.string().max(200).optional().describe('One line shown in the target chat'),
   },
   async ({ target_convo_id, message, when, reason }) => sessionControlCall('/session-carry-on', { target_convo_id, message, ...(when ? { when } : {}), ...(reason ? { reason } : {}) }, 'session_carry_on')
+);
+
+// --- Coordinator consent approval (spec 2026-09-29 coordinator consent) ---
+// consent_list / consent_decide go through the bridge loopback
+// (index.js mounts lib/consent-tools.js at /consent/<op>); the journal
+// allows both to the Coordinator alone.
+const CONSENT_WHAT = "Consent approval is for the user's Coordinator only (the journal refuses anyone else) and only for the user's own agents and boxes. It covers agent chat invites, room join requests and agent_session_start spawns — never tool permission prompts or secret requests, which stay with the user. The user always sees the card too and may answer first; every decision you make shows on the card and in the tracker as made by the Coordinator, with your reason, and the user can stop the session or mute the room with one tap. Follow the rules in your instructions: approve only what you understand and that follows the box rules, never into an offline box, give a reason every time, and leave the rest for the user.";
+
+async function callConsent(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/consent/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `consent_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `consent_${name} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'consent_list',
+  `List the chat invites, room join requests and spawn requests waiting for the user's approval, oldest first, each with who asks whom, the box and its state, the task or justification, and the consent_decide call to answer it. ${CONSENT_WHAT} Call it when the journal nudges you about a pending request, when your own agent_session_start or agent_chat_start is waiting, and when you sweep the state of the world.`,
+  {},
+  async () => callConsent('list', {}, formatPendingList),
+);
+
+server.tool(
+  'consent_decide',
+  `Approve or decline one waiting chat or spawn request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} A daily cap applies to approvals; at the cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. Declines are never capped.`,
+  {
+    kind: z.enum(['chat', 'spawn']).describe('As consent_list shows it'),
+    id: z.string().max(128).describe('The request id from consent_list (a spawn id, or room_id/device_id for a chat)'),
+    decision: z.enum(['approve', 'decline']),
+    reason: z.string().min(1).max(200).describe('One line the user reads on the card and in the tracker: why this follows the rules, or why not'),
+  },
+  async (args) => callConsent('decide', args, (d) => formatDecideAck(d, args)),
 );
 
 async function sessionControlCall(route, body, name) {

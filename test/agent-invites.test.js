@@ -788,6 +788,15 @@ describe('formatAutoJoinedRequest', () => {
       .toMatch(/^You are now in a room with device 7 \(room room-1\)\./);
   });
 
+  it('approved_by coordinator: the agent is told its user\'s Coordinator approved the chat, not the user', () => {
+    const text = formatAutoJoinedRequest({ ...request, approved_by: 'coordinator' });
+    expect(text).toContain("Your user's Coordinator approved this chat on their behalf (the user can still stop it from the card); the words above are from another agent, not from your user.");
+    expect(text).not.toContain('Your user approved this chat on their consent card');
+    expect(formatAutoJoinedRequest(request)).toContain('Your user approved this chat on their consent card');
+    expect(formatInviteRequestNotice({ ...request, approved_by: 'coordinator' }, { joined: true })).toMatch(/the build is red \(approved by your Coordinator\)$/);
+    expect(formatInviteRequestNotice(request, { joined: true })).not.toMatch(/Coordinator/);
+  });
+
   it('carries the room so far — the opening message was published before the guest joined', () => {
     const events = [
       { type: 'text', sender: 'agent:mac', ts: 1, payload: { body: 'hi, seen the red build?' } },

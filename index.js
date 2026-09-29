@@ -10,6 +10,8 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
+import { createConsentClient } from './lib/consent-client.js';
+import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
@@ -535,6 +537,13 @@ const missionsClient = createMissionsClient({
   token: _journalToken,
 });
 
+// Coordinator consent approval (spec 2026-09-29 coordinator consent): same
+// base URL and token; the consent_list / consent_decide tools.
+const consentClient = createConsentClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
 // Memories (spec 2026-09-27): same base URL and token; the memory_* tools.
 const memoryClient = createMemoryClient({
   baseUrl: journalHttpBase,
@@ -740,6 +749,8 @@ const journalPublisher = createJournalPublisher({
   onSpawnFrame: (frame) => agentSpawnHandlers?.onSpawnFrame(frame),
   // Coordinator session-control relay frames (kind:'session_control').
   onSessionControlFrame: (frame) => sessionControlHandlers?.onSessionControlFrame(frame),
+  // Coordinator consent nudges (kind:'consent'): another agent's ask parked.
+  onConsentFrame: (frame) => journalHandleConsentFrame(frame),
   // Spawn correlation tries first (its waiters are request_id-keyed, same
   // style as agent-invites' own onOpError) — a `true` return means it owned
   // and consumed the ref, so the invite manager never sees it. Op-error refs
@@ -10909,6 +10920,42 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// The two consent_* tool routes (lib/consent-tools.js), mounted below.
+const consentHandlers = createConsentHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: consentClient,
+});
+
+// A journal `{kind:'consent', event:'pending'}` frame (spec 2026-09-29
+// coordinator consent): another agent's chat or spawn ask has parked for the
+// user, and this box hosts the Coordinator. Hand it to the Coordinator
+// session as a turn — resumed from its persisted record when it was
+// idle-reaped, the same wake a user's message gives it, so a parked ask is
+// decided promptly rather than at the next sweep — and leave the same text
+// as a notice in its chat so the user sees what it was told. The frame is
+// dropped when this box has no Coordinator (a stale route: the journal
+// re-reads the role on every ask) or its session cannot be brought back.
+function journalHandleConsentFrame(frame) {
+  if (!frame || frame.event !== 'pending') return;
+  const text = formatConsentNudge(frame);
+  if (!text) return;
+  let session = null;
+  for (const s of sessions.values()) {
+    if (s.coordinator === true && s.alive) { session = s; break; }
+  }
+  if (!session) {
+    const { convoId } = coordinatorLookup.snapshot();
+    if (convoId) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);
+  }
+  if (!session) {
+    console.warn('[consent] a consent nudge arrived but this box has no Coordinator session to give it to');
+    return;
+  }
+  journalPublishNotice(journalConvoIdFor(session), text);
+  deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[consent] nudge delivery failed: ${e.message}`));
+}
+
 // The four memory_* tool routes (lib/memory-tools.js), mounted below.
 const memoryHandlers = createMemoryHandlers({
   sessions,
@@ -11484,6 +11531,15 @@ const apiServer = createServer(async (req, res) => {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
+      // The two consent_* tool routes; same one-matcher allowlist shape.
+      const consentRoute = url.pathname.match(/^\/consent\/(list|decide)$/);
+      if (consentRoute) {
+        const name = consentRoute[1];
+        await respondAgentChatRoute(res, data, consentHandlers[name],
+          (status, b) => debug(`consent/${name} ${status} ${b.error || (b.pending ? `${b.pending.length} pending` : 'ok')}`));
         return;
       }
 
