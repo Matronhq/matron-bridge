@@ -931,12 +931,17 @@ describe('local_memories / local_memory_get', () => {
     handler(REQ('local_memories', null, 'c'));
     handler(REQ('local_memories', { offset: -1 }, 'd'));
     handler(REQ('local_memories', { offset: '5' }, 'e'));
+    handler(REQ('local_memories', { claude_md_offset: 12 }, 'f'));
+    handler(REQ('local_memories', { claude_md_offset: -1 }, 'g'));
+    handler(REQ('local_memories', { claude_md_offset: 1, project: '-x' }, 'h'));
     expect(calls.index).toEqual([
       { folders: ['/home/dan'], project: '-home-dan-repo', offset: 30 },
       { folders: ['/home/dan'], offset: 0 },
+      { folders: ['/home/dan'], offset: 0, claudeMdOffset: 12 },
     ]);
     expect(responses.map((r) => [r.requestId, r.ok, r.error?.code ?? null])).toEqual([
       ['a', true, null], ['b', false, 'bad_request'], ['c', true, null], ['d', false, 'bad_request'], ['e', false, 'bad_request'],
+      ['f', true, null], ['g', false, 'bad_request'], ['h', false, 'bad_request'],
     ]);
   });
 

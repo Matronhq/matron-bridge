@@ -22,7 +22,7 @@ Both are agent RPCs beside `recent_folders` (`lib/journal-rpc.js`),
 answered from `lib/local-memories.js`. Every path in a reply is absolute.
 Times are ms since the epoch.
 
-### `local_memories {project?, offset?}`
+### `local_memories {project?, offset?, claude_md_offset?}`
 
 ```json
 {
@@ -73,11 +73,15 @@ Times are ms since the epoch.
   newest-first memories; the reply echoes it); (2) drop whole projects,
   least recently active first, naming each in `more_projects: [dir]` so
   the client fetches it with `project: dir`; (3) drop `claude_md` entries
-  from the end, counted in `more_claude_md` (needs ~90 CLAUDE.md files on
-  one box). `more_projects` / `more_claude_md` are absent when nothing was
-  dropped.
-- Errors: `bad_request` for a non-string `project` or a non-integer /
-  negative `offset`. An unknown `project` answers `projects: []`.
+  from the end, counted in `more_claude_md` — read them with
+  `{claude_md_offset: claude_md_offset + claude_md.length}`, a
+  claude_md-only page (no `projects`, echoes `claude_md_offset`) until
+  `more_claude_md` is absent. `more_projects` / `more_claude_md` are absent
+  when nothing was dropped.
+- Errors: `bad_request` for a non-string `project`, a non-integer /
+  negative `offset` or `claude_md_offset`, or `claude_md_offset` combined
+  with `project` (they are separate pages). An unknown `project` answers
+  `projects: []`.
 
 ### `local_memory_get {path, offset?}`
 

@@ -243,6 +243,25 @@ describe('index()', () => {
     expect(result.claude_md.length + result.more_claude_md).toBe(30);
     expect(result.more_claude_md).toBeGreaterThan(0);
     expect(result.claude_md[0].folder).toBe(folders[0]);
+    // The dropped CLAUDE.md entries are read back with claude_md_offset pages
+    // (no projects on those), each within budget, none missed or repeated.
+    const seen = [...result.claude_md.map((e) => e.path)];
+    let more = result.more_claude_md;
+    let guard = 0;
+    while (more) {
+      const page = make({ maxResultBytes: budget }).index({ folders, claudeMdOffset: seen.length });
+      expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThanOrEqual(budget);
+      expect(page.projects).toEqual([]);
+      expect(page.claude_md_offset).toBe(seen.length);
+      expect(page.claude_md.length).toBeGreaterThan(0);
+      seen.push(...page.claude_md.map((e) => e.path));
+      more = page.more_claude_md ?? 0;
+      if (++guard > 10) throw new Error('claude_md paging did not converge');
+    }
+    expect(seen).toHaveLength(30);
+    expect(new Set(seen).size).toBe(30);
+    // Past the end: empty page, offset clamped, nothing more.
+    expect(make().index({ folders, claudeMdOffset: 500 })).toMatchObject({ claude_md_offset: 30, claude_md: [], projects: [] });
   });
 
   it('caps description, title and hook lengths', () => {
