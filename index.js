@@ -1570,12 +1570,15 @@ async function refreshCodexTelemetry(session, { force = false } = {}) {
 // in-flight promise (resolving true when the cache gained fresh lines) when
 // a fetch is running, or null when the cache is still fresh — callers use
 // the promise to repaint the status frame once new numbers land.
-function refreshUsageLimits(cwd) {
+// `force` skips the freshness check (never the in-flight dedupe): a
+// usage-limit stall means the cached meters are wrong by definition, and
+// the reset time the roster shows must come from a fetch made after it.
+function refreshUsageLimits(cwd, { force = false } = {}) {
   // The cache exists solely to feed status frames — with the journal
   // disabled nothing consumes it, and each refresh boots a claude process.
   if (!JOURNAL_ENABLED) return null;
   if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
-  if (Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
+  if (!force && Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
   usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
     .then((raw) => {
       const parsed = parseUsageLimits(raw);
@@ -4166,6 +4169,7 @@ function handleClaudeEvent(session, event) {
       // filled); published at once so the roster shows the stall without
       // waiting for a turn end that may not come.
       const stall = stallFromAssistantEvent(event);
+      const assistantCtxTokens = contextTokensFromAssistantEvent(event);
       if (stall) {
         // The error record's own model is a placeholder; the session's
         // current model is the one that hit the limit. `since` is the first
@@ -4177,9 +4181,9 @@ function handleClaudeEvent(session, event) {
           resets_at: stallResetsAt(usageLimitsCache.lines),
         };
         journalStatus(session);
-        // The cached meters may predate the stall (5-minute cache) — refresh
-        // them and republish once the reset time is known.
-        const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);
+        // The cached meters predate the stall by definition — fetch fresh
+        // ones past the cache TTL and republish once the reset time is known.
+        const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR, { force: true });
         if (refresh) {
           refresh.then((updated) => {
             if (!updated || !session.alive || !session._stall) return;
@@ -4187,10 +4191,15 @@ function handleClaudeEvent(session, event) {
             journalStatus(session);
           });
         }
-      } else {
+      } else if (assistantCtxTokens) {
+        // Only a record with real usage — an answer the API accepted, which
+        // proves the limit has lifted — clears a stall. A stall record has
+        // zero usage, and so does anything synthetic; a restored stall on a
+        // resumed session therefore survives until Claude really answers
+        // (a resume-time filler that reaches the API counts, because it
+        // could only have been served past the limit).
         session._stall = null;
       }
-      const assistantCtxTokens = contextTokensFromAssistantEvent(event);
       if (assistantCtxTokens) {
         session._lastContextTokens = assistantCtxTokens;
         // Live header: repaint mid-turn so a long tool-heavy turn doesn't

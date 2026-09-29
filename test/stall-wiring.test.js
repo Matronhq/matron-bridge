@@ -25,8 +25,14 @@ describe('usage-limit stall wiring (source inspection)', () => {
     expect(c).toContain('model: stall.model || session.currentModel || undefined,');
     expect(c).toContain('since: session._stall?.since ?? Date.now(),');
     expect(c).toContain('resets_at: stallResetsAt(usageLimitsCache.lines),');
-    expect(c).toContain('const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR);');
-    expect(c).toContain('session._stall = null;');
+    expect(c).toContain('const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR, { force: true });');
+    // Cleared only by a record with real usage (the API answered), never by
+    // a zero-usage or synthetic record — so a restored stall survives resume.
+    expect(c).toContain('} else if (assistantCtxTokens) {');
+    expect(c.slice(c.indexOf('} else if (assistantCtxTokens) {'))).toContain('session._stall = null;');
+    expect(c).not.toMatch(/} else \{\s*session\._stall = null;/);
+    const rul = body('function refreshUsageLimits(cwd, { force = false } = {}) {', '\nfunction ');
+    expect(rul).toContain('if (!force && Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;');
   });
   it('sidechain (subagent) records never reach the assistant case, so they cannot clear a parent stall', () => {
     const fn = body('function handleClaudeEvent(session, event) {', "    case 'assistant': {");
