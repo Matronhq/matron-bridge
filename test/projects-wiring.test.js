@@ -178,4 +178,57 @@ describe('projects wiring', () => {
       expect(pkg.scripts.check).toContain(`node --check ${f}`);
     }
   });
+
+  describe('instructions (spec 2026-09-30 §5 "Prompts")', () => {
+    const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
+    const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
+    const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    const DEFINITION = 'A Project is the user\'s tracker object that groups related missions — not a working directory, and nothing to do with `~/.claude/projects`.';
+
+    it('both session prompts define a Project once and teach filing with project_list first', () => {
+      for (const [name, md] of [['BRIDGE_CLAUDE.md', claudeMd], ['BRIDGE_CODEX.md', codexMd]]) {
+        const section = md.slice(md.indexOf('## Missions & milestones'));
+        expect(section, name).toContain(DEFINITION);
+        expect(section.split(DEFINITION).length - 1, name).toBe(1);
+        expect(section, name).toContain('When you start a mission, run `project_list` and file it into the project it belongs to');
+        expect(section, name).toContain('Create one with `project_create` only when none fits');
+      }
+    });
+
+    it('both session prompts teach join-not-refusal, leave, and naming the mission on milestone_post', () => {
+      for (const [name, md] of [['BRIDGE_CLAUDE.md', claudeMd], ['BRIDGE_CODEX.md', codexMd]]) {
+        const section = md.slice(md.indexOf('## Missions & milestones'));
+        expect(section, name).toContain('A conversation can be on several missions; one is current.');
+        expect(section, name).toContain('When you move on to new work, join it: `mission_join N`');
+        expect(section, name).toContain('`mission_leave N` when you are done with a mission that goes on without you');
+        expect(section, name).toContain('pass `mission: N` to `milestone_post` when you are on several');
+        expect(section, name).not.toMatch(/already belongs to another mission/);
+      }
+    });
+
+    it('Codex fallbacks: leave, conversation missions, named milestone, project filing, project routes', () => {
+      const section = codexMd.slice(codexMd.indexOf('## Missions & milestones'));
+      expect(section).toContain('`mission_leave`');
+      expect(section).toContain('`project_list`, `project_get`, `project_create`, `project_update`, `project_status`');
+      expect(section).toContain('`POST $BASE/missions/:num/leave` `{"convo_id":"<id>"}`');
+      expect(section).toContain('`GET $BASE/conversations/<id>/missions`');
+      expect(section).toContain('409 `not_linked`');
+      expect(section).toContain('`{"project":"#P"}`');
+      expect(section).toContain('`GET $BASE/projects?state=open`');
+      expect(section).toContain('`POST $BASE/projects` `{"title":"...","body":"...","convo_id":"<id>"}`');
+      expect(section).toContain('`PATCH $BASE/projects/:num`');
+    });
+
+    it('the Coordinator brief: definition, project sweep, merges reported, ONE filing question, never without the answer', () => {
+      expect(coord).toContain('## Projects');
+      expect(coord).toContain(DEFINITION);
+      expect(coord).toContain('After the missions, refresh the projects: `project_list`, then for each open project `project_get N` and `project_status` with `num: N`');
+      expect(coord).toContain('`project_merge` with `num` the one to fold away and `into` the one to keep');
+      expect(coord).toContain('Report each merge in your reply: `Merged #A title into #B title — why`.');
+      expect(coord).toContain('Then file ONE question (`item_create`, `kind: "question"`) proposing which missions `mission_list` shows with "no project" go into which project, and which quiet missions to close.');
+      expect(coord).toContain('Never move a mission into, out of or between projects, and never close a mission, without the user\'s answer.');
+      expect(coord).toContain('`mission_update` with `mission: N` and `project: P` (or `null`)');
+      expect(coord).toMatch(/`project_list` for every open project/);
+    });
+  });
 });
