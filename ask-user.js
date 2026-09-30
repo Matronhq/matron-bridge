@@ -455,7 +455,7 @@ server.tool(
 
 server.tool(
   'consent_decide',
-  `Approve or decline one waiting chat or spawn request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} A daily cap applies to approvals; at the cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. Declines are never capped.`,
+  `Approve or decline one waiting chat or spawn request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} The journal's operator may cap approvals per day; at that cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. Declines are never capped.`,
   {
     kind: z.enum(['chat', 'spawn']).describe('As consent_list shows it'),
     id: z.string().max(128).describe('The request id from consent_list (a spawn id, or room_id/device_id for a chat)'),

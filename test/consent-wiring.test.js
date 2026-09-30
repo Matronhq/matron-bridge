@@ -70,7 +70,8 @@ describe('consent wiring (source inspection)', () => {
     expect(coord).toMatch(/never into a box that is offline/);
     expect(coord).toMatch(/last-resort boxes only when every other box is busy/);
     expect(coord).toMatch(/Always give a reason/);
-    expect(coord).toMatch(/Approvals are capped per day/);
+    expect(coord).toMatch(/operator has set a daily cap on approvals and it is reached/);
+    expect(coord).toMatch(/Declines are never capped/);
     expect(coord).toMatch(/Tool permission prompts and secret requests are never yours to answer/);
   });
 });
