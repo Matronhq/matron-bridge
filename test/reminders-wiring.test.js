@@ -89,8 +89,21 @@ describe('reminders wiring', () => {
     const block = coordinatorMd.slice(i);
     expect(block).toContain('reminder_create');
     expect(block).toContain('repeat: "daily"');
-    expect(block).toContain('tz: "Europe/London"');
     expect(block).toContain('reminder_list');
     expect(block).toContain('memory_save');
+    // The user's zone, not a hardcoded one; asked for when unknown.
+    expect(block).not.toContain('tz: "Europe/London"');
+    expect(block).toMatch(/the user's IANA time zone \(e\.g\. Europe\/London; ask if unknown, and save it with the cadence rule\)/);
+    // Duplicates checked before creating; a missing check-in is a question,
+    // never a silent re-create (the user may have cancelled it).
+    expect(block).toMatch(/Before creating check-ins, call `reminder_list`/);
+    expect(block).toContain('actions: ["Restore", "Update the rule"]');
+    expect(block).not.toMatch(/re-create any that is missing/);
+  });
+
+  it('/timer cancel all says how many of the cancelled were daily check-ins', () => {
+    const cancel = index.slice(index.indexOf("if (parsed.kind === 'cancel') {"), index.indexOf("if (parsed.kind === 'cancel') {") + 1200);
+    expect(cancel).toMatch(/filter\(t => t\.repeat\)\.length/);
+    expect(cancel).toMatch(/including \$\{daily\} daily check-in/);
   });
 });

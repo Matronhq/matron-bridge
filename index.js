@@ -7966,9 +7966,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             : `No timer #${parsed.which} in this conversation. /timer lists the active ones.`);
           break;
         }
+        // Daily check-ins (reminder_create repeat: "daily") end for good
+        // here, so `cancel all` names them rather than folding them into a
+        // count the user may read as one-shot timers.
+        const daily = cancelled.filter(t => t.repeat).length;
         await sendReply(cancelled.length === 1
           ? `🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").${cancelled[0].repeat ? ' It will not repeat.' : ''}`
-          : `🚫 Cancelled ${cancelled.length} timers.`);
+          : `🚫 Cancelled ${cancelled.length} timers${daily ? ` (including ${daily} daily check-in${daily === 1 ? '' : 's'})` : ''}.`);
         break;
       }
       // 'list'
@@ -9299,7 +9303,7 @@ async function announceAgentReminder(session, record) {
   const summary = record.repeat
     ? `⏰ The agent set itself a daily reminder #${record.id} — ${formatRepeat(record.repeat)}, ` +
       `first in ${formatTimerDuration(record.fireAt - Date.now())} (at ${formatTimerFireAt(record)}): "${record.text}". ` +
-      'Send now delivers it once without changing the schedule; Cancel stops it for good.'
+      'Send now delivers it once extra and never moves the schedule; Cancel stops it for good.'
     : `⏰ The agent set itself reminder #${record.id} — in ${formatTimerDuration(record.fireAt - Date.now())} ` +
       `(at ${formatTimerFireAt(record)}): "${record.text}".${hold}`;
   if (session.sendButtonMessage) {
@@ -9363,11 +9367,12 @@ function cancelTimerFromButton(session, timerId, sendReply) {
 
 // A tap on the same card's Send-now button (value timer:send:<id>): deliver
 // the scheduled message immediately instead of waiting out the delay. The
-// store's fireNow routes through the SAME fire path as a natural expiry, so
+// store's fireNow routes through the SAME delivery (onFire) as a natural expiry, so
 // delivery gets the "⏰ Timer #N: sending …" notice and the auto-resume
 // behavior for free — no extra success reply needed here. Only the
 // nothing-matched case (already fired / cancelled elsewhere) speaks. A daily
-// reminder is delivered and stays armed for the occurrence it already had.
+// reminder is delivered and its schedule is left untouched (lib/timer-command.js
+// fireNow) — a tap just before an occurrence still gets that occurrence too.
 function sendTimerNowFromButton(session, timerId, sendReply) {
   const convoId = journalConvoIdFor(session);
   const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;

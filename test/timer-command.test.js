@@ -642,6 +642,33 @@ describe('daily repeating reminders', () => {
     expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-25T08:00:00Z'));
   });
 
+  it('Send-now never moves the schedule, even a tap within MIN_TIMER_MS of the occurrence: that occurrence still fires', () => {
+    const fired = [];
+    const h = makeStore({ start: START, onFire: (r) => fired.push(r.id) });
+    const rec = addDaily(h);
+    // 2 s before today's 08:00 BST (07:00Z) — inside the minimum gap.
+    h.tick(HOUR - 2_000);
+    const savesBefore = h.saves.length;
+    const handlesBefore = [...h.scheduled.keys()];
+    h.store.fireNow('c1', rec.id);
+    expect(fired).toEqual([rec.id]);
+    // Record, armed handle and file all untouched: a pure extra delivery.
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-24T07:00:00Z'));
+    expect([...h.scheduled.keys()]).toEqual(handlesBefore);
+    expect(h.saves.length).toBe(savesBefore);
+    h.tick(2_000);
+    expect(fired).toEqual([rec.id, rec.id]);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-25T08:00:00Z'));
+  });
+
+  it('Send-now on a repeating record survives a throwing delivery and keeps it armed', () => {
+    const h = makeStore({ start: START, onFire: () => { throw new Error('boom'); } });
+    const rec = addDaily(h);
+    expect(h.store.fireNow('c1', rec.id)).toEqual(expect.objectContaining({ id: rec.id }));
+    expect(h.scheduled.size).toBe(1);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-24T07:00:00Z'));
+  });
+
   it('never holds the box awake: a repeating record is left out of the keep-awake marker', () => {
     const h = makeStore({ start: START });
     addDaily(h, { holdAwake: true });
