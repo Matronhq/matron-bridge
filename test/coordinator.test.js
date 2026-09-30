@@ -181,7 +181,7 @@ describe('coordinator block file', () => {
   });
 
   it('the fallback brief also forbids filing or closing missions without the user', () => {
-    expect(FALLBACK_COORDINATOR_BLOCK).toContain('Never move missions between projects or close them without the user\'s answer.');
+    expect(FALLBACK_COORDINATOR_BLOCK).toContain('Never move missions between projects, close them, or close a project without the user\'s answer.');
   });
 });
 
