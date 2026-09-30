@@ -631,6 +631,93 @@ describe('missions handlers', () => {
     });
   });
 
+  describe('filing missions into projects (spec 2026-09-30 §4.2, §5)', () => {
+    it('start with project: sends it; the ack data names the project; an existing mission keeps project_requested', async () => {
+      const filed = { id: 'ms_1', num: 61, title: 'M', state: 'open', project_id: 'pj_7', project_num: 7 };
+      const { h, client } = fixture({ start: vi.fn(async () => ({ status: 201, data: { mission: filed } })) });
+      expect((await h.start({ roomId: '!r:s', title: 'M', project: 0 })).status).toBe(400);
+      expect((await h.start({ roomId: '!r:s', title: 'M', project: null })).status).toBe(400);
+      const r = await h.start({ roomId: '!r:s', title: 'M', project: 7, idem_key: 'k' });
+      expect(r.status).toBe(201);
+      expect(client.start.mock.calls[0]).toEqual([{ title: 'M', convo_id: 'c1', project: 7 }, { idemKey: 'k' }]);
+      expect(r.body.project_requested).toBe(7);
+      expect(r.body.project_ignored).toBeUndefined();
+    });
+
+    it('start/create: a journal with no project_id on the mission row ignored project → project_ignored', async () => {
+      const { h } = fixture(); // default fixture mission has no project_id key
+      const r = await h.start({ roomId: '!r:s', title: 'M', project: 7 });
+      expect(r.status).toBe(201);
+      expect(r.body.project_ignored).toBe(true);
+      const c = fixture({ get: vi.fn(async (id) => ({ status: 200, data: { mission: { id }, milestones: [], items: [], conversations: [] } })) });
+      const rc = await c.h.create({ roomId: '!r:s', title: 'M', project: 7 });
+      expect(rc.status).toBe(201);
+      expect(c.client.create.mock.calls[0][0]).toEqual({ title: 'M', convo_id: 'c1', attach: false, project: 7 });
+      expect(rc.body.project_ignored).toBe(true);
+    });
+
+    it('start: an idempotent replay that did not file the project reports project_not_applied', async () => {
+      const filed = { id: 'ms_1', num: 61, title: 'M', state: 'open', project_id: 'pj_7', project_num: 7 };
+      const { h } = fixture({ start: vi.fn(async () => ({ status: 200, data: { mission: { ...filed, project_id: null, project_num: null } } })) });
+      const r = await h.start({ roomId: '!r:s', title: 'M', project: 7 });
+      expect(r.status).toBe(200);
+      expect(r.body.project_not_applied).toBe(true);
+    });
+
+    it('start/create with project: 404 names the project as well as the conversation', async () => {
+      const text = 'no project #7 is visible to this session (project_list shows the projects), or the journal did not accept this conversation';
+      const s = fixture({ start: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+      const rs = await s.h.start({ roomId: '!r:s', title: 'M', project: 7 });
+      expect(rs.status).toBe(404); expect(rs.body.error).toBe(text);
+      const c = fixture({ create: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+      const rc = await c.h.create({ roomId: '!r:s', title: 'M', project: 7 });
+      expect(rc.status).toBe(404); expect(rc.body.error).toBe(text);
+    });
+
+    it('update with project: number or null; project alone is enough; other values are 400', async () => {
+      const filed = { id: 'ms_1', num: 61, title: 'M', state: 'open', project_id: 'pj_7', project_num: 7 };
+      const { h, client, session } = fixture({ update: vi.fn(async () => ({ status: 200, data: { mission: filed } })) });
+      session.missionId = 'ms_1';
+      const none = await h.update({ roomId: '!r:s' });
+      expect(none.status).toBe(400);
+      expect(none.body.error).toBe('title, body or project is required');
+      expect((await h.update({ roomId: '!r:s', project: 0 })).status).toBe(400);
+      expect((await h.update({ roomId: '!r:s', project: '#7' })).status).toBe(400);
+      expect((await h.update({ roomId: '!r:s', project: 7 })).status).toBe(200);
+      expect((await h.update({ roomId: '!r:s', project: null })).status).toBe(200);
+      expect(client.update.mock.calls).toEqual([['ms_1', { project: 7 }], ['ms_1', { project: null }]]);
+    });
+
+    it('update with mission: by number, never resolves or touches the cache', async () => {
+      const { h, client, session } = fixture({ update: vi.fn(async () => ({ status: 200, data: { mission: { id: 'ms_5', num: 5, project_id: 'pj_7', project_num: 7 } } })) });
+      expect((await h.update({ roomId: '!r:s', mission: 0, project: 7 })).status).toBe(400);
+      const r = await h.update({ roomId: '!r:s', mission: 5, project: 7 });
+      expect(r.status).toBe(200);
+      expect(client.update.mock.calls[0]).toEqual([5, { project: 7 }]);
+      expect(client.conversationMissions).not.toHaveBeenCalled();
+      expect(client.list).not.toHaveBeenCalled();
+      expect(session.missionId).toBeUndefined();
+    });
+
+    it('update with project: old journal (400, or 200 without project_id) and unknown project (404) read as sentences', async () => {
+      const rejected = fixture({ update: vi.fn(async () => ({ status: 400, data: { error: 'bad_request' } })) });
+      const a = await rejected.h.update({ roomId: '!r:s', mission: 5, project: 7 });
+      expect(a.status).toBe(400);
+      expect(a.body.error).toBe('this journal does not support projects yet — it rejected project: 7; deploy the journal projects update');
+      const ignored = fixture(); // update returns the fixture mission, no project_id key
+      const b = await ignored.h.update({ roomId: '!r:s', mission: 5, title: 'T', project: 7 });
+      expect(b.status).toBe(200);
+      expect(b.body.project_ignored).toBe(true);
+      const hidden = fixture({ update: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+      const c = await hidden.h.update({ roomId: '!r:s', mission: 5, project: 7 });
+      expect(c.status).toBe(404);
+      expect(c.body.error).toBe('no mission #5 or project #7 is visible to this session — mission_get and project_list check the numbers');
+      // Without project, errors are untouched.
+      const plain = fixture({ update: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+      expect((await plain.h.update({ roomId: '!r:s', mission: 5, title: 'T' })).body).toEqual({ error: 'not_found' });
+    });
+  });
+
   // Coordinator mission close (#4901, spec 2026-09-29 coordinator session
   // control "Coordinator mission close"): `mission: N` closes ANOTHER
   // mission by number, Coordinator only, never cached, both item tiers
