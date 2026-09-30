@@ -179,6 +179,10 @@ describe('coordinator block file', () => {
     expect(block).toMatch(/kind: "question"/);
     expect(block).toMatch(/Never call `mission_start` or `mission_join` for this conversation/);
   });
+
+  it('the fallback brief also forbids filing or closing missions without the user', () => {
+    expect(FALLBACK_COORDINATOR_BLOCK).toContain('Never move missions between projects, close them, or close a project without the user\'s answer.');
+  });
 });
 
 describe('loadCoordinatorBlock', () => {

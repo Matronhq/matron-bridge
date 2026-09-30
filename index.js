@@ -10,6 +10,8 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
+import { createProjectsClient } from './lib/projects-client.js';
+import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
 import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
@@ -533,6 +535,13 @@ const itemsClient = createItemsClient({
 // Missions & milestones (spec 2026-09-10): same base URL and token as the
 // items client; a missing journal resolves status 0 → 502 in the handlers.
 const missionsClient = createMissionsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Projects (spec 2026-09-30 projects): same base URL and token; the
+// project_* tools.
+const projectsClient = createProjectsClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -10920,6 +10929,21 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// The seven project_* tool routes (lib/projects-tools.js), mounted below.
+// project_get with no num reads this conversation's current mission through
+// the missions resolver (one cache). project_close / project_merge are the
+// Coordinator's: the same test as the consent tools — the spawn-time flag,
+// or the journal's current role holder (a session that gained the role live
+// keeps coordinator:false until it respawns).
+const projectsHandlers = createProjectsHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: projectsClient,
+  missionsClient,
+  resolveMission: (session, convoId) => missionsHandlers.resolveMission(session, convoId),
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
 // The two consent_* tool routes (lib/consent-tools.js), mounted below.
 const consentHandlers = createConsentHandlers({
   sessions,
@@ -11531,13 +11555,22 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The nine mission_* / milestone_post tool routes; same one-matcher
+      // The ten mission_* / milestone_post tool routes; same one-matcher
       // allowlist shape as /items above.
-      const missionsRoute = url.pathname.match(/^\/missions\/(start|create|post|update|status|join|get|list|close)$/);
+      const missionsRoute = url.pathname.match(/^\/missions\/(start|create|post|update|status|join|leave|get|list|close)$/);
       if (missionsRoute) {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
+      // The seven project_* tool routes; same one-matcher allowlist shape.
+      const projectsRoute = url.pathname.match(/^\/projects\/(list|get|create|update|status|close|merge)$/);
+      if (projectsRoute) {
+        const name = projectsRoute[1];
+        await respondAgentChatRoute(res, data, projectsHandlers[name],
+          (status, b) => debug(`projects/${name} ${status} ${b.error || (b.project ? `#${b.project.num ?? '?'}` : b.projects ? `${b.projects.length} projects` : 'ok')}`));
         return;
       }
 
