@@ -15,6 +15,7 @@ import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } 
 import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
+import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -464,6 +465,58 @@ server.tool(
     reason: z.string().min(1).max(200).describe('One line the user reads on the card and in the tracker: why this follows the rules, or why not'),
   },
   async (args) => callConsent('decide', args, (d) => formatDecideAck(d, args)),
+);
+
+// --- Read state (spec: matron-journal 2026-09-30 read state) ---
+// unseen_list (Coordinator), unseen_mine (any agent, its own messages) and
+// unseen_flag go through the bridge loopback (index.js mounts
+// lib/unseen-tools.js at /unseen/<op>); the journal is the gate.
+async function callUnseen(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/unseen/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `unseen_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `unseen_${name} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'unseen_list',
+  "List what the user hasn't actually seen — messages that were never on their screen and tracker items they haven't opened — grouped by conversation, important first, each with why it matters and a ref. Coordinator only. Importance comes from the journal: items waiting on the user, questions, unanswered prompts, a session's last message before it stopped, failures, the user named in an agent room. Use it in every status update (a short \"You haven't seen\" section, at most 5 lines) and when the journal nudges you. Things already raised (unseen_flag) are left out unless include_flagged.",
+  {
+    older_than: z.string().max(16).optional().describe("Skip what's newer than this — the user may be about to read it. Default 30m."),
+    since: z.string().max(16).optional().describe('How far back to look, e.g. 3d (default), up to 30d.'),
+    importance: z.enum(['important', 'all']).optional().describe("'important' (default) or 'all' unseen agent messages"),
+    conversation: z.string().max(128).optional().describe('Only this conversation (its id)'),
+    mission: z.number().int().min(1).optional().describe('Only this mission number'),
+    include_flagged: z.boolean().optional().describe('Include entries already raised with the user'),
+    limit: z.number().int().min(1).max(200).optional().describe('Default 50'),
+  },
+  async (args) => callUnseen('list', args, formatUnseenList),
+);
+
+server.tool(
+  'unseen_mine',
+  "Which of YOUR messages in this conversation the user hasn't seen yet — they were never on the user's screen. Check it when you finish a long turn: if something that matters went unseen, restate it once, briefly, in your closing message (\"Earlier I said X; you may have missed it\"), then unseen_flag its ref. Never repeat a restatement, and never tell the user they haven't read something.",
+  {
+    older_than: z.string().max(16).optional().describe('Skip messages newer than this. Default 10m.'),
+  },
+  async (args) => callUnseen('mine', args, formatUnseenMine),
+);
+
+server.tool(
+  'unseen_flag',
+  "Record that you've raised these unseen entries with the user, so they are never listed or nudged about again. Pass refs exactly as unseen_list or unseen_mine gave them. An ordinary agent may only flag its own messages in this conversation.",
+  {
+    refs: z.array(z.string().max(200)).min(1).max(100).describe('Refs from unseen_list / unseen_mine'),
+  },
+  async (args) => callUnseen('flag', args, (d) => formatFlagAck(d, d.refs || args.refs)),
 );
 
 async function sessionControlCall(route, body, name) {
