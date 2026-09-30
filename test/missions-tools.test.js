@@ -18,7 +18,7 @@ function fixture(clientOverrides = {}, handlerOptions = {}) {
     // Default: a journal from before mission links (404), so every existing
     // cold-resolve test keeps exercising the old scan.
     conversationMissions: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })),
-    leave: vi.fn(async () => ({ status: 200, data: { mission } })),
+    leave: vi.fn(async () => ({ status: 200, data: { mission, current_mission: null } })),
     ...clientOverrides,
   };
   const h = createMissionsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, ...handlerOptions });
@@ -541,6 +541,93 @@ describe('missions handlers', () => {
       const r = await h.get({ roomId: '!r:s' });
       expect(r.status).toBe(200);
       expect(r.body.conversation_missions).toBeUndefined();
+    });
+  });
+
+  describe('several missions per conversation (spec 2026-09-30 §3)', () => {
+    it('join makes the joined mission current in the cache, replacing the old one', async () => {
+      const joined = { id: 'ms_9', num: 9, title: 'Next', state: 'open' };
+      const { h, client, session } = fixture({ join: vi.fn(async () => ({ status: 200, data: { mission: joined } })) });
+      session.missionId = 'ms_1';
+      const r = await h.join({ roomId: '!r:s', num: 9 });
+      expect(r.status).toBe(200);
+      expect(client.join.mock.calls[0]).toEqual([9, { convo_id: 'c1' }]);
+      expect(session.missionId).toBe('ms_9');
+    });
+
+    it('leave: validates num, posts convo_id, drops the cache and reports the new current mission', async () => {
+      const next = { id: 'ms_3', num: 3, title: 'Other', current: true, active: true };
+      const { h, client, session } = fixture({
+        leave: vi.fn(async () => ({ status: 200, data: { mission: { id: 'ms_1', num: 61 }, current_mission: next } })),
+      });
+      session.missionId = 'ms_1';
+      expect((await h.leave({ roomId: '!r:s' })).status).toBe(400);
+      expect((await h.leave({ roomId: '!r:s', num: 0 })).status).toBe(400);
+      const r = await h.leave({ roomId: '!r:s', num: 61 });
+      expect(r.status).toBe(200);
+      expect(client.leave.mock.calls[0]).toEqual([61, { convo_id: 'c1' }]);
+      expect(r.body.left).toBe(61);
+      expect(r.body.current).toEqual(next);
+      expect(session.missionId).toBe('ms_3');
+    });
+
+    it('leave: no current mission left → current null and nothing cached', async () => {
+      const { h, session } = fixture();
+      session.missionId = 'ms_1';
+      const r = await h.leave({ roomId: '!r:s', num: 61 });
+      expect(r.status).toBe(200);
+      expect(r.body.current).toBeNull();
+      expect(session.missionId).toBeUndefined();
+    });
+
+    it('leave: a leave body without current_mission reports current unknown', async () => {
+      const { h, session } = fixture({ leave: vi.fn(async () => ({ status: 200, data: { mission: { id: 'ms_1', num: 61 } } })) });
+      session.missionId = 'ms_1';
+      const r = await h.leave({ roomId: '!r:s', num: 61 });
+      expect(r.status).toBe(200);
+      expect(r.body.current).toBeUndefined();
+      expect(session.missionId).toBeUndefined();
+    });
+
+    it('leave: 404 is "not on that mission" (or an old journal) in a sentence; the cache is kept; 502 when unreachable', async () => {
+      const { h, session } = fixture({ leave: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+      session.missionId = 'ms_1';
+      const r = await h.leave({ roomId: '!r:s', num: 5 });
+      expect(r.status).toBe(404);
+      expect(r.body.error).toBe('this conversation is not on mission #5 — nothing to leave (a journal older than mission history cannot leave either: deploy the journal update)');
+      expect(session.missionId).toBe('ms_1');
+      const down = fixture({ leave: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
+      expect((await down.h.leave({ roomId: '!r:s', num: 5 })).status).toBe(502);
+    });
+
+    it('post with mission: validates it, sends it, and never caches the named mission', async () => {
+      const named = { id: 'ms_3', num: 3, title: 'Other', state: 'open' };
+      const { h, client, session } = fixture({ postMilestone: vi.fn(async () => ({ status: 201, data: { milestone: { num: 80 }, mission: named } })) });
+      session.missionId = 'ms_1';
+      expect((await h.post({ roomId: '!r:s', kind: 'progress', title: 't', mission: 0 })).status).toBe(400);
+      expect((await h.post({ roomId: '!r:s', kind: 'progress', title: 't', mission: '3' })).status).toBe(400);
+      const r = await h.post({ roomId: '!r:s', kind: 'progress', title: 't', mission: 3, idem_key: 'k' });
+      expect(r.status).toBe(201);
+      expect(client.postMilestone.mock.calls[0]).toEqual([{ convo_id: 'c1', kind: 'progress', title: 't', mission: 3 }, { idemKey: 'k' }]);
+      expect(session.missionId).toBe('ms_1');
+    });
+
+    it('post: a journal that ignores mission (posted to another number) is an error naming both', async () => {
+      const { h } = fixture({ postMilestone: vi.fn(async () => ({ status: 201, data: { milestone: { num: 80 }, mission: { id: 'ms_1', num: 61 } } })) });
+      const r = await h.post({ roomId: '!r:s', kind: 'progress', title: 't', mission: 3 });
+      expect(r.status).toBe(502);
+      expect(r.body.error).toBe("this journal does not support posting to a named mission yet — the milestone went to this conversation's current mission #61 instead of #3; deploy the journal update (mission links)");
+    });
+
+    it('post with mission: 404 is the conversation sentence; 409 not_linked passes through', async () => {
+      const gone = fixture({ postMilestone: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+      const g = await gone.h.post({ roomId: '!r:s', kind: 'progress', title: 't', mission: 3 });
+      expect(g.status).toBe(404);
+      expect(g.body.error).toBe('the journal did not accept this conversation — it may have no journal row yet, or its mission is not visible to this session');
+      const unlinked = fixture({ postMilestone: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'not_linked' } })) });
+      const u = await unlinked.h.post({ roomId: '!r:s', kind: 'progress', title: 't', mission: 3 });
+      expect(u.status).toBe(409);
+      expect(u.body.blocked_by).toBe('not_linked');
     });
   });
 
