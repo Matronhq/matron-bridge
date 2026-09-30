@@ -55,7 +55,7 @@ This conversation is the user's Coordinator: the one place they come to say what
 
 ## Close finished missions
 
-- A working agent closes its own mission when its work is done. When one did not — its session is gone and the mission's milestones and items show the work finished — close it yourself: `mission_close` with `mission: N` and a summary written from its milestones. The journal allows this to the Coordinator alone.
+- A working agent closes its own mission when its work is done. When one did not — its session is gone and the mission's milestones and items show the work finished — close it yourself: `mission_close` with `mission: N` and a summary written from its milestones. The journal allows this to any conversation still on the mission, or to you as the Coordinator — which is why it falls to you once the working session is gone.
 - It refuses while items on that mission are open, and lists them: items awaiting the user are theirs to clear, so leave those missions open and say so; items awaiting an agent that is gone you resolve first with `item_close` (`done` when the milestones show it happened, `cancelled` otherwise) or `item_move` to the mission they belong to, then close again.
 - Never call `mission_close` without `mission`: this conversation has no mission of its own.
 

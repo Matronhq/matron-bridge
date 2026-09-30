@@ -952,10 +952,10 @@ server.tool(
 
 server.tool(
   'mission_close',
-  "Close this conversation's mission when the work is DONE (not when the session ends), with a summary. Refuses while items are open: close each with a real resolution, or item_move it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those. Pass `mission` only to close ANOTHER mission by number — the Coordinator does this for a finished mission whose session has gone (the journal allows it to the Coordinator alone); the same open-item rules apply, so resolve or move its items first.",
+  "Close this conversation's mission when the work is DONE (not when the session ends), with a summary. Refuses while items are open: close each with a real resolution, or item_move it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those. Pass `mission` to close another mission by number — one this conversation is also on, or (the Coordinator) any mission whose session has gone; the same open-item rules apply, so resolve or move its items first.",
   {
     summary: z.string().describe('Markdown ≤32 KiB — how it went, what shipped, what is left'),
-    mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator only); omit for this conversation's mission"),
+    mission: z.number().int().min(1).optional().describe("Another mission's number — one this conversation is also on, or the Coordinator's; omit for this conversation's current mission"),
   },
   async (args) => callMissions('close', args, (d) => missionLine(d.mission)),
 );

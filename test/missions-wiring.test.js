@@ -104,6 +104,15 @@ describe('missions wiring', () => {
     expect(codexMd).toMatch(/"attach":false/);
   });
 
+  // M3 (final-review, 2026-09-30): `mission_start` returns the current
+  // mission unchanged once there is one (BRIDGE_CLAUDE.md two lines
+  // earlier), so "Use mission_start for your own work" read as though it
+  // still applied after the conversation already has one.
+  it('BRIDGE_CLAUDE.md scopes "Use mission_start for your own work" to a conversation with no mission yet', () => {
+    expect(claudeMd).toContain('Use `mission_start` for your own work when this conversation has no mission yet.');
+    expect(claudeMd).not.toContain('Use `mission_start` for your own work.');
+  });
+
   it('mission_close takes an optional mission number for the Coordinator, and the Coordinator prompt teaches it', () => {
     const tool = askUser.slice(askUser.indexOf("'mission_close',"), askUser.indexOf("'item_move',"));
     expect(tool).toContain("mission: z.number().int().min(1).optional()");
@@ -112,6 +121,10 @@ describe('missions wiring', () => {
     expect(coord).toMatch(/^## Close finished missions/m);
     expect(coord).toContain('`mission_close` with `mission: N`');
     expect(coord).toContain('Never call `mission_close` without `mission`');
+    // I1 (final-review, 2026-09-30): the journal allows a named-mission close
+    // to any conversation with an active link to it, not the Coordinator
+    // alone — the prompt must not claim exclusivity it no longer has.
+    expect(coord).not.toContain('The journal allows this to the Coordinator alone.');
   });
 
   it('mission_status carries the spec description verbatim and its schema; mission_list takes only state', () => {
