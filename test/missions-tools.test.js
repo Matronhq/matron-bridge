@@ -15,6 +15,10 @@ function fixture(clientOverrides = {}, handlerOptions = {}) {
     close: vi.fn(async () => ({ status: 200, data: { mission: { ...mission, state: 'closed' } } })),
     postMilestone: vi.fn(async () => ({ status: 201, data: { milestone: { id: 'ml_1', num: 63 }, mission } })),
     listMilestones: vi.fn(async () => ({ status: 200, data: { milestones: [] } })),
+    // Default: a journal from before mission links (404), so every existing
+    // cold-resolve test keeps exercising the old scan.
+    conversationMissions: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })),
+    leave: vi.fn(async () => ({ status: 200, data: { mission } })),
     ...clientOverrides,
   };
   const h = createMissionsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, ...handlerOptions });
@@ -436,6 +440,108 @@ describe('missions handlers', () => {
     expect((await old.h.list({ roomId: '!r:s' })).body.error).toMatch(/does not have the \/missions routes/);
     const down = fixture({ list: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
     expect((await down.h.list({ roomId: '!r:s' })).status).toBe(502);
+  });
+
+  describe('cold resolve through GET /conversations/:id/missions (spec 2026-09-30 §5)', () => {
+    const link = (id, num, extra = {}) => ({ id, num, title: `M${num}`, state: 'open', current: false, active: true, joined_at: 1, ended_at: null, how: 'joined', ...extra });
+
+    it('one call, caches the CURRENT link, never scans', async () => {
+      const { h, client, session } = fixture({
+        conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: [link('ms_7', 7, { current: true }), link('ms_3', 3)] } })),
+      });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(200);
+      expect(client.conversationMissions.mock.calls[0]).toEqual(['c1']);
+      expect(client.update.mock.calls[0][0]).toBe('ms_7');
+      expect(session.missionId).toBe('ms_7');
+      expect(client.list).not.toHaveBeenCalled();
+      expect(client.get).not.toHaveBeenCalled();
+    });
+
+    it('picks the current link wherever it sits; an active-not-current or ended link is never the default', async () => {
+      const { h, client, session } = fixture({
+        conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: [link('ms_3', 3), link('ms_2', 2, { active: false, ended_at: 5 }), link('ms_9', 9, { current: true })] } })),
+      });
+      await h.update({ roomId: '!r:s', title: 'New' });
+      expect(client.update.mock.calls[0][0]).toBe('ms_9');
+      expect(session.missionId).toBe('ms_9');
+    });
+
+    it('links but none current → the no-mission 404, no scan, nothing cached', async () => {
+      const { h, client, session } = fixture({
+        conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: [link('ms_3', 3, { active: false, ended_at: 5 })] } })),
+      });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(404);
+      expect(r.body.error).toMatch(/call mission_start/);
+      expect(session.missionId).toBeUndefined();
+      expect(client.list).not.toHaveBeenCalled();
+      expect(client.update).not.toHaveBeenCalled();
+    });
+
+    it('an outage on the links route is reported — never a scan, never "no mission"', async () => {
+      for (const res of [{ status: 0, data: { error: 'journal unreachable' } }, { status: 500, data: { error: 'boom' } }]) {
+        const { h, client, session } = fixture({ conversationMissions: vi.fn(async () => res) });
+        const r = await h.update({ roomId: '!r:s', title: 'New' });
+        expect(r.status).toBe(res.status === 0 ? 502 : 500);
+        expect(r.body.error).not.toContain('mission_start');
+        expect(client.list).not.toHaveBeenCalled();
+        expect(session.missionId).toBeUndefined();
+      }
+    });
+
+    it('a 200 with an unreadable link list is a 502', async () => {
+      const { h, client } = fixture({ conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: 'nope' } })) });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(502);
+      expect(r.body.error).toBe("the journal returned an unreadable list of this conversation's missions");
+      expect(client.update).not.toHaveBeenCalled();
+    });
+
+    it('a 404 on the links route (old journal) falls back to the GET /missions scan', async () => {
+      const { h, client, session, mission } = fixture({ list: vi.fn(async () => ({ status: 200, data: { missions: [mission] } })) });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(200);
+      expect(client.conversationMissions).toHaveBeenCalledTimes(1);
+      expect(client.list).toHaveBeenCalledTimes(1);
+      expect(session.missionId).toBe('ms_1');
+    });
+
+    it('a 404 on the links route from a NEW journal (rows carry project_id) is "no mission" without the per-mission sweep', async () => {
+      const { h, client } = fixture({ list: vi.fn(async () => ({ status: 200, data: { missions: [{ id: 'ms_5', num: 5, origin_convo_id: 'other', project_id: null }] } })) });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(404);
+      expect(client.get).not.toHaveBeenCalled();
+    });
+
+    it('resolveMission is exposed for the projects handlers and shares the cache', async () => {
+      const { h, session } = fixture({
+        conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: [link('ms_7', 7, { current: true })] } })),
+      });
+      expect(await h.resolveMission(session, 'c1')).toEqual({ id: 'ms_7' });
+      expect(session.missionId).toBe('ms_7');
+    });
+
+    it("get with no num attaches this conversation's missions; with num it does not", async () => {
+      const links = [link('ms_1', 61, { current: true }), link('ms_3', 3)];
+      const { h, client, session } = fixture({ conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: links } })) });
+      session.missionId = 'ms_1';
+      const own = await h.get({ roomId: '!r:s' });
+      expect(own.status).toBe(200);
+      expect(own.body.conversation_missions).toEqual(links);
+      const other = await h.get({ roomId: '!r:s', num: 5 });
+      expect(other.body.conversation_missions).toBeUndefined();
+      expect(client.conversationMissions).toHaveBeenCalledTimes(1);
+      expect(client.get.mock.calls.every((c) => c[1]?.history === true)).toBe(true);
+    });
+
+    it('get with no num still answers when the links route is missing (old journal)', async () => {
+      const { h, session } = fixture();
+      session.missionId = 'ms_1';
+      const r = await h.get({ roomId: '!r:s' });
+      expect(r.status).toBe(200);
+      expect(r.body.conversation_missions).toBeUndefined();
+    });
   });
 
   // Coordinator mission close (#4901, spec 2026-09-29 coordinator session
