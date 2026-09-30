@@ -19,18 +19,29 @@ function body(startMarker, endMarker) {
 
 describe('session control wiring (source inspection)', () => {
   it('registers the RPC method and the publisher hooks', () => {
-    expect(index).toContain("controlSession: (params) => journalControlSession(params),");
+    expect(index).toContain("controlSession: (params, meta) => journalControlSession(params, meta),");
     expect(index).toContain("onSessionControlFrame: (frame) => sessionControlHandlers?.onSessionControlFrame(frame),");
     expect(index).toMatch(/onOpError: \(e\) => \{ if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers/);
   });
   it('resolves or resumes the target, then parks, schedules or applies', () => {
-    const fn = body('async function journalControlSession(rawParams) {', '\nasync function applyControlSteps(');
+    const fn = body('async function journalControlSession(rawParams, { fromDeviceId } = {}) {', '\nasync function applyControlSteps(');
     expect(fn).toContain('let session = findSessionByClaudeSessionId(params.convoId);');
     expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(params.convoId, JOURNAL_RESUME_NOTICE);');
     expect(fn).toContain("code: known ? 'gone' : 'not_found'");
     expect(fn).toContain('planSessionControl({ params, session, canSwitch: canSwitchAgent })');
-    expect(fn).toContain("session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...plan.slot, id: randomUUID() } };");
+    expect(fn).toContain("session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...mergeParkedSlot(session._deferredControls?.[plan.slot.kind], plan.slot), id: randomUUID() } };");
     expect(fn).toContain("session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };");
+  });
+  it('authorizes a journal-originated alert against the current Coordinator before resolving the target', () => {
+    const fn = body('async function journalControlSession(rawParams, { fromDeviceId } = {}) {', '\nasync function applyControlSteps(');
+    const auth = fn.indexOf('const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinator.convoId });');
+    expect(auth).toBeGreaterThan(-1);
+    // A cold or stale role cache gets one forced refresh before an alert is refused (Bugbot).
+    const refresh = fn.indexOf("if (params.action === 'alert' && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {\n    coordinator = await coordinatorLookup.refresh({ force: true });");
+    expect(refresh).toBeGreaterThan(-1);
+    expect(refresh).toBeLessThan(auth);
+    expect(fn).toContain('if (denied) return { ok: false, error: denied };');
+    expect(auth).toBeLessThan(fn.indexOf('findSessionByClaudeSessionId(params.convoId)'));
   });
   it('applies steps through the existing switch, model, compact and turn paths', () => {
     const fn = body('async function applyControlSteps(session, steps) {', '\nfunction drainDeferredControls(');
@@ -55,8 +66,8 @@ describe('session control wiring (source inspection)', () => {
     // refused or scheduled); it is removed only if still the same object.
     // Settled by id (a recreate rebuilds the slot object from persisted JSON).
     expect(fn).toContain('if (held && (held === slots[kind] || (held.id && held.id === slots[kind].id))) {');
-    const jcs = body('async function journalControlSession(rawParams) {', '\nasync function applyControlSteps(');
-    expect(jcs).toContain('[plan.slot.kind]: { ...plan.slot, id: randomUUID() } };');
+    const jcs = body('async function journalControlSession(rawParams, { fromDeviceId } = {}) {', '\nasync function applyControlSteps(');
+    expect(jcs).toContain('[plan.slot.kind]: { ...mergeParkedSlot(session._deferredControls?.[plan.slot.kind], plan.slot), id: randomUUID() } };');
     expect(fn.indexOf('session._drainingControls = true;')).toBeLessThan(fn.indexOf('void (async () => {'));
     expect(fn.slice(0, fn.indexOf('void (async () => {'))).not.toContain('session._deferredControls = null;\n  session._drainingControls');
     // A slot that started a turn ends the drain; the rest wait for the next

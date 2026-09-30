@@ -979,3 +979,20 @@ describe('local_memories / local_memory_get', () => {
     expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'forbidden' } });
   });
 });
+
+describe('session_control', () => {
+  it('hands the params and the sender device id to controlSession and relays its answer', async () => {
+    const calls = [];
+    const { handler, responses } = harness({
+      controlSession: (params, meta) => { calls.push({ params, meta }); return { ok: true, result: { applied: 'now' } }; },
+    });
+    await handler({ request_id: 'r1', from_device_id: 0, method: 'session_control', params: { convo_id: 'c', action: 'alert', message: 'm' } });
+    expect(calls).toEqual([{ params: { convo_id: 'c', action: 'alert', message: 'm' }, meta: { fromDeviceId: 0 } }]);
+    expect(responses[0]).toMatchObject({ requestId: 'r1', toDeviceId: 0, ok: true, result: { applied: 'now' } });
+  });
+  it('relays a refusal as the error body', async () => {
+    const { handler, responses } = harness({ controlSession: () => ({ ok: false, error: { code: 'forbidden', detail: 'x' } }) });
+    await handler(REQ('session_control', { convo_id: 'c', action: 'alert', message: 'm' }));
+    expect(responses[0]).toMatchObject({ ok: false, error: { code: 'forbidden', detail: 'x' } });
+  });
+});
