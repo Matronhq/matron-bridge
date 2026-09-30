@@ -506,6 +506,7 @@ server.tool(
   "Which of YOUR messages in this conversation the user hasn't seen yet — they were never on the user's screen. Check it when you finish a long turn: if something that matters went unseen, restate it once, briefly, in your closing message (\"Earlier I said X; you may have missed it\"), then unseen_flag its ref. Never repeat a restatement, and never tell the user they haven't read something.",
   {
     older_than: z.string().max(16).optional().describe('Skip messages newer than this. Default 10m.'),
+    room_id: z.string().max(128).optional().describe('An agent chat room you take part in, instead of this conversation'),
   },
   async (args) => callUnseen('mine', args, formatUnseenMine),
 );

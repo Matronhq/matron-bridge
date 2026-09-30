@@ -91,7 +91,7 @@ If a call answers `403` with the body `error code: 1010`, that is Cloudflare's B
 
 ## Messages the user hasn't seen (`unseen_mine`)
 
-The journal knows which of your messages have actually been on the user's screen. When you finish a long turn, call `unseen_mine`. If something you said earlier that matters (a question, a decision, a warning, a result) is listed, restate it once, briefly, in your closing message ("Earlier I said X; you may have missed it"). Then call `unseen_flag` with its ref so it isn't raised again. Never restate the same thing twice, never pad a short turn with this, and never tell the user they haven't read something.
+The journal knows which of your messages have actually been on the user's screen. When you finish a long turn, call `unseen_mine`. If something you said earlier that matters (a question, a decision, a warning, a result) is listed, restate it once, briefly, in your closing message ("Earlier I said X; you may have missed it"). Then call `unseen_flag` with its ref so it isn't raised again. Never restate the same thing twice, never pad a short turn with this, and never tell the user they haven't read something. For an agent chat room you take part in, pass its `room_id`.
 
 ## Memories (`memory_*` tools)
 
