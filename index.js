@@ -70,6 +70,7 @@ import {
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
 import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton, keepAwakeMarker } from './lib/timer-command.js';
+import { formatRepeat } from './lib/daily-repeat.js';
 import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
@@ -7966,7 +7967,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           break;
         }
         await sendReply(cancelled.length === 1
-          ? `🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`
+          ? `🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").${cancelled[0].repeat ? ' It will not repeat.' : ''}`
           : `🚫 Cancelled ${cancelled.length} timers.`);
         break;
       }
@@ -7976,7 +7977,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No timers set. Usage: /timer <duration|time> <message> — e.g. /timer 2h hey, /timer 30m /compact, or /timer 09:00 standup.');
         break;
       }
-      const lines = active.map(t => `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
+      // A daily reminder the agent set (reminder_create repeat: "daily") shows
+      // up here too; say it repeats, and that "in" is its next fire.
+      const lines = active.map(t => t.repeat
+        ? `#${t.id} — ${formatRepeat(t.repeat)}, next in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`
+        : `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
       await sendReply(`⏰ Timers for this conversation:\n${lines.join('\n')}\n\n/timer cancel <id|all> to cancel.`);
       break;
     }
@@ -9207,6 +9212,10 @@ async function carryOnConvo(convoId, session, _sendReply) {
 // of the send: journalRouteTextToSession's delivery paths all skip the
 // journal mirror (they assume the client already has its own send row,
 // which a timer-fired message never does).
+// A daily reminder (record.repeat) is delivered exactly like a one-shot; the
+// store has already kept it and re-arms it for the next occurrence right
+// after this is kicked off (lib/timer-command.js fireRepeating) — the notice
+// says so, so the user knows it will come back.
 async function fireTimer(record) {
   let session = findSessionByClaudeSessionId(record.convoId);
   if (!session || !session.alive) session = journalResumeConvo(record.convoId);
@@ -9218,7 +9227,8 @@ async function fireTimer(record) {
   if (record.source === 'agent') {
     // Set by the agent through reminder_create: the delivered turn says so,
     // or the model reads its own reminder as something the user just typed.
-    journalPublishNotice(journalConvoIdFor(session), `⏰ Reminder #${record.id} (set by the agent): "${record.text}"`);
+    const repeats = record.repeat ? `, ${formatRepeat(record.repeat)}` : '';
+    journalPublishNotice(journalConvoIdFor(session), `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`);
     await journalRouteTextToSession(session,
       `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`);
     return;
@@ -9282,11 +9292,16 @@ function formatTimerFireAt(record) {
 // Send-now / Cancel card a typed /timer gets, so the user can see and undo
 // what their agent scheduled from the phone. Falls back to a plain notice
 // where the session cannot publish picker frames.
+// A daily reminder's card says so, and what its two buttons do to it: Send
+// now is an extra delivery (the schedule stands), Cancel ends it for good.
 async function announceAgentReminder(session, record) {
   const hold = record.holdAwake ? ' It keeps this box awake (and the session un-reaped) until then.' : '';
-  const summary =
-    `⏰ The agent set itself reminder #${record.id} — in ${formatTimerDuration(record.fireAt - Date.now())} ` +
-    `(at ${formatTimerFireAt(record)}): "${record.text}".${hold}`;
+  const summary = record.repeat
+    ? `⏰ The agent set itself a daily reminder #${record.id} — ${formatRepeat(record.repeat)}, ` +
+      `first in ${formatTimerDuration(record.fireAt - Date.now())} (at ${formatTimerFireAt(record)}): "${record.text}". ` +
+      'Send now delivers it once without changing the schedule; Cancel stops it for good.'
+    : `⏰ The agent set itself reminder #${record.id} — in ${formatTimerDuration(record.fireAt - Date.now())} ` +
+      `(at ${formatTimerFireAt(record)}): "${record.text}".${hold}`;
   if (session.sendButtonMessage) {
     await session.sendButtonMessage(
       summary,
@@ -9343,7 +9358,7 @@ function cancelTimerFromButton(session, timerId, sendReply) {
     sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
     return;
   }
-  sendReply(`🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`);
+  sendReply(`🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").${cancelled[0].repeat ? ' It will not repeat.' : ''}`);
 }
 
 // A tap on the same card's Send-now button (value timer:send:<id>): deliver
@@ -9351,7 +9366,8 @@ function cancelTimerFromButton(session, timerId, sendReply) {
 // store's fireNow routes through the SAME fire path as a natural expiry, so
 // delivery gets the "⏰ Timer #N: sending …" notice and the auto-resume
 // behavior for free — no extra success reply needed here. Only the
-// nothing-matched case (already fired / cancelled elsewhere) speaks.
+// nothing-matched case (already fired / cancelled elsewhere) speaks. A daily
+// reminder is delivered and stays armed for the occurrence it already had.
 function sendTimerNowFromButton(session, timerId, sendReply) {
   const convoId = journalConvoIdFor(session);
   const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;

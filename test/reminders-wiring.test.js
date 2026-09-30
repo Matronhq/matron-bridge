@@ -13,6 +13,7 @@ describe('reminders wiring', () => {
   const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
   const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
   const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
+  const coordinatorMd = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
 
   it('mounts the three /reminders routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/reminders\\\/\(([a-z|]+)\)\$\/\)/);
@@ -57,5 +58,39 @@ describe('reminders wiring', () => {
       expect(md).toContain('hold_awake');
     }
     expect(claudeMd).toMatch(/CronCreate/);
+  });
+
+  it('reminder_create offers repeat + tz as plain strings, so the bridge (not zod) words the rejection', () => {
+    const create = askUser.slice(askUser.indexOf("'reminder_create',"), askUser.indexOf("'reminder_list',"));
+    expect(create).toMatch(/repeat: z\.string\(\)\.optional\(\)/);
+    expect(create).toMatch(/tz: z\.string\(\)\.optional\(\)/);
+    // The description is a double-quoted JS string, so its quotes are escaped.
+    expect(create).toMatch(/repeat: \\"daily\\"/);
+    expect(create).toMatch(/standing check-ins/);
+  });
+
+  it('every surface that renders a reminder says when it repeats', () => {
+    // The chat card (Send-now / Cancel), the /timer list, the fire notice
+    // and the Cancel-button reply all go through formatRepeat.
+    const announce = index.slice(index.indexOf('async function announceAgentReminder'), index.indexOf('async function announceAgentReminder') + 1500);
+    expect(announce).toMatch(/record\.repeat/);
+    expect(announce).toMatch(/formatRepeat\(record\.repeat\)/);
+    const list = index.slice(index.indexOf("const active = timerStore.listForConvo(convoId);"), index.indexOf("const active = timerStore.listForConvo(convoId);") + 700);
+    expect(list).toMatch(/formatRepeat\(t\.repeat\)/);
+    const fire = index.slice(index.indexOf('async function fireTimer'), index.indexOf('async function fireTimer') + 1600);
+    expect(fire).toMatch(/formatRepeat\(record\.repeat\)/);
+    const cancelBtn = index.slice(index.indexOf('function cancelTimerFromButton'), index.indexOf('function cancelTimerFromButton') + 900);
+    expect(cancelBtn).toMatch(/\.repeat/);
+  });
+
+  it('the Coordinator sets its check-ins once as daily reminders and re-checks them on each one', () => {
+    const i = coordinatorMd.indexOf('## Check-ins');
+    expect(i, 'BRIDGE_COORDINATOR.md has no Check-ins section').toBeGreaterThan(coordinatorMd.indexOf('## Projects'));
+    const block = coordinatorMd.slice(i);
+    expect(block).toContain('reminder_create');
+    expect(block).toContain('repeat: "daily"');
+    expect(block).toContain('tz: "Europe/London"');
+    expect(block).toContain('reminder_list');
+    expect(block).toContain('memory_save');
   });
 });
