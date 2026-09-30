@@ -89,6 +89,10 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
 
 If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header. If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
 
+## Messages the user hasn't seen (`unseen_mine`)
+
+The journal knows which of your messages have actually been on the user's screen. When you finish a long turn, call `unseen_mine`. If something you said earlier that matters (a question, a decision, a warning, a result) is listed, restate it once, briefly, in your closing message ("Earlier I said X; you may have missed it"). Then call `unseen_flag` with its ref so it isn't raised again. Never restate the same thing twice, never pad a short turn with this, and never tell the user they haven't read something. For an agent chat room you take part in, pass its `room_id`.
+
 ## Memories (`memory_*` tools)
 
 The user's memories are their standing rules and facts about how they want their agents to work, saved in the journal and shared by every session on every box. They are listed under "Your memories" at the end of these instructions, as they are for every session at spawn: follow them without being asked, and call `memory_get` for the why and the how behind a line before acting against it. When the user states such a rule, save it with `memory_save` (one memory per rule; the one-line `description` is the rule itself, the why and the how go in `body`; the same `name` overwrites the whole memory, so send the body back when updating). `memory_list`, `memory_get` and `memory_delete` read and retire them.

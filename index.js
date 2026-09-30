@@ -14,6 +14,8 @@ import { createProjectsClient } from './lib/projects-client.js';
 import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
 import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
+import { createUnseenClient } from './lib/unseen-client.js';
+import { createUnseenHandlers, formatUnseenNudge } from './lib/unseen-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
@@ -554,6 +556,13 @@ const consentClient = createConsentClient({
   token: _journalToken,
 });
 
+// Read state (spec: matron-journal 2026-09-30 read state): same base URL and
+// token; the unseen_list / unseen_mine / unseen_flag tools.
+const unseenClient = createUnseenClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
 // Memories (spec 2026-09-27): same base URL and token; the memory_* tools.
 const memoryClient = createMemoryClient({
   baseUrl: journalHttpBase,
@@ -761,6 +770,8 @@ const journalPublisher = createJournalPublisher({
   onSessionControlFrame: (frame) => sessionControlHandlers?.onSessionControlFrame(frame),
   // Coordinator consent nudges (kind:'consent'): another agent's ask parked.
   onConsentFrame: (frame) => journalHandleConsentFrame(frame),
+  // Unseen nudges (kind:'unseen'): important things the user hasn't seen.
+  onUnseenFrame: (frame) => journalHandleUnseenFrame(frame),
   // Spawn correlation tries first (its waiters are request_id-keyed, same
   // style as agent-invites' own onOpError) — a `true` return means it owned
   // and consumed the ref, so the invite manager never sees it. Op-error refs
@@ -11024,6 +11035,37 @@ function journalHandleConsentFrame(frame) {
   deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[consent] nudge delivery failed: ${e.message}`));
 }
 
+// The three unseen_* tool routes (lib/unseen-tools.js), mounted below.
+const unseenHandlers = createUnseenHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: unseenClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
+// A journal `{kind:'unseen', event:'pending'}` frame (spec: matron-journal
+// 2026-09-30 read state): important things the user hasn't seen for 2 h or
+// more. Delivered to the Coordinator exactly like a consent nudge — resumed
+// if idle-reaped, the same text left as a notice in its chat.
+function journalHandleUnseenFrame(frame) {
+  if (!frame || frame.event !== 'pending') return;
+  const text = formatUnseenNudge(frame);
+  if (!text) return;
+  const { convoId } = coordinatorLookup.snapshot();
+  if (!convoId) {
+    console.warn('[unseen] an unseen nudge arrived but the journal lists no Coordinator on this box');
+    return;
+  }
+  let session = findSessionByClaudeSessionId(convoId);
+  if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);
+  if (!session) {
+    console.warn(`[unseen] an unseen nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
+    return;
+  }
+  journalPublishNotice(journalConvoIdFor(session), text);
+  deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[unseen] nudge delivery failed: ${e.message}`));
+}
+
 // The four memory_* tool routes (lib/memory-tools.js), mounted below.
 const memoryHandlers = createMemoryHandlers({
   sessions,
@@ -11608,6 +11650,15 @@ const apiServer = createServer(async (req, res) => {
         const name = projectsRoute[1];
         await respondAgentChatRoute(res, data, projectsHandlers[name],
           (status, b) => debug(`projects/${name} ${status} ${b.error || (b.project ? `#${b.project.num ?? '?'}` : b.projects ? `${b.projects.length} projects` : 'ok')}`));
+        return;
+      }
+
+      // The three unseen_* tool routes; same one-matcher allowlist shape.
+      const unseenRoute = url.pathname.match(/^\/unseen\/(list|mine|flag)$/);
+      if (unseenRoute) {
+        const name = unseenRoute[1];
+        await respondAgentChatRoute(res, data, unseenHandlers[name],
+          (status, b) => debug(`unseen/${name} ${status} ${b.error || (b.entries ? `${b.entries.length} unseen` : 'ok')}`));
         return;
       }
 
