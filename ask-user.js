@@ -8,8 +8,9 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
-import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList } from './lib/missions-format.js';
+import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
+import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
@@ -847,7 +848,7 @@ server.tool(
 async function callMissions(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   if (name === 'start' || name === 'post' || name === 'create') {
-    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
+    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body, mission: args?.mission });
   }
   try {
     const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
@@ -863,47 +864,52 @@ async function callMissions(name, args, render) {
     return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
   }
 }
-const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_create', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_create', post: 'milestone_post', update: 'mission_update', join: 'mission_join', leave: 'mission_leave', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
 
 server.tool(
   'mission_start',
-  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has one this returns it unchanged.",
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
+    project: z.number().int().min(1).optional().describe('A project number from project_list to file the mission in'),
   },
   async (args) => callMissions('start', args, formatStartAck),
 );
 
 server.tool(
   'mission_create',
-  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work. Returns the mission number.",
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in a project. Returns the mission number.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal: what done looks like, constraints, links'),
+    project: z.number().int().min(1).optional().describe('A project number from project_list to file the mission in'),
   },
   async (args) => callMissions('create', args, formatCreateAck),
 );
 
 server.tool(
   'milestone_post',
-  "Post a milestone: a checkpoint on this conversation's mission that is also a jump target back to this exact point in the transcript. kind 'user_input' whenever an input from the user starts or redirects work (skip typos, one-word answers, clarifications) — the user's stated purpose is to get back to their last input easily. kind 'progress' as often as useful: a landed PR, a diagnosis, a decision, a phase done. There is no cap. Refused with an instruction if the conversation has no mission yet.",
+  "Post a milestone: a checkpoint on this conversation's current mission that is also a jump target back to this exact point in the transcript. kind 'user_input' whenever an input from the user starts or redirects work (skip typos, one-word answers, clarifications) — the user's stated purpose is to get back to their last input easily. kind 'progress' as often as useful: a landed PR, a diagnosis, a decision, a phase done. There is no cap. Pass `mission` to post to another mission this conversation is on (mission_get lists them). Refused with an instruction if the conversation has no mission yet.",
   {
     kind: z.enum(['user_input', 'progress']),
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
+    mission: z.number().int().min(1).optional().describe('A mission this conversation is on; omit for the current mission'),
   },
   async (args) => callMissions('post', args, formatMilestoneAck),
 );
 
 server.tool(
   'mission_update',
-  "Rename this conversation's mission or rewrite its standing description (title and/or body). Use it when the work changes shape.",
+  "Rename a mission, rewrite its standing description, or file it in a project (project: N; null takes it out — a mission is in one project or none). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
   {
     title: z.string().optional().describe('≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB'),
+    project: z.number().int().min(1).nullable().optional().describe('A project number from project_list, or null to take the mission out of its project'),
+    mission: z.number().int().min(1).optional().describe("Another mission's number; omit for this conversation's current mission"),
   },
-  async (args) => callMissions('update', args, (d) => missionLine(d.mission)),
+  async (args) => callMissions('update', args, formatUpdateAck),
 );
 
 server.tool(
@@ -925,14 +931,21 @@ server.tool(
 
 server.tool(
   'mission_join',
-  'Attach this conversation to an existing mission by number (e.g. work handed over from another session). Items filed here from now on belong to that mission.',
+  "Join a mission by number and make it this conversation's current mission — milestones and new items go there by default. Use it when you move on to other work (mission_create the new mission first if it does not exist yet), or to pick up work handed over from another session. The missions this conversation was already on stay linked; mission_leave ends one.",
   { num: z.number().int().min(1).describe('The mission number, e.g. 61') },
-  async (args) => callMissions('join', args, (d) => missionLine(d.mission)),
+  async (args) => callMissions('join', args, formatJoinAck),
+);
+
+server.tool(
+  'mission_leave',
+  "End this conversation's link to a mission you are done with while the mission itself goes on (closing it is mission_close). If it was the current mission, the most recently joined remaining one becomes current, or none. The link stays in the mission's history.",
+  { num: z.number().int().min(1).describe('The mission number to leave') },
+  async (args) => callMissions('leave', args, formatLeaveAck),
 );
 
 server.tool(
   'mission_get',
-  "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's mission.",
+  "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's current mission, plus every mission this conversation is on (current, also on, earlier).",
   { num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission') },
   async (args) => callMissions('get', args, formatMissionDetail),
 );
@@ -955,6 +968,97 @@ server.tool(
     mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
   },
   async (args) => callItems('move', args, (d) => itemLine(d.item)),
+);
+
+// --- Projects (spec 2026-09-30 projects §5) ---
+//
+// Same shape as callMissions: the bridge loopback (index.js mounts
+// lib/projects-tools.js at /projects/<op>), a 409 rendered as the next move,
+// other errors through the journal-error mapper — never isError, never raw
+// JSON. project_create carries an idempotency key the model never sees.
+async function callProjects(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  if (name === 'create') payload.idem_key = missionIdemKey({ op: 'project_create', roomId: ROOM_ID, title: args?.title, body: args?.body });
+  try {
+    const res = await fetch(`${BRIDGE_API}/projects/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409) return { content: [{ type: 'text', text: `project_${name} failed: ${formatProjectBlocked(data)}` }] };
+    if (!res.ok) return { content: [{ type: 'text', text: `project_${name} failed: ${formatProjectJournalError(name, data) || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `project_${name} failed: ${err.message}` }] };
+  }
+}
+
+const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. A mission is in one project or none.';
+
+server.tool(
+  'project_list',
+  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. ${PROJECT_WHAT}`,
+  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
+  async (args) => callProjects('list', args, formatProjectList),
+);
+
+server.tool(
+  'project_get',
+  "Read a project: its missions with their status, items awaiting the user across them, the latest milestones and sessions per box. Default: the project of this conversation's current mission.",
+  { num: z.number().int().min(1).optional().describe("A project number; omit for the project of this conversation's current mission") },
+  async (args) => callProjects('get', args, formatProjectDetail),
+);
+
+server.tool(
+  'project_create',
+  `Create a project — only after project_list shows none that fits (the Coordinator merges duplicates). Then file missions into it with mission_update project: N, or mission_start / mission_create with project: N. Returns the project number. ${PROJECT_WHAT}`,
+  {
+    title: z.string().describe('One line, ≤200 chars — what the missions in it add up to'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — the goal, and what belongs in it'),
+  },
+  async (args) => callProjects('create', args, formatProjectCreateAck),
+);
+
+server.tool(
+  'project_update',
+  'Rename a project or rewrite its description (the goal it groups missions under).',
+  {
+    num: z.number().int().min(1).describe('The project number'),
+    title: z.string().optional().describe('≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB'),
+  },
+  async (args) => callProjects('update', args, (d) => projectLine(d.project)),
+);
+
+server.tool(
+  'project_status',
+  "Set a project's status — one short paragraph (≤600 chars) summing up its missions: what is moving, what waits on the user, the next date or blocker. The headline on the project's card in the apps; the Coordinator writes these in its status sweep.",
+  {
+    num: z.number().int().min(1).describe('The project number'),
+    status: z.string().describe('One short paragraph, ≤600 characters'),
+  },
+  async (args) => callProjects('status', args, formatProjectStatusAck),
+);
+
+server.tool(
+  'project_close',
+  "Close a finished project with a summary. The Coordinator only (the journal allows it to the Coordinator alone). Refused while missions in it are open — only the user closes a project with open missions.",
+  {
+    num: z.number().int().min(1).describe('The project number'),
+    summary: z.string().describe('Markdown ≤32 KiB — what the project delivered'),
+  },
+  async (args) => callProjects('close', args, (d) => projectLine(d.project)),
+);
+
+server.tool(
+  'project_merge',
+  'Merge project #num into project #into: every mission in #num moves to #into, and #num closes as "Merged into #into" (its number keeps pointing there). The Coordinator only — for near-duplicate projects; report each merge to the user.',
+  {
+    num: z.number().int().min(1).describe('The project to fold away'),
+    into: z.number().int().min(1).describe('The project to keep'),
+  },
+  async (args) => callProjects('merge', args, (d) => formatProjectMergeAck(d, args)),
 );
 
 // --- Memories (spec 2026-09-27 memories): the user's shared agent memory ---

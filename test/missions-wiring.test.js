@@ -1,14 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-const OPS = ['start', 'create', 'post', 'update', 'status', 'join', 'get', 'list', 'close'];
+const OPS = ['start', 'create', 'post', 'update', 'status', 'join', 'leave', 'get', 'list', 'close'];
 const TOOL_CALLS = {
   mission_start: "callMissions('start', args, formatStartAck)",
   mission_create: "callMissions('create', args, formatCreateAck)",
   milestone_post: "callMissions('post', args, formatMilestoneAck)",
-  mission_update: "callMissions('update', args, (d) => missionLine(d.mission))",
+  mission_update: "callMissions('update', args, formatUpdateAck)",
   mission_status: "callMissions('status', args, formatStatusAck)",
-  mission_join: "callMissions('join', args, (d) => missionLine(d.mission))",
+  mission_join: "callMissions('join', args, formatJoinAck)",
+  mission_leave: "callMissions('leave', args, formatLeaveAck)",
   mission_get: "callMissions('get', args, formatMissionDetail)",
   mission_list: "callMissions('list', args, formatMissionList)",
   mission_close: "callMissions('close', args, (d) => missionLine(d.mission))",
@@ -23,7 +24,7 @@ describe('missions wiring', () => {
   const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
   const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
 
-  it('mounts all nine /missions routes through the shared handler map', () => {
+  it('mounts all ten /missions routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/missions\\\/\(([a-z|]+)\)\$\/\)/);
     expect(m, 'the /missions route matcher is missing from index.js').toBeTruthy();
     expect(m[1].split('|').sort()).toEqual([...OPS].sort());
@@ -31,7 +32,7 @@ describe('missions wiring', () => {
     expect(index).toMatch(/createMissionsHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: missionsClient,?\s*\}\)/);
   });
 
-  it('registers the nine mission tools and item_move, each pinned to its exact renderer', () => {
+  it('registers the ten mission tools and item_move, each pinned to its exact renderer', () => {
     for (const [tool, call] of Object.entries(TOOL_CALLS)) {
       expect(askUser, `${tool} is not registered`).toContain(`'${tool}',`);
       expect(askUser, `${tool} does not go through ${call}`).toContain(call);
@@ -56,7 +57,7 @@ describe('missions wiring', () => {
     // start and post carry a key the model never supplies; update/join/get/
     // close must not (they are not idempotent routes on the journal).
     expect(fn).toMatch(/name === 'start' \|\| name === 'post'/);
-    expect(fn).toMatch(/payload\.idem_key = missionIdemKey\(\{ op: name, roomId: ROOM_ID, kind: args\?\.kind, title: args\?\.title, body: args\?\.body \}\)/);
+    expect(fn).toMatch(/payload\.idem_key = missionIdemKey\(\{ op: name, roomId: ROOM_ID, kind: args\?\.kind, title: args\?\.title, body: args\?\.body, mission: args\?\.mission \}\)/);
     expect(fn).toContain('body: JSON.stringify(payload)');
     // …and no tool schema exposes it.
     expect(askUser).not.toMatch(/idem_key:\s*z\./);
@@ -162,5 +163,21 @@ describe('missions wiring', () => {
     expect(coord).toMatch(/one line per mission you changed/);
     expect(coord).toContain('Never call `mission_status` without `mission`');
     expect(coord).toMatch(/`mission_list` for every open mission/);
+  });
+
+  it('spec 2026-09-30: new and changed mission schemas', () => {
+    // R10: anchor on the registration — missionToolName names the tools too.
+    const slice = (from, to) => askUser.slice(askUser.indexOf(`server.tool(\n  '${from}',`), askUser.indexOf(`server.tool(\n  '${to}',`));
+    expect(slice('mission_start', 'mission_create')).toMatch(/project: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    expect(slice('mission_create', 'milestone_post')).toMatch(/project: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    expect(slice('milestone_post', 'mission_update')).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    const update = slice('mission_update', 'mission_status');
+    expect(update).toMatch(/project: z\.number\(\)\.int\(\)\.min\(1\)\.nullable\(\)\.optional\(\)/);
+    expect(update).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    expect(slice('mission_leave', 'mission_get')).toMatch(/num: z\.number\(\)\.int\(\)\.min\(1\)/);
+    expect(slice('mission_join', 'mission_leave')).not.toMatch(/already belongs/);
+    expect(askUser).not.toMatch(/already belongs to another mission/);
+    expect(askUser).toContain("leave: 'mission_leave'");
+    expect(askUser).toMatch(/import \{[^}]*\bformatJoinAck\b[^}]*\bformatLeaveAck\b[^}]*\bformatUpdateAck\b[^}]*\} from '\.\/lib\/missions-format\.js'/);
   });
 });
