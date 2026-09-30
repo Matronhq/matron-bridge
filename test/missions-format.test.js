@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { missionLine, formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, formatBlocked, formatJournalError, formatStatusAck, formatMissionList } from '../lib/missions-format.js';
+import { missionLine, formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck, statusLine } from '../lib/missions-format.js';
 
 // Real journal response bodies (see the file's _source): these renderers are
 // the only place the bridge reads the mission JSON, so the contract is
@@ -18,7 +18,7 @@ describe('missions-format', () => {
   });
   it('start ack distinguishes new from existing', () => {
     expect(formatStartAck({ mission })).toBe('Started mission #61 "Missions" (id ms_1)');
-    expect(formatStartAck({ mission, existing: true })).toBe('Already in mission #61 "Missions" — nothing changed (id ms_1)');
+    expect(formatStartAck({ mission, existing: true })).toBe('Already in mission #61 "Missions" — nothing changed (id ms_1). For different work, mission_create it and mission_join the new number');
   });
   it('create ack uses the contract wording', () => {
     expect(formatCreateAck({ mission })).toBe('Mission #61 "Missions" created (unassigned)');
@@ -55,7 +55,8 @@ describe('missions-format', () => {
     expect(formatBlocked({ error: 'conflict', blocked_by: 'closed' })).toMatch(/closed/);
     expect(formatBlocked({ error: 'conflict', blocked_by: 'user_items', items: [{ num: 64, title: 'Q?' }] })).toBe('blocked by items awaiting the user: #64 Q? — only the user can clear those');
     expect(formatBlocked({ error: 'conflict', blocked_by: 'agent_items', items: [{ num: 71, title: 'T' }] })).toBe('blocked by open items: #71 T — close each with a real resolution (item_close), or item_move it to the mission it belongs to');
-    expect(formatBlocked({ error: 'conflict', blocked_by: 'other_mission' })).toMatch(/another mission/);
+    expect(formatBlocked({ error: 'conflict', blocked_by: 'other_mission' })).toBe('this journal still allows only one mission per conversation — deploy the journal update (mission history); nothing changed');
+    expect(formatBlocked({ error: 'conflict', blocked_by: 'other_mission' })).not.toMatch(/already belongs/);
     expect(formatBlocked({ error: 'weird' })).toBe('weird');
   });
 
@@ -67,12 +68,81 @@ describe('missions-format', () => {
     expect(formatJournalError('get', {})).toBe('');
     expect(formatJournalError('get', null)).toBe('');
   });
+
+  it('missionLine shows activity and project only when the journal sends them', () => {
+    expect(missionLine({ ...mission, activity: 'quiet', project_id: 'pj_7', project_num: 70 })).toBe('#61 Missions — open, quiet, project #70, 2 open items (1 need you), 3 conversations, 5 milestones (id ms_1)');
+    expect(missionLine({ ...mission, project_id: null })).toBe('#61 Missions — open, no project, 2 open items (1 need you), 3 conversations, 5 milestones (id ms_1)');
+    expect(missionLine({ ...mission, project_id: 'pj_7' })).toBe('#61 Missions — open, project pj_7, 2 open items (1 need you), 3 conversations, 5 milestones (id ms_1)');
+    // A closed mission's activity is noise.
+    expect(missionLine({ ...mission, state: 'closed', activity: 'quiet' })).toBe('#61 Missions — closed, 2 open items (1 need you), 3 conversations, 5 milestones (id ms_1)');
+  });
+
+  it('start/create acks say where the mission was filed, or that the journal could not file it', () => {
+    expect(formatStartAck({ mission, project_requested: 7 })).toBe('Started mission #61 "Missions" (id ms_1) in project #7');
+    expect(formatStartAck({ mission, project_requested: 7, project_ignored: true })).toBe('Started mission #61 "Missions" (id ms_1) — but this journal does not support projects yet, so it was not filed (deploy the journal projects update)');
+    expect(formatStartAck({ mission, existing: true, project_requested: 7 })).toBe('Already in mission #61 "Missions" — nothing changed (id ms_1). For different work, mission_create it and mission_join the new number; to file this one, mission_update with project: 7');
+    expect(formatCreateAck({ mission, project_requested: 7 })).toBe('Mission #61 "Missions" created (unassigned) in project #7');
+    expect(formatCreateAck({ mission, project_requested: 7, project_ignored: true })).toBe('Mission #61 "Missions" created (unassigned) — but this journal does not support projects yet, so it was not filed (deploy the journal projects update)');
+    // R5 (2026-09-30 preflight): an idempotent replay never re-applies
+    // `project` — the mission comes back unfiled (or filed elsewhere), which
+    // is not the same as the journal rejecting projects outright.
+    expect(formatCreateAck({ mission, project_requested: 7, project_not_applied: true })).toBe('Mission #61 "Missions" created (unassigned) — not filed in #7: the journal returned an identical mission created moments ago; mission_update with mission: 61 and project: 7 files it');
+  });
+
+  it('join, leave and update acks', () => {
+    expect(formatJoinAck({ mission })).toBe("Joined mission #61 \"Missions\" (id ms_1) — it is now this conversation's current mission: milestones and new items go there by default. Missions it was already on stay linked; mission_leave N ends one");
+    expect(formatJoinAck({})).toBe("Joined — it is now this conversation's current mission");
+    expect(formatLeaveAck({ left: 61, current: { num: 3, title: 'Other' } })).toBe('Left mission #61 — the current mission is now #3 "Other"');
+    expect(formatLeaveAck({ left: 61, current: null })).toBe('Left mission #61 — this conversation has no current mission now; mission_join one before posting milestones');
+    expect(formatLeaveAck({ left: 61 })).toBe('Left mission #61');
+    expect(formatUpdateAck({ mission })).toBe(missionLine(mission));
+    expect(formatUpdateAck({ mission, project_ignored: true })).toBe(`${missionLine(mission)} — but this journal does not support projects yet, so the project was not changed (deploy the journal projects update)`);
+  });
+
+  it('detail: link history on conversations, and this conversation\'s missions when attached', () => {
+    const out = formatMissionDetail({
+      mission, milestones: [], items: [],
+      conversations: [
+        { id: 'c1', title: 'Now', box: 'dev-2', state: 'running', current: true, subchat_count: 2 },
+        { id: 'c2', title: 'Before', box: 'ang', state: 'idle', current: false, ended_at: 1700000000000, subchat_count: 1 },
+      ],
+      conversation_missions: [
+        { num: 61, title: 'Missions', state: 'open', current: true, active: true },
+        { num: 3, title: 'Other', state: 'open', current: false, active: true },
+        { num: 2, title: 'Old', state: 'open', current: false, active: false, ended_at: 1700000000000 },
+        { num: 1, title: 'Done', state: 'closed', current: false, active: true },
+      ],
+    });
+    expect(out.split('\n').slice(-8)).toEqual([
+      'Conversations:',
+      '- c1 Now (dev-2, running · 2 sub-chats)',
+      '- c2 Before (ang, idle · left 2023-11-14T22:13:20.000Z · 1 sub-chat)',
+      "This conversation's missions:",
+      '- #61 Missions — current',
+      '- #3 Other — also on',
+      '- #2 Old — earlier (left 2023-11-14T22:13:20.000Z)',
+      '- #1 Done — earlier (closed)',
+    ]);
+  });
+
+  it('blocked: not_linked is an instruction; either field carries the code', () => {
+    const text = 'this conversation is not on that mission — mission_join it first (it becomes the current mission), or leave out `mission` to post to the current one';
+    expect(formatBlocked({ error: 'conflict', blocked_by: 'not_linked' })).toBe(text);
+    expect(formatBlocked({ error: 'not_linked' })).toBe(text);
+    // R4 (2026-09-30 preflight): a closed or merged project on start/create/update.
+    expect(formatBlocked({ error: 'conflict', blocked_by: 'project_closed' })).toMatch(/^that project is closed/);
+  });
+
+  it('statusLine is exported for the project renderers', () => {
+    expect(statusLine({ status: ' x ', status_by: 'agent', status_updated_at: 1700000000000 })).toBe('Status (2023-11-14T22:13:20.000Z, by an agent): x');
+    expect(statusLine({})).toBeNull();
+  });
 });
 
 describe('missions-format against real journal response bodies', () => {
   it('renders POST /missions 201 and its 200 existing replay', () => {
     expect(formatStartAck(shapes.start_201)).toBe('Started mission #1 "Missions & milestones" (id ms_7Kq2XwvN)');
-    expect(formatStartAck(shapes.start_200_existing)).toBe('Already in mission #1 "Missions & milestones" — nothing changed (id ms_7Kq2XwvN)');
+    expect(formatStartAck(shapes.start_200_existing)).toBe('Already in mission #1 "Missions & milestones" — nothing changed (id ms_7Kq2XwvN). For different work, mission_create it and mission_join the new number');
     expect(missionLine(shapes.start_201.mission)).toBe('#1 Missions & milestones — open, 0 open items, 1 conversation, 0 milestones (id ms_7Kq2XwvN)');
   });
 
