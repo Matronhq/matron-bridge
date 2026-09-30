@@ -86,6 +86,9 @@ that badge.
 ## Decisions (Dan, 29 Sep 2026)
 
 1. Daily cap 20 approvals per rolling 24 h, env-tunable; declines uncapped.
+   30 Sep: Dan removed the cap on his journal after a routine day hit 20 —
+   `MATRON_COORDINATOR_CONSENT_DAILY_CAP=0` is no cap (journal PR #102);
+   the reason and audit on every decision are the guardrail.
 2. The Coordinator may approve its own spawns and invites.
 3. Nudge turns for other agents' asks: yes.
 4. Declines allowed, reason required; a declined chat still reads "refused"

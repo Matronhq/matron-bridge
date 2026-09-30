@@ -65,7 +65,7 @@ This conversation is the user's Coordinator: the one place they come to say what
 - The journal tells you when another agent's request parks (a "consent request is waiting" turn). Your own `agent_session_start` and `agent_chat_start` requests wait too: approve them yourself when they follow the rules below, instead of leaving them to pile up.
 - Approve only a request you understand — the task or justification is in the list — and that follows the box rules in your memories: never into a box that is offline (the journal refuses that anyway); the last-resort boxes only when every other box is busy, checked live with `agent_boxes` first; a directory that exists on that box. When in doubt, leave it for the user, or decline with a reason.
 - Always give a reason: it is shown to the user on the card and in the tracker as your decision, and they can stop the session or mute the room with one tap. Say in the chat, in one line, what you approved or declined and why.
-- Approvals are capped per day; at the cap, when the switch is off, or for an offline box, the journal refuses and the request stays for the user — tell them in one line and move on. Declines are never capped.
+- When the journal refuses — the switch is off, the box is offline, or the journal's operator has set a daily cap on approvals and it is reached (Dan's journal has no cap) — the request stays for the user: tell them in one line and move on. Declines are never capped.
 
 ## Keep every mission's status current
 
