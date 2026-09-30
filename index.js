@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn, execFileSync } from 'child_process';
-import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
@@ -397,6 +397,11 @@ try {
 }
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
+const WHISPER_PROMPT = resolveWhisperPrompt();
+// Resolved per note: the vocabulary above plus the fleet's box names from the
+// journal roster (lib/transcribe.js makeWhisperPrompt), once journalPublisher
+// exists below.
+let whisperPrompt = async () => WHISPER_PROMPT;
 
 // Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
@@ -779,6 +784,15 @@ const journalPublisher = createJournalPublisher({
   // race, just "ask the spawn side first."
   onOpError: (e) => { if (sessionControlHandlers?.onOpError?.(e)) return; if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
+});
+// Voice-note vocabulary: the built-in words (or WHISPER_PROMPT) plus this
+// user's box names from the journal roster, cached ten minutes at a time.
+whisperPrompt = makeWhisperPrompt({
+  base: WHISPER_PROMPT,
+  fetchNames: async () => {
+    const r = await journalPublisher.fetchRoster();
+    return (r?.agents || []).map((a) => a?.name);
+  },
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
 // publisher is a disabled no-op (its methods are already safe no-ops; this
@@ -8613,7 +8627,7 @@ function journalOnText(session, body, { username }) {
 // the journal too, mirroring what the Matrix m.audio path records.
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
-  transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
@@ -8634,7 +8648,7 @@ const journalMediaRouter = createJournalMediaRouter({
     let narration = null;
     if (result.hasAudio) {
       try {
-        narration = await transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
+        narration = await transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() });
       } catch (e) {
         console.warn(`[journal-media] video narration transcription failed for ${safeName}: ${e.message} — delivering frames without it`);
       }
@@ -8743,7 +8757,7 @@ const saveItemAttachments = createItemAttachmentSaver({
 const itemTurnRouter = createItemTurnRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   saveAttachments: saveItemAttachments,
-  transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
   queueText: (session, { text, preview }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
