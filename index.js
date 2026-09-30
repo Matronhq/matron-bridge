@@ -158,7 +158,7 @@ import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
-import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
+import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
 import {
@@ -9661,8 +9661,16 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
   // A journal-originated alert must come from the journal itself and aim
   // at the journal's CURRENT Coordinator (never a spawn-time flag, see
   // journalHandleConsentFrame). Checked before the target is resolved, so
-  // a refused alert never resumes a session.
-  const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinatorLookup.snapshot().convoId });
+  // a refused alert never resumes a session. The cached role can be cold
+  // or stale (a box woken to take this very alert has only kicked its
+  // GET /coordinator off, not awaited it — Bugbot), so a journal alert that
+  // does not match the cache waits for one forced refresh before it is
+  // refused. Only from device 0: a forged sender never costs a journal GET.
+  let coordinator = coordinatorLookup.snapshot();
+  if (params.action === 'alert' && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {
+    coordinator = await coordinatorLookup.refresh({ force: true });
+  }
+  const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinator.convoId });
   if (denied) return { ok: false, error: denied };
   let session = findSessionByClaudeSessionId(params.convoId);
   if (!session || !session.alive) session = journalResumeConvo(params.convoId, JOURNAL_RESUME_NOTICE);

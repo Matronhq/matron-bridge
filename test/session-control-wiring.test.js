@@ -34,8 +34,12 @@ describe('session control wiring (source inspection)', () => {
   });
   it('authorizes a journal-originated alert against the current Coordinator before resolving the target', () => {
     const fn = body('async function journalControlSession(rawParams, { fromDeviceId } = {}) {', '\nasync function applyControlSteps(');
-    const auth = fn.indexOf('const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinatorLookup.snapshot().convoId });');
+    const auth = fn.indexOf('const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinator.convoId });');
     expect(auth).toBeGreaterThan(-1);
+    // A cold or stale role cache gets one forced refresh before an alert is refused (Bugbot).
+    const refresh = fn.indexOf("if (params.action === 'alert' && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {\n    coordinator = await coordinatorLookup.refresh({ force: true });");
+    expect(refresh).toBeGreaterThan(-1);
+    expect(refresh).toBeLessThan(auth);
     expect(fn).toContain('if (denied) return { ok: false, error: denied };');
     expect(auth).toBeLessThan(fn.indexOf('findSessionByClaudeSessionId(params.convoId)'));
   });
