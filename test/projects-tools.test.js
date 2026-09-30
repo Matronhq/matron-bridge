@@ -98,7 +98,7 @@ describe('projects handlers', () => {
     expect(r.status).toBe(201);
     expect(client.create.mock.calls[0]).toEqual([{ title: 'Promo launch', body: 'goal', convo_id: 'c1' }, { idemKey: 'k' }]);
     const old = fixture({ create: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
-    expect((await old.h.create({ roomId: '!r:s', title: 'P' })).body.error).toBe('the journal refused the project — this deployment may not have the /projects routes yet (deploy the journal projects update), or this conversation has no journal row yet');
+    expect((await old.h.create({ roomId: '!r:s', title: 'P' })).body.error).toBe('the journal refused the project — this deployment may not have the /projects routes yet (deploy the journal projects update), or this conversation has no journal row yet or is not writable by this session');
   });
 
   it('update: num required, title or body required, carries convo_id; any agent', async () => {
