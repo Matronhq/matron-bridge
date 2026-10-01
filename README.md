@@ -171,13 +171,17 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | Status | `Get-ScheduledTask -TaskPath '\Matron\' \| Select TaskName, State` |
 | Restart | `.\restart.ps1` (graceful: `POST /shutdown`, then the task is started again) |
 | Deploy latest | `.\deploy.ps1` (`-DryRun` to preflight only) |
-| Logs | `Get-Content -Wait "$env:LOCALAPPDATA\matron-bridge\logs\matron-bridge.log"` (errors: `matron-bridge.err.log`) |
-| Stop | `Stop-ScheduledTask -TaskPath '\Matron\' -TaskName matron-bridge` |
+| Logs | `Get-Content -Wait "$env:LOCALAPPDATA\matron-bridge\logs\matron-bridge.log"` |
+| Stop | `.\restart.ps1 -StopOnly` (graceful; disables the task until the next `.\restart.ps1`) |
 | Uninstall | `setup\service.ps1 -Uninstall` |
 
 The task restarts the bridge within a minute if it exits with a non-zero
-code, up to ten times per logon; a clean exit (code 0, e.g. after
-`POST /shutdown`) is not restarted, which is what `restart.ps1` relies on.
+code, and a five-minute watchdog trigger relaunches it whenever it is not
+running (a no-op while it is). A plain `Stop-ScheduledTask` is therefore
+undone within five minutes; use `-StopOnly`, which disables the task.
+`restart.ps1` run from inside a bridge session (a Claude tool call,
+`deploy.ps1`) hands itself to a one-shot Scheduled Task a few seconds out,
+because Task Scheduler would otherwise stop it along with the bridge.
 
 ## Config (.env)
 
