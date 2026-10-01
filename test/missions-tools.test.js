@@ -252,6 +252,30 @@ describe('missions handlers', () => {
     expect(session.missionId).toBeUndefined();
   });
 
+  it('cold resolve: a membership lookup that fails (outage) is reported, never "no mission"', async () => {
+    // The list propagates an outage; the detail GET that confirms an origin
+    // hit must too. Treating a 503 or an unreachable journal as "not a
+    // member" would answer no-mission, and the model would mission_start a
+    // duplicate the moment the journal is back. A detail 404 stays a skip:
+    // that mission is gone, the others may still match.
+    const missions = [{ id: 'ms_mine', num: 61, origin_convo_id: 'c1', state: 'open' }];
+    for (const [detailResult, expected] of [[{ status: 0, data: { error: 'journal unreachable' } }, 502], [{ status: 503, data: { error: 'busy' } }, 503]]) {
+      const { h, session } = fixture({
+        list: vi.fn(async () => ({ status: 200, data: { missions } })),
+        get: vi.fn(async () => detailResult),
+      });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(expected);
+      expect(r.body.error).not.toMatch(/no mission/i);
+      expect(session.missionId).toBeUndefined();
+    }
+    const gone = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions } })),
+      get: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })),
+    });
+    expect((await gone.h.update({ roomId: '!r:s', title: 'New' })).status).toBe(404);
+  });
+
   it('cold resolve against an unreachable or failing journal reports the outage, never "no mission"', async () => {
     for (const listResult of [{ status: 0, data: { error: 'journal unreachable' } }, { status: 500, data: { error: 'boom' } }]) {
       const { h, client, session } = fixture({ list: vi.fn(async () => listResult) });
