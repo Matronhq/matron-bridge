@@ -16,6 +16,7 @@ import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
+import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck } from './lib/routines-tools.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -518,6 +519,58 @@ server.tool(
     refs: z.array(z.string().max(200)).min(1).max(100).describe('Refs from unseen_list / unseen_mine'),
   },
   async (args) => callUnseen('flag', args, (d) => formatFlagAck(d, d.refs || args.refs)),
+);
+
+// --- Coordinator routines (spec: matron-journal 2026-10-01 coordinator routines) ---
+// routine_list / routine_update / routine_run go through the bridge loopback
+// (index.js mounts lib/routines-tools.js at /routine/<op>); the journal
+// allows all three to the Coordinator alone. Create and delete stay in the apps.
+const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
+
+async function callRoutine(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/routine/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `routine_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `routine_${name} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'routine_list',
+  `List the user's Coordinator routines: name, title, schedule in words, next fire, last fire and outcome, paused or not. ${ROUTINE_WHAT} Call it when a routine turn seems to be missing or doubled, and when the user asks what runs when.`,
+  {},
+  async () => callRoutine('list', {}, formatRoutineList),
+);
+
+server.tool(
+  'routine_update',
+  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. The user creates and deletes routines in the apps (Settings ▸ Coordinator ▸ Routines); only change one when the user asks or the playbook says to.`,
+  {
+    name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
+    title: z.string().max(200).optional().describe('One line'),
+    schedule: z.string().max(64).optional().describe('Five cron fields: minute hour day-of-month month day-of-week, e.g. "5 7 * * *" (daily 07:05) or "0 */2 * * *" (every 2 h)'),
+    tz: z.string().max(64).optional().describe('IANA zone the schedule is in, e.g. Europe/London'),
+    prompt: z.string().max(2000).optional().describe('The turn text the journal fires; keep it one line pointing at the playbook section'),
+    enabled: z.boolean().optional().describe('false pauses, true resumes'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('For a triggered routine: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes (fire only when the reset is at least that far away, or unknown)'),
+  },
+  async (args) => callRoutine('update', args, (d) => formatRoutineUpdateAck(d, args)),
+);
+
+server.tool(
+  'routine_run',
+  `Fire one routine now, whatever its schedule or paused state says; the journal delivers its prompt to this conversation as a later turn, so do not wait or run it twice. ${ROUTINE_WHAT}`,
+  {
+    name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
+  },
+  async (args) => callRoutine('run', args, (d) => formatRoutineRunAck(d, args.name)),
 );
 
 async function sessionControlCall(route, body, name) {

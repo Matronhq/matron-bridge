@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { loadCoordinatorBlock } from '../lib/coordinator.js';
 
 // index.js cannot be imported in-process (top-level side effects), so the
 // consent wiring is pinned by source inspection — same approach as
@@ -7,7 +8,14 @@ import { readFileSync } from 'node:fs';
 // test/consent-tools.test.js.
 const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
-const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+// The Coordinator prompt is the preamble plus the playbook directory
+// (spec 2026-10-01 coordinator routines), assembled as index.js does.
+const coord = loadCoordinatorBlock({
+  readFile: (p) => readFileSync(p, 'utf8'),
+  path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
+  dir: new URL('../coordinator', import.meta.url).pathname,
+  readDir: (d) => readdirSync(d),
+});
 
 function body(startMarker, endMarker) {
   const start = index.indexOf(startMarker);
@@ -64,11 +72,11 @@ describe('consent wiring (source inspection)', () => {
   });
 
   it('the Coordinator prompt teaches the rules: own asks, box rules, reasons, the cap and the off switch', () => {
-    expect(coord).toMatch(/^## Approve chats and spawns on the user's behalf/m);
+    expect(coord).toMatch(/^## Procedure: triage a consent request/m);
     expect(coord).toContain('`consent_list` and `consent_decide(kind, id, decision, reason)`');
     expect(coord).toMatch(/approve them yourself when they follow the rules/);
     expect(coord).toMatch(/never into a box that is offline/);
-    expect(coord).toMatch(/last-resort boxes only when every other box is busy/);
+    expect(coord).toMatch(/last-resort boxes .*only when every other box is busy/);
     expect(coord).toMatch(/Always give a reason/);
     expect(coord).toMatch(/operator has set a daily cap on approvals and it is reached/);
     expect(coord).toMatch(/Declines are never capped/);

@@ -20,6 +20,9 @@ describe('coordinator spawn wiring (source inspection)', () => {
     expect(index).toContain("const DEFAULT_BRIDGE_COORDINATOR_MD_PATH = path.join(__dirname, 'BRIDGE_COORDINATOR.md');");
     expect(index).toContain('const BRIDGE_COORDINATOR_MD_PATH = process.env.BRIDGE_COORDINATOR_MD_PATH || DEFAULT_BRIDGE_COORDINATOR_MD_PATH;');
     expect(index).toMatch(/const COORDINATOR_BLOCK = loadCoordinatorBlock\(\{/);
+    expect(index).toContain("const DEFAULT_BRIDGE_COORDINATOR_DIR = path.join(__dirname, 'coordinator');");
+    expect(index).toContain('const BRIDGE_COORDINATOR_DIR = process.env.BRIDGE_COORDINATOR_DIR || DEFAULT_BRIDGE_COORDINATOR_DIR;');
+    expect(index).toMatch(/dir: BRIDGE_COORDINATOR_DIR,\s*readDir: \(d\) => fs\.readdirSync\(d\),/);
   });
 
   it('builds one lookup on the journal HTTP base and refreshes it at boot and on every hello_ok', () => {

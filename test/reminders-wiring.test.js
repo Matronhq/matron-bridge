@@ -83,22 +83,20 @@ describe('reminders wiring', () => {
     expect(cancelBtn).toMatch(/\.repeat/);
   });
 
-  it('the Coordinator sets its check-ins once as daily reminders and re-checks them on each one', () => {
-    const i = coordinatorMd.indexOf('## Check-ins');
-    expect(i, 'BRIDGE_COORDINATOR.md has no Check-ins section').toBeGreaterThan(coordinatorMd.indexOf('## Projects'));
+  it('the Coordinator no longer arms check-in reminders: routines (journal-owned) replace them, and duplicates are cancelled', () => {
+    // Spec 2026-10-01 coordinator routines: the Check-ins section is gone.
+    expect(coordinatorMd).not.toContain('## Check-ins');
+    expect(coordinatorMd).not.toContain('repeat: "daily"');
+    const i = coordinatorMd.indexOf('## Your playbook and routines');
+    expect(i, 'BRIDGE_COORDINATOR.md has no routines section').toBeGreaterThan(-1);
     const block = coordinatorMd.slice(i);
-    expect(block).toContain('reminder_create');
-    expect(block).toContain('repeat: "daily"');
-    expect(block).toContain('reminder_list');
-    expect(block).toContain('memory_save');
-    // The user's zone, not a hardcoded one; asked for when unknown.
-    expect(block).not.toContain('tz: "Europe/London"');
-    expect(block).toMatch(/the user's IANA time zone \(e\.g\. Europe\/London; ask if unknown, and save it with the cadence rule\)/);
-    // Duplicates checked before creating; a missing check-in is a question,
-    // never a silent re-create (the user may have cancelled it).
-    expect(block).toMatch(/Before creating check-ins, call `reminder_list`/);
-    expect(block).toContain('actions: ["Restore", "Update the rule"]');
-    expect(block).not.toMatch(/re-create any that is missing/);
+    expect(block).toContain('routine_list');
+    expect(block).toContain('routine_update');
+    expect(block).toContain('routine_run');
+    expect(block).toMatch(/never set `reminder_create` reminders for routine work/);
+    expect(block).toMatch(/cancel it with `reminder_cancel`/);
+    // One-off check-backs are still reminders; a standing cadence is a routine.
+    expect(block).toMatch(/Keep `reminder_create` for one-off check-backs/);
   });
 
   it('/timer cancel all says how many of the cancelled were daily check-ins', () => {
