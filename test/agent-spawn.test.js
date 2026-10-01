@@ -553,7 +553,9 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     const end = indexSrc.indexOf('\n  },', start);
     const body = indexSrc.slice(start, end);
     // The normal cases are untouched…
-    expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text\)/);
+    expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text, \{ notice: NOTICE\.CONTROL \}\)/);
+    // The outcome line opens the parent's turn only when the parent takes it now.
+    expect(body).toContain('if (session && !sessionOccupiedForRoomDelivery(session)) announceTurnStart(session, TURN_ORIGIN.SPAWN);');
     expect(body).toMatch(/if \(session\) \{/);
     expect(body).toMatch(/roomDelivery\.deliver\(session, session\.roomId,/);
     // …and the fallback fires ONLY when session is absent (the `else`) AND
@@ -574,7 +576,7 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     expect(args).toMatch(/getDisk: \(\) => buildDisk\(\{ path: DEFAULT_WORKDIR \}\)/);
     expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
     expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
-    expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true \}\)/);
+    expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true, turnOrigin: TURN_ORIGIN\.SPAWN \}\)/);
     expect(args).toMatch(/serverLabel: SERVER_LABEL,/);
     expect(indexSrc).toMatch(/import \{ buildActivity, buildLimits, buildDisk \} from '\.\/lib\/spawn-capacity\.js';/);
   });

@@ -62,7 +62,7 @@ describe('Codex journal publication', () => {
     const item = { id: 'auto', type: 'contextCompaction' };
     h.codex.emit('item', { method: 'item/started', item, turnId: 'turn' });
     h.codex.emit('item', { method: 'item/completed', item, turnId: 'turn' });
-    expect(h.notice).toHaveBeenLastCalledWith(h.session, '✅ Context compacted — conversation history summarized.');
+    expect(h.notice).toHaveBeenLastCalledWith(h.session, '✅ Context compacted — conversation history summarized.', 'compaction');
     expect(h.session.busy).toBe(true);
     expect(h.session.queuedMessages).toEqual([[{ type: 'text', text: 'Follow up' }]]);
     expect(h.activity).toHaveBeenLastCalledWith(h.session, 'thinking');

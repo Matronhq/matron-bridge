@@ -132,7 +132,7 @@ describe('live coordinator events (source inspection)', () => {
     expect(fn).toContain('{ model: plan.model, modelExplicit: false }');
     expect(fn).toContain('applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });');
     expect(fn).toContain('const target = sessions.get(roomId) || session;');
-    expect(fn).toContain("await deliverCoordinatorTurn(target, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir })));");
+    expect(fn).toContain("await deliverCoordinatorTurn(target, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir })), TURN_ORIGIN.COORDINATOR);");
   });
 
   it("a user's parked /model pick is handed to the plan, so the implicit switch never overwrites it", () => {
@@ -144,7 +144,9 @@ describe('live coordinator events (source inspection)', () => {
     const fn = body('async function deliverCoordinatorTurn(', '\nfunction ');
     expect(fn).toContain('sessionOccupiedForRoomDelivery(session)');
     expect(fn).toContain('mirrorToJournal: false');
-    expect(fn).toContain('sendTextToSession(session, text, { skipJournalMirror: true })');
+    expect(fn).toContain('sendTextToSession(session, text, { skipJournalMirror: true, turnOrigin })');
+    // The origin rides the queued entry too, so a parked turn is marked when it is delivered.
+    expect(fn).toMatch(/fullText: text,\s*\n\s*turnOrigin,/);
   });
 });
 
