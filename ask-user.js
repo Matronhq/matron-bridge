@@ -975,7 +975,7 @@ const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_crea
 
 server.tool(
   'mission_start',
-  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project.",
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project; leave it out only when none fits, and the mission gets a project of its own with the same name.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
@@ -986,7 +986,7 @@ server.tool(
 
 server.tool(
   'mission_create',
-  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in a project. Returns the mission number.",
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in an existing project; without one it gets a project of its own with the same name. Returns the mission number.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal: what done looks like, constraints, links'),
@@ -1009,11 +1009,11 @@ server.tool(
 
 server.tool(
   'mission_update',
-  "Rename a mission, rewrite its standing description, or file it in a project (project: N; null takes it out — a mission is in one project or none). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
+  "Rename a mission, rewrite its standing description, or move it to another project (project: N — every mission is in exactly one project, so it can move but never be taken out). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
   {
     title: z.string().optional().describe('≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB'),
-    project: z.number().int().min(1).nullable().optional().describe('A project number from project_list, or null to take the mission out of its project'),
+    project: z.number().int().min(1).optional().describe('A project number from project_list to move the mission to'),
     mission: z.number().int().min(1).optional().describe("Another mission's number; omit for this conversation's current mission"),
   },
   async (args) => callMissions('update', args, formatUpdateAck),
@@ -1101,7 +1101,7 @@ async function callProjects(name, args, render) {
   }
 }
 
-const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. A mission is in one project or none.';
+const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. Every mission is in exactly one project: the one named when it started, or one of its own with the same name.';
 
 server.tool(
   'project_list',
