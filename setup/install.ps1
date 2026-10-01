@@ -25,7 +25,14 @@ Write-Host "Repo: $RepoDir"
 Write-Host "User: $env:USERNAME"
 Write-Host ''
 
-function Fail($msg) { Write-Error $msg; exit 1 }
+function Fail($msg) { Write-Host "ERROR: $msg"; exit 1 }
+# Native commands under Windows PowerShell 5.1: see deploy.ps1 (stderr lines
+# become terminating errors under Stop when stderr is redirected).
+function Invoke-Native([string]$exe, [string[]]$arguments) {
+  $ErrorActionPreference = 'Continue'
+  & $exe @arguments 2>&1 | ForEach-Object { "$_" } | Write-Host
+  return $LASTEXITCODE
+}
 
 $node = Get-Command node.exe -ErrorAction SilentlyContinue
 if (-not $node) { Fail 'node.exe not found on PATH. Install Node.js 22+ (winget install OpenJS.NodeJS.LTS) and open a new terminal.' }
@@ -41,8 +48,7 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host 'Installing npm dependencies...'
-& npm install
-if ($LASTEXITCODE -ne 0) { Fail 'npm install failed' }
+if ((Invoke-Native 'npm' @('install')) -ne 0) { Fail 'npm install failed' }
 
 $envFile = Join-Path $RepoDir '.env'
 if (-not (Test-Path $envFile)) {
@@ -57,7 +63,8 @@ if (-not (Test-Path $envFile)) {
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $hmac = -join ($bytes | ForEach-Object { '{0:x2}' -f $_ })
-    $content = $content -replace '(?m)^HMAC_SECRET=$', "HMAC_SECRET=$hmac"
+    # (?=\r?$): .NET's $ ignores a CR, so a CRLF template would keep HMAC_SECRET empty.
+    $content = $content -replace '(?m)^HMAC_SECRET=(?=\r?$)', "HMAC_SECRET=$hmac"
     $content = $content -replace '(?m)^DEFAULT_WORKDIR=.*$', "DEFAULT_WORKDIR=$($env:USERPROFILE -replace '\\', '/')"
     # UTF-8 without BOM (Windows PowerShell's -Encoding utf8 writes one).
     [IO.File]::WriteAllText($envFile, $content, (New-Object System.Text.UTF8Encoding $false))
@@ -67,6 +74,8 @@ if (-not (Test-Path $envFile)) {
 } else {
   Write-Host ".env already exists - run 'npm run setup' to change it."
 }
+# chmod 600 equivalent: only this user can read .env (best effort).
+& icacls.exe $envFile /inheritance:r /grant:r "$($env:USERNAME):F" *> $null
 
 Write-Host ''
 Write-Host 'Done. Next steps:'

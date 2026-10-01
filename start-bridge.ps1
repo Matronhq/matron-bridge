@@ -6,9 +6,12 @@
   The Windows counterpart of start-bridge.sh and the body of the Scheduled
   Tasks that setup\service.ps1 registers. It checks the prerequisites, rotates
   the log and runs node on the absolute index.js path (restart.ps1 finds the
-  process by that command line), redirecting output to
-  %LOCALAPPDATA%\matron-bridge\logs\. It exits with node's exit code so the
-  task's restart-on-failure fires on a crash and stays quiet on a clean exit.
+  process by that command line) through cmd.exe, which appends stdout and
+  stderr to one log under %LOCALAPPDATA%\matron-bridge\logs\ (opened shared,
+  so `Get-Content -Wait` can follow it). It exits with node's exit code so
+  the task's restart-on-failure fires on a crash and stays quiet on a clean
+  exit, after ending any session trees the bridge left behind (they would
+  otherwise keep the task instance alive).
 
   index.js loads .env itself (dotenv), so no environment inlining is needed:
   edit .env, then .\restart.ps1.
@@ -32,7 +35,7 @@ $StateDir = Join-Path $env:LOCALAPPDATA 'matron-bridge'
 $LogDir = Join-Path $StateDir 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-function Fail($msg) { Write-Error $msg; exit 1 }
+function Fail($msg) { Write-Host "ERROR: $msg"; exit 1 }
 
 if (-not (Test-Path (Join-Path $RepoDir '.env'))) { Fail "No .env in $RepoDir. Run setup\install.ps1 (or npm run setup) first." }
 $node = Get-Command node.exe -ErrorAction SilentlyContinue
@@ -45,20 +48,37 @@ if (-not $Viewer -and -not (Get-Command claude -ErrorAction SilentlyContinue)) {
 
 # Rotate: keep the last 5 runs.
 $Log = Join-Path $LogDir "$Name.log"
-$ErrLog = Join-Path $LogDir "$Name.err.log"
-foreach ($f in @($Log, $ErrLog)) {
-  for ($i = 4; $i -ge 1; $i--) {
-    if (Test-Path "$f.$i") { Move-Item -Force "$f.$i" "$f.$($i + 1)" }
-  }
-  if (Test-Path $f) { Move-Item -Force $f "$f.1" }
+for ($i = 4; $i -ge 1; $i--) {
+  if (Test-Path "$Log.$i") { Move-Item -Force "$Log.$i" "$Log.$($i + 1)" }
 }
+if (Test-Path $Log) { Move-Item -Force $Log "$Log.1" }
+"[start-bridge] $(Get-Date -Format o) starting $Name ($Entry) with $($node.Source)" | Out-File -FilePath $Log -Encoding utf8
 
 # ELECTRON_RUN_AS_NODE unset, as the systemd unit does.
 Remove-Item Env:\ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
 
-# stdout goes straight to the (freshly rotated) log so `Get-Content -Wait`
-# follows it live; stderr to its own file. Start-Process truncates both.
-$proc = Start-Process -FilePath $node.Source -ArgumentList @("`"$Entry`"") -WorkingDirectory $RepoDir `
-  -NoNewWindow -PassThru -Wait -RedirectStandardOutput $Log -RedirectStandardError $ErrLog
-"[start-bridge] $(Get-Date -Format o) $Name exited with code $($proc.ExitCode)" | Out-File -FilePath $ErrLog -Append -Encoding utf8
-exit $proc.ExitCode
+# cmd /s /c strips the outer quotes and runs the rest; its exit code is node's.
+$cmdLine = "/d /s /c `"`"$($node.Source)`" `"$Entry`" >> `"$Log`" 2>&1`""
+$proc = Start-Process -FilePath $env:ComSpec -ArgumentList $cmdLine -WorkingDirectory $RepoDir -NoNewWindow -PassThru
+$null = $proc.Handle   # cache the handle so ExitCode is readable after exit
+# node is cmd's child; remember its pid so leftovers can be found after exit.
+$nodePid = 0
+for ($i = 0; $i -lt 20 -and $nodePid -eq 0; $i++) {
+  Start-Sleep -Milliseconds 250
+  $child = Get-CimInstance Win32_Process -Filter "ParentProcessId = $($proc.Id)" | Select-Object -First 1
+  if ($child) { $nodePid = [int]$child.ProcessId }
+}
+$proc.WaitForExit()
+$code = $proc.ExitCode
+
+# Session trees the bridge did not get to kill (a crash) stay in this task's
+# job and would keep the instance "Running", so restart-on-failure never
+# fires. End them here.
+if ($nodePid -gt 0) {
+  Get-CimInstance Win32_Process -Filter "ParentProcessId = $nodePid" | ForEach-Object {
+    $ErrorActionPreference = 'Continue'
+    & taskkill.exe /PID $_.ProcessId /T /F *> $null
+  }
+}
+"[start-bridge] $(Get-Date -Format o) $Name exited with code $code" | Out-File -FilePath $Log -Append -Encoding utf8
+exit $code

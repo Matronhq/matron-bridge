@@ -33,10 +33,15 @@ $TaskPath = '\Matron\'
 $Start = Join-Path $RepoDir 'start-bridge.ps1'
 $LogDir = Join-Path (Join-Path $env:LOCALAPPDATA 'matron-bridge') 'logs'
 
-function Fail($msg) { Write-Error $msg; exit 1 }
+function Fail($msg) { Write-Host "ERROR: $msg"; exit 1 }
 
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if ($isAdmin) { Fail 'Run this from a normal (non-elevated) PowerShell as the user who will run the bridge: the tasks are per-user and run in that user''s desktop session.' }
+# The tasks are registered for $env:USERNAME and run in that user's desktop
+# session, so this must be the console user (a `runas` shell would register
+# them for someone who is not logged on at the desktop).
+$consoleUser = (Get-CimInstance Win32_ComputerSystem).UserName
+if ($consoleUser -and ($consoleUser -notmatch ('\\' + [regex]::Escape($env:USERNAME) + '$'))) {
+  Write-Warning "This shell runs as $env:USERDOMAIN\$env:USERNAME but the desktop is logged on as $consoleUser; the bridge will only run while $env:USERNAME is logged on at the desktop."
+}
 
 $tasks = @(
   @{ Name = 'matron-bridge';        Args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Start`"";         Desc = 'Matron Bridge (Claude Code sessions for Matron)' },
@@ -64,7 +69,12 @@ Write-Host "User: $user"
 Write-Host "Logs: $LogDir"
 Write-Host ''
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $user
+# Watchdog: with MultipleInstances=IgnoreNew this is a no-op while the bridge
+# runs and relaunches it within 5 minutes otherwise - RestartCount is a cap
+# per trigger start, not Restart=always. `restart.ps1 -StopOnly` disables the
+# task, which also silences the watchdog.
+$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
   -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
@@ -78,7 +88,7 @@ foreach ($t in $tasks) {
     Stop-ScheduledTask -TaskPath $TaskPath -TaskName $t.Name -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $t.Name -Confirm:$false
   }
-  Register-ScheduledTask -TaskPath $TaskPath -TaskName $t.Name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $t.Desc | Out-Null
+  Register-ScheduledTask -TaskPath $TaskPath -TaskName $t.Name -Action $action -Trigger @($logon, $watchdog) -Principal $principal -Settings $settings -Description $t.Desc | Out-Null
   Start-ScheduledTask -TaskPath $TaskPath -TaskName $t.Name
   Write-Host "Registered and started $TaskPath$($t.Name)"
 }
@@ -92,7 +102,7 @@ Write-Host 'Manage:'
 Write-Host "  Status    Get-ScheduledTask -TaskPath '$TaskPath' | Select TaskName, State"
 Write-Host '  Restart   .\restart.ps1'
 Write-Host "  Logs      Get-Content -Wait '$LogDir\matron-bridge.log'"
-Write-Host "  Stop      .\restart.ps1 is start+stop; to stop only: Stop-ScheduledTask -TaskPath '$TaskPath' -TaskName matron-bridge"
+Write-Host '  Stop      .\restart.ps1 -StopOnly   (graceful; disables the task until the next .\restart.ps1)'
 Write-Host '  Uninstall setup\service.ps1 -Uninstall'
 Write-Host ''
 Write-Host 'The tasks run in your desktop session and only while you are logged on; for an unattended box, configure auto-logon.'
