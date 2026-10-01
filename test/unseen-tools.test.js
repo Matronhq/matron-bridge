@@ -5,7 +5,7 @@ import { createUnseenClient } from '../lib/unseen-client.js';
 const NOW = 1_790_000_000_000;
 const msg = { ref: 'msg:c-1:41', kind: 'message', convo_id: 'c-1', convo_title: 'Deploy prep', session_state: 'waiting', mission_num: 61, is_room: false, seq: 41, ts: NOW - 3 * 3_600_000, sender: 'agent:ang', type: 'text', snippet: 'PR is up\nplease approve', reasons: ['final'], important: true };
 const item = { ref: 'item:it_ab:1789', kind: 'item', convo_id: 'c-1', convo_title: 'Deploy prep', session_state: 'waiting', mission_num: 61, is_room: false, item_id: 'it_ab', item_num: 640, item_kind: 'question', ts: NOW - 5 * 3_600_000, snippet: 'Which box?', reasons: ['awaiting_user', 'question'], important: true };
-const room = { ref: 'msg:r-1:50', kind: 'message', convo_id: 'r-1', convo_title: 'A ↔ B', is_room: true, seq: 50, ts: NOW - 90 * 60_000, sender: 'agent:bev', type: 'text', snippet: 'Dan should see this', reasons: ['mentions_user'], important: true };
+const room = { ref: 'msg:r-1:50', kind: 'message', convo_id: 'r-1', convo_title: 'A ↔ B', is_room: true, seq: 50, ts: NOW - 90 * 60_000, sender: 'agent:bev', type: 'text', snippet: 'Dan should see this', reasons: [], important: false };
 
 function fixture({ coordinator = true, list = { status: 200, data: { entries: [msg, item], truncated: false } }, flag = { status: 200, data: { flagged: 1 } } } = {}) {
   const session = { roomId: '!r:s', coordinator, journalConvoId: 'c-coord' };
@@ -99,7 +99,9 @@ describe('unseen formatting', () => {
     expect(text).toContain('3 h ago · agent:ang · the session\'s last message before it stopped: "PR is up ⏎ please approve" · ref msg:c-1:41');
     expect(text).toContain('tracker #640 (question) · 5 h ago · waiting on the user, a question: "Which box?" — link [#640](matron://item/640) · ref item:it_ab:1789');
     expect(text).toContain('[A ↔ B](matron://convo/r-1) · agent room');
-    expect(text).toContain('names the user in an agent room');
+    // A room message is never important on its own: no reason, even when it names the user.
+    expect(text).toContain('2 h ago · agent:bev: "Dan should see this" · ref msg:r-1:50');
+    expect(text).not.toContain('names the user');
     expect(formatUnseenList({ entries: [] })).toMatch(/^Nothing matching is unseen/);
   });
 

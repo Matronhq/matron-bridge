@@ -489,7 +489,7 @@ async function callUnseen(name, args, render) {
 
 server.tool(
   'unseen_list',
-  "List what the user hasn't actually seen — messages that were never on their screen and tracker items they haven't opened — grouped by conversation, important first, each with why it matters and a ref. Coordinator only. Importance comes from the journal: items waiting on the user, questions, unanswered prompts, a session's last message before it stopped, failures, the user named in an agent room. Use it in every status update (a short \"You haven't seen\" section, at most 5 lines) and when the journal nudges you. Things already raised (unseen_flag) are left out unless include_flagged.",
+  "List what the user hasn't actually seen — messages that were never on their screen and tracker items they haven't opened — grouped by conversation, important first, each with why it matters and a ref. Coordinator only. Importance comes from the journal: items waiting on the user, questions, unanswered prompts, a session's last message before it stopped, failures. Agent-to-agent rooms are never important on their own (what needs the user there becomes a tracker item). Use it in every status update (a short \"You haven't seen\" section, at most 5 lines) and when the journal nudges you. Things already raised (unseen_flag) are left out unless include_flagged.",
   {
     older_than: z.string().max(16).optional().describe("Skip what's newer than this — the user may be about to read it. Default 30m."),
     since: z.string().max(16).optional().describe('How far back to look, e.g. 3d (default), up to 30d.'),
