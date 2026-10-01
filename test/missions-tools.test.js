@@ -274,6 +274,17 @@ describe('missions handlers', () => {
       get: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })),
     });
     expect((await gone.h.update({ roomId: '!r:s', title: 'New' })).status).toBe(404);
+    // A 200 whose body has no readable conversations[] is unreadable, like
+    // an unreadable list: a 502 naming it, never the detail body passed off
+    // as the op's own success.
+    const unreadable = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions } })),
+      get: vi.fn(async () => ({ status: 200, data: { mission: { id: 'ms_mine' } } })),
+    });
+    const ru = await unreadable.h.update({ roomId: '!r:s', title: 'New' });
+    expect(ru.status).toBe(502);
+    expect(ru.body.error).toMatch(/unreadable/);
+    expect(unreadable.client.update).not.toHaveBeenCalled();
   });
 
   it('cold resolve against an unreachable or failing journal reports the outage, never "no mission"', async () => {
