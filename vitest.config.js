@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { defineConfig, configDefaults } from 'vitest/config';
 
 // Tests that exercise POSIX-only pieces and cannot run on the Windows CI job:
 // the bash hook scripts (their Node ports in hooks/*.mjs are tested by
@@ -54,7 +54,7 @@ const WINDOWS_EXCLUDES = [
 export default defineConfig({
   test: {
     exclude: [
-      '**/node_modules/**',
+      ...configDefaults.exclude,
       ...(process.platform === 'win32' ? WINDOWS_EXCLUDES : []),
     ],
   },

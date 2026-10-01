@@ -10,12 +10,13 @@ describe('killProcessTree', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('win32: taskkill /T /F on the pid, and no direct kill when it succeeds', async () => {
-    const kill = vi.fn();
-    const exec = vi.fn((file, args, opts, cb) => cb(null));
+  it('win32: taskkill /T /F on the pid first, then the direct kill (releases pty handles)', async () => {
+    const order = [];
+    const kill = vi.fn(() => order.push('kill'));
+    const exec = vi.fn((file, args, opts, cb) => { order.push('taskkill'); cb(null); });
     await expect(killProcessTree(1234, 'SIGTERM', { kill, exec, platform: 'win32' })).resolves.toBe('taskkill');
     expect(exec).toHaveBeenCalledWith('taskkill', ['/PID', '1234', '/T', '/F'], expect.objectContaining({ windowsHide: true }), expect.any(Function));
-    expect(kill).not.toHaveBeenCalled();
+    expect(order).toEqual(['taskkill', 'kill']);
   });
 
   it('win32: falls back to the direct kill when taskkill fails', async () => {

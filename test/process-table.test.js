@@ -44,6 +44,12 @@ describe('Windows process table output', () => {
     expect(work).toEqual([2200, 2300]);
   });
 
+  it('treats node.exe as a launcher, so an absolute-node-path server is not work', () => {
+    const table = parseProcessTable('1 0 x\r\n2 1 C:\\nodejs\\node.exe C:\\bridge\\ask-user.js\r\n3 1 C:\\work\\job.exe\r\n');
+    const sigs = mcpServerSignatures({ s: { command: 'C:\\nodejs\\node.exe', args: ['C:\\bridge\\ask-user.js'] } });
+    expect(liveWorkChildren(1, table, sigs).map(p => p.pid)).toEqual([3]);
+  });
+
   it('matches a server by basename through a backslash path', () => {
     const table = parseProcessTable('1 0 x\r\n2 1 C:\\tools\\some-mcp.exe --flag\r\n3 1 C:\\work\\job.exe\r\n');
     const sigs = mcpServerSignatures({ s: { command: 'uvx', args: ['some-mcp.exe'] } });
