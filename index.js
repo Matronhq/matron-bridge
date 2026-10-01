@@ -90,7 +90,7 @@ import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
-import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
+import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { matronFilesDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -4029,6 +4029,11 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
+    // The parent's settled window (alias, id and gauge) and its model: a
+    // same-family child inherits the window (lib/session-status.js
+    // subagentContextWindow).
+    getParentModel: () => session.currentModel || session.initData?.model,
+    getParentWindow: () => contextWindowForSession(session),
     runningStore: subagentRunningStore,
     log: console,
   });
@@ -4195,7 +4200,11 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
       }
       const body = formatSubagentToolBody(block.name, block.input || {});
       if (!body) continue;
-      journalPublisher.publishText(convoId, { body, from: 'assistant' });
+      // `step` is the same call as data (lib/subagent-tool-format.js): clients
+      // read it for the plain-English activity line; older clients ignore it
+      // and render the body exactly as before.
+      const step = subagentToolStep(block.name, block.input || {});
+      journalPublisher.publishText(convoId, { body, from: 'assistant', ...(step ? { step } : {}) });
       session.lastActivityAt = Date.now();
     }
   }
