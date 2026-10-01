@@ -1,12 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { loadCoordinatorBlock } from '../lib/coordinator.js';
 
 // index.js cannot be imported in-process (top-level side effects), so the
 // unseen wiring is pinned by source inspection, like consent-wiring. The
 // handlers themselves are unit-tested in test/unseen-tools.test.js.
 const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
-const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+// The Coordinator prompt is the preamble plus the playbook directory
+// (spec 2026-10-01 coordinator routines), assembled as index.js does.
+const coord = loadCoordinatorBlock({
+  readFile: (p) => readFileSync(p, 'utf8'),
+  path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
+  dir: new URL('../coordinator', import.meta.url).pathname,
+  readDir: (d) => readdirSync(d),
+});
 const claude = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
 const codex = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
 
@@ -53,7 +61,7 @@ describe('unseen wiring (source inspection)', () => {
   });
 
   it('the prompts teach the rules: Coordinator section, and unseen_mine for every agent', () => {
-    expect(coord).toMatch(/^## Tell the user what they missed/m);
+    expect(coord).toMatch(/^## Procedure: tell the user what they missed/m);
     expect(coord).toMatch(/"You haven't seen" section: at most 5 lines/);
     expect(coord).toMatch(/call `unseen_flag` with its refs/);
     expect(coord).toMatch(/Never nag/);

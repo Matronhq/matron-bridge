@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import {
   createCoordinatorLookup,
   loadCoordinatorBlock,
@@ -185,7 +185,73 @@ describe('coordinator block file', () => {
   });
 });
 
+describe('playbook directory (spec 2026-10-01 coordinator routines)', () => {
+  const root = new URL('../coordinator/', import.meta.url);
+  const files = (sub) => readdirSync(new URL(sub, root)).filter((n) => n.endsWith('.md')).sort();
+  it('has one procedure per standard task and one section per starter routine', () => {
+    const procedures = files('procedures/').map((n) => readFileSync(new URL(`procedures/${n}`, root), 'utf8'));
+    const heads = procedures.map((t) => t.split('\n')[0]);
+    for (const want of ['sweep', 'triage a consent request', 'unstick a session', 'close missions', 'refresh mission and project statuses', 'file projects', 'infrastructure alert', 'tell the user what they missed', 'hand work to the merge train or the deploy owner']) {
+      expect(heads.some((h) => h === `## Procedure: ${want}`), want).toBe(true);
+    }
+    const routines = files('routines/');
+    expect(routines).toEqual(['daily-sweep.md', 'deploy-window.md', 'project-status.md', 'session-health.md', 'unseen-digest.md']);
+    for (const n of routines) {
+      const text = readFileSync(new URL(`routines/${n}`, root), 'utf8');
+      expect(text.split('\n')[0]).toMatch(new RegExp(`^## Routine: ${n.replace(/\.md$/, '')} — `));
+    }
+  });
+  it('the preamble explains routines and the tools, and no longer tells the Coordinator to arm check-in reminders', () => {
+    const block = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    expect(block).toMatch(/## Your playbook and routines/);
+    expect(block).toMatch(/\[routine <name>, fired by the journal at <time>\]/);
+    expect(block).toMatch(/routine_list/);
+    expect(block).toMatch(/routine_update/);
+    expect(block).toMatch(/routine_run/);
+    expect(block).not.toMatch(/## Check-ins/);
+    expect(block).not.toMatch(/repeat: "daily"/);
+  });
+  it('the playbook stays generic: it names the user\'s memories, never one user\'s rules', () => {
+    for (const sub of ['procedures/', 'routines/']) {
+      for (const n of files(sub)) {
+        const text = readFileSync(new URL(`${sub}${n}`, root), 'utf8');
+        expect(text, n).not.toMatch(/yearbook|deploy-1|greg|dan-mac|bev\b/i);
+      }
+    }
+  });
+});
+
 describe('loadCoordinatorBlock', () => {
+  it('appends every .md under <dir>/procedures then <dir>/routines, in name order; a missing directory only warns', () => {
+    const fs = {
+      '/x': '# brief\n',
+      '/d/procedures/20-b.md': 'B', '/d/procedures/10-a.md': ' A \n', '/d/procedures/notes.txt': 'no',
+      '/d/routines/daily-sweep.md': 'R1', '/d/routines/empty.md': '  ',
+    };
+    const dirs = { '/d/procedures': ['notes.txt', '20-b.md', '10-a.md'], '/d/routines': ['empty.md', 'daily-sweep.md'] };
+    const readFile = (p) => { if (!(p in fs)) throw new Error('ENOENT'); return fs[p]; };
+    const readDir = (d) => { if (!(d in dirs)) throw new Error('ENOENT'); return dirs[d]; };
+    expect(loadCoordinatorBlock({ readFile, path: '/x', dir: '/d', readDir })).toBe('# brief\n\nA\n\nB\n\nR1');
+    const log = { warn: vi.fn() };
+    expect(loadCoordinatorBlock({ readFile, path: '/x', dir: '/nope', readDir, log })).toBe('# brief');
+    expect(log.warn).toHaveBeenCalledTimes(2);
+    // No dir: exactly the old behaviour.
+    expect(loadCoordinatorBlock({ readFile, path: '/x' })).toBe('# brief');
+    // An unreadable preamble is the fallback even when the directory is fine.
+    expect(loadCoordinatorBlock({ readFile: () => { throw new Error('x'); }, path: '/x', dir: '/d', readDir, log })).toBe(FALLBACK_COORDINATOR_BLOCK);
+  });
+  it('the real files load into one block that starts with the preamble and ends with the last routine', () => {
+    const block = loadCoordinatorBlock({
+      readFile: (p) => readFileSync(p, 'utf8'),
+      path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
+      dir: new URL('../coordinator', import.meta.url).pathname,
+      readDir: (d) => readdirSync(d),
+    });
+    expect(block).toMatch(/^# You are this user's Coordinator/);
+    expect(block).toMatch(/## Procedure: sweep/);
+    expect(block).toMatch(/## Routine: unseen-digest/);
+    expect(block.indexOf('## Procedure: sweep')).toBeLessThan(block.indexOf('## Routine: daily-sweep'));
+  });
   it('trims the file; falls back (and warns) when unreadable or empty', () => {
     expect(loadCoordinatorBlock({ readFile: () => '  hi \n', path: '/x' })).toBe('hi');
     const warns = [];

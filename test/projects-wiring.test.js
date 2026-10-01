@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { loadCoordinatorBlock } from '../lib/coordinator.js';
 import { describe, expect, it, vi } from 'vitest';
 import { createProjectsHandlers } from '../lib/projects-tools.js';
 import { formatProjectBlocked, formatProjectJournalError } from '../lib/projects-format.js';
@@ -182,7 +183,12 @@ describe('projects wiring', () => {
   describe('instructions (spec 2026-09-30 §5 "Prompts")', () => {
     const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
     const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
-    const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    const coord = loadCoordinatorBlock({
+      readFile: (p) => readFileSync(p, 'utf8'),
+      path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
+      dir: new URL('../coordinator', import.meta.url).pathname,
+      readDir: (d) => readdirSync(d),
+    });
     const DEFINITION = 'A Project is the user\'s tracker object that groups related missions — not a working directory, and nothing to do with `~/.claude/projects`.';
 
     it('both session prompts define a Project once and teach filing with project_list first', () => {
@@ -220,7 +226,7 @@ describe('projects wiring', () => {
     });
 
     it('the Coordinator brief: definition, project sweep, merges reported, ONE filing question, never without the answer', () => {
-      expect(coord).toContain('## Projects');
+      expect(coord).toContain('## Procedure: file projects');
       expect(coord).toContain(DEFINITION);
       expect(coord).toContain('After the missions, refresh the projects: `project_list`, then for each open project `project_get N` and `project_status` with `num: N`');
       expect(coord).toContain('`project_merge` with `num` the one to fold away and `into` the one to keep');

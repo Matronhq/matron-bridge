@@ -16,6 +16,8 @@ import { createConsentClient } from './lib/consent-client.js';
 import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
 import { createUnseenClient } from './lib/unseen-client.js';
 import { createUnseenHandlers, formatUnseenNudge } from './lib/unseen-tools.js';
+import { createRoutinesClient } from './lib/routines-client.js';
+import { createRoutineHandlers } from './lib/routines-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
@@ -160,7 +162,7 @@ import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
-import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
+import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
 import {
@@ -197,6 +199,7 @@ import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const DEFAULT_BRIDGE_COORDINATOR_MD_PATH = path.join(__dirname, 'BRIDGE_COORDINATOR.md');
+const DEFAULT_BRIDGE_COORDINATOR_DIR = path.join(__dirname, 'coordinator');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work within the configured sandbox. Use native approval requests for actions requiring extra permission. Never post secrets in chat.';
 
@@ -454,6 +457,9 @@ const SECRET_REQUESTS_FILE = path.join(os.homedir(), '.matron-bridge-secrets.jso
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
 const BRIDGE_COORDINATOR_MD_PATH = process.env.BRIDGE_COORDINATOR_MD_PATH || DEFAULT_BRIDGE_COORDINATOR_MD_PATH;
+// The playbook directory (spec 2026-10-01 coordinator routines): one file
+// per procedure and per routine, appended to BRIDGE_COORDINATOR.md at boot.
+const BRIDGE_COORDINATOR_DIR = process.env.BRIDGE_COORDINATOR_DIR || DEFAULT_BRIDGE_COORDINATOR_DIR;
 
 // Gemini client for room topic summarization
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -493,6 +499,8 @@ const CODEX_BRIDGE_PROMPT = loadCodexBridgePrompt();
 const COORDINATOR_BLOCK = loadCoordinatorBlock({
   readFile: (p) => fs.readFileSync(p, 'utf-8'),
   path: BRIDGE_COORDINATOR_MD_PATH,
+  dir: BRIDGE_COORDINATOR_DIR,
+  readDir: (d) => fs.readdirSync(d),
   log: console,
 });
 
@@ -564,6 +572,12 @@ const consentClient = createConsentClient({
 // Read state (spec: matron-journal 2026-09-30 read state): same base URL and
 // token; the unseen_list / unseen_mine / unseen_flag tools.
 const unseenClient = createUnseenClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+// Coordinator routines (spec: matron-journal 2026-10-01 coordinator
+// routines): the routine_* tools' journal client.
+const routinesClient = createRoutinesClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -9692,7 +9706,7 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
   // does not match the cache waits for one forced refresh before it is
   // refused. Only from device 0: a forged sender never costs a journal GET.
   let coordinator = coordinatorLookup.snapshot();
-  if (params.action === 'alert' && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {
+  if (JOURNAL_ONLY_ACTIONS.has(params.action) && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {
     coordinator = await coordinatorLookup.refresh({ force: true });
   }
   const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinator.convoId });
@@ -11057,6 +11071,16 @@ const unseenHandlers = createUnseenHandlers({
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
+// The three routine_* tool routes (lib/routines-tools.js), mounted below.
+// The journal gates every write to the Coordinator; this refuses a
+// non-Coordinator first, counting the journal's current role holder.
+const routineHandlers = createRoutineHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: routinesClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
 // A journal `{kind:'unseen', event:'pending'}` frame (spec: matron-journal
 // 2026-09-30 read state): important things the user hasn't seen for 2 h or
 // more. Delivered to the Coordinator exactly like a consent nudge — resumed
@@ -11673,6 +11697,15 @@ const apiServer = createServer(async (req, res) => {
         const name = unseenRoute[1];
         await respondAgentChatRoute(res, data, unseenHandlers[name],
           (status, b) => debug(`unseen/${name} ${status} ${b.error || (b.entries ? `${b.entries.length} unseen` : 'ok')}`));
+        return;
+      }
+
+      // The three routine_* tool routes; same one-matcher allowlist shape.
+      const routineRoute = url.pathname.match(/^\/routine\/(list|update|run)$/);
+      if (routineRoute) {
+        const name = routineRoute[1];
+        await respondAgentChatRoute(res, data, routineHandlers[name],
+          (status, b) => debug(`routine/${name} ${status} ${b.error || (b.routines ? `${b.routines.length} routines` : b.routine ? b.routine.name : 'ok')}`));
         return;
       }
 

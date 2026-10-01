@@ -1,5 +1,15 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { loadCoordinatorBlock } from '../lib/coordinator.js';
 import { describe, expect, it } from 'vitest';
+
+// The Coordinator prompt is the preamble plus the playbook directory
+// (spec 2026-10-01 coordinator routines), assembled as index.js does.
+const coordinatorPlaybook = () => loadCoordinatorBlock({
+  readFile: (p) => readFileSync(p, 'utf8'),
+  path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
+  dir: new URL('../coordinator', import.meta.url).pathname,
+  readDir: (d) => readdirSync(d),
+});
 
 const OPS = ['start', 'create', 'post', 'update', 'status', 'join', 'leave', 'get', 'list', 'close'];
 const TOOL_CALLS = {
@@ -117,8 +127,8 @@ describe('missions wiring', () => {
     const tool = askUser.slice(askUser.indexOf("'mission_close',"), askUser.indexOf("'item_move',"));
     expect(tool).toContain("mission: z.number().int().min(1).optional()");
     expect(tool).toMatch(/Coordinator/);
-    const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
-    expect(coord).toMatch(/^## Close finished missions/m);
+    const coord = coordinatorPlaybook();
+    expect(coord).toMatch(/^## Procedure: close missions/m);
     expect(coord).toContain('`mission_close` with `mission: N`');
     expect(coord).toContain('Never call `mission_close` without `mission`');
     // I1 (final-review, 2026-09-30): the journal allows a named-mission close
@@ -153,8 +163,8 @@ describe('missions wiring', () => {
   });
 
   it('the Coordinator brief carries the refresh procedure and the exact app message', () => {
-    const coord = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
-    expect(coord).toContain("## Keep every mission's status current");
+    const coord = coordinatorPlaybook();
+    expect(coord).toContain('## Procedure: refresh mission and project statuses');
     expect(coord).toContain('"Refresh the status of every open mission from its latest milestones, sessions and open items."');
     expect(coord).toMatch(/`mission_list` for the open missions, then for each one `mission_get N` and `mission_status` with `mission: N`/);
     // Fix round 1 (#1): the journal has no idle state — skip only on running
@@ -173,7 +183,7 @@ describe('missions wiring', () => {
     // Fix round 1 (#4): a status the user wrote themselves (", by the user")
     // is left alone unless clearly stale, and a replacement is called out.
     expect(coord).toContain('A status `mission_list` marks ", by the user" is one they wrote themselves: leave it unless it is clearly out of date against newer milestones or items, and if you do replace it, say so in that mission\'s reply line.');
-    expect(coord).toMatch(/one line per mission you changed/);
+    expect(coord).toMatch(/one line per mission( and per project)? you changed/);
     expect(coord).toContain('Never call `mission_status` without `mission`');
     expect(coord).toMatch(/`mission_list` for every open mission/);
   });
