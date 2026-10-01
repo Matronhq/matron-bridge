@@ -339,6 +339,30 @@ describe('createAgentInvites', () => {
       await expect(p).resolves.toEqual({ kind: 'pending_busy' });
     });
 
+    it('sends from_convo_id so the owner can name the joining session', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j', fromConvoId: 'convo-mine' });
+      expect(sendRoomOp).toHaveBeenCalledWith({
+        op: 'agent_join', room_id: 'r2', from_convo_id: 'convo-mine', justification: 'j',
+      });
+    });
+
+    it('omits from_convo_id entirely when the session has no journal convo yet', async () => {
+      // Same absent-never-null discipline as invite()'s: the journal
+      // validates a PRESENT from_convo_id against this device and fails the
+      // whole join on a mismatch, so a null would turn a missing label into
+      // a failed join.
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j', fromConvoId: null });
+      expect('from_convo_id' in sendRoomOp.mock.calls[0][0]).toBe(false);
+    });
+
+    it('omits from_convo_id entirely when not given', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j' });
+      expect('from_convo_id' in sendRoomOp.mock.calls[0][0]).toBe(false);
+    });
+
     it('correlates error frames via ref agent_join', async () => {
       const { inv } = makeInvites();
       const p = inv.join({ roomId: 'r2', justification: 'j' });
