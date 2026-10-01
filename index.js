@@ -12739,7 +12739,10 @@ function sessionChildPid(session) {
 function readProcessTable() {
   try {
     const { file, args: ptArgs } = processTableCommand();
-    return parseProcessTable(execFileSync(file, ptArgs, { encoding: 'utf8', timeout: 15000, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }));
+    // execFileSync blocks the event loop: 5 s for ps as before; PowerShell
+    // needs a cold start, so Windows gets 15 s.
+    const timeout = process.platform === 'win32' ? 15000 : 5000;
+    return parseProcessTable(execFileSync(file, ptArgs, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }));
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
     return [];
