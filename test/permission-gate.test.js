@@ -71,7 +71,7 @@ describe('buildPrintSessionSettings', () => {
   });
 
   it('quotes the hooks dir and room id for the shell', () => {
-    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: "/opt/it's here/hooks", apiPort: 9802, roomId: "!a'b;$(x)" });
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: "/opt/it's here/hooks", apiPort: 9802, roomId: "!a'b;$(x)", platform: 'linux' });
     expect(gateCommand(settings).command)
       .toBe(`node '/opt/it'\\''s here/hooks/permission-gate.mjs' --port '9802' --room '!a'\\''b;$(x)'`);
   });

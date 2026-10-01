@@ -13,11 +13,16 @@ import { fileURLToPath } from 'node:url';
 import { readStdinJson } from './hook-util.mjs';
 import { liveLogPath } from '../lib/live-log-dir.js';
 
-export function rewriteCommand({ command, toolUseId, nodeBin, teeBin, logPath }) {
-  const q = (s) => `"${String(s).replace(/\\/g, '/').replace(/"/g, '\\"')}"`;
+// Paths go in bash double quotes with forward slashes (Node and Git Bash both
+// accept them); the characters bash still interprets inside double quotes
+// (" $ ` and \) are escaped. The original command is POSIX single-quoted.
+export function bashDoubleQuotePath(p) {
+  return `"${String(p).replace(/\\/g, '/').replace(/["$`\\]/g, (c) => `\\${c}`)}"`;
+}
+
+export function rewriteCommand({ command, nodeBin, teeBin, logPath }) {
   const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-  void toolUseId;
-  return `${q(nodeBin)} ${q(teeBin)} ${q(logPath)} -- bash -c ${sq(command)}`;
+  return `${bashDoubleQuotePath(nodeBin)} ${bashDoubleQuotePath(teeBin)} ${bashDoubleQuotePath(logPath)} -- bash -c ${sq(command)}`;
 }
 
 export function hookOutput(input, { env = process.env, nodeBin = process.execPath, hooksDir } = {}) {
@@ -35,7 +40,7 @@ export function hookOutput(input, { env = process.env, nodeBin = process.execPat
   return {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      updatedInput: { command: rewriteCommand({ command, toolUseId, nodeBin, teeBin, logPath }) },
+      updatedInput: { command: rewriteCommand({ command, nodeBin, teeBin, logPath }) },
     },
   };
 }

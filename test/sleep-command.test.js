@@ -141,6 +141,8 @@ describe('runSleepCommand', () => {
       child,
       timers,
       spawn: vi.fn(() => child),
+      // The POSIX shape is what these tests pin; the Windows one has its own case.
+      platform: 'linux',
       setTimer: (fn, ms) => { timers.push({ fn, ms }); return 'handle'; },
       fire: () => timers.forEach(t => t.fn()),
     };

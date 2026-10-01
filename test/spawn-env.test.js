@@ -22,6 +22,7 @@ function claude(overrides = {}) {
   return buildClaudeSpawnEnv({
     baseEnv: BRIDGE_ENV,
     execPath: EXEC,
+    pathDelimiter: ':',
     roomId: '!room:example',
     apiPort: 8787,
     journalProxyHeaderFile: '/tmp/matron-journal-proxy-x/header',
