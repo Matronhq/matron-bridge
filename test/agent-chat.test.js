@@ -1054,7 +1054,7 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'user handed me this room' });
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({ room_id: 'room-1', status: 'pending_busy' });
-      expect(invites.join).toHaveBeenCalledWith({ roomId: 'room-1', justification: 'user handed me this room' });
+      expect(invites.join).toHaveBeenCalledWith({ roomId: 'room-1', justification: 'user handed me this room', fromConvoId: 'convo-sess' });
       expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
     });
 
