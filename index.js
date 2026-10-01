@@ -8771,7 +8771,7 @@ const journalMediaRouter = createJournalMediaRouter({
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = [...blocks];
   if (!mirrorToJournal) markJournalOrigin(entry);
@@ -8790,6 +8790,7 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       fullText,
       // Same capability gate as the text path above.
       allowSendOne: session.agent !== AGENT_CODEX,
+      source,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
@@ -8818,11 +8819,12 @@ const itemTurnRouter = createItemTurnRouter({
   saveAttachments: saveItemAttachments,
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
-  queueText: (session, { text, preview }) => journalQueueMedia(session, {
+  queueText: (session, { text, preview, source }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
     preview,
     fullText: text,
+    source,
   }),
   publishNotice: journalPublishNotice,
   // The journal strips any client-supplied transcript, so a voice note on an
