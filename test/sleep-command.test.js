@@ -153,6 +153,14 @@ describe('runSleepCommand', () => {
       expect.objectContaining({ detached: true }));
   });
 
+  it('runs the command through PowerShell on Windows', () => {
+    const h = harness();
+    runSleepCommand('Stop-Computer -Force', { ...h, platform: 'win32' });
+    expect(h.spawn).toHaveBeenCalledWith('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'Stop-Computer -Force'],
+      expect.objectContaining({ detached: true, windowsHide: true }));
+  });
+
   it('rejects when the spawn itself fails, instead of crashing the bridge', async () => {
     // An unhandled 'error' event on a ChildProcess terminates the process.
     // fork(2) returning EAGAIN under memory pressure is a real way to get one.

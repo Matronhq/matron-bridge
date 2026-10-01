@@ -37,7 +37,7 @@ function gateCommand(settings) {
 
 describe('buildPrintSessionSettings', () => {
   it('gated: adds the MCP permission gate hook next to the bridge hooks', () => {
-    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room-1' });
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room-1', platform: 'linux' });
     // Pinned on: the inline --settings layer outranks the project and user
     // settings files, so an on-disk `disableAllHooks: true` cannot switch the
     // gate off (verified against the real CLI below).
@@ -52,6 +52,15 @@ describe('buildPrintSessionSettings', () => {
     expect(gate.type).toBe('command');
     expect(gate.command).toBe(`node '${GATE_HOOK}' --port '9802' --room 'room-1'`);
     expect(gate.timeout).toBeGreaterThan(10);
+  });
+
+  it('win32: every bridge hook is exec form — node.exe + the .mjs port + literal args, no shell', () => {
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room 1', platform: 'win32', execPath: 'C:\\nodejs\\node.exe' });
+    expect(settings.hooks.PreCompact[0].hooks[0]).toEqual({ type: 'command', command: 'C:\\nodejs\\node.exe', args: [path.join(HOOKS_DIR, 'compact-notify.mjs')], timeout: 5 });
+    expect(settings.hooks.PreToolUse[0].hooks[0]).toEqual({ type: 'command', command: 'C:\\nodejs\\node.exe', args: [path.join(HOOKS_DIR, 'matron-bash-tee.mjs')] });
+    const gate = gateCommand(settings);
+    expect(gate.command).toBe('C:\\nodejs\\node.exe');
+    expect(gate.args).toEqual([GATE_HOOK, '--port', '9802', '--room', 'room 1']);
   });
 
   it('bypass: no gate hook (nothing is gated)', () => {
