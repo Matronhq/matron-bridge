@@ -1186,7 +1186,7 @@ async function callMemory(name, args, render) {
   }
 }
 
-const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and listed under \"Your memories\" in every session's instructions at spawn.";
+const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and listed under \"Your memories\" in every session's instructions at spawn. Each has a scope: 'global' (every session), 'coordinator' (the user's Coordinator only) or 'repo:<name>' (sessions working in that repo); a session is given the global memories, its repo's, and all of them when it is the Coordinator.";
 
 server.tool(
   'memory_save',
@@ -1196,14 +1196,15 @@ server.tool(
     description: z.string().describe('One line, ≤200 chars: the rule as every session should read it.'),
     body: z.string().optional().describe('Markdown, ≤8 KB: **Why:** and **How to apply:**. Omitted on an update clears the stored body — send it back.'),
     type: z.enum(['user', 'feedback', 'project', 'reference']).optional().describe("Defaults to 'feedback' (how the user wants work done). 'user' = who they are; 'project' = ongoing work or constraints; 'reference' = a pointer (URL, dashboard, ticket)."),
+    scope: z.string().optional().describe("Who the memory is for: 'global' (every session; the default on create), 'coordinator' (a rule only the Coordinator acts on: sweeps, compaction, usage limits, box capacity) or 'repo:<name>' (a rule about one repo's workflow, e.g. 'repo:yearbook-app' — the bare repo name). Omitted on an update keeps the stored scope."),
   },
   async (args) => callMemory('save', args, formatSaveAck),
 );
 
 server.tool(
   'memory_list',
-  `List the user's memories: name, type, description and when each was last updated. ${MEMORY_WHAT} Call it before deciding anything a standing rule might cover if your instructions do not already carry the list.`,
-  {},
+  `List the user's memories: name, type, scope, description and when each was last updated. ${MEMORY_WHAT} Without \`all\` an ordinary session gets the memories in its own scopes and a count of the rest; the Coordinator always gets every one. Call it before deciding anything a standing rule might cover if your instructions do not already carry the list.`,
+  { all: z.boolean().optional().describe('true = every memory in every scope, not only the ones for this session.') },
   async (args) => callMemory('list', args, formatMemoryList),
 );
 
