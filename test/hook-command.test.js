@@ -8,9 +8,9 @@ const WIN_HOOKS = 'C:\\bridge\\hooks';
 describe('hookEntry', () => {
   it('POSIX: the .sh script path as a shell-form command', () => {
     expect(hookEntry({ hooksDir: HOOKS, name: 'stop-notify', timeout: 10, platform: 'linux' }))
-      .toEqual({ type: 'command', command: path.join(HOOKS, 'stop-notify.sh'), timeout: 10 });
+      .toEqual({ type: 'command', command: path.posix.join(HOOKS, 'stop-notify.sh'), timeout: 10 });
     expect(hookEntry({ hooksDir: HOOKS, name: 'matron-bash-tee', platform: 'darwin' }))
-      .toEqual({ type: 'command', command: path.join(HOOKS, 'matron-bash-tee.sh') });
+      .toEqual({ type: 'command', command: path.posix.join(HOOKS, 'matron-bash-tee.sh') });
   });
 
   it('win32: exec form — node.exe plus the .mjs port and literal args, no shell', () => {
@@ -18,7 +18,7 @@ describe('hookEntry', () => {
     expect(entry).toEqual({
       type: 'command',
       command: 'C:\\nodejs\\node.exe',
-      args: [path.join(WIN_HOOKS, 'stop-notify.mjs')],
+      args: [path.win32.join(WIN_HOOKS, 'stop-notify.mjs')],
       timeout: 10,
     });
   });
@@ -37,7 +37,7 @@ describe('hookEntry', () => {
 describe('nodeHookEntry', () => {
   it('POSIX: node + single-quoted script and args as one shell string', () => {
     const entry = nodeHookEntry({ hooksDir: HOOKS, name: 'permission-gate', args: ['--port', '9802', '--room', "r'1"], timeout: 30, platform: 'linux' });
-    expect(entry.command).toBe(`node '${path.join(HOOKS, 'permission-gate.mjs')}' --port '9802' --room 'r'\\''1'`);
+    expect(entry.command).toBe(`node '${path.posix.join(HOOKS, 'permission-gate.mjs')}' --port '9802' --room 'r'\\''1'`);
     expect(entry.args).toBeUndefined();
     expect(entry.timeout).toBe(30);
   });
@@ -47,7 +47,7 @@ describe('nodeHookEntry', () => {
     expect(entry).toEqual({
       type: 'command',
       command: 'C:\\nodejs\\node.exe',
-      args: [path.join(WIN_HOOKS, 'permission-gate.mjs'), '--port', '9802', '--room', 'r 1'],
+      args: [path.win32.join(WIN_HOOKS, 'permission-gate.mjs'), '--port', '9802', '--room', 'r 1'],
     });
   });
 });
