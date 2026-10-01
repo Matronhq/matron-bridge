@@ -263,12 +263,22 @@ resolve to absolute paths today; forward slashes are fine for Node on Windows.
 ### CI
 
 `ci.yml` gains a `test-windows` job on `windows-latest`, Node 22: `npm ci`,
-`npm run lint`, `npm run check`, `npm test`. Tests that exercise POSIX-only
-pieces (the `.sh` hooks, `xvfb-wrap.sh`, the codex producer, anything that
-shells out to `ps`/`lsof`) are excluded on win32 through a `vitest.config.js`
-that reads `process.platform`. The exclude list is explicit and short, and the
-`.mjs` hook tests and the new lib tests run on both platforms. The Linux job is
-unchanged.
+`npm run lint`, `npm run check`, `npm test`. A `vitest.config.js` that reads
+`process.platform` excludes suites on win32, in three groups, each listed
+with its reason:
+
+1. POSIX-only subjects: the `.sh` hooks, `xvfb-wrap.sh`, the Codex shim and
+   liveness (`/proc`, symlinks, process groups).
+2. Integration suites that need ffmpeg or a journal.
+3. Suites whose *fixtures* pin POSIX paths, modes, symlinks or FIFOs (the code
+   they cover is platform-neutral): file-link guard, transcript dir encoding,
+   viewer download/view, attachments, atomic-write modes, and the Coordinator
+   block loaders. The first Windows run failed 27 of 203 files; these are
+   excluded rather than ported now, and porting them is follow-up work.
+
+The `.mjs` hook tests and every new lib test run on both platforms. A
+`.gitattributes` with `eol=lf` keeps Windows checkouts from handing the
+bridge CRLF markdown and hooks. The Linux job is unchanged.
 
 ### Docs
 
@@ -311,12 +321,13 @@ Linux regression: `npm test` on the dev server, `deploy.sh` on a Linux bridge â€
 
 **New:** `start-bridge.ps1`, `restart.ps1`, `deploy.ps1`, `setup/install.ps1`,
 `setup/service.ps1`, `hooks/compact-notify.mjs`, `hooks/stop-notify.mjs`,
-`hooks/matron-bash-tee.mjs`, `lib/hook-command.js`, `lib/live-log-dir.js`,
-`lib/process-kill.js`, `lib/process-table.js`, `lib/shutdown-endpoint.js`,
-`vitest.config.js`, tests for each.
+`hooks/matron-bash-tee.mjs`, `hooks/hook-util.mjs`, `lib/hook-command.js`,
+`lib/live-log-dir.js`, `lib/process-kill.js`, `lib/process-table.js`,
+`lib/shutdown-endpoint.js`, `vitest.config.js`, `.gitattributes`, tests for each.
 
 **Modified:** `index.js` (hook entries, live log dir, process table, tree kill,
-shutdown route, `windowsHide`, `SIGBREAK`, Codex refusal on win32),
+shutdown route, `windowsHide`, `SIGBREAK`, Codex falls back to Claude on win32
+with a notice),
 `lib/permission-prompt.js` (hook entries), `lib/spawn-env.js` (delimiter),
 `lib/live-output.js` (dir param already exists; caller changes),
 `lib/work-hold.js` (basename), `lib/mcp-config.js` + `lib/mcp-config-mac.js`
