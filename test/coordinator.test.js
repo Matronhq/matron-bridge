@@ -310,12 +310,33 @@ describe('memory block plumbing (spec 2026-09-27 memories; every session since 2
 });
 
 describe('renderMemoryBlock', () => {
-  const m = (name, description = `Rule ${name}.`, type = 'feedback') => ({ id: `me_${name}`, name, type, description });
-  it('lists name (type): description per memory, sorted by name', () => {
+  const m = (name, description = `Rule ${name}.`, type = 'feedback', scope) => ({ id: `me_${name}`, name, type, description, ...(scope ? { scope } : {}) });
+  it('lists name (type, scope): description per memory, sorted by name, and says which scopes are listed', () => {
     const out = renderMemoryBlock({ known: true, memories: [m('b-two'), m('a-one', 'Never use eric.', 'user')] });
     expect(out.startsWith('## Your memories\n\n')).toBe(true);
     expect(out).toContain('memory_save');
-    expect(out.endsWith('\n- a-one (user): Never use eric.\n- b-two (feedback): Rule b-two.')).toBe(true);
+    expect(out).toContain('Listed here: the global memories only (this session has no repo).\n');
+    expect(out).not.toContain('left out');
+    expect(out.endsWith('\n- a-one (user, global): Never use eric.\n- b-two (feedback, global): Rule b-two.')).toBe(true);
+  });
+  it('an ordinary session gets global and its repo, and is told what was left out and how to see it', () => {
+    const memories = [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('app-rule', 'Train.', 'project', 'repo:yearbook-app'), m('infra-rule', 'Infra.', 'project', 'repo:yearbook-infra'), m('g-rule'), m('odd', 'Odd.', 'feedback', 'team:ops')];
+    const out = renderMemoryBlock({ known: true, memories }, { coordinator: false, repo: 'yearbook-app' });
+    expect(out).toContain("Listed here: the global memories and the memories for repo:yearbook-app (this session's repo). 3 in other scopes (coordinator, repo:yearbook-infra, team:ops) are left out; memory_list with all: true shows every memory.\n");
+    expect(out.endsWith('\n- app-rule (project, repo:yearbook-app): Train.\n- g-rule (feedback, global): Rule g-rule.')).toBe(true);
+    expect(out).not.toContain('c-rule');
+    const one = renderMemoryBlock({ known: true, memories: [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('g-rule')] }, { repo: 'x' });
+    expect(one).toContain('1 in other scopes (coordinator) is left out');
+    const none = renderMemoryBlock({ known: true, memories: [m('c-rule', 'Compact.', 'feedback', 'coordinator')] }, { repo: 'x' });
+    expect(none).toMatch(/1 in other scopes \(coordinator\) is left out.*\n\nNone of them applies to this session\.$/s);
+    expect(none).not.toMatch(/no memories yet/);
+  });
+  it('the Coordinator gets every memory with its scope and is told so', () => {
+    const memories = [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('app-rule', 'Train.', 'project', 'repo:yearbook-app'), m('g-rule')];
+    const out = renderMemoryBlock({ known: true, memories }, { coordinator: true, repo: 'danbarker' });
+    expect(out).toContain('You are the Coordinator, so every memory is listed with its scope');
+    expect(out).not.toContain('left out');
+    expect(out.endsWith('\n- app-rule (project, repo:yearbook-app): Train.\n- c-rule (feedback, coordinator): Compact.\n- g-rule (feedback, global): Rule g-rule.')).toBe(true);
   });
   it('known and empty says there are none; unknown says to call memory_list and never claims none', () => {
     expect(renderMemoryBlock({ known: true, memories: [] })).toMatch(/You have no memories yet\.$/);
@@ -326,7 +347,7 @@ describe('renderMemoryBlock', () => {
   });
   it('flattens multi-line fields and skips junk entries', () => {
     const out = renderMemoryBlock({ known: true, memories: [m('x', 'line one\nline  two'), null, { name: '' }, 'junk'] });
-    expect(out).toContain('- x (feedback): line one line two');
+    expect(out).toContain('- x (feedback, global): line one line two');
     expect(out.split('\n- ')).toHaveLength(2);
   });
   it('caps the block at 16 KB and says how many were left out', () => {

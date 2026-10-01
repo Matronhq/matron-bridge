@@ -21,6 +21,7 @@ import { createRoutineHandlers } from './lib/routines-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
+import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
@@ -636,15 +637,19 @@ const coordinatorLookup = createCoordinatorLookup({
 // since 2026-09-29): lib/memory-lookup.js, refreshed on every hello_ok, on
 // every `memory` event, on every `coordinator` event with role `assigned`,
 // and throttled behind every spawn.
-// memoryBlockNow() renders whatever the cache holds for the three spawn
-// builders (a resume goes through the same builders) and the live
-// `assigned` turn. One user per bridge token, so this is the session
-// owner's memories only.
+// memoryBlockNow({ coordinator, workdir }) renders whatever the cache holds
+// for the three spawn builders (a resume goes through the same builders)
+// and the live `assigned` turn — the memories in that session's audience
+// (spec 2026-10-01 memory scopes): the global ones, its repo's (the repo
+// name of its workdir, lib/repo-name.js), and every one for the
+// Coordinator. One user per bridge token, so this is the session owner's
+// memories only.
 const memoryLookup = createMemoryLookup({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
-const memoryBlockNow = () => renderMemoryBlock(memoryLookup.snapshot());
+const repoNames = createRepoNameLookup();
+const memoryBlockNow = ({ coordinator, workdir }) => renderMemoryBlock(memoryLookup.snapshot(), { coordinator: coordinator === true, repo: repoNames.nameFor(workdir) });
 
 // With no summary model this box silently loses written titles, its roster
 // summary and its summary events (lib/summary-model-nag.js). Nothing said so
@@ -2075,7 +2080,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
-  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow() });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }) });
   const args = [
     '--print',
     '--verbose',
@@ -2451,7 +2456,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow() });
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }) });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -2959,7 +2964,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // prompts lib/prompt-detector.js already surfaces as Matron yes/no cards.
   const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
   if (ivRootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
-  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow() });
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }) });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     ...(ivBypass ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'auto']),
@@ -8912,7 +8917,8 @@ async function journalOnCoordinator(convoId, { role }) {
     session._coordinatorPending = role;
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
-  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow()));
+  const target = sessions.get(roomId) || session;
+  await deliverCoordinatorTurn(target, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir })));
 }
 
 // The injected assigned/released turn. Same inject-or-queue rule as a
@@ -11105,10 +11111,15 @@ function journalHandleUnseenFrame(frame) {
 }
 
 // The four memory_* tool routes (lib/memory-tools.js), mounted below.
+// memory_list's audience (spec 2026-10-01 memory scopes): the same
+// Coordinator test as the consent and projects tools, and the repo name of
+// the session's workdir.
 const memoryHandlers = createMemoryHandlers({
   sessions,
   journalConvoIdFor,
   client: memoryClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+  repoFor: (session) => repoNames.nameFor(session?.workdir),
 });
 
 // Plan approvals mirrored into the tracker (lib/plan-approval-items.js,
