@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createRoutineHandlers, describeSchedule, formatRoutineList, formatRoutineLine, formatRoutineUpdateAck, formatRoutineRunAck, formatJournalRoutinesError, validateUpdateFields } from '../lib/routines-tools.js';
+import { createRoutineHandlers, describeSchedule, describeTrigger, formatRoutineList, formatRoutineLine, formatRoutineUpdateAck, formatRoutineRunAck, formatJournalRoutinesError, validateUpdateFields } from '../lib/routines-tools.js';
 import { createRoutinesClient } from '../lib/routines-client.js';
 
 const NOW = Date.parse('2026-10-01T10:00:00Z'); // 11:00 BST
@@ -67,7 +67,7 @@ describe('routine handlers', () => {
     expect(client.update.mock.calls[0]).toEqual(['daily-sweep', { enabled: false, title: 'Sweep', convo_id: 'c-coord' }]);
     // Journal refusals become sentences.
     expect((await fixture({ update: { status: 403, data: { error: 'forbidden', detail: 'not_coordinator' } } }).h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: true })).body.error).toMatch(/does not list this conversation as the Coordinator/);
-    expect((await fixture({ update: { status: 404, data: { error: 'not_found' } } }).h.update({ roomId: '!r:s', name: 'nope', enabled: true })).body.error).toBe('no routine named "nope" — routine_list shows the user\'s routines');
+    expect((await fixture({ update: { status: 404, data: { error: 'not_found' } } }).h.update({ roomId: '!r:s', name: 'nope', enabled: true })).body.error).toMatch(/^no routine named "nope" .*or this journal deployment does not have the \/routines routes yet$/);
     expect((await fixture({ update: { status: 400, data: { error: 'bad_request' } } }).h.update({ roomId: '!r:s', name: 'daily-sweep', schedule: '* * * * *' })).body.error).toMatch(/15 minutes apart/);
   });
 
@@ -114,12 +114,24 @@ describe('formatting', () => {
   it('acks', () => {
     expect(formatRoutineUpdateAck({ routine: { ...sweep, enabled: false, next_at: null } }, { enabled: false })).toMatch(/^Paused daily-sweep: it will not fire until resumed/);
     expect(formatRoutineUpdateAck({ routine: sweep }, { enabled: true })).toMatch(/^Resumed daily-sweep\./);
+    expect(formatRoutineUpdateAck({ routine: sweep }, { name: 'daily-sweep', roomId: '!r', enabled: true })).toMatch(/^Resumed daily-sweep\./);
     expect(formatRoutineUpdateAck({ routine: sweep }, { title: 'Sweep' })).toMatch(/^Updated daily-sweep\./);
     expect(formatRoutineRunAck({ accepted: true }, 'daily-sweep')).toMatch(/^Firing daily-sweep now/);
     expect(formatRoutineRunAck({ delivered: false, reason: 'no_coordinator' }, 'daily-sweep')).toMatch(/no Coordinator/);
     expect(formatRoutineRunAck({ delivered: false, reason: 'busy' }, 'daily-sweep')).toMatch(/try again/);
     expect(formatJournalRoutinesError({ error: 'conflict', blocked_by: 'cap' })).toMatch(/maximum/);
     expect(validateUpdateFields({ enabled: true, name: 'x', roomId: 'r' })).toEqual({ ok: true, value: { enabled: true } });
+    expect(validateUpdateFields({ trigger: { kind: 'context_over', pct: 55 } })).toEqual({ ok: true, value: { trigger: { kind: 'context_over', pct: 55 } } });
+    expect(validateUpdateFields({ trigger: { kind: 'stalled' } })).toEqual({ ok: true, value: { trigger: { kind: 'stalled' } } });
+    expect(validateUpdateFields({ trigger: { kind: 'stalled', reset_minutes: 30 } })).toEqual({ ok: true, value: { trigger: { kind: 'stalled', reset_minutes: 30 } } });
+    expect(validateUpdateFields({ trigger: { kind: 'context_over', pct: 100 } }).ok).toBe(false);
+    expect(validateUpdateFields({ trigger: { kind: 'volcano', pct: 5 } }).ok).toBe(false);
+    expect(validateUpdateFields({ trigger: { kind: 'disk_under', pct: 20 }, schedule: '5 7 * * *' }).err.body.error).toMatch(/not both/);
+    expect(describeTrigger({ kind: 'context_over', pct: 40 })).toBe('when a session passes 40% of its context window');
+    expect(describeTrigger({ kind: 'stalled', reset_minutes: 120 })).toBe('when a session stalls on a usage limit with no reset within 2 h');
+    expect(describeTrigger({ kind: 'disk_under', pct: 20 })).toBe('when a box drops under 20% free disk');
+    const trig = { id: 'rt_9', name: 'disk-low', title: 'Box disk under the threshold', schedule: null, trigger: { kind: 'disk_under', pct: 20 }, tz: 'Europe/London', prompt: 'p', enabled: true, origin: 'seed', next_at: null, last_fired_at: null, last_outcome: null };
+    expect(formatRoutineLine(trig, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk');
   });
 });
 

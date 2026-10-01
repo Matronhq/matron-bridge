@@ -195,7 +195,7 @@ describe('playbook directory (spec 2026-10-01 coordinator routines)', () => {
       expect(heads.some((h) => h === `## Procedure: ${want}`), want).toBe(true);
     }
     const routines = files('routines/');
-    expect(routines).toEqual(['daily-sweep.md', 'deploy-window.md', 'project-status.md', 'session-health.md', 'unseen-digest.md']);
+    expect(routines).toEqual(['context-over.md', 'daily-sweep.md', 'deploy-window.md', 'disk-low.md', 'project-status.md', 'session-health.md', 'stalled-session.md', 'unseen-digest.md']);
     for (const n of routines) {
       const text = readFileSync(new URL(`routines/${n}`, root), 'utf8');
       expect(text.split('\n')[0]).toMatch(new RegExp(`^## Routine: ${n.replace(/\.md$/, '')} — `));
@@ -237,8 +237,10 @@ describe('loadCoordinatorBlock', () => {
     expect(log.warn).toHaveBeenCalledTimes(2);
     // No dir: exactly the old behaviour.
     expect(loadCoordinatorBlock({ readFile, path: '/x' })).toBe('# brief');
-    // An unreadable preamble is the fallback even when the directory is fine.
-    expect(loadCoordinatorBlock({ readFile: () => { throw new Error('x'); }, path: '/x', dir: '/d', readDir, log })).toBe(FALLBACK_COORDINATOR_BLOCK);
+    // An unreadable preamble falls back to the built-in brief but keeps the playbook (review finding 5).
+    const fallbackRead = (p) => { if (p === '/x') throw new Error('x'); return readFile(p); };
+    expect(loadCoordinatorBlock({ readFile: fallbackRead, path: '/x', dir: '/d', readDir, log })).toBe(`${FALLBACK_COORDINATOR_BLOCK}\n\nA\n\nB\n\nR1`);
+    expect(loadCoordinatorBlock({ readFile: () => { throw new Error('x'); }, path: '/x', log })).toBe(FALLBACK_COORDINATOR_BLOCK);
   });
   it('the real files load into one block that starts with the preamble and ends with the last routine', () => {
     const block = loadCoordinatorBlock({
