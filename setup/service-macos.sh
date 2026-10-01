@@ -7,7 +7,7 @@ SCOPE="${SCOPE:-user}"
 NODE_BIN="${NODE_BIN:-$(command -v node)}"
 
 if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
-  echo "ERROR: node not found. Install Node.js 20+ (e.g. 'brew install node@20')." >&2
+  echo "ERROR: node not found. Install Node.js 22+ (e.g. 'brew install node@22')." >&2
   exit 1
 fi
 
@@ -18,6 +18,15 @@ fi
 
 case "$SCOPE" in
   user)
+    # Under sudo, $HOME is still the invoking user's but `id -u` is 0, so
+    # bootstrap targets gui/0 (fails with error 125) and the plists and
+    # LaunchAgents dir are left owned by root.
+    if [ "$(id -u)" -eq 0 ]; then
+      echo "ERROR: user-scope install must not run as root." >&2
+      echo "Re-run without sudo:       bash $0" >&2
+      echo "or for a boot-time daemon: sudo SCOPE=system bash $0" >&2
+      exit 1
+    fi
     PLIST_DIR="$HOME/Library/LaunchAgents"
     LOG_DIR="$HOME/Library/Logs"
     TARGET="gui/$(id -u)"
