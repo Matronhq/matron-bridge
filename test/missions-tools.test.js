@@ -65,7 +65,10 @@ describe('missions handlers', () => {
     const { h, client, session, mission } = fixture({ list: vi.fn(async () => ({ status: 200, data: { missions: [{ ...mission, id: 'ms_9', num: 9 }] } })) });
     await h.get({ roomId: '!r:s', num: 5 });
     expect(client.get.mock.calls[0][0]).toBe(5);
-    client.get.mockResolvedValueOnce({ status: 200, data: { mission: { id: 'ms_9', num: 9 }, milestones: [], items: [], conversations: [{ id: 'c1' }] } });
+    // The scan confirms the origin hit's membership (one detail GET) before
+    // the handler's own GET for the body: both answer for ms_9.
+    const ms9 = { status: 200, data: { mission: { id: 'ms_9', num: 9 }, milestones: [], items: [], conversations: [{ id: 'c1' }] } };
+    client.get.mockImplementation(async (id) => (id === 'ms_9' ? ms9 : { status: 404, data: { error: 'not_found' } }));
     const r = await h.get({ roomId: '!r:s' });
     expect(r.status).toBe(200);
     expect(client.list.mock.calls[0]).toEqual([]);
@@ -213,6 +216,75 @@ describe('missions handlers', () => {
     expect(client.update.mock.calls[0][0]).toBe('ms_b');
     // ms_a then ms_b — the scan stops on the match, never reaching ms_c.
     expect(client.get.mock.calls.map((c) => c[0])).toEqual(['ms_a', 'ms_b']);
+  });
+
+  it('cold resolve: a mission this conversation only CREATED (mission_create, attach:false) is not its own', async () => {
+    // mission_create records the caller as origin_convo_id for provenance
+    // without joining it. The scan's origin shortcut took that as
+    // membership, so after a create every "this conversation's mission" op
+    // (mission_get, mission_close) landed on the new unassigned mission —
+    // mission_close was refused for an item that belonged to it — until a
+    // mission_join put the cache right. Origin alone is not membership: a
+    // mission the conversation is actually on wins, newest-first or not.
+    const missions = [
+      { id: 'ms_new', num: 62, origin_convo_id: 'c1', state: 'open' },
+      { id: 'ms_mine', num: 61, origin_convo_id: 'c1', state: 'open' },
+    ];
+    const detail = (id, convos) => ({ status: 200, data: { mission: { id }, milestones: [], items: [], conversations: convos } });
+    const { h, client, session } = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions } })),
+      get: vi.fn(async (id) => detail(id, id === 'ms_mine' ? [{ id: 'c1' }] : [{ id: 'cHandedOff' }])),
+    });
+    const r = await h.close({ roomId: '!r:s', summary: 'done' });
+    expect(r.status).toBe(200);
+    expect(session.missionId).toBe('ms_mine');
+    expect(client.close.mock.calls[0][0]).toBe('ms_mine');
+  });
+
+  it('cold resolve: an origin match the conversation is not on, and no membership anywhere → no mission', async () => {
+    const missions = [{ id: 'ms_new', num: 62, origin_convo_id: 'c1', state: 'open' }];
+    const { h, session } = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions } })),
+      get: vi.fn(async (id) => ({ status: 200, data: { mission: { id }, milestones: [], items: [], conversations: [{ id: 'cHandedOff' }] } })),
+    });
+    const r = await h.update({ roomId: '!r:s', title: 'New' });
+    expect(r.status).toBe(404);
+    expect(session.missionId).toBeUndefined();
+  });
+
+  it('cold resolve: a membership lookup that fails (outage) is reported, never "no mission"', async () => {
+    // The list propagates an outage; the detail GET that confirms an origin
+    // hit must too. Treating a 503 or an unreachable journal as "not a
+    // member" would answer no-mission, and the model would mission_start a
+    // duplicate the moment the journal is back. A detail 404 stays a skip:
+    // that mission is gone, the others may still match.
+    const missions = [{ id: 'ms_mine', num: 61, origin_convo_id: 'c1', state: 'open' }];
+    for (const [detailResult, expected] of [[{ status: 0, data: { error: 'journal unreachable' } }, 502], [{ status: 503, data: { error: 'busy' } }, 503]]) {
+      const { h, session } = fixture({
+        list: vi.fn(async () => ({ status: 200, data: { missions } })),
+        get: vi.fn(async () => detailResult),
+      });
+      const r = await h.update({ roomId: '!r:s', title: 'New' });
+      expect(r.status).toBe(expected);
+      expect(r.body.error).not.toMatch(/no mission/i);
+      expect(session.missionId).toBeUndefined();
+    }
+    const gone = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions } })),
+      get: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })),
+    });
+    expect((await gone.h.update({ roomId: '!r:s', title: 'New' })).status).toBe(404);
+    // A 200 whose body has no readable conversations[] is unreadable, like
+    // an unreadable list: a 502 naming it, never the detail body passed off
+    // as the op's own success.
+    const unreadable = fixture({
+      list: vi.fn(async () => ({ status: 200, data: { missions } })),
+      get: vi.fn(async () => ({ status: 200, data: { mission: { id: 'ms_mine' } } })),
+    });
+    const ru = await unreadable.h.update({ roomId: '!r:s', title: 'New' });
+    expect(ru.status).toBe(502);
+    expect(ru.body.error).toMatch(/unreadable/);
+    expect(unreadable.client.update).not.toHaveBeenCalled();
   });
 
   it('cold resolve against an unreachable or failing journal reports the outage, never "no mission"', async () => {
