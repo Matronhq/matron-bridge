@@ -58,7 +58,7 @@ describe('code-update self-restart wiring', () => {
     expect(boot).toMatch(/selectAutoCarryOn\(stale, stamp, \{ enabled: CODE_UPDATE_AUTO_CARRY_ON \}\)/);
     // Same two gates as a card: a persisted session to resume, and a convo id a resume can address.
     expect(boot).toMatch(/auto\.filter\(rec => resumable\.has\(rec\.convoId\) && isResumeConvoId\(rec\.convoId\)\)/);
-    expect(boot).toMatch(/setTimeout\(\(\) => \{[\s\S]*?carryOnConvo\(rec\.convoId, null, null, CODE_UPDATE_AUTO_CARRY_ON_TEXT\)[\s\S]*?\}, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS\)/);
+    expect(boot).toMatch(/setTimeout\(\(\) => \{[\s\S]*?carryOnConvo\(rec\.convoId, null, null, CODE_UPDATE_AUTO_CARRY_ON_TEXT, notice\)[\s\S]*?\}, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS\)/);
     // The resume notice says why, instead of the default "session was idle" copy.
     expect(boot).toMatch(/const notice = `🔄 The bridge restarted itself onto new code[^`]*carry on automatically\.`;/);
     // The card loop skips what carries on by itself.
@@ -68,7 +68,7 @@ describe('code-update self-restart wiring', () => {
 
   it('carryOnConvo still delivers the literal "carry on" for a tap, and the marked text for the automatic path', () => {
     const fnCarry = index.slice(index.indexOf('async function carryOnConvo('), index.indexOf('async function carryOnConvo(') + 2400);
-    expect(fnCarry).toMatch(/async function carryOnConvo\(convoId, session, _sendReply, text = 'carry on'\)/);
+    expect(fnCarry).toMatch(/async function carryOnConvo\(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined\)/);
     expect(fnCarry).toMatch(/await journalRouteTextToSession\(target, text\);/);
     expect(fnCarry).toMatch(/journalResumeConvo\(convoId, resumeNotice\)/);
   });
