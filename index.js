@@ -92,6 +92,13 @@ import { liveLogDir, liveLogPath as liveLogPathFor } from './lib/live-log-dir.js
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
+import {
+  createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
+  restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
+  RESTART_EXIT_CODE as CODE_UPDATE_EXIT_CODE,
+  DEFAULT_POLL_MS as CODE_UPDATE_POLL_DEFAULT_MS, DEFAULT_SETTLE_MS as CODE_UPDATE_SETTLE_DEFAULT_MS,
+  DEFAULT_MAX_DEFER_MS as CODE_UPDATE_MAX_DEFER_DEFAULT_MS,
+} from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
@@ -281,6 +288,14 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 // long to hold memory for an idle session), and 1h would mean restarting the
 // bridge before a long meeting silently loses the card.
 const RESTART_CARRY_ON_MAX_AGE_MS = parseInt(process.env.MATRON_RESTART_CARRY_ON_MAX_AGE_MS || '21600000', 10);
+// Restart onto new code by itself (lib/code-update-restart.js): poll the
+// checkout's HEAD reflog, let a landed update settle, then exit for the
+// supervisor at the first poll with no session mid-turn — or after
+// MAX_DEFER regardless. MATRON_CODE_UPDATE_RESTART=0 switches it off.
+const CODE_UPDATE_RESTART = codeUpdateRestartEnabled(process.env.MATRON_CODE_UPDATE_RESTART);
+const CODE_UPDATE_POLL_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_POLL_MS, CODE_UPDATE_POLL_DEFAULT_MS);
+const CODE_UPDATE_SETTLE_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_SETTLE_MS, CODE_UPDATE_SETTLE_DEFAULT_MS);
+const CODE_UPDATE_MAX_DEFER_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_MAX_DEFER_MS, CODE_UPDATE_MAX_DEFER_DEFAULT_MS);
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -9729,6 +9744,50 @@ function startAutoResumeSweep() {
   return timer;
 }
 
+// Restart onto new code by itself — lib/code-update-restart.js has the
+// policy and the why. A rollout that found a live session here left the
+// new code on disk and the old process running; this is the "next natural
+// restart" it was deferred to. The checkout is the directory index.js runs
+// from. "Mid-turn" is session.busy, the same flag the loopback /sessions
+// list reports and restart_session parks on. A restart is the ordinary
+// SIGTERM path (gracefulShutdown: every session killed, the journal outbox
+// flushed) with a non-zero exit so every supervisor relaunches the bridge;
+// an idle session resumes with its history on its next turn, an
+// interrupted one gets a carry-on card at boot (publishRestartCarryOnCards).
+function startCodeUpdateWatcher() {
+  if (!CODE_UPDATE_RESTART) {
+    console.log('[code-update] self-restart onto new code: OFF (MATRON_CODE_UPDATE_RESTART)');
+    return null;
+  }
+  const gitDir = resolveGitDir(__dirname);
+  const boot = gitDir ? readHeadReflog(gitDir) : null;
+  if (!boot) {
+    console.log(`[code-update] self-restart onto new code: OFF (no HEAD reflog under ${__dirname})`);
+    return null;
+  }
+  const watcher = createCodeUpdateWatcher({
+    readHead: () => readHeadReflog(gitDir),
+    busySessions: () => { let n = 0; for (const [, s] of sessions) if (s.alive && s.busy) n++; return n; },
+    preflight: () => defaultPreflight(__dirname),
+    restart: (info) => {
+      if (shuttingDown) return;
+      console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
+      void gracefulShutdown('code-update', { exitCode: CODE_UPDATE_EXIT_CODE });
+    },
+    log: (m) => console.log(m),
+    warn: (m) => console.warn(m),
+    bootSha: boot.sha,
+    settleMs: CODE_UPDATE_SETTLE_MS,
+    maxDeferMs: CODE_UPDATE_MAX_DEFER_MS,
+  });
+  console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, defer at most ${CODE_UPDATE_MAX_DEFER_MS}ms)`);
+  const timer = setInterval(() => {
+    watcher.tick().catch(e => { try { console.warn(`[code-update] tick failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+  }, CODE_UPDATE_POLL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
 // A session that was waiting for its limit to reset has just been moved to
 // another model: the reason to wait is gone, so the armed carry-on fires at
 // the next sweep instead of at the old reset time (Bugbot: it would
@@ -13073,6 +13132,9 @@ async function main() {
   // queues frames FIFO until hello_ok, exactly as the eager control-convo
   // upsert above relies on, so nothing is dropped by publishing here.
   publishRestartCarryOnCards();
+  // After the carry-on cards: a self-restart for new code must never land
+  // before the previous process's interruptions have been surfaced.
+  startCodeUpdateWatcher();
 }
 
 main().catch(err => {
@@ -13086,13 +13148,15 @@ main().catch(err => {
 // socket can't hang shutdown), so a clean restart delivers pending releases
 // inline; anything still unsettled is durable in the outbox and reconciled on
 // next boot.
+// `exitCode` is 0 for a stop and CODE_UPDATE_EXIT_CODE for a self-restart
+// onto new code: launchd relaunches only after a non-zero exit.
 let shuttingDown = false;
-async function gracefulShutdown(signal) {
+async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
   if (signal === 'SIGINT') console.log('\nShutting down...');
   // Everything is inside try/finally so a throw from ANY step (sampler, session
-  // kill, or the flush) still reaches process.exit(0). Previously stopCpuSampler
+  // kill, or the flush) still reaches process.exit(exitCode). Previously stopCpuSampler
   // / killSession ran outside the try, so a throw there rejected the promise the
   // signal handlers ignore, and the process never exited (unhandled rejection).
   try {
@@ -13109,7 +13173,7 @@ async function gracefulShutdown(signal) {
   } catch (e) {
     try { console.warn(`[shutdown] failed: ${e?.message ?? String(e)}`); } catch { /* ignore */ }
   } finally {
-    process.exit(0);
+    process.exit(exitCode);
   }
 }
 
