@@ -93,10 +93,19 @@ setup/install.sh                # installs npm deps, seeds .env
 # Linux (systemd):
 sudo setup/service.sh
 
-# macOS (LaunchAgent — runs while you're logged in):
+# macOS (LaunchAgent — runs while you're logged in). Do NOT use sudo:
 setup/service.sh
 # or, system-wide LaunchDaemon (runs at boot, requires sudo):
 sudo SCOPE=system setup/service.sh
+```
+
+On macOS, the default user-scope install must run as your own user. Under
+`sudo` it fails with `Bootstrap failed: 125: Domain does not support specified
+action` and can leave root-owned files behind. If that happened, clean up with:
+
+```bash
+sudo rm -f ~/Library/LaunchAgents/chat.matron.matron-bridge*.plist
+sudo chown "$USER":staff ~/Library/LaunchAgents
 ```
 
 After editing `.env`, re-run `setup/service.sh` (on macOS, launchd has no
