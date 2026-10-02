@@ -555,7 +555,7 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     // The normal cases are untouched…
     expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text, \{ notice: NOTICE\.CONTROL \}\)/);
     // The outcome line opens the parent's turn only when the parent takes it now.
-    expect(body).toContain('if (session && !sessionOccupiedForRoomDelivery(session)) announceTurnStart(session, TURN_ORIGIN.SPAWN);');
+    expect(body).toContain('if (session && !sessionOccupiedForRoomDelivery(session) && canAnnounceTurn(session)) announceTurnStart(session, TURN_ORIGIN.SPAWN);');
     expect(body).toMatch(/if \(session\) \{/);
     expect(body).toMatch(/roomDelivery\.deliver\(session, session\.roomId,/);
     // …and the fallback fires ONLY when session is absent (the `else`) AND

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   NOTICE, TURN_ORIGIN, controlTurnOrigin, canAnnounceTurn, announceTurnStart, turnSeq,
-  noteTurnDispatch, takeTurnStart, withTurnStart, markTurnOrigin, turnOriginOf,
+  noteTurnDispatch, noteTurnEnd, holdTurnRow, withTurnRowStart, takeTurnStart, withTurnStart, markTurnOrigin, turnOriginOf,
   mergedTurnOrigin, TURN_EVENT_METHODS,
 } from '../lib/turn-markers.js';
 
@@ -52,6 +52,7 @@ describe('canAnnounceTurn', () => {
     expect(canAnnounceTurn({ alive: true, busy: true })).toBe(false);
     expect(canAnnounceTurn({ alive: true, waitingForAnswer: 'text-reply' })).toBe(false);
     expect(canAnnounceTurn({ alive: true, pendingInteractivePrompt: {} })).toBe(false);
+    expect(canAnnounceTurn({ alive: true, pendingUnclassifiedPrompt: true })).toBe(false);
     expect(canAnnounceTurn(null)).toBe(false);
   });
 
@@ -67,6 +68,88 @@ describe('canAnnounceTurn', () => {
 });
 
 describe('turn_start arming', () => {
+  it('a turn end drops an arm its turn never published', () => {
+    const s = {};
+    noteTurnDispatch(s, 'nudge');
+    noteTurnEnd(s);
+    expect(takeTurnStart(s)).toBeNull();
+  });
+
+  it('a turn end drops an announced line whose turn never dispatched, so the next same-origin turn is marked', () => {
+    const s = {};
+    announceTurnStart(s, 'spawn');
+    takeTurnStart(s);
+    noteTurnEnd(s);
+    noteTurnDispatch(s, 'spawn');
+    expect(takeTurnStart(s)).toEqual({ origin: 'spawn' });
+  });
+
+  it('a row still on its way gets the marker its turn left unused; nothing else does', () => {
+    const s = {};
+    noteTurnDispatch(s, 'nudge');
+    const seq = turnSeq(s);
+    const release = holdTurnRow(s);
+    noteTurnEnd(s);
+    expect(takeTurnStart(s)).toBeNull();
+    const row = { message_ref: 't1' };
+    expect(withTurnRowStart(s, seq, 'publishToolOutput', row)).toEqual({ message_ref: 't1', turn_start: { origin: 'nudge' } });
+    expect(withTurnRowStart(s, seq, 'publishToolOutput', row)).toEqual(row);
+    release();
+  });
+
+  it('the last release drops a set-aside marker no row took', () => {
+    const s = {};
+    noteTurnDispatch(s, 'nudge');
+    const seq = turnSeq(s);
+    const a = holdTurnRow(s);
+    const b = holdTurnRow(s);
+    noteTurnEnd(s);
+    a();
+    a();
+    expect(s._journalHeldTurnStart).toEqual({ seq, origin: 'nudge' });
+    b();
+    expect(withTurnRowStart(s, seq, 'publishToolOutput', { message_ref: 't' })).toEqual({ message_ref: 't' });
+  });
+
+  it('a late row of an older turn takes nothing, and a new dispatch discards the set-aside marker', () => {
+    const s = {};
+    noteTurnDispatch(s, 'nudge');
+    const seq = turnSeq(s);
+    const release = holdTurnRow(s);
+    noteTurnEnd(s);
+    noteTurnDispatch(s, 'item');
+    expect(withTurnRowStart(s, seq, 'publishToolOutput', { message_ref: 't' })).toEqual({ message_ref: 't' });
+    release();
+    expect(takeTurnStart(s)).toEqual({ origin: 'item' });
+  });
+
+  it('a newer turn announced before the late row lands discards the set-aside marker', () => {
+    const s = {};
+    noteTurnDispatch(s, 'nudge');
+    const seq = turnSeq(s);
+    const release = holdTurnRow(s);
+    noteTurnEnd(s);
+    announceTurnStart(s, 'reminder');
+    expect(takeTurnStart(s)).toEqual({ origin: 'reminder' });
+    expect(withTurnRowStart(s, seq, 'publishToolOutput', { message_ref: 't' })).toEqual({ message_ref: 't' });
+    release();
+  });
+
+  it('a late row of the current turn with nothing set aside takes the live arm', () => {
+    const s = {};
+    noteTurnDispatch(s, 'peer');
+    expect(withTurnRowStart(s, turnSeq(s), 'publishToolOutput', { message_ref: 't' }))
+      .toEqual({ message_ref: 't', turn_start: { origin: 'peer' } });
+  });
+
+  it('a turn end leaves the turn counter alone', () => {
+    const s = {};
+    noteTurnDispatch(s, 'peer');
+    noteTurnEnd(s);
+    expect(turnSeq(s)).toBe(1);
+    noteTurnEnd(null);
+  });
+
   it('a dispatch with an origin marks exactly the next agent event', () => {
     const s = {};
     noteTurnDispatch(s, 'routine');

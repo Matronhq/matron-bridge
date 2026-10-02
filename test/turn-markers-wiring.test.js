@@ -148,7 +148,7 @@ describe('dispatch and queue seams (source inspection)', () => {
   it('sendToSession decides the arm at the one real dispatch point, after the resume hold', () => {
     const fn = body('function sendToSession(session, contentBlocks, { skipJournalMirror = false, turnOrigin = null } = {}) {', '\nfunction sendTextToSession(');
     const hold = fn.indexOf('(session._resumeOutbox ||= []).push(skipJournalMirror ? markTurnOrigin(markJournalOrigin(contentBlocks), turnOrigin) : contentBlocks);');
-    const dispatch = fn.indexOf('const markDispatched = () => noteTurnDispatch(session, skipJournalMirror ? turnOrigin : null);');
+    const dispatch = fn.indexOf('const markDispatched = () => { if (!busyAtDispatch) noteTurnDispatch(session, skipJournalMirror ? turnOrigin : null); };');
     expect(hold).toBeGreaterThan(-1);
     expect(dispatch).toBeGreaterThan(hold);
     // Armed only on an accepted send (Codex accepted, PTY typed, stdin written)...
@@ -250,7 +250,7 @@ describe('notice classes at their emit sites (source inspection)', () => {
   });
   it('a Claude tool output finalized late only marks the turn that ran it', () => {
     expect(index).toContain('turnSeq: turnSeq(session),');
-    expect(index).toContain("entry.turnSeq === turnSeq(entry.session) ? withTurnStart(entry.session, 'publishToolOutput', finalPayload) : finalPayload,");
+    expect(index).toContain("withTurnRowStart(entry.session, entry.turnSeq, 'publishToolOutput', finalPayload),");
   });
 
   it('Claude compaction start (PreCompact hook) is a compaction notice', () => {
@@ -316,5 +316,273 @@ describe('notice classes at their emit sites (source inspection)', () => {
   it('undelivered queued messages and session-control results', () => {
     expect(index).toMatch(/the session ended before it was sent\.",\s*\n\s*\{ notice: NOTICE\.DELIVERY_FAILED \}\);/);
     expect(index).toContain('notify: (convoId, text) => journalPublishNotice(convoId, text, { notice: NOTICE.CONTROL }),');
+  });
+});
+
+// The turn-end seams and the dispatch decision, run for real. A stub
+// flushResponse publishes the turn's buffered text the way the real one does
+// (through sendToRoom -> journalPublish), so the arm is taken or left exactly
+// as it would be in the bridge.
+function seamHarness() {
+  const h = harness();
+  const ctx = h.context;
+  Object.assign(ctx, {
+    debug: () => {},
+    AGENT_CODEX: 'codex', DEFAULT_WORKDIR: '/work',
+    inflightMarker: { noteTurnStart: vi.fn(), noteTurnEnd: vi.fn() },
+    journalSessionState: vi.fn(), journalActivity: vi.fn(), journalStatus: vi.fn(),
+    journalStreamClear: vi.fn(), maybeSummarizeAtTurnEnd: vi.fn(), clearPendingInterrupt: vi.fn(),
+    refreshUsageLimits: () => null, extractTextContent: () => '', splitMessage: (t) => [t],
+    escapeHtml: (t) => t, markdownToHtml: (t) => t,
+    planItems: { opened: vi.fn(), resolved: vi.fn() },
+    dispatchDeferredCommand: vi.fn(() => false), flushPendingSessionQueue: vi.fn(() => false), maybeFlushRoomDelivery: vi.fn(),
+    flushResponse: (s) => {
+      const text = s.responseBuffer;
+      s.responseBuffer = '';
+      if (text && text.trim()) ctx.sendToRoom(s.roomId, text, '');
+    },
+  });
+  Object.assign(h.session, { busy: true, responseBuffer: '', toolCalls: [], totalUsage: {}, turnCount: 0 });
+  const iv = fnSource('function createInteractiveSessionForRoom(').match(/ {2}session\.onTurnEnd = \(\) => \{[\s\S]*?\n {2}\};\n/);
+  expect(iv, 'iv onTurnEnd not found').not.toBeNull();
+  const handle = fnSource('function handleClaudeEvent(session, event) {');
+  const resultStart = handle.indexOf("    case 'result': {");
+  const resultEnd = handle.indexOf('\n      break;\n    }\n', handle.indexOf('maybeFlushRoomDelivery(session);', resultStart));
+  expect(resultStart).toBeGreaterThan(-1);
+  vm.runInContext([
+    `function installIvTurnEnd(session) {\n${iv[0]}}`,
+    `function printResult(session, event) {\n  switch (event.type) {\n${handle.slice(resultStart, resultEnd)}\n      break;\n    }\n  }\n}`,
+    fnSource('function finishCodexTurn(session, {'),
+  ].join('\n'), ctx);
+  const seams = {
+    iv: (s) => { ctx.installIvTurnEnd(s); s.onTurnEnd(); },
+    print: (s) => ctx.printResult(s, { type: 'result' }),
+    codex: (s) => { s._codexTurnFinished = false; ctx.finishCodexTurn(s); },
+  };
+  return { ...h, seams };
+}
+
+describe('turn-end seams drop an arm the turn never used (runs the real index.js code)', () => {
+  for (const seam of ['iv', 'print', 'codex']) {
+    it(`${seam}: an injected turn that published nothing leaves no marker for the next line`, () => {
+      const h = seamHarness();
+      markers.noteTurnDispatch(h.session, 'nudge');
+      h.seams[seam](h.session);
+      h.context.journalPublishNotice('convo', '🛠 Model switched', { notice: 'control' });
+      expect(h.published.at(-1).payload).toEqual({ notice: 'control', body: '🛠 Model switched', from: 'assistant' });
+    });
+
+    it(`${seam}: the turn's own last row still takes its marker`, () => {
+      const h = seamHarness();
+      markers.noteTurnDispatch(h.session, 'reminder');
+      h.session.responseBuffer = 'done';
+      h.seams[seam](h.session);
+      expect(h.published.map((e) => e.payload)).toEqual([{ body: 'done', from: 'assistant', turn_start: { origin: 'reminder' } }]);
+    });
+
+    it(`${seam}: an announced line whose turn never ran does not swallow the next same-origin turn`, () => {
+      const h = seamHarness();
+      markers.announceTurnStart(h.session, 'reminder');
+      h.context.journalPublishNotice('convo', '⏰ Timer #1', { notice: 'control' });
+      h.seams[seam](h.session);
+      markers.noteTurnDispatch(h.session, 'reminder');
+      h.context.sendToRoom('room', 'on it', '');
+      expect(h.published.at(-1).payload).toEqual({ body: 'on it', from: 'assistant', turn_start: { origin: 'reminder' } });
+    });
+
+    it(`${seam}: a turn the seam itself dispatches keeps its marker`, () => {
+      const h = seamHarness();
+      markers.noteTurnDispatch(h.session, 'nudge');
+      h.session.queuedMessages = [[{ type: 'text', text: 'queued' }]];
+      h.context.flushPendingSessionQueue.mockImplementation((s) => { markers.noteTurnDispatch(s, 'item'); return true; });
+      h.seams[seam](h.session);
+      h.context.sendToRoom('room', 'reply', '');
+      expect(h.published.at(-1).payload).toEqual({ body: 'reply', from: 'assistant', turn_start: { origin: 'item' } });
+    });
+  }
+
+  it('the plan "build" write starts a user turn: it clears a stale arm and bumps the turn counter', async () => {
+    const h = seamHarness();
+    Object.assign(h.context, { hasToolResultInHistory: () => false, persistSession: vi.fn(),
+      notice: (kind, plain, html) => ({ plain, html }) });
+    vm.runInContext(fnSource('async function approvePlanBuild(session, { sendHtml }) {'), h.context);
+    markers.noteTurnDispatch(h.session, 'nudge');
+    const seq = markers.turnSeq(h.session);
+    Object.assign(h.session, { busy: false, pendingPlanDenialId: 'tool-1', proc: { stdin: { write: vi.fn() } } });
+    await h.context.approvePlanBuild(h.session, { sendHtml: (plain, html) => h.context.sendToRoom('room', plain, html) });
+    expect(h.session.proc.stdin.write).toHaveBeenCalledTimes(1);
+    expect(markers.turnSeq(h.session)).toBe(seq + 1);
+    expect(h.published.at(-1).payload).toEqual({ body: '▶️ Building...', from: 'assistant' });
+  });
+});
+
+describe('a spawn outcome (runs the real notifyParent)', () => {
+  function notifyHarness() {
+    const h = harness();
+    const start = index.indexOf('notifyParent: ({ session, convoId, text }) => {');
+    expect(start).toBeGreaterThan(-1);
+    const arrow = index.slice(start + 'notifyParent: '.length, index.indexOf('\n  },', start) + 4);
+    Object.assign(h.context, { NOTICE: markers.NOTICE, TURN_ORIGIN: markers.TURN_ORIGIN, JOURNAL_CONTROL_CONVO_ID: 'control',
+      sessionOccupiedForRoomDelivery: (s) => !!s.busy, roomDelivery: { deliver: vi.fn() } });
+    return { ...h, notifyParent: vm.runInContext(`(${arrow})`, h.context) };
+  }
+
+  it('into a parent that would take the turn, the outcome line opens it', () => {
+    const h = notifyHarness();
+    h.notifyParent({ session: h.session, convoId: 'convo', text: '✅ Spawned' });
+    markers.noteTurnDispatch(h.session, 'spawn');
+    h.context.sendToRoom('room', 'the helper is up', '');
+    expect(h.published.map((e) => e.payload)).toEqual([
+      { notice: 'control', body: '✅ Spawned', from: 'assistant', turn_start: { origin: 'spawn' } },
+      { body: 'the helper is up', from: 'assistant' },
+    ]);
+  });
+
+  it('into an auto-stopped parent, the line announces nothing, so the later spawn turn is still marked', () => {
+    const h = notifyHarness();
+    h.session._autoStopped = true;
+    h.notifyParent({ session: h.session, convoId: 'convo', text: '✅ Spawned' });
+    h.session._autoStopped = false;
+    markers.noteTurnDispatch(h.session, 'spawn');
+    h.context.sendToRoom('room', 'back, reading the outcome', '');
+    expect(h.published.map((e) => e.payload)).toEqual([
+      { notice: 'control', body: '✅ Spawned', from: 'assistant' },
+      { body: 'back, reading the outcome', from: 'assistant', turn_start: { origin: 'spawn' } },
+    ]);
+  });
+});
+
+describe('a merged flush into a busy session starts no injected turn (runs the real sendToSession)', () => {
+  function sendHarness(mode) {
+    const h = seamHarness();
+    Object.assign(h.context, {
+      reportSessionSendFailure: vi.fn(() => false), isCompactCommand: () => false, codexInput: (b) => b,
+      contentBlocksToCodexPrompt: () => 'prompt', contextFullToNative: () => null,
+      applyPendingAgentHandoff: (s, blocks) => ({ blocks, pending: null }), commitDispatchedUserTurn: vi.fn(),
+    });
+    vm.runInContext(fnSource('function sendToSession(session, contentBlocks, { skipJournalMirror = false, turnOrigin = null } = {}) {'), h.context);
+    if (mode === 'iv') h.session.iv = { sendText: vi.fn() };
+    else h.session.proc = { stdin: { write: vi.fn() } };
+    return h;
+  }
+  const item = () => markers.markTurnOrigin(markJournalOrigin([{ type: 'text', text: '📌 a reply on the item' }]), 'item');
+
+  for (const mode of ['iv', 'print']) {
+    it(`${mode}: "Send now" while a turn runs leaves the running turn unmarked`, () => {
+      const h = sendHarness(mode);
+      h.session.busy = true;
+      expect(h.context.dispatchMergedFlush(h.session, [item()])).toBe(true);
+      h.context.sendToRoom('room', 'still working on the earlier task', '');
+      expect(h.published.at(-1).payload).toEqual({ body: 'still working on the earlier task', from: 'assistant' });
+    });
+
+    it(`${mode}: the same flush into an idle session opens the item turn`, () => {
+      const h = sendHarness(mode);
+      h.session.busy = false;
+      expect(h.context.dispatchMergedFlush(h.session, [item()])).toBe(true);
+      h.context.sendToRoom('room', 'replying to the item', '');
+      expect(h.published.at(-1).payload).toEqual({ body: 'replying to the item', from: 'assistant', turn_start: { origin: 'item' } });
+    });
+  }
+
+  for (const mode of ['iv', 'print']) {
+    it(`${mode}: "Send now" while an injected turn runs keeps that turn's own marker`, () => {
+      const h = sendHarness(mode);
+      h.session.busy = true;
+      markers.noteTurnDispatch(h.session, 'nudge');
+      const seq = markers.turnSeq(h.session);
+      expect(h.context.dispatchMergedFlush(h.session, [item()])).toBe(true);
+      expect(markers.turnSeq(h.session)).toBe(seq);
+      h.context.sendToRoom('room', 'flagging the unseen items', '');
+      expect(h.published.at(-1).payload).toEqual({ body: 'flagging the unseen items', from: 'assistant', turn_start: { origin: 'nudge' } });
+    });
+  }
+
+  it('a mirrored continuation sent into a busy session is a plain user row', () => {
+    const h = sendHarness('print');
+    h.session.busy = true;
+    const continuation = markers.markTurnOrigin([{ type: 'text', text: 'carry on with X' }], 'carry_on');
+    expect(h.context.dispatchMergedFlush(h.session, [continuation])).toBe(true);
+    expect(h.published.at(-1).payload).toEqual({ body: 'carry on with X', from: 'user' });
+  });
+});
+
+describe('a tool output still finalizing at turn end keeps its turn marker (runs the real finalize)', () => {
+  function finalizeHarness() {
+    const h = seamHarness();
+    let release;
+    const finalized = [];
+    h.publisher.finalizeToolOutput = vi.fn((convoId, ref, payload) => {
+      if (h.failFinalize) throw new Error('journal down');
+      finalized.push(payload);
+    });
+    Object.assign(h.context, {
+      fs: { promises: { stat: () => Promise.reject(new Error('no log')) } },
+      toolStreamPumps: new Map(), TOOL_LOG_UPLOAD_MAX_BYTES: 1024, TOOL_SNIPPET_READ_BYTES: 256,
+      toolOutputSnippet: (t) => t, decodeByteExact: () => ({ text: '' }),
+    });
+    vm.runInContext(fnSource('function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, truncated = false } = {}) {'), h.context);
+    const start = () => {
+      const entry = { pump: { stop: vi.fn(), flushFinal: () => new Promise((r) => { release = r; }) },
+        session: h.session, turnSeq: markers.turnSeq(h.session), convoId: 'convo', command: 'npm test', logPath: '/nope', messageRef: 'tool-1' };
+      h.context.finalizeToolStreamEntry('k', entry, { exitCode: 0 });
+    };
+    return { ...h, finalized, start, release: async () => { release(); await new Promise((r) => setTimeout(r, 0)); } };
+  }
+
+  it('the late row takes the marker, and nothing published after it does', async () => {
+    const h = finalizeHarness();
+    markers.noteTurnDispatch(h.session, 'nudge');
+    h.start();
+    h.seams.print(h.session);
+    await h.release();
+    expect(h.finalized[0].turn_start).toEqual({ origin: 'nudge' });
+    h.context.journalPublishNotice('convo', '🛠 Model switched', { notice: 'control' });
+    expect(h.published.at(-1).payload.turn_start).toBeUndefined();
+  });
+
+  it('a line published between the turn end and the late row does not take its marker', async () => {
+    const h = finalizeHarness();
+    markers.noteTurnDispatch(h.session, 'nudge');
+    h.start();
+    h.seams.print(h.session);
+    h.context.journalPublishNotice('convo', '📬 Sending your queued message', { notice: 'control' });
+    await h.release();
+    expect(h.published.at(-1).payload.turn_start).toBeUndefined();
+    expect(h.finalized[0].turn_start).toEqual({ origin: 'nudge' });
+  });
+
+  it('a late row whose turn was followed by a new dispatch takes nothing', async () => {
+    const h = finalizeHarness();
+    markers.noteTurnDispatch(h.session, 'nudge');
+    h.start();
+    h.seams.print(h.session);
+    markers.noteTurnDispatch(h.session, 'item');
+    await h.release();
+    expect(h.finalized[0].turn_start).toBeUndefined();
+    h.context.sendToRoom('room', 'on the item', '');
+    expect(h.published.at(-1).payload.turn_start).toEqual({ origin: 'item' });
+  });
+
+  it('a reminder line announced before the late row lands keeps the boundaries in order', async () => {
+    const h = finalizeHarness();
+    markers.noteTurnDispatch(h.session, 'nudge');
+    h.start();
+    h.seams.print(h.session);
+    h.context.journalPublishSessionNotice(h.session, '⏰ Reminder #3', { notice: 'control', turnOrigin: 'reminder' });
+    await h.release();
+    expect(h.published.at(-1).payload.turn_start).toEqual({ origin: 'reminder' });
+    expect(h.finalized[0].turn_start).toBeUndefined();
+  });
+
+  it('a finalize that fails still drops the marker once it is done', async () => {
+    const h = finalizeHarness();
+    h.failFinalize = true;
+    markers.noteTurnDispatch(h.session, 'nudge');
+    h.start();
+    h.seams.print(h.session);
+    await h.release();
+    h.context.journalPublishNotice('convo', '🛠 Model switched', { notice: 'control' });
+    expect(h.published.at(-1).payload.turn_start).toBeUndefined();
   });
 });

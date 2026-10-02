@@ -159,7 +159,7 @@ import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
-import { NOTICE, TURN_ORIGIN, controlTurnOrigin, canAnnounceTurn, announceTurnStart, noteTurnDispatch, withTurnStart, markTurnOrigin, mergedTurnOrigin, turnSeq } from './lib/turn-markers.js';
+import { NOTICE, TURN_ORIGIN, controlTurnOrigin, canAnnounceTurn, announceTurnStart, noteTurnDispatch, noteTurnEnd, holdTurnRow, withTurnStart, withTurnRowStart, markTurnOrigin, mergedTurnOrigin, turnSeq } from './lib/turn-markers.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from './lib/journal-title-seed.js';
@@ -2987,6 +2987,9 @@ function finishCodexTurn(session, {
     if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
     else if (session.sendCallback) session.sendCallback(message);
   }
+  // The turn is over: drop any turn_start it left unused, before anything
+  // below dispatches the next turn (lib/turn-markers.js).
+  noteTurnEnd(session);
 
   if (!preserveQueue && !session._codexSteerPending && !session._codexUncertainSteer) {
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
@@ -3429,6 +3432,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         session._operatorCompactTimer = null;
       }
     }
+    // The turn is over: drop any turn_start it left unused, before
+    // anything below dispatches the next turn (lib/turn-markers.js).
+    noteTurnEnd(session);
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
     // the queue (and the roomId-keyed room-delivery inbox) carries into the
     // replacement session; see dispatchDeferredCommand. This seam also
@@ -4942,6 +4948,9 @@ function handleClaudeEvent(session, event) {
         void planItems.opened(session, planText, { toolUseId: planDenial.tool_use_id });
       }
 
+      // The turn is over: drop any turn_start it left unused, before
+      // anything below dispatches the next turn (lib/turn-markers.js).
+      noteTurnEnd(session);
       // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
       // the queue (and the roomId-keyed room-delivery inbox) carries into
       // the replacement session; see dispatchDeferredCommand.
@@ -5462,11 +5471,15 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, turn
   session.lastActivityAt = Date.now();
   session.responseBuffer = '';
   session.toolCalls = [];
+  // A send into a turn that is still running (a queued entry's "Send now")
+  // starts no turn of its own: it neither marks the running turn with its
+  // origin nor clears that turn's own marker.
+  const busyAtDispatch = session.busy === true;
   session.busy = true;
   // The turn_start arm is decided only once the backend has ACCEPTED the
   // turn (markDispatched below); a refused send clears it instead, so its
   // failure line can never read as the start of a turn that never ran.
-  const markDispatched = () => noteTurnDispatch(session, skipJournalMirror ? turnOrigin : null);
+  const markDispatched = () => { if (!busyAtDispatch) noteTurnDispatch(session, skipJournalMirror ? turnOrigin : null); };
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
@@ -5810,7 +5823,10 @@ function dispatchMergedFlush(session, queued) {
   // it the user's. When the bridge mirrors the batch as a user row (a
   // bridge-composed continuation), that row is the turn's first event and
   // carries the turn_start itself.
-  const injectedOrigin = mergedTurnOrigin(queued);
+  // Sent into a turn that is still running ("Send now"), it starts no
+  // injected turn: sendToSession leaves the running turn's marker alone, and
+  // the mirrored row carries none either.
+  const injectedOrigin = session.busy === true ? null : mergedTurnOrigin(queued);
   if (!sendToSession(session, blocks, { skipJournalMirror: true, turnOrigin: mirrorText ? null : injectedOrigin })) return false;
   if (mirrorText) {
     journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user', ...(injectedOrigin ? { turn_start: { origin: injectedOrigin } } : {}) });
@@ -6305,6 +6321,9 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
   toolStreamPumps.delete(key);
   entry.pump.stop();
   const toolUseId = entry.messageRef;
+  // A row of the turn that is still current may land after the turn ends;
+  // it keeps that turn's turn_start until it does (lib/turn-markers.js).
+  const releaseTurnRow = entry.turnSeq === turnSeq(entry.session) ? holdTurnRow(entry.session) : () => {};
   (async () => {
     try {
       // Bounded final flush BEFORE the durable finalize publish below: bytes
@@ -6385,10 +6404,12 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
       // The finalize lands after an async upload: it is the first row of its
       // turn only if that turn is still the session's current one.
       journalPublisher.finalizeToolOutput(entry.convoId, toolUseId,
-        entry.turnSeq === turnSeq(entry.session) ? withTurnStart(entry.session, 'publishToolOutput', finalPayload) : finalPayload,
+        withTurnRowStart(entry.session, entry.turnSeq, 'publishToolOutput', finalPayload),
         blobRef);
     } catch (e) {
       try { console.warn(`[journal] tool-output finalize failed: ${e.message}`); } catch { /* logging must never throw */ }
+    } finally {
+      releaseTurnRow();
     }
   })();
 }
@@ -11070,6 +11091,9 @@ async function approvePlanBuild(session, { sendHtml }) {
     }
     session.busy = true;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
+    // The user's approval starts this turn, the way sendToSession's own
+    // dispatch does for a typed message: no turn_start, and a new turn.
+    noteTurnDispatch(session, null);
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -11514,7 +11538,7 @@ agentSpawnHandlers = createAgentSpawnHandlers({
     // The outcome line opens the parent's injected turn when the parent is
     // free to take it now (roomDelivery injects below); a busy parent's turn
     // is marked when the coalesced inbox is delivered.
-    if (session && !sessionOccupiedForRoomDelivery(session)) announceTurnStart(session, TURN_ORIGIN.SPAWN);
+    if (session && !sessionOccupiedForRoomDelivery(session) && canAnnounceTurn(session)) announceTurnStart(session, TURN_ORIGIN.SPAWN);
     if (convoId) journalPublishNotice(convoId, text, { notice: NOTICE.CONTROL });
     if (session) {
       roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
