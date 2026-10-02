@@ -168,6 +168,7 @@ import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
+import { spawnModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
@@ -1237,6 +1238,11 @@ const journalRpcHandler = createRpcRequestHandler({
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
   joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),
+  // Fable-limit fallback (lib/fable-fallback.js): a no-model start on a box
+  // whose Fable weekly meter is spent runs on Opus instead of stalling on
+  // its first turn. Late-bound like joinMission (usageLimitsCache is
+  // declared further down).
+  startModelFallback: () => startModelFallbackFromLimits(),
   // Read-only `local_memories` / `local_memory_get`: this box's CLAUDE.md
   // files and ~/.claude/projects/*/memory/ (lib/local-memories.js). The
   // repo list is the picker's own folder history.
@@ -1699,6 +1705,25 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
     })
     .finally(() => { usageLimitsCache.inflight = null; });
   return usageLimitsCache.inflight;
+}
+
+// The reading a no-model start decides its model on. A cache this fresh is
+// used as it stands; an older one (the box may have idled for hours while
+// other boxes on the same account spent the meter) is refreshed first, the
+// wait capped well inside the journal's 30 s start timeout — a /usage
+// one-shot takes ~10 s — after which whatever the cache holds decides.
+const START_LIMITS_FRESH_MS = 15 * 60 * 1000;
+const START_LIMITS_WAIT_MS = 12_000;
+function startModelFallbackFromLimits() {
+  const decide = () => spawnModelFallback({ defaultModel: DEFAULT_MODEL, lines: usageLimitsCache.lines });
+  // Nothing to fall back from: skip the /usage spawn entirely.
+  if (!isFableModel(DEFAULT_MODEL)) return null;
+  if (usageLimitsCache.lines && Date.now() - usageLimitsCache.fetchedAt < START_LIMITS_FRESH_MS) return decide();
+  const refresh = refreshUsageLimits(DEFAULT_WORKDIR, { force: true });
+  if (!refresh) return decide();
+  let timer;
+  const deadline = new Promise((resolve) => { timer = setTimeout(resolve, START_LIMITS_WAIT_MS); timer.unref?.(); });
+  return Promise.race([refresh.catch(() => false), deadline]).then(() => { clearTimeout(timer); return decide(); });
 }
 
 // Logged-in account email for the status frame, read from ~/.claude.json's

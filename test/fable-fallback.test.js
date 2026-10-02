@@ -1,0 +1,73 @@
+import { describe, it, expect } from 'vitest';
+import { fableMaxed, isFableModel, spawnModelFallback, FABLE_MAXED_PERCENT } from '../lib/fable-fallback.js';
+
+const NOW = Date.parse('2026-10-02T12:00:00Z');
+const FUTURE = '2026-10-09T05:00:00.000Z';
+const PAST = '2026-10-01T05:00:00.000Z';
+const fable = (percent, extra = {}) => ({ id: 'week_fable', label: 'Week (Fable)', percent, resets_at: FUTURE, ...extra });
+const all = (percent, extra = {}) => ({ id: 'week_all', label: 'Week (all models)', percent, resets_at: FUTURE, ...extra });
+const session = (percent) => ({ id: 'session', label: 'Session', percent, resets_at: FUTURE });
+
+describe('fableMaxed', () => {
+  it('true at the threshold and above while the all-models meter has room', () => {
+    expect(FABLE_MAXED_PERCENT).toBe(99);
+    expect(fableMaxed([session(10), all(60), fable(99)], NOW)).toBe(true);
+    expect(fableMaxed([all(60), fable(100)], NOW)).toBe(true);
+    expect(fableMaxed([all(60), fable(98)], NOW)).toBe(false);
+  });
+
+  it('false when the all-models meter is spent too — Opus would stall as well', () => {
+    expect(fableMaxed([all(100), fable(100)], NOW)).toBe(false);
+  });
+
+  it('an absent all-models line reads as room; an absent Fable line as not maxed', () => {
+    expect(fableMaxed([fable(100)], NOW)).toBe(true);
+    expect(fableMaxed([all(10), session(100)], NOW)).toBe(false);
+  });
+
+  it('a meter whose reset has passed is not a reading of now', () => {
+    expect(fableMaxed([all(60), fable(100, { resets_at: PAST })], NOW)).toBe(false);
+    // A spent all-models meter that has since reset no longer blocks.
+    expect(fableMaxed([all(100, { resets_at: PAST }), fable(100)], NOW)).toBe(true);
+  });
+
+  it('a relabelled Fable meter (week_fable_5) still counts; other weekly meters do not', () => {
+    expect(fableMaxed([{ id: 'week_fable_5', label: 'Week (Fable 5)', percent: 100 }], NOW)).toBe(true);
+    expect(fableMaxed([{ id: 'week_fableish', label: 'x', percent: 100 }], NOW)).toBe(false);
+    expect(fableMaxed([{ id: 'week_opus', label: 'Week (Opus)', percent: 100 }], NOW)).toBe(false);
+  });
+
+  it('a line with no reset time is taken at face value', () => {
+    expect(fableMaxed([{ id: 'week_fable', label: 'Week (Fable)', percent: 100 }], NOW)).toBe(true);
+  });
+
+  it('junk in, false out', () => {
+    for (const lines of [null, undefined, 'x', {}, [null], [{ id: 'week_fable', percent: 'full' }]]) {
+      expect(fableMaxed(lines, NOW)).toBe(false);
+    }
+  });
+});
+
+describe('isFableModel', () => {
+  it('the alias and full fable names; nothing else', () => {
+    for (const m of ['fable', 'Fable', 'claude-fable-5-1', 'fable[1m]']) expect(isFableModel(m)).toBe(true);
+    for (const m of ['opus', 'sonnet', 'claude-opus-5-5', '', null, undefined]) expect(isFableModel(m)).toBe(false);
+  });
+});
+
+describe('spawnModelFallback', () => {
+  it('opus with reason fable_limit on a Fable-default box whose Fable meter is spent', () => {
+    expect(spawnModelFallback({ defaultModel: 'fable', lines: [all(40), fable(100)], nowMs: NOW }))
+      .toEqual({ model: 'opus', reason: 'fable_limit' });
+  });
+
+  it('null when the box default is not Fable — that default is not out', () => {
+    expect(spawnModelFallback({ defaultModel: 'opus', lines: [all(40), fable(100)], nowMs: NOW })).toBeNull();
+    expect(spawnModelFallback({ defaultModel: 'sonnet', lines: [all(40), fable(100)], nowMs: NOW })).toBeNull();
+  });
+
+  it('null when Fable has room or there is no reading', () => {
+    expect(spawnModelFallback({ defaultModel: 'fable', lines: [all(40), fable(50)], nowMs: NOW })).toBeNull();
+    expect(spawnModelFallback({ defaultModel: 'fable', lines: null, nowMs: NOW })).toBeNull();
+  });
+});
