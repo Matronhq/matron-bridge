@@ -8736,6 +8736,9 @@ function journalOnText(session, body, { username }) {
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
+  // A journal with a cloud transcriber has the words already; this box's
+  // whisper is the fallback (older journal, no key, failed or slow job).
+  fetchTranscript: (blobRef) => journalPublisher.fetchTranscript(blobRef),
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
