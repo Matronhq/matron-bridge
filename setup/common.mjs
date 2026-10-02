@@ -113,6 +113,16 @@ export function currentToken(existing) {
   return (existing.JOURNAL_TOKEN || '').trim();
 }
 
+// A token in <repo>/.journal-token that .env doesn't reference: left behind
+// when a first-run wizard paired (pairing stores the token immediately) and
+// was then interrupted before it wrote .env. Returns TOKEN_PATH when .env
+// names no token at all and that file holds one, '' otherwise — so it never
+// overrides a JOURNAL_TOKEN_FILE or JOURNAL_TOKEN the operator chose.
+export function strandedTokenFile(existing, tokenPath = TOKEN_PATH) {
+  if (existing.JOURNAL_TOKEN_FILE || existing.JOURNAL_TOKEN) return '';
+  return readIfExists(tokenPath).trim() ? tokenPath : '';
+}
+
 // One live-only hello against the journal: proves the URL resolves, TLS
 // works, and the token is a valid agent token. Resolves to the agent name
 // on success, throws with a readable reason otherwise.

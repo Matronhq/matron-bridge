@@ -22,6 +22,7 @@ import {
   hmacSecretFor,
   writeEnvFile,
   currentToken,
+  strandedTokenFile,
   testConnection,
   pairWithApp,
 } from './common.mjs';
@@ -63,6 +64,20 @@ export function pairingJournalUrl(raw) {
   return url.toString();
 }
 
+// Point .env at the token file. The token itself is already safe on disk, so
+// a failure here only needs the operator to finish the edit by hand.
+function saveEnv(existing, journalUrl) {
+  let backedUp;
+  try {
+    backedUp = writeEnvFile(existing, { ...tokenEnv(journalUrl), HMAC_SECRET: hmacSecretFor(existing) });
+  } catch (e) {
+    console.error(`Could not update ${ENV_PATH}: ${e.message}`);
+    console.error(`The token is saved; set JOURNAL_WS_URL=${journalUrl} and JOURNAL_TOKEN_FILE=${TOKEN_PATH} in .env by hand.`);
+    process.exit(1);
+  }
+  console.log(`Updated ${ENV_PATH}${backedUp ? ' (previous .env backed up to .env.bak)' : ''}.`);
+}
+
 function askLine(question) {
   const rl = createInterface({ input: process.stdin, output: process.stdout, historySize: 0 });
   return new Promise((resolve) => {
@@ -98,12 +113,20 @@ async function main() {
   // Refuse to replace a token that still works: pairing mints a NEW agent
   // device in the journal, and the old one would be orphaned (still listed,
   // still valid) until someone revokes it in the app.
-  const oldToken = currentToken(existing);
+  // A token a first-run wizard paired and stored before it was interrupted
+  // (so .env never pointed at it) is adopted rather than re-paired.
+  const stranded = strandedTokenFile(existing);
+  const oldToken = currentToken(existing) || (stranded ? readIfExists(stranded).trim() : '');
   if (oldToken && !opts.force) {
     process.stdout.write(`Checking the current agent token against ${journalUrl} ... `);
     try {
       const name = await testConnection(journalUrl, oldToken);
       console.log('ok');
+      if (stranded) {
+        saveEnv(existing, journalUrl);
+        console.log(`Found agent "${name}" already paired in ${stranded}; .env now points at it.`);
+        return;
+      }
       console.log(`This bridge is already paired as agent "${name}". Nothing to do.`);
       console.log('To pair it again anyway (e.g. as a different agent), re-run with --force:');
       console.log('  npm run pair -- --force');
@@ -133,13 +156,19 @@ async function main() {
     process.off('SIGINT', onSigint);
   }
 
-  writeTokenFile(TOKEN_PATH, token);
+  // The journal handed the token over exactly once: if it can't be saved,
+  // the new agent exists with no way to use it, so say how to clean up.
+  try {
+    writeTokenFile(TOKEN_PATH, token);
+  } catch (e) {
+    console.error(`\nPaired, but saving the token to ${TOKEN_PATH} failed: ${e.message}`);
+    console.error('Revoke the new agent in the Matron app (Settings -> Devices), fix the problem, and re-run npm run pair.');
+    process.exit(1);
+  }
   const hadEnv = Object.keys(existing).length > 0;
-  const backedUp = writeEnvFile(existing, { ...tokenEnv(journalUrl), HMAC_SECRET: hmacSecretFor(existing) });
-
   console.log('');
   console.log(`Paired. Agent token stored in ${TOKEN_PATH} (mode 600, gitignored).`);
-  console.log(`Updated ${ENV_PATH}${backedUp ? ' (previous .env backed up to .env.bak)' : ''}.`);
+  saveEnv(existing, journalUrl);
 
   process.stdout.write(`Testing ${journalUrl} ... `);
   try {

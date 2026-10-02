@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs, pairingJournalUrl } from '../setup/pair.mjs';
-import { currentToken, tokenEnv, TOKEN_PATH, pairWithApp } from '../setup/common.mjs';
+import { currentToken, tokenEnv, TOKEN_PATH, pairWithApp, strandedTokenFile } from '../setup/common.mjs';
 import { tokenMethod } from '../setup/wizard.mjs';
 
 describe('npm run pair argument parsing', () => {
@@ -88,6 +88,35 @@ describe('currentToken (same precedence as index.js)', () => {
   it('uses JOURNAL_TOKEN when no file is set', () => {
     expect(currentToken({ JOURNAL_TOKEN: ' raw ' })).toBe('raw');
     expect(currentToken({})).toBe('');
+  });
+});
+
+describe('strandedTokenFile', () => {
+  const withTokenFile = (content, fn) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pair-stranded-'));
+    const file = path.join(dir, '.journal-token');
+    if (content !== null) fs.writeFileSync(file, content);
+    try { fn(file); } finally { fs.rmSync(dir, { recursive: true }); }
+  };
+
+  it('finds a paired token that .env never pointed at', () => {
+    withTokenFile('tok\n', (file) => expect(strandedTokenFile({}, file)).toBe(file));
+  });
+
+  it('never overrides a token source .env already names', () => {
+    withTokenFile('tok\n', (file) => {
+      expect(strandedTokenFile({ JOURNAL_TOKEN_FILE: '/etc/matron/agent-token' }, file)).toBe('');
+      expect(strandedTokenFile({ JOURNAL_TOKEN: 'raw' }, file)).toBe('');
+    });
+  });
+
+  it('ignores a missing or empty token file', () => {
+    withTokenFile(null, (file) => expect(strandedTokenFile({}, file)).toBe(''));
+    withTokenFile('  \n', (file) => expect(strandedTokenFile({}, file)).toBe(''));
+  });
+
+  it('defaults to the repo token path', () => {
+    expect(strandedTokenFile({ JOURNAL_TOKEN: 'raw' })).toBe('');
   });
 });
 

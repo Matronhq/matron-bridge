@@ -22,6 +22,7 @@ import {
   normalizeJournalUrl,
   isLocalHost,
   tokenEnv,
+  strandedTokenFile,
   hmacSecretFor,
   writeEnvFile,
   testConnection,
@@ -106,7 +107,13 @@ async function pairToken(journalUrl) {
     const token = await pairWithApp({ journalUrl, signal: pairAbort.signal });
     // Store it right away: the journal hands the token over exactly once,
     // and a Ctrl-C at a later prompt must not lose a freshly minted agent.
-    writeTokenFile(TOKEN_PATH, token);
+    try {
+      writeTokenFile(TOKEN_PATH, token);
+    } catch (e) {
+      console.log(`\nPaired, but saving the token to ${TOKEN_PATH} failed: ${e.message}`);
+      console.log('Revoke the new agent in the Matron app (Settings -> Devices), fix the problem, and pair again.');
+      return '';
+    }
     console.log('');
     console.log(`Paired. Agent token stored in ${TOKEN_PATH}.`);
     return token;
@@ -172,10 +179,12 @@ async function main() {
 
   // --- agent token ---
   let token = '';
-  const haveStoredToken = existing.JOURNAL_TOKEN_FILE && fs.existsSync(existing.JOURNAL_TOKEN_FILE);
-  if (haveStoredToken) {
-    const keep = await askYesNo(`Keep the agent token already stored in ${existing.JOURNAL_TOKEN_FILE}?`, true);
-    if (keep) token = fs.readFileSync(existing.JOURNAL_TOKEN_FILE, 'utf8').trim();
+  // A token paired by an earlier run that was interrupted before .env was
+  // written counts as stored too: re-pairing would mint a second agent.
+  const storedTokenFile = existing.JOURNAL_TOKEN_FILE || strandedTokenFile(existing);
+  if (storedTokenFile && fs.existsSync(storedTokenFile)) {
+    const keep = await askYesNo(`Keep the agent token already stored in ${storedTokenFile}?`, true);
+    if (keep) token = fs.readFileSync(storedTokenFile, 'utf8').trim();
   }
   while (!token) {
     console.log('How should this machine get its agent token?');
