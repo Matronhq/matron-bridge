@@ -168,10 +168,10 @@ import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
-import { spawnModelFallback, isFableModel } from './lib/fable-fallback.js';
+import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
-import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
+import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -1709,9 +1709,13 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
 
 // The reading a no-model start decides its model on. A cache this fresh is
 // used as it stands; an older one (the box may have idled for hours while
-// other boxes on the same account spent the meter) is refreshed first, the
-// wait capped well inside the journal's 30 s start timeout — a /usage
-// one-shot takes ~10 s — after which whatever the cache holds decides.
+// other boxes on the same account spent the meter) is refreshed first — a
+// /usage one-shot takes ~10 s — after which whatever the cache holds
+// decides. Budget against the journal's 30 s start timeout: this wait (12 s)
+// plus the mission pre-join's joinDeadlineMs (5 s) run in sequence before
+// the reply; startSession itself returns at spawn, not at Claude's boot.
+// Raise either and the sum must stay well under 30 s, or the journal fails
+// a spawn this bridge goes on to start.
 const START_LIMITS_FRESH_MS = 15 * 60 * 1000;
 const START_LIMITS_WAIT_MS = 12_000;
 function startModelFallbackFromLimits() {
@@ -4384,6 +4388,9 @@ function handleClaudeEvent(session, event) {
               persistControlState(session);
             }
             journalStatus(session);
+            // Decided on these fresh meters, after the carry-on is armed: a
+            // switch brings it forward, no switch leaves it for the reset.
+            if (session._stall.kind === 'usage_limit') switchFableStall(session);
           });
         }
       } else if (assistantCtxTokens) {
@@ -9651,6 +9658,15 @@ async function fireAutoResume(roomId, convoId, slot) {
   // A deferred model recovery is retried as a recovery, not as a turn on
   // the still-unavailable model.
   if (slot.kind === 'bad_model') { recoverBadModel(session); return; }
+  // Likewise a deferred Fable-stall switch: retried, and when it no longer
+  // applies the session goes back to waiting for its reset.
+  if (slot.kind === 'fable_switch') {
+    if (!switchFableStall(session, { retry: slot.retry || 0 }) && !session._autoResume && session._stall) {
+      session._autoResume = armFromStall(session._stall, null, Date.now(), session._autoResumeRetries || 0);
+      persistControlState(session);
+    }
+    return;
+  }
   postControlNotice(session, slot.kind === 'model_recovery'
     ? '🕒 Model switched — carrying on.'
     : slot.source === 'coordinator'
@@ -9737,6 +9753,38 @@ function recoverBadModel(session) {
   next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: BAD_MODEL_RECOVERY_TEXT };
   persistControlState(next);
   postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on once the switch has settled.');
+}
+
+// Fable stall, reset far off (lib/fable-fallback.js stallModelFallback):
+// move the session to Opus and carry on rather than sit until the weekly
+// reset. explicit:false like the bad-model recovery — the bridge picked it,
+// not a person, so a later Coordinator assignment may change it. Returns
+// true when the switch went through (or was parked for the turn's end).
+const FABLE_SWITCH_MAX_RETRIES = 3;
+function switchFableStall(session, { retry = 0 } = {}) {
+  if (session.agent === AGENT_CODEX || !session.alive || !session._stall) return false;
+  const fb = stallModelFallback({ stall: session._stall, model: session._modelAlias || session.currentModel, lines: usageLimitsCache.lines });
+  if (!fb) return false;
+  const when = fb.resetsAt ? ` (Fable resets ${new Date(fb.resetsAt).toUTCString().replace(/:\d\d GMT$/, ' UTC')})` : '';
+  const ctx = journalSessionCommandCtx(session);
+  const switched = !controlOccupied(session)
+    && applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+  if (!switched) {
+    // Refused (a resume hold, a busy turn, a TUI not ready): try again in a
+    // minute, a few times, then fall back to waiting for the reset.
+    if (retry >= FABLE_SWITCH_MAX_RETRIES) return false;
+    session._autoResume = { at: new Date(Date.now() + 60_000).toISOString(), kind: 'fable_switch', retry: retry + 1 };
+    persistControlState(session);
+    return false;
+  }
+  // As in recoverBadModel: a print-mode switch recreated the process, so
+  // the carry-on slot lands on the replacement, and goes through the sweep
+  // once the switch has settled.
+  const next = sessions.get(session.roomId) || session;
+  next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: FABLE_SWITCH_TEXT };
+  persistControlState(next);
+  postControlNotice(next, `🛠 Fable weekly limit reached${when} — switched this session to Opus; carrying on once the switch has settled.`);
+  return true;
 }
 
 // --- Coordinator session control, target side (lib/session-control.js) ---

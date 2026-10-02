@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fableMaxed, isFableModel, spawnModelFallback, FABLE_MAXED_PERCENT } from '../lib/fable-fallback.js';
+import { fableMaxed, isFableModel, spawnModelFallback, stallModelFallback, FABLE_MAXED_PERCENT } from '../lib/fable-fallback.js';
 
 const NOW = Date.parse('2026-10-02T12:00:00Z');
 const FUTURE = '2026-10-09T05:00:00.000Z';
@@ -69,5 +69,44 @@ describe('spawnModelFallback', () => {
   it('null when Fable has room or there is no reading', () => {
     expect(spawnModelFallback({ defaultModel: 'fable', lines: [all(40), fable(50)], nowMs: NOW })).toBeNull();
     expect(spawnModelFallback({ defaultModel: 'fable', lines: null, nowMs: NOW })).toBeNull();
+  });
+});
+
+describe('stallModelFallback', () => {
+  const STALL = { kind: 'usage_limit', model: 'claude-fable-5-1' };
+  const H = 60 * 60 * 1000;
+  const fableResets = (ms) => fable(100, { resets_at: new Date(NOW + ms).toISOString() });
+
+  it('a Fable stall with the weekly reset days away switches to Opus', () => {
+    expect(stallModelFallback({ stall: STALL, lines: [session(20), all(50), fable(100)], nowMs: NOW }))
+      .toEqual({ model: 'opus', reason: 'fable_limit', resetsAt: FUTURE });
+  });
+
+  it('a reset under 12 h away waits instead', () => {
+    expect(stallModelFallback({ stall: STALL, lines: [all(50), fableResets(11 * H)], nowMs: NOW })).toBeNull();
+    expect(stallModelFallback({ stall: STALL, lines: [all(50), fableResets(13 * H)], nowMs: NOW })).not.toBeNull();
+  });
+
+  it('no reset time on a spent meter still switches', () => {
+    expect(stallModelFallback({ stall: STALL, lines: [{ id: 'week_fable', label: 'x', percent: 100 }], nowMs: NOW }))
+      .toEqual({ model: 'opus', reason: 'fable_limit' });
+  });
+
+  it('not when the session meter (every model) is full, or all-models is spent', () => {
+    expect(stallModelFallback({ stall: STALL, lines: [session(100), all(50), fable(100)], nowMs: NOW })).toBeNull();
+    expect(stallModelFallback({ stall: STALL, lines: [all(100), fable(100)], nowMs: NOW })).toBeNull();
+  });
+
+  it('only a usage-limit stall on Fable; the session model stands in for a stall without one', () => {
+    const lines = [all(50), fable(100)];
+    expect(stallModelFallback({ stall: { kind: 'bad_model', model: 'fable' }, lines, nowMs: NOW })).toBeNull();
+    expect(stallModelFallback({ stall: { kind: 'usage_limit', model: 'claude-opus-5-5' }, lines, nowMs: NOW })).toBeNull();
+    expect(stallModelFallback({ stall: { kind: 'usage_limit' }, model: 'fable', lines, nowMs: NOW })).not.toBeNull();
+    expect(stallModelFallback({ stall: { kind: 'usage_limit' }, model: 'opus', lines, nowMs: NOW })).toBeNull();
+    expect(stallModelFallback({ stall: null, model: 'fable', lines, nowMs: NOW })).toBeNull();
+  });
+
+  it('a Fable meter with room is not a Fable stall to switch away from', () => {
+    expect(stallModelFallback({ stall: STALL, lines: [all(50), fable(60)], nowMs: NOW })).toBeNull();
   });
 });
