@@ -302,12 +302,13 @@ describe('writeTokenFile', () => {
       process.umask(oldUmask);
     }
     expect(fs.readFileSync(file, 'utf8')).toBe(`${TOKEN}\n`);
-    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    // Windows has no POSIX mode bits (stat reports 0o666 regardless).
+    if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o777).toBe(0o600);
     expect(fs.readdirSync(dir)).toEqual(['.journal-token']); // no temp left behind
     fs.rmSync(dir, { recursive: true });
   });
 
-  it('tightens an existing looser file to 0600 on overwrite', () => {
+  it.skipIf(process.platform === 'win32')('tightens an existing looser file to 0600 on overwrite', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pair-token-'));
     const file = path.join(dir, '.journal-token');
     fs.writeFileSync(file, 'old\n', { mode: 0o644 });

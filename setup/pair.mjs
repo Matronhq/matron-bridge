@@ -157,8 +157,12 @@ async function main() {
   }
   console.log('Restart the bridge to pick up the new token:');
   console.log('  npm start                     # in this terminal');
-  console.log('  setup/service.sh              # or, if it runs as a service, re-run its installer');
-  console.log('                                # (sudo on Linux; macOS inlines .env into the plist)');
+  if (process.platform === 'win32') {
+    console.log('  setup\\service.ps1             # or, if it runs as a Scheduled Task, re-run its installer');
+  } else {
+    console.log('  setup/service.sh              # or, if it runs as a service, re-run its installer');
+    console.log('                                # (sudo on Linux; macOS inlines .env into the plist)');
+  }
 }
 
 const isMain = (() => {
