@@ -20,25 +20,25 @@ describe('fableMaxed', () => {
     expect(fableMaxed([all(100), fable(100)], NOW)).toBe(false);
   });
 
-  it('an absent all-models line reads as room; an absent Fable line as not maxed', () => {
-    expect(fableMaxed([fable(100)], NOW)).toBe(true);
+  it('no all-models reading is no evidence of room; an absent Fable line is not maxed', () => {
+    expect(fableMaxed([fable(100)], NOW)).toBe(false);
     expect(fableMaxed([all(10), session(100)], NOW)).toBe(false);
   });
 
   it('a meter whose reset has passed is not a reading of now', () => {
     expect(fableMaxed([all(60), fable(100, { resets_at: PAST })], NOW)).toBe(false);
-    // A spent all-models meter that has since reset no longer blocks.
-    expect(fableMaxed([all(100, { resets_at: PAST }), fable(100)], NOW)).toBe(true);
+    // An all-models line past its reset is no reading at all.
+    expect(fableMaxed([all(10, { resets_at: PAST }), fable(100)], NOW)).toBe(false);
   });
 
   it('a relabelled Fable meter (week_fable_5) still counts; other weekly meters do not', () => {
-    expect(fableMaxed([{ id: 'week_fable_5', label: 'Week (Fable 5)', percent: 100 }], NOW)).toBe(true);
-    expect(fableMaxed([{ id: 'week_fableish', label: 'x', percent: 100 }], NOW)).toBe(false);
-    expect(fableMaxed([{ id: 'week_opus', label: 'Week (Opus)', percent: 100 }], NOW)).toBe(false);
+    expect(fableMaxed([all(10), { id: 'week_fable_5', label: 'Week (Fable 5)', percent: 100 }], NOW)).toBe(true);
+    expect(fableMaxed([all(10), { id: 'week_fableish', label: 'x', percent: 100 }], NOW)).toBe(false);
+    expect(fableMaxed([all(10), { id: 'week_opus', label: 'Week (Opus)', percent: 100 }], NOW)).toBe(false);
   });
 
   it('a line with no reset time is taken at face value', () => {
-    expect(fableMaxed([{ id: 'week_fable', label: 'Week (Fable)', percent: 100 }], NOW)).toBe(true);
+    expect(fableMaxed([all(10), { id: 'week_fable', label: 'Week (Fable)', percent: 100 }], NOW)).toBe(true);
   });
 
   it('junk in, false out', () => {
@@ -88,7 +88,7 @@ describe('stallModelFallback', () => {
   });
 
   it('no reset time on a spent meter still switches', () => {
-    expect(stallModelFallback({ stall: STALL, lines: [{ id: 'week_fable', label: 'x', percent: 100 }], nowMs: NOW }))
+    expect(stallModelFallback({ stall: STALL, lines: [all(10), { id: 'week_fable', label: 'x', percent: 100 }], nowMs: NOW }))
       .toEqual({ model: 'opus', reason: 'fable_limit' });
   });
 
