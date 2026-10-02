@@ -16,6 +16,7 @@ import {
   abortableSleep,
   PairingError,
   RATE_LIMIT_BACKOFF_MS,
+  START_RETRY_MS,
 } from '../lib/journal-pairing.js';
 
 const BASE = 'https://journal.example.com';
@@ -108,6 +109,27 @@ describe('startPair', () => {
   it('falls back to a 600 s TTL when expires_in is missing', async () => {
     const r = await startPair({ httpBase: BASE, fetch: scriptedFetch([res(200, { pair_code: 'X', poll_token: POLL })]) });
     expect(r.expiresInMs).toBe(600_000);
+  });
+});
+
+describe('request timeout', () => {
+  // A fetch that never answers but honours its abort signal, like real fetch.
+  const hangingFetch = (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+  });
+
+  it('surfaces the request deadline as a network error, not as a cancel', async () => {
+    const err = await startPair({ httpBase: BASE, fetch: hangingFetch, timeoutMs: 20 }).catch((e) => e);
+    expect(err.message).toMatch(/no answer from the journal/);
+    expect(err.name).not.toBe('AbortError');
+    expect(err).not.toBeInstanceOf(PairingError);
+  });
+
+  it('still reports a user cancel as AbortError', async () => {
+    const ac = new AbortController();
+    const p = startPair({ httpBase: BASE, fetch: hangingFetch, signal: ac.signal, timeoutMs: 60_000 });
+    ac.abort();
+    await expect(p).rejects.toMatchObject({ name: 'AbortError' });
   });
 });
 
@@ -236,6 +258,28 @@ describe('pairAgent', () => {
     const r = await pairAgent({ httpBase: BASE, fetch, sleep: time.sleep, now: time.now, onWait });
     expect(r.token).toBe(TOKEN);
     expect(onWait).toHaveBeenCalledWith(expect.objectContaining({ reason: 'network' }));
+  });
+
+  it('fails fast when the very first pair/start cannot reach the journal', async () => {
+    const time = fakeTime();
+    const fetch = scriptedFetch([new TypeError('fetch failed')]);
+    await expect(pairAgent({ httpBase: BASE, fetch, sleep: time.sleep, now: time.now }))
+      .rejects.toThrow(/fetch failed/);
+  });
+
+  it('retries a replacement pair/start that hits a network failure', async () => {
+    const time = fakeTime();
+    const fetch = scriptedFetch([
+      started('AAAA-AAAA'),
+      res(404, {}),
+      new Error('no answer from the journal within 15 s'),
+      started('BBBB-BBBB'),
+      res(200, { status: 'approved', token: TOKEN, device_id: 1 }),
+    ]);
+    const onWait = vi.fn();
+    const r = await pairAgent({ httpBase: BASE, fetch, sleep: time.sleep, now: time.now, onWait });
+    expect(r.token).toBe(TOKEN);
+    expect(onWait).toHaveBeenCalledWith(expect.objectContaining({ reason: 'network', retryAfterMs: START_RETRY_MS }));
   });
 
   it('fails hard on an unexpected journal refusal', async () => {
