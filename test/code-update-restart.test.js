@@ -325,7 +325,7 @@ describe('self-restart stamp — carrying on by itself', () => {
     writeSelfRestartStamp(file, { bootId: 'boot-1', sha: NEW, busy: 2, at: T0 });
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ bootId: 'boot-1', sha: NEW, busy: 2, at: T0 });
     expect(takeSelfRestartStamp(file)).toEqual({ bootId: 'boot-1', sha: NEW, busy: 2, at: T0 });
-    expect(fs.existsSync(file)).toBe(false);
+    expect(() => fs.readFileSync(file)).toThrow();
     expect(takeSelfRestartStamp(file)).toBeNull();
   });
 
@@ -341,10 +341,10 @@ describe('self-restart stamp — carrying on by itself', () => {
     const file = path.join(dir, 'stamp.json');
     fs.writeFileSync(file, 'not json');
     expect(takeSelfRestartStamp(file)).toBeNull();
-    expect(fs.existsSync(file)).toBe(false);
+    expect(() => fs.readFileSync(file)).toThrow();
     fs.writeFileSync(file, JSON.stringify({ sha: NEW }));
     expect(takeSelfRestartStamp(file)).toBeNull();
-    expect(fs.existsSync(file)).toBe(false);
+    expect(() => fs.readFileSync(file)).toThrow();
     // A stamp that cannot be removed must not be used either: the next boot
     // would find it again and resume the same turns twice.
     fs.writeFileSync(file, JSON.stringify({ bootId: 'b' }));

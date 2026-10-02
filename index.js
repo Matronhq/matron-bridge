@@ -9338,10 +9338,14 @@ function sleepingConvoIdFor(roomId) {
 // would surface as an unhandled rejection rather than as a message to the
 // user. Same stance as journalRouteTextToSession's other non-awaiting caller,
 // the router's routeTextToSession adapter.
-async function carryOnConvo(convoId, session, _sendReply, text = 'carry on') {
+// `text` is what the resumed session receives; `resumeNotice` is what the
+// chat is told while it comes back (the automatic path after a self-restart
+// says why — the default "session was idle, your message will be delivered"
+// copy would be wrong there: no message is coming).
+async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined) {
   try {
     let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
-    if (!target || !target.alive) target = journalResumeConvo(convoId);
+    if (!target || !target.alive) target = journalResumeConvo(convoId, resumeNotice);
     if (!target) {
       // A carry-on tap always originates in a Matron journal chat (the card
       // is only ever published there — see publishRestartCarryOnCards), so
@@ -13073,8 +13077,8 @@ function publishRestartCarryOnCards() {
     try { console.log(`[code-update] ${autoResumable.length} chat(s) cut off by the self-restart onto ${String(stamp.sha || '').slice(0, 7)} carry on by themselves in ${CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS}ms`); } catch { /* logging must never throw */ }
     setTimeout(() => {
       for (const rec of autoResumable) {
-        journalPublishNotice(rec.convoId, `🔄 The bridge restarted itself onto new code while this chat was mid-turn (interrupted ${formatInterruptedAgo(rec.ageMs)}) — carrying on automatically.`);
-        void carryOnConvo(rec.convoId, null, null, CODE_UPDATE_AUTO_CARRY_ON_TEXT);
+        const notice = `🔄 The bridge restarted itself onto new code while this chat was mid-turn (interrupted ${formatInterruptedAgo(rec.ageMs)}) — resuming it to carry on automatically.`;
+        void carryOnConvo(rec.convoId, null, null, CODE_UPDATE_AUTO_CARRY_ON_TEXT, notice);
       }
     }, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS);
   }
