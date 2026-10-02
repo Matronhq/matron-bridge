@@ -1,7 +1,7 @@
 // Unit tests for the pure parts of npm run pair (setup/pair.mjs), the shared
 // setup helpers it reuses from setup/common.mjs, and the wizard's token-source
 // menu. The interactive flows themselves need a live journal.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -41,6 +41,29 @@ describe('pairing journal URL', () => {
 
   it('rejects garbage', () => {
     expect(() => pairingJournalUrl('ftp://x')).toThrow(/could not parse/);
+  });
+
+  it('pairWithApp resolves to the token string and never prints it', async () => {
+    const replies = [
+      { pair_code: 'BCDF-GHJK', poll_token: 'p'.repeat(64), expires_in: 600 },
+      { status: 'approved', token: 'the-agent-token', device_id: 9 },
+    ];
+    const fetch = async () => ({ status: 200, headers: { get: () => null }, json: async () => replies.shift() });
+    const printed = [];
+    const ac = new AbortController();
+    // Real abortableSleep with the default 2.5 s poll is too slow for a unit
+    // test, so time is skipped with fake timers.
+    vi.useFakeTimers();
+    try {
+      const p = pairWithApp({ journalUrl: 'wss://j.example.com/ws', fetch, signal: ac.signal, print: (l) => printed.push(l) });
+      await vi.runAllTimersAsync();
+      await expect(p).resolves.toBe('the-agent-token');
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(printed.join('\n')).toContain('BCDF-GHJK');
+    expect(printed.join('\n')).not.toContain('the-agent-token');
+    expect(printed.join('\n')).not.toContain('p'.repeat(64));
   });
 
   it('pairWithApp refuses a remote cleartext journal before any request', async () => {

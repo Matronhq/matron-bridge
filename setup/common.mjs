@@ -146,7 +146,7 @@ function renderQr(uri) {
 // the app to approve it, and resolves to the agent token (never printed).
 // Rejects with AbortError when `signal` fires, PairingError on a journal
 // refusal, or a network error from /pair/start.
-export async function pairWithApp({ journalUrl, signal, print = console.log }) {
+export async function pairWithApp({ journalUrl, signal, print = console.log, fetch: fetchFn = fetch }) {
   // The claim response carries the agent token: never fetch it in cleartext
   // from anything but this machine.
   const { protocol, hostname } = new URL(journalUrl);
@@ -156,8 +156,9 @@ export async function pairWithApp({ journalUrl, signal, print = console.log }) {
   const httpBase = pairHttpBase(journalUrl);
   const suggested = os.hostname().split('.')[0];
   let waitNoted = false;
-  return await pairAgent({
+  const { token } = await pairAgent({
     httpBase,
+    fetch: fetchFn,
     signal,
     onCode: ({ pairCode, uri, expiresInMs }) => {
       waitNoted = false;
@@ -182,4 +183,5 @@ export async function pairWithApp({ journalUrl, signal, print = console.log }) {
       else print('Lost contact with the journal; still trying...');
     },
   });
+  return token;
 }
