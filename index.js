@@ -11213,7 +11213,7 @@ const unseenHandlers = createUnseenHandlers({
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
-// The three routine_* tool routes (lib/routines-tools.js), mounted below.
+// The routine_* tool routes (lib/routines-tools.js), mounted below.
 // The journal gates every write to the Coordinator; this refuses a
 // non-Coordinator first, counting the journal's current role holder.
 const routineHandlers = createRoutineHandlers({
@@ -11866,11 +11866,12 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The three routine_* tool routes; same one-matcher allowlist shape.
-      const routineRoute = url.pathname.match(/^\/routine\/(list|update|run)$/);
+      // The routine_* tool routes; same one-matcher allowlist shape. The
+      // delete tool's handler is `remove` (delete is a reserved word).
+      const routineRoute = url.pathname.match(/^\/routine\/(list|update|run|create|delete)$/);
       if (routineRoute) {
         const name = routineRoute[1];
-        await respondAgentChatRoute(res, data, routineHandlers[name],
+        await respondAgentChatRoute(res, data, routineHandlers[name === 'delete' ? 'remove' : name],
           (status, b) => debug(`routine/${name} ${status} ${b.error || (b.routines ? `${b.routines.length} routines` : b.routine ? b.routine.name : 'ok')}`));
         return;
       }
