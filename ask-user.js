@@ -20,7 +20,7 @@ import {
   formatSharedMissionList, formatSharedMissionDetail, formatSharingError,
 } from './lib/sharing-format.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
-import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck } from './lib/routines-tools.js';
+import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -526,9 +526,10 @@ server.tool(
 );
 
 // --- Coordinator routines (spec: matron-journal 2026-10-01 coordinator routines) ---
-// routine_list / routine_update / routine_run go through the bridge loopback
-// (index.js mounts lib/routines-tools.js at /routine/<op>); the journal
-// allows all three to the Coordinator alone. Create and delete stay in the apps.
+// routine_list / routine_update / routine_run / routine_create /
+// routine_delete go through the bridge loopback (index.js mounts
+// lib/routines-tools.js at /routine/<op>); the journal allows the writes to
+// the Coordinator alone.
 const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
 
 async function callRoutine(name, args, render) {
@@ -555,7 +556,7 @@ server.tool(
 
 server.tool(
   'routine_update',
-  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. The user creates and deletes routines in the apps (Settings ▸ Coordinator ▸ Routines); only change one when the user asks or the playbook says to.`,
+  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. A routine cannot switch between schedule and trigger, nor be renamed: delete it and create it afresh. Only change one when the user asks or the playbook says to.`,
   {
     name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
     title: z.string().max(200).optional().describe('One line'),
@@ -575,6 +576,30 @@ server.tool(
     name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
   },
   async (args) => callRoutine('run', args, (d) => formatRoutineRunAck(d, args.name)),
+);
+
+server.tool(
+  'routine_create',
+  `Create a routine: a new slug, a one-line title, the prompt the journal fires, and either a schedule (five cron fields in tz, at least 15 minutes apart) or a trigger. ${ROUTINE_WHAT} Create one only when the user asks for it or agrees to it; keep the prompt one line pointing at a playbook section or a memory, so editing the procedure never means editing the routine. The user sees it in the apps as created by the Coordinator.`,
+  {
+    name: z.string().max(64).describe('New slug: lowercase letters, digits and dashes, e.g. "exception-triage"'),
+    title: z.string().max(200).describe('One line, shown in the apps'),
+    schedule: z.string().max(64).optional().describe('Five cron fields: minute hour day-of-month month day-of-week, e.g. "30 8,16 * * *" (08:30 and 16:30). Give this or trigger.'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('Instead of a schedule: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes'),
+    tz: z.string().max(64).optional().describe('IANA zone the schedule is in; default Europe/London'),
+    prompt: z.string().max(2000).describe('The turn text the journal fires, e.g. "Routine exception-triage: follow the exception-triage-routine memory."'),
+    enabled: z.boolean().optional().describe('Default true; false creates it paused'),
+  },
+  async (args) => callRoutine('create', args, formatRoutineCreateAck),
+);
+
+server.tool(
+  'routine_delete',
+  `Delete one routine for good: the journal stops firing it and the apps drop it from the list. ${ROUTINE_WHAT} Delete only when the user asks; to stop one for a while, pause it with routine_update (enabled: false) instead.`,
+  {
+    name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
+  },
+  async (args) => callRoutine('delete', args, () => formatRoutineDeleteAck(args.name)),
 );
 
 async function sessionControlCall(route, body, name) {
