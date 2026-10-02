@@ -170,9 +170,10 @@ import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
+import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
-import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
+import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -991,6 +992,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live) derived._deferredControls = live._deferredControls || null;
   if (live) derived._autoResume = live._autoResume || null;
   if (live) derived._badModelRecovered = !!live._badModelRecovered;
+  if (live) derived._fableStallSwitched = !!live._fableStallSwitched;
   if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;
   // The last gauge, so a resumed session knows whether to compact before it
   // carries on (lib/auto-resume.js shouldCompactBefore).
@@ -1247,6 +1249,11 @@ const journalRpcHandler = createRpcRequestHandler({
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
   joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),
+  // Fable-limit fallback (lib/fable-fallback.js): a no-model start on a box
+  // whose Fable weekly meter is spent runs on Opus instead of stalling on
+  // its first turn. Late-bound like joinMission (usageLimitsCache is
+  // declared further down).
+  startModelFallback: () => startModelFallbackFromLimits(),
   // Read-only `local_memories` / `local_memory_get`: this box's CLAUDE.md
   // files and ~/.claude/projects/*/memory/ (lib/local-memories.js). The
   // repo list is the picker's own folder history.
@@ -1638,7 +1645,9 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 // runs overnight). A failed fetch stamps fetchedAt too, so an outage can't
 // turn every turn end into a spawn storm.
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
-const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
+// okAt: the last fetch that actually parsed. fetchedAt also stamps failed
+// fetches (the refresh throttle), so freshness checks read okAt.
+const usageLimitsCache = { lines: null, fetchedAt: 0, okAt: 0, inflight: null };
 const codexAccountReader = createCodexAccountReader();
 const codexTelemetryReader = new CodexTelemetryReader();
 
@@ -1696,6 +1705,7 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
       usageLimitsCache.fetchedAt = Date.now();
       if (parsed.ok) {
         usageLimitsCache.lines = parsed.lines;
+        usageLimitsCache.okAt = usageLimitsCache.fetchedAt;
         // Fresh numbers: the journal's copy of this box's status is stale
         // the moment they land.
         publishBoxStatus('limits refresh');
@@ -1709,6 +1719,29 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
     })
     .finally(() => { usageLimitsCache.inflight = null; });
   return usageLimitsCache.inflight;
+}
+
+// The reading a no-model start decides its model on. A cache this fresh is
+// used as it stands; an older one (the box may have idled for hours while
+// other boxes on the same account spent the meter) is refreshed first — a
+// /usage one-shot takes ~10 s — after which whatever the cache holds
+// decides. Budget against the journal's 30 s start timeout: this wait (12 s)
+// plus the mission pre-join's joinDeadlineMs (5 s) run in sequence before
+// the reply; startSession itself returns at spawn, not at Claude's boot.
+// Raise either and the sum must stay well under 30 s, or the journal fails
+// a spawn this bridge goes on to start.
+const START_LIMITS_FRESH_MS = 15 * 60 * 1000;
+const START_LIMITS_WAIT_MS = 12_000;
+function startModelFallbackFromLimits() {
+  const decide = () => spawnModelFallback({ defaultModel: DEFAULT_MODEL, lines: usageLimitsCache.lines });
+  // Nothing to fall back from: skip the /usage spawn entirely.
+  if (!isFableModel(DEFAULT_MODEL)) return null;
+  if (usageLimitsCache.lines && Date.now() - usageLimitsCache.okAt < START_LIMITS_FRESH_MS) return decide();
+  const refresh = refreshUsageLimits(DEFAULT_WORKDIR, { force: true });
+  if (!refresh) return decide();
+  let timer;
+  const deadline = new Promise((resolve) => { timer = setTimeout(resolve, START_LIMITS_WAIT_MS); timer.unref?.(); });
+  return Promise.race([refresh.catch(() => false), deadline]).then(() => { clearTimeout(timer); return decide(); });
 }
 
 // Logged-in account email for the status frame, read from ~/.claude.json's
@@ -2245,6 +2278,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     _deferredControls: persistedMode?._deferredControls || null,
     _autoResume: persistedMode?._autoResume || null,
     _badModelRecovered: !!persistedMode?._badModelRecovered,
+    _fableStallSwitched: !!persistedMode?._fableStallSwitched,
     _autoResumeRetries: persistedMode?._autoResumeRetries || 0,
     _lastContextTokens: Number.isFinite(persistedMode?._lastContextTokens) ? persistedMode._lastContextTokens : undefined,
     // Accumulated usage stats
@@ -3096,6 +3130,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     _deferredControls: persistedForRoom?._deferredControls || null,
     _autoResume: persistedForRoom?._autoResume || null,
     _badModelRecovered: !!persistedForRoom?._badModelRecovered,
+    _fableStallSwitched: !!persistedForRoom?._fableStallSwitched,
     _autoResumeRetries: persistedForRoom?._autoResumeRetries || 0,
     _lastContextTokens: Number.isFinite(persistedForRoom?._lastContextTokens) ? persistedForRoom._lastContextTokens : undefined,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
@@ -4369,6 +4404,9 @@ function handleClaudeEvent(session, event) {
               persistControlState(session);
             }
             journalStatus(session);
+            // Decided on these fresh meters, after the carry-on is armed: a
+            // switch brings it forward, no switch leaves it for the reset.
+            if (session._stall.kind === 'usage_limit') switchFableStall(session);
           });
         }
       } else if (assistantCtxTokens) {
@@ -4379,9 +4417,10 @@ function handleClaudeEvent(session, event) {
         // (a resume-time filler that reaches the API counts, because it
         // could only have been served past the limit).
         session._stall = null;
-        if (session._autoResume || session._badModelRecovered || session._autoResumeRetries) {
+        if (session._autoResume || session._badModelRecovered || session._fableStallSwitched || session._autoResumeRetries) {
           session._autoResume = null;
           session._badModelRecovered = false;
+          session._fableStallSwitched = false;
           session._autoResumeRetries = 0;
           persistControlState(session);
         }
@@ -9636,6 +9675,17 @@ async function fireAutoResume(roomId, convoId, slot) {
   // A deferred model recovery is retried as a recovery, not as a turn on
   // the still-unavailable model.
   if (slot.kind === 'bad_model') { recoverBadModel(session); return; }
+  // Likewise a deferred Fable-stall switch: retried, and when it no longer
+  // applies the session goes back to waiting for its reset.
+  if (slot.kind === 'fable_switch') {
+    // The slot it displaced (a Coordinator's after_limit_reset message
+    // among them) comes back when the switch is off.
+    if (!switchFableStall(session, { retry: slot.retry || 0, prior: slot.prior || null }) && !session._autoResume && session._stall) {
+      session._autoResume = armFromStall(session._stall, slot.prior || null, Date.now(), session._autoResumeRetries || 0);
+      persistControlState(session);
+    }
+    return;
+  }
   postControlNotice(session, slot.kind === 'model_recovery'
     ? '🕒 Model switched — carrying on.'
     : slot.source === 'coordinator'
@@ -9722,6 +9772,50 @@ function recoverBadModel(session) {
   next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: BAD_MODEL_RECOVERY_TEXT };
   persistControlState(next);
   postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on once the switch has settled.');
+}
+
+// Fable stall, reset far off (lib/fable-fallback.js stallModelFallback):
+// move the session to Opus and carry on rather than sit until the weekly
+// reset. explicit:false like the bad-model recovery — the bridge picked it,
+// not a person, so a later Coordinator assignment may change it. Returns
+// true when the switch went through (or was parked for the turn's end).
+const FABLE_SWITCH_MAX_RETRIES = 3;
+function switchFableStall(session, { retry = 0, prior = undefined } = {}) {
+  if (session.agent === AGENT_CODEX || !session.alive || !session._stall) return false;
+  // Once per stall, like the bad-model recovery: an interactive switch
+  // reports success once /model is typed, so a TUI that stayed on Fable
+  // would stall again and switch again on every carry-on. Cleared by the
+  // next real answer.
+  if (session._fableStallSwitched) return false;
+  // The slot this switch displaces: the reset carry-on, possibly carrying a
+  // Coordinator's message. A retry passes the one it already held.
+  const displaced = prior === undefined ? session._autoResume : prior;
+  const fb = stallModelFallback({ stall: session._stall, model: session._modelAlias || session.currentModel, lines: usageLimitsCache.lines });
+  if (!fb) return false;
+  const when = fb.resetsAt ? ` (Fable resets ${new Date(fb.resetsAt).toUTCString().replace(/:\d\d GMT$/, ' UTC')})` : '';
+  const ctx = journalSessionCommandCtx(session);
+  const switched = !controlOccupied(session)
+    && applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+  if (!switched) {
+    // Refused (a resume hold, a busy turn, a TUI not ready): try again in a
+    // minute, a few times, then fall back to waiting for the reset.
+    if (retry >= FABLE_SWITCH_MAX_RETRIES) return false;
+    session._autoResume = { at: new Date(Date.now() + 60_000).toISOString(), kind: 'fable_switch', retry: retry + 1, ...(displaced ? { prior: displaced } : {}) };
+    persistControlState(session);
+    return false;
+  }
+  // As in recoverBadModel: a print-mode switch recreated the process, so
+  // the carry-on slot lands on the replacement, and goes through the sweep
+  // once the switch has settled.
+  const next = sessions.get(session.roomId) || session;
+  next._fableStallSwitched = true;
+  // A Coordinator's carry-on for this stall is still the message to send:
+  // the switch is what lifts the limit.
+  const text = displaced?.source === 'coordinator' && displaced.text ? displaced.text : FABLE_SWITCH_TEXT;
+  next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text };
+  persistControlState(next);
+  postControlNotice(next, `🛠 Fable weekly limit reached${when} — switched this session to Opus; carrying on once the switch has settled.`);
+  return true;
 }
 
 // --- Coordinator session control, target side (lib/session-control.js) ---
