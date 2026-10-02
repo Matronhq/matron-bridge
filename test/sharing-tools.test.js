@@ -19,7 +19,7 @@ function fixture(over = {}) {
     contactRemove: vi.fn(async () => ok({ contact: { id: 'ct_1', address: 'tim', state: 'removed' } })),
     contactBlock: vi.fn(async () => ok({ contact: { id: 'ct_1', address: 'tim', state: 'blocked' } })),
     share: vi.fn(async () => ({ status: 202, data: { grant: { id: 'gr_1', direction: 'out', level: 'read', state: 'awaiting_owner', grantee: { name: 'tim', address: 'tim' }, mission: { id: 'ms_1', num: 61, title: 'Launch' } }, pending: 'owner' } })),
-    shares: vi.fn(async () => ok({ grants: [{ id: 'gr_1', direction: 'out', state: 'active', grantee: { name: 'tim', address: 'tim' } }] })),
+    shares: vi.fn(async () => ok({ grants: [{ id: 'gr_1', direction: 'out', state: 'active', contact_id: 'ct_tim', grantee: { name: 'tim', address: 'tim' } }] })),
     grants: vi.fn(async () => ok({ grants: [] })),
     revoke: vi.fn(async () => ok({ grant: { id: 'gr_1', direction: 'out', state: 'revoked', grantee: { name: 'tim', address: 'tim' }, mission: { title: 'Launch' } } })),
     sharedMissions: vi.fn(async () => ok({ missions: [] })),
@@ -95,8 +95,14 @@ describe('sharing handlers', () => {
     await h.unshare({ roomId: '!r:s', contact: 'tim' });
     expect(client.shares).toHaveBeenCalledWith('ms_1');
     expect(client.revoke).toHaveBeenLastCalledWith('gr_1');
+    // contact_list prints the contact's id, and remove and block take it:
+    // so does unshare.
+    client.revoke.mockClear();
+    await h.unshare({ roomId: '!r:s', contact: 'ct_tim' });
+    expect(client.revoke).toHaveBeenCalledWith('gr_1');
     const miss = await h.unshare({ roomId: '!r:s', contact: 'sam', mission: 61 });
     expect(miss.status).toBe(404);
+    expect((await h.unshare({ roomId: '!r:s', contact: 'ct_sam' })).status).toBe(404);
     expect((await h.unshare({ roomId: '!r:s' })).status).toBe(400);
   });
 
