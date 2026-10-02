@@ -15,6 +15,10 @@ import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } 
 import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
+import {
+  formatContactList, formatContactAddAck, formatContactEndAck, formatGrantList, formatShareAck, formatUnshareAck,
+  formatSharedMissionList, formatSharedMissionDetail, formatSharingError,
+} from './lib/sharing-format.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck } from './lib/routines-tools.js';
 
@@ -1032,8 +1036,13 @@ server.tool(
 server.tool(
   'mission_list',
   "List the user's missions — open by default, state: 'closed' for closed ones — each with its counts, its status (when and by whom) and its last milestone. The Coordinator uses it to find every mission whose status to refresh.",
-  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
-  async (args) => callMissions('list', args, formatMissionList),
+  {
+    state: z.enum(['open', 'closed']).optional().describe("Default 'open'"),
+    shared: z.boolean().optional().describe('true = the missions OTHER PEOPLE share with the user (read-only), instead of the user\'s own'),
+  },
+  async (args) => (args.shared
+    ? callSharing('shared_list', 'mission_list', {}, formatSharedMissionList)
+    : callMissions('list', args, formatMissionList)),
 );
 
 server.tool(
@@ -1053,8 +1062,13 @@ server.tool(
 server.tool(
   'mission_get',
   "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's current mission, plus every mission this conversation is on (current, also on, earlier).",
-  { num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission') },
-  async (args) => callMissions('get', args, formatMissionDetail),
+  {
+    num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission'),
+    shared_by: z.string().max(64).optional().describe('To read a mission another person shares with the user: their user name, with num = THEIR mission number (mission_list shared: true lists both). Read-only.'),
+  },
+  async (args) => (args.shared_by
+    ? callSharing('shared_get', 'mission_get', args, formatSharedMissionDetail)
+    : callMissions('get', args, formatMissionDetail)),
 );
 
 server.tool(
@@ -1075,6 +1089,85 @@ server.tool(
     mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
   },
   async (args) => callItems('move', args, (d) => itemLine(d.item)),
+);
+
+// --- Contacts and mission sharing between people (spec: matron-journal
+// 2026-10-02 matron-to-matron sharing, phase 1) ---
+// The bridge loopback (index.js mounts lib/sharing-tools.js at
+// /sharing/<op>); the journal is the gate. `tool` is the name the model
+// called, for the failure line.
+const SHARING_WHAT = "Contacts are other PEOPLE (other Matron users), not the user's own agents or boxes. Two people become contacts only when one asks and the other accepts, and a contact can then be offered a mission to read. Your ask never reaches the other person by itself: the user gets a card (in this conversation and in their tracker) and only their own tap sends it on; then the other person gets a card of their own. You cannot approve either card and neither can the Coordinator, so do not wait on the result: say in one line that it is with the user and carry on.";
+
+async function callSharing(name, tool, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/sharing/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `${tool} failed: ${res.status === 409 || [400, 403, 404].includes(res.status) ? formatSharingError(name, data) : (data.error || `HTTP ${res.status}`)}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `${tool} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'contact_list',
+  `List the user's contacts and where each stands (contact, requested, waiting for the user). ${SHARING_WHAT} Pass users: true to also list the other users on this journal who could be asked.`,
+  { users: z.boolean().optional().describe('Also list the other users on this journal') },
+  async (args) => callSharing('contact_list', 'contact_list', args, formatContactList),
+);
+
+server.tool(
+  'contact_add',
+  `Ask another user on this journal to be the user's contact. ${SHARING_WHAT} Use it only when the user asked for it or clearly wants to share with that person.`,
+  { user: z.string().max(64).describe('The other user\'s name on this journal (contact_list users: true lists them)') },
+  async (args) => callSharing('contact_add', 'contact_add', args, formatContactAddAck),
+);
+
+server.tool(
+  'contact_remove',
+  'Remove a contact, or withdraw a contact request that has not been answered. Every mission shared between the two people, in either direction, ends at once. Becoming contacts again needs a new request and a new accept, so do it only when the user asks.',
+  { contact: z.string().max(128).describe('A contact name or id from contact_list') },
+  async (args) => callSharing('contact_remove', 'contact_remove', args, formatContactEndAck('Removed')),
+);
+
+server.tool(
+  'contact_block',
+  'Block a person: removes them as a contact, ends every share between the two, and their future contact requests never reach the user. Only the user can unblock, in the app. Do it only when the user asks.',
+  { contact: z.string().max(128).describe('A contact name or id from contact_list') },
+  async (args) => callSharing('contact_block', 'contact_block', args, formatContactEndAck('Blocked')),
+);
+
+server.tool(
+  'mission_share',
+  `Offer a mission to one of the user's contacts to read. They will see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. They cannot change anything, and conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT} Read-only is the only level so far.`,
+  {
+    contact: z.string().max(128).describe('A contact name or id from contact_list — they must already be a contact'),
+    mission: z.number().int().min(1).optional().describe("A mission number; omit for this conversation's current mission"),
+    level: z.enum(['read']).optional().describe("Default and only level: 'read'"),
+  },
+  async (args) => callSharing('share', 'mission_share', args, formatShareAck),
+);
+
+server.tool(
+  'mission_unshare',
+  "End a mission share: one the user gave (the contact can no longer read it, at once) or one given to the user (it leaves their shared list). Pass grant (an id from mission_shares), or contact and mission for a share the user gave.",
+  {
+    grant: z.string().max(128).optional().describe('A grant id from mission_shares'),
+    contact: z.string().max(128).optional().describe('The contact a mission of the user\'s is shared with'),
+    mission: z.number().int().min(1).optional().describe("With contact: the mission number; omit for this conversation's current mission"),
+  },
+  async (args) => callSharing('unshare', 'mission_unshare', args, formatUnshareAck),
+);
+
+server.tool(
+  'mission_shares',
+  "List mission shares in both directions: what the user shares with whom, what is shared with the user, and what is still waiting for an answer. Read a mission shared with the user with mission_get shared_by + num.",
+  {},
+  async () => callSharing('shares', 'mission_shares', {}, formatGrantList),
 );
 
 // --- Projects (spec 2026-09-30 projects §5) ---

@@ -14,6 +14,8 @@ import { createProjectsClient } from './lib/projects-client.js';
 import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
 import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
+import { createSharingClient } from './lib/sharing-client.js';
+import { createSharingHandlers } from './lib/sharing-tools.js';
 import { createUnseenClient } from './lib/unseen-client.js';
 import { createUnseenHandlers, formatUnseenNudge } from './lib/unseen-tools.js';
 import { createRoutinesClient } from './lib/routines-client.js';
@@ -571,6 +573,14 @@ const projectsClient = createProjectsClient({
 // Coordinator consent approval (spec 2026-09-29 coordinator consent): same
 // base URL and token; the consent_list / consent_decide tools.
 const consentClient = createConsentClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Contacts and grants (spec: matron-journal 2026-10-02 matron-to-matron
+// sharing, phase 1): same base URL and token; the contact_* and
+// mission_share tools and the shared reads of mission_list / mission_get.
+const sharingClient = createSharingClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -11068,6 +11078,16 @@ const projectsHandlers = createProjectsHandlers({
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
+// The contact_* / mission_share tool routes (lib/sharing-tools.js), mounted
+// below at /sharing/<op>. No Coordinator gate: any session may ask, and no
+// session — the Coordinator included — may answer (the journal refuses).
+const sharingHandlers = createSharingHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: sharingClient,
+  resolveMission: (session, convoId) => missionsHandlers.resolveMission(session, convoId),
+});
+
 // The two consent_* tool routes (lib/consent-tools.js), mounted below.
 const consentHandlers = createConsentHandlers({
   sessions,
@@ -11778,6 +11798,16 @@ const apiServer = createServer(async (req, res) => {
         const name = routineRoute[1];
         await respondAgentChatRoute(res, data, routineHandlers[name],
           (status, b) => debug(`routine/${name} ${status} ${b.error || (b.routines ? `${b.routines.length} routines` : b.routine ? b.routine.name : 'ok')}`));
+        return;
+      }
+
+      // The contact_* / mission_share tool routes; same one-matcher
+      // allowlist shape.
+      const sharingRoute = url.pathname.match(/^\/sharing\/(contact_list|contact_add|contact_remove|contact_block|share|unshare|shares|shared_list|shared_get)$/);
+      if (sharingRoute) {
+        const name = sharingRoute[1];
+        await respondAgentChatRoute(res, data, sharingHandlers[name],
+          (status, b) => debug(`sharing/${name} ${status} ${b.error || b.blocked_by || 'ok'}`));
         return;
       }
 
