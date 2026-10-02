@@ -12,6 +12,11 @@ import {
   readHeadReflog,
   defaultPreflight,
   createCodeUpdateWatcher,
+  AUTO_CARRY_ON_TEXT,
+  autoCarryOnEnabled,
+  writeSelfRestartStamp,
+  takeSelfRestartStamp,
+  selectAutoCarryOn,
 } from '../lib/code-update-restart.js';
 
 // A bridge restarting ITSELF onto new code. A rollout that finds a live
@@ -305,5 +310,55 @@ describe('createCodeUpdateWatcher — defaults', () => {
     expect(DEFAULT_SETTLE_MS).toBe(5 * 60_000);
     expect(DEFAULT_MAX_DEFER_MS).toBe(30 * 60_000);
     vi.restoreAllMocks();
+  });
+});
+
+describe('self-restart stamp — carrying on by itself', () => {
+  it('is on unless switched off, and the text is marked as the bridge talking', () => {
+    expect(autoCarryOnEnabled(undefined)).toBe(true);
+    expect(autoCarryOnEnabled('0')).toBe(false);
+    expect(AUTO_CARRY_ON_TEXT).toMatch(/^\[auto-continue after bridge update\] /);
+  });
+
+  it('round-trips through the file and is gone after one take', () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cur-')), 'stamp.json');
+    writeSelfRestartStamp(file, { bootId: 'boot-1', sha: NEW, busy: 2, at: T0 });
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ bootId: 'boot-1', sha: NEW, busy: 2, at: T0 });
+    expect(takeSelfRestartStamp(file)).toEqual({ bootId: 'boot-1', sha: NEW, busy: 2, at: T0 });
+    expect(fs.existsSync(file)).toBe(false);
+    expect(takeSelfRestartStamp(file)).toBeNull();
+  });
+
+  it('stamps the time itself when none is given', () => {
+    const writes = [];
+    writeSelfRestartStamp('/x', { bootId: 'b', sha: NEW }, { write: (_f, d) => writes.push(JSON.parse(d)) });
+    expect(writes[0].bootId).toBe('b');
+    expect(Number.isFinite(writes[0].at)).toBe(true);
+  });
+
+  it('is null — the chats get a card — for a malformed or bootId-less stamp, and removes it anyway', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cur-'));
+    const file = path.join(dir, 'stamp.json');
+    fs.writeFileSync(file, 'not json');
+    expect(takeSelfRestartStamp(file)).toBeNull();
+    expect(fs.existsSync(file)).toBe(false);
+    fs.writeFileSync(file, JSON.stringify({ sha: NEW }));
+    expect(takeSelfRestartStamp(file)).toBeNull();
+    expect(fs.existsSync(file)).toBe(false);
+    // A stamp that cannot be removed must not be used either: the next boot
+    // would find it again and resume the same turns twice.
+    fs.writeFileSync(file, JSON.stringify({ bootId: 'b' }));
+    expect(takeSelfRestartStamp(file, { unlinkSync: () => { throw new Error('EACCES'); } })).toBeNull();
+  });
+
+  it('selects only the markers the stamped run wrote; everything else keeps the tap', () => {
+    const mine = { convoId: 'c1', bootId: 'boot-1' };
+    const older = { convoId: 'c2', bootId: 'boot-0' };
+    const unknown = { convoId: 'c3' };
+    const stamp = { bootId: 'boot-1', sha: NEW };
+    expect(selectAutoCarryOn([mine, older, unknown], stamp)).toEqual({ auto: [mine], card: [older, unknown] });
+    expect(selectAutoCarryOn([mine, older], null)).toEqual({ auto: [], card: [mine, older] });
+    expect(selectAutoCarryOn([mine], stamp, { enabled: false })).toEqual({ auto: [], card: [mine] });
+    expect(selectAutoCarryOn(null, stamp)).toEqual({ auto: [], card: [] });
   });
 });
