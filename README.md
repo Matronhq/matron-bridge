@@ -18,7 +18,7 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 
 - Node.js 22+
 - Claude Code CLI and/or Codex CLI installed and authenticated
-- A [matron-journal](https://github.com/Matronhq/matron-journal) server and an agent token for the bridge (`matron-admin agent add <user> <device-name>` on the journal server)
+- A [matron-journal](https://github.com/Matronhq/matron-journal) server, plus the Matron app signed in to it (to pair the bridge by QR code) or an agent token minted on the journal server with `matron-admin agent add <user> <device-name>`
 
 **Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm). For voice notes: `setup/install-whisper.sh` will install the rest.
 
@@ -36,11 +36,29 @@ brew install cloudflared
 
 ```bash
 npm install
-npm run setup   # guided: asks for your journal URL + agent token, tests the connection, writes .env
+npm run setup   # guided: asks for your journal URL, pairs with the Matron app (or takes a pasted token), tests the connection, writes .env
 npm start
 ```
 
-The wizard stores the agent token in a gitignored `.journal-token` file (mode 600),
+To get the agent token, the wizard shows a pairing code as a QR code in the terminal. In the
+Matron app, open **Settings -> Devices -> Add Agent -> Scan QR** (or type the code) and name
+the agent; the bridge picks up the token by itself, so nobody copies it around. If you'd
+rather mint the token on the journal server (`matron-admin agent add <user> <device-name>`),
+choose the paste option instead.
+
+To pair (or re-pair) without going through the rest of the wizard, for example after the
+agent was revoked in the app:
+
+```bash
+npm run pair                          # uses JOURNAL_WS_URL from .env
+npm run pair -- --server https://journal.example.com
+npm run pair -- --force               # replace a token that still works (pairs a NEW agent)
+```
+
+`npm run pair` refuses to replace a token that still connects unless you pass `--force`.
+Remote journals must use https/wss: the token comes back in the pairing response.
+
+The wizard and `npm run pair` store the agent token in a gitignored `.journal-token` file (mode 600),
 generates `HMAC_SECRET`, and leaves every other setting on its documented default.
 Re-run it any time to change answers; the previous `.env` is backed up to `.env.bak`.
 
@@ -315,7 +333,7 @@ What rides the journal connection:
 | `JOURNAL_CONTROL_CONVO_ID` | Stable convo id for session-management commands | `bridge-<hostname>` |
 | `JOURNAL_STREAM_INTERVAL_MS` | Streaming-overlay coalescing floor (at most one in-progress frame per conversation+message per window) | `200` |
 
-Provision the agent token on the journal server with `matron-admin agent add <user> <device-name>`.
+Get the agent token by pairing with the Matron app (`npm run pair`, or the first option in `npm run setup`), or provision it on the journal server with `matron-admin agent add <user> <device-name>`.
 
 The journal also exposes an HTTP **search API** (`GET /search?q=` on the https base derived from `JOURNAL_WS_URL`, authenticated with the same agent token) that full-text searches every one of the user's conversations across all their devices, plus an `around_seq` context mode on `GET /convo/:id/messages` for reading prose around a hit. Bridge sessions are told how to use it in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`; the full spec lives in matron-journal's [`docs/protocol.md`](https://github.com/Matronhq/matron-journal/blob/master/docs/protocol.md) ("Journal search").
 
