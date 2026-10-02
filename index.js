@@ -147,6 +147,7 @@ import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest,
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { createMacKeepAwake } from './lib/mac-keep-awake.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
@@ -9342,6 +9343,9 @@ async function fireTimer(record) {
 // forget the work lease, a reaper tick cannot forget the reminders.
 let workHoldUntil = 0;
 let workHoldSessions = 0;
+// A Mac has no host probe reading the marker, so the same lease holds a
+// `caffeinate -i` there (lib/mac-keep-awake.js); a no-op elsewhere.
+const macKeepAwake = createMacKeepAwake({ log: (m) => console.warn(`[keep-awake] ${m}`) });
 
 function writeKeepAwakeMarker(timers) {
   writeKeepAwake(keepAwakeMarker(timers));
@@ -9354,6 +9358,7 @@ function refreshKeepAwakeMarker() {
 function writeKeepAwake(marker) {
   try {
     const until = keepAwakeUntil({ timerUntil: marker?.until ?? null, workUntil: workHoldUntil });
+    macKeepAwake.update(until);
     if (!until) {
       fs.rmSync(KEEPAWAKE_FILE, { force: true });
       return;
