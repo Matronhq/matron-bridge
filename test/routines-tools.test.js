@@ -91,6 +91,8 @@ describe('routine create and delete', () => {
     expect((await h.create({ roomId: '!r:s', ...triage, name: 'Exception Triage' })).body.error).toMatch(/lowercase letters, digits and dashes/);
     expect((await h.create({ roomId: '!r:s', ...triage, title: undefined })).body.error).toMatch(/title is required/);
     expect((await h.create({ roomId: '!r:s', ...triage, prompt: undefined })).body.error).toMatch(/prompt is required/);
+    expect((await h.create({ roomId: '!r:s', ...triage, title: null })).body.error).toMatch(/title is required/);
+    expect((await h.create({ roomId: '!r:s', ...triage, prompt: null })).body.error).toMatch(/prompt is required/);
     expect((await h.create({ roomId: '!r:s', ...triage, schedule: undefined })).body.error).toMatch(/schedule or a trigger/);
     expect((await h.create({ roomId: '!r:s', ...triage, trigger: { kind: 'disk_under', pct: 20 } })).body.error).toMatch(/not both/);
     expect((await h.create({ roomId: '!r:s', ...triage, schedule: 'twice daily' })).body.error).toMatch(/five cron fields/);
