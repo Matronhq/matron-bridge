@@ -147,6 +147,7 @@ import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest,
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
@@ -9364,6 +9365,33 @@ function writeKeepAwake(marker) {
   }
 }
 
+// macOS has no host to keep the box up (lib/power-hold.js): the bridge holds
+// the sleep assertion itself while any session is live or a hold_awake
+// reminder is pending — and, with MATRON_KEEP_AWAKE=always, on mains power
+// for as long as it runs. Re-evaluated every POWER_HOLD_TICK_MS rather than
+// hooked into each place a session starts or ends; 'off' everywhere else.
+const KEEP_AWAKE_MODE = keepAwakeMode();
+const powerHold = createPowerHold();
+
+function refreshPowerHold() {
+  let liveSessions = 0;
+  for (const [, session] of sessions) {
+    if (session.alive && !session._autoStopped) liveSessions += 1;
+  }
+  const holdUntil = keepAwakeUntil({ timerUntil: timerStore.holdAwakeMarker()?.until ?? null, workUntil: workHoldUntil });
+  const flags = powerHoldFlags({ mode: KEEP_AWAKE_MODE, liveSessions, holdUntil });
+  if (powerHold.set(flags)) {
+    console.log(flags.length ? `[power] holding the Mac awake (caffeinate ${flags.join(' ')}; ${liveSessions} live session${liveSessions === 1 ? '' : 's'})` : '[power] released the keep-awake hold');
+  }
+}
+
+function startPowerHold() {
+  if (KEEP_AWAKE_MODE === 'off') return;
+  console.log(`Keep awake: ${KEEP_AWAKE_MODE}`);
+  refreshPowerHold();
+  setInterval(refreshPowerHold, POWER_HOLD_TICK_MS).unref();
+}
+
 // Wall-clock rendering of a timer's fire time, including the timezone name
 // ("12:26 AM UTC") — the server's clock is rarely the user's, so a bare time
 // is ambiguous, and echoing the resolved moment is the only thing that
@@ -12913,6 +12941,8 @@ async function main() {
   }
   // Independent of the idle reaper: armed carry-ons must fire either way.
   startAutoResumeSweep();
+  // So is the macOS sleep assertion: a disabled reaper still has live sessions.
+  startPowerHold();
   // Re-arm persisted /timer schedules (overdue ones fire after a short
   // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
   const rearmed = timerStore.init();
@@ -12977,6 +13007,7 @@ async function gracefulShutdown(signal) {
     for (const [, session] of sessions) {
       killSession(session);
     }
+    powerHold.stop();
     await journalPublisher.flush({ timeoutMs: FLUSH_TIMEOUT_MS });
   } catch (e) {
     try { console.warn(`[shutdown] failed: ${e?.message ?? String(e)}`); } catch { /* ignore */ }
