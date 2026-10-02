@@ -231,7 +231,10 @@ describe('injection sites name their origin (source inspection)', () => {
     expect(ctx.roomTurnOrigin(undefined)).toBe('peer');
   });
   it('room lines: 💬 opens an idle turn, ⏳ is a control line, 📨 takes the flushed turn', () => {
-    expect(index).toContain('{ turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.PEER });');
+    expect(index).toContain('{ notice: NOTICE.CONTROL, turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.PEER });');
+    // A muted room's echo and its 🔇 line are control lines too.
+    expect(index).toContain('formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }), { notice: NOTICE.CONTROL });');
+    expect(index).toContain('journalPublishNotice(convoId, ROOM_MUTED_NOT_DELIVERED_NOTICE, { notice: NOTICE.CONTROL });');
     expect(index).toContain('journalPublishSessionNotice(session, ROOM_MESSAGE_QUEUED_NOTICE, { notice: NOTICE.CONTROL });');
     const gate = body('function flushRoomInbox(session) {', '\n}\n');
     expect(gate).toContain('{ notice: flushed ? NOTICE.CONTROL : NOTICE.DELIVERY_FAILED });');

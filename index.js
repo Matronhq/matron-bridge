@@ -10357,8 +10357,8 @@ function deliverRoomFrameTo(room, frame) {
     if (disposition === 'muted-user' && echoFrom) {
       const convoId = live ? journalConvoIdFor(session) : sleepingConvoIdFor(room.sessionRoomId);
       if (convoId) {
-        journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }));
-        journalPublishNotice(convoId, ROOM_MUTED_NOT_DELIVERED_NOTICE);
+        journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }), { notice: NOTICE.CONTROL });
+        journalPublishNotice(convoId, ROOM_MUTED_NOT_DELIVERED_NOTICE, { notice: NOTICE.CONTROL });
       }
     }
     return;
@@ -10386,7 +10386,7 @@ function deliverRoomFrameTo(room, frame) {
     // flush that actually delivers it (the 📨 line).
     journalPublishSessionNotice(session,
       formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }),
-      { turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.PEER });
+      { notice: NOTICE.CONTROL, turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.PEER });
   }
   // A reply consumed by an agent_chat_send wait already reached the agent
   // inline as the tool result — the session is busy for the whole tool call,
