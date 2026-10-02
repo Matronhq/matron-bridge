@@ -2145,7 +2145,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // avoid. Counted BEFORE the drop clears the inbox.
     const teardown = src.slice(start, end);
     expect(teardown.indexOf('roomDelivery.pendingCount(')).toBeLessThan(teardown.indexOf('roomDelivery.dropSession('));
-    expect(teardown).toMatch(/if \(strandedRoomMessages && convoId\) \{\s*\n\s*journalPublishNotice\(convoId, formatRoomDeliveryFailedNotice\(strandedRoomMessages\)\)/);
+    expect(teardown).toMatch(/if \(strandedRoomMessages && convoId\) \{\s*\n\s*journalPublishNotice\(convoId, formatRoomDeliveryFailedNotice\(strandedRoomMessages\), \{ notice: NOTICE\.DELIVERY_FAILED \}\)/);
     // Eviction must NOT leave the rooms (2026-09-21): the conversation is
     // still resumable and keeps them. The I4 black-hole guard lives in
     // deliverRoomFrameTo / orphanRoomBinding instead (test/agent-chat.test.js).

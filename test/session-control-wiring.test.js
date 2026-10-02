@@ -44,13 +44,13 @@ describe('session control wiring (source inspection)', () => {
     expect(auth).toBeLessThan(fn.indexOf('findSessionByClaudeSessionId(params.convoId)'));
   });
   it('applies steps through the existing switch, model, compact and turn paths', () => {
-    const fn = body('async function applyControlSteps(session, steps) {', '\nfunction drainDeferredControls(');
+    const fn = body('async function applyControlSteps(session, steps, { turnOrigin = null } = {}) {', '\nfunction drainDeferredControls(');
     expect(fn).toContain('await switchAgentSession(current.roomId, step.agent, { sendReply: ctx.sendReply });');
     expect(fn).toContain('if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true })) {');
     // The model rides into an agent switch via agentSessions[target].model.
     expect(fn).toContain('{ agentSessions: mergeAgentStates(persisted.agentSessions, { [step.agent]: targetState }) });');
-    expect(fn).toContain("await journalRouteTextToSession(current, '/compact');");
-    expect(fn).toContain('sendTextToSession(current, step.text, { skipJournalMirror: true })');
+    expect(fn).toContain("await journalRouteTextToSession(current, '/compact', { turnOrigin });");
+    expect(fn).toContain('sendTextToSession(current, step.text, { skipJournalMirror: true, turnOrigin })');
   });
   it('drains parked slots from the shared free gate, before room delivery, and never on an occupied session', () => {
     const gate = body('function maybeFlushRoomDelivery(session) {', '\n}');
@@ -121,8 +121,10 @@ describe('automatic carry-on wiring (source inspection)', () => {
     expect(fire).toContain('if (controlOccupied(session)) return;');
     expect(fire).toContain('session._autoResume = null;');
     expect(fire).toContain("if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {");
-    expect(fire).toContain("await journalRouteTextToSession(session, '/compact');");
-    expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));");
+    expect(fire).toContain("await journalRouteTextToSession(session, '/compact', { turnOrigin });");
+    expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT), { turnOrigin });");
+    // The 🕒 line opens the carry-on turn: usage_limit for a limit reset, carry_on after a model recovery.
+    expect(fire).toContain("const turnOrigin = slot.kind === 'model_recovery' ? TURN_ORIGIN.CARRY_ON : TURN_ORIGIN.USAGE_LIMIT;");
     expect(fire).toContain("slot.kind === 'model_recovery'");
     // A thrown delivery puts the slot back unless something newer was armed.
     expect(fire).toContain('if (!live._autoResume) { live._autoResume = slot; persistControlState(live); }');

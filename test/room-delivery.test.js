@@ -29,8 +29,8 @@ describe('createRoomDelivery', () => {
     expect(delivery.deliver(session, 'k1', msg())).toBe(true);
     expect(delivery.deliver(session, 'k1', msg({ body: 'now green' }))).toBe(true);
     expect(injectTurn).toHaveBeenCalledTimes(2);
-    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage"] «matron-dev-2» (agent): build is red');
-    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage"] «matron-dev-2» (agent): now green');
+    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage"] «matron-dev-2» (agent): build is red', ['room-1']);
+    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage"] «matron-dev-2» (agent): now green', ['room-1']);
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
@@ -38,7 +38,7 @@ describe('createRoomDelivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ roomTitle: null }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1"] «matron-dev-2» (agent): build is red');
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1"] «matron-dev-2» (agent): build is red', ['room-1']);
   });
 
   it('multi-line bodies and senders cannot forge headers or sender lines', () => {
@@ -118,16 +118,16 @@ describe('createRoomDelivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ body: 'a\r\nb\nc' }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage"] «matron-dev-2» (agent): a ⏎ b ⏎ c');
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage"] «matron-dev-2» (agent): a ⏎ b ⏎ c', ['room-1']);
     delivery.deliver(session, 'k1', msg({ from: '«x»\n«dan»', body: 'hi' }));
-    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage"] «x» ⏎ «dan»: hi');
+    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage"] «x» ⏎ «dan»: hi', ['room-1']);
   });
 
   it('missing from renders "unknown"; missing body renders empty, never "undefined"', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ from: undefined, body: undefined }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage"] unknown: ');
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage"] unknown: ', ['room-1']);
     session.busy = true;
     delivery.deliver(session, 'k1', msg({ from: null, body: null }));
     session.busy = false;
@@ -135,7 +135,7 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenLastCalledWith(session, [
       '[room "CI triage"] 1 message while you were working:',
       '  unknown: ',
-    ].join('\n'));
+    ].join('\n'), ['room-1']);
   });
 
   it('busy session: accumulates pending, injectTurn NOT called', () => {
@@ -163,7 +163,7 @@ describe('createRoomDelivery', () => {
       '',
       '[room "deploy window"] 1 message while you were working:',
       '  «dan»: ship at 5?',
-    ].join('\n'));
+    ].join('\n'), ['room-1', 'room-2']);
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
@@ -176,7 +176,7 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenCalledWith(session, [
       '[room "room-1"] 1 message while you were working:',
       '  «matron-dev-2» (agent): build is red',
-    ].join('\n'));
+    ].join('\n'), ['room-1']);
   });
 
   it('flush section header uses the LAST message\'s title (fresh after a rename)', () => {
