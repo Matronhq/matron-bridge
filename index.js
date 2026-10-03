@@ -174,7 +174,7 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
-import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
+import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW, splitSpoken, spokenPayload, spokenRefFor } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -6419,6 +6419,11 @@ async function maybeUpdatePinnedSummary(session) {
     // prior ROSTER paragraph as a fenced context preamble.
     const { messages, nextCount } = summaryWindow(session.chatHistory, session.lastSummaryMsgCount);
     if (!messages.length) return;
+    // Which reply the spoken lines will belong to. Read here, in the same
+    // step as the window and BEFORE the model call below: that call takes
+    // seconds, and a reply flushed by the next turn meanwhile must not lend
+    // its ref to this window's lines.
+    const replyRef = spokenRefFor(messages, session._lastReplyRef);
     const prompt = buildSummaryPrompt({
       messages,
       priorRoster: session.lastRosterText || null,
@@ -6426,7 +6431,10 @@ async function maybeUpdatePinnedSummary(session) {
     });
 
     const text = await summaryModel.generate(prompt);
-    const parsed = parseTitlePassResponse(text);
+    // The spoken lines come out first; the title/summary parser gets the rest
+    // (see splitSpoken for why it must not see spoken prose).
+    const voiced = splitSpoken(text);
+    const parsed = parseTitlePassResponse(voiced.rest);
 
     // Update room name (Element sidebar truncates visually, full name visible on hover)
     if (parsed.title) {
@@ -6450,12 +6458,16 @@ async function maybeUpdatePinnedSummary(session) {
     }
 
     // TOC event: one per successful pass, anchored by its own journal seq.
+    // It also carries the spoken version of the agent's last reply for voice
+    // mode — {spoken, spoken_more?, spoken_ref}, all or none (spokenPayload).
+    // Old apps ignore the extra keys; the journal passes the payload through.
     const toc = (parsed.added || parsed.summary || '').trim();
     if (toc) {
       journalPublish(session, 'publishSummary', {
         toc: toc.slice(0, 300),
         detail: (parsed.roster || '').slice(0, 1000),
         model: summaryModel.model,
+        ...spokenPayload(voiced, replyRef),
       });
     }
 

@@ -471,8 +471,10 @@ describe('parseTitlePassResponse (Gemini title-pass parsing)', () => {
 describe('title-pass wiring in index.js (source inspection)', () => {
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
 
-  it('routes the Gemini response through parseTitlePassResponse', () => {
-    expect(indexSrc).toMatch(/const parsed = parseTitlePassResponse\(text\);/);
+  it('routes the Gemini response through parseTitlePassResponse, with the spoken lines already cut out', () => {
+    // The spoken lines (voice mode) are taken out by splitSpoken first; the
+    // parser must be given what is left. See test/spoken-summary-wiring.test.js.
+    expect(indexSrc).toMatch(/const parsed = parseTitlePassResponse\(voiced\.rest\);/);
   });
 
   it('builds the prompt via buildSummaryPrompt instead of hand-rolling it', () => {

@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import { armReplyRef, settleReplyRef } from '../lib/journal-stream.js';
+import { summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor } from '../lib/summary-pass.js';
+import { parseTitlePassResponse, withSessionShort, titleMarkerFor } from '../lib/journal-title-seed.js';
 
 // The spoken summary (voice mode, matron-apple spec 2026-10-03 §1) as index.js
 // wires it. Importing index.js would start the bridge, so the two functions
@@ -89,5 +91,114 @@ describe('reply ref wiring (flushResponse)', () => {
     expect(received).toEqual(['The fix is ready.']);
     expect(session._journalDurableRef).toBeNull();
     expect(session._lastReplyRef).toBeNull();
+  });
+});
+
+// maybeUpdatePinnedSummary is run for real too, with the model and the journal
+// stubbed: `answer` is what the model returns, and the result is every journal
+// publish the pass made. `during` runs while the model call is in flight.
+async function runPass(session, answer, { during } = {}) {
+  const start = src.indexOf('async function maybeUpdatePinnedSummary(');
+  const end = src.indexOf('\n}\n', start) + 2;
+  expect(start, 'could not find maybeUpdatePinnedSummary in index.js — this test needs updating').toBeGreaterThan(-1);
+  const published = [];
+  const context = vm.createContext({
+    applyFallbackTitle: () => {}, SERVER_LABEL: 'bridge', updateRoomName: () => {},
+    summaryModel: { model: 'test-model', generate: async () => { during?.(); return answer; } },
+    summaryModelNag: { maybeFile: () => {} },
+    journalConvoIdFor: () => 'convo', debug: () => {}, console,
+    summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor,
+    parseTitlePassResponse, withSessionShort, titleMarkerFor,
+    journalUpsertConvo: () => {}, persistSession: () => {},
+    // JSON round trip: the payload is built inside the vm, in another realm.
+    journalPublish: (_session, method, payload) => published.push({ method, payload: JSON.parse(JSON.stringify(payload)) }),
+  });
+  vm.runInContext(src.slice(start, end), context);
+  await context.maybeUpdatePinnedSummary(session);
+  return published;
+}
+
+// A session whose turn has just ended: one user message, one reply, and the
+// ref that reply's text event was published under.
+function turnEnded(extra = {}) {
+  return {
+    roomId: 'room', claudeSessionId: 'ab12', workdir: '/tmp/w',
+    chatHistory: [{ role: 'user', text: 'Fix the export.' }, { role: 'assistant', text: 'Fixed. Shall I deploy it?' }],
+    pinnedSummaryText: '• Looked at the export.', lastSummaryMsgCount: 0, lastRosterText: '',
+    _lastReplyRef: 'msg_A',
+    ...extra,
+  };
+}
+
+const ANSWER = [
+  'TITLE: export fix',
+  'NEW: Fixed the export.',
+  'SPOKEN: The agent asks whether to deploy now. The export is fixed.',
+  'SPOKEN_MORE: Deploying now puts it live tonight,',
+  'before anyone has reviewed it.',
+  'ROSTER: Fixing the nightly export.',
+].join('\n');
+
+describe('spoken summary wiring (maybeUpdatePinnedSummary)', () => {
+  it('publishes one summary event carrying {toc, detail, model, spoken, spoken_more, spoken_ref}', async () => {
+    const published = await runPass(turnEnded(), ANSWER);
+    expect(published).toEqual([{
+      method: 'publishSummary',
+      payload: {
+        toc: 'Fixed the export.',
+        detail: 'Fixing the nightly export.',
+        model: 'test-model',
+        spoken: 'The agent asks whether to deploy now. The export is fixed.',
+        spoken_more: 'Deploying now puts it live tonight, before anyone has reviewed it.',
+        spoken_ref: 'msg_A',
+      },
+    }]);
+    expect(Object.keys(published[0].payload)).toEqual(['toc', 'detail', 'model', 'spoken', 'spoken_more', 'spoken_ref']);
+  });
+
+  it('leaves spoken_more out when the model wrote NONE', async () => {
+    const [{ payload }] = await runPass(turnEnded(), ANSWER.replace(/SPOKEN_MORE:[\s\S]*?\nROSTER/, 'SPOKEN_MORE: none\nROSTER'));
+    expect(payload.spoken).toBe('The agent asks whether to deploy now. The export is fixed.');
+    expect(payload.spoken_ref).toBe('msg_A');
+    expect('spoken_more' in payload).toBe(false);
+  });
+
+  it('with no SPOKEN line the event is published exactly as before', async () => {
+    const [{ payload }] = await runPass(turnEnded(), 'TITLE: export fix\nNEW: Fixed the export.\nROSTER: Fixing the nightly export.');
+    expect(payload).toEqual({ toc: 'Fixed the export.', detail: 'Fixing the nightly export.', model: 'test-model' });
+  });
+
+  it('a turn in which the agent said nothing gets no spoken keys, whatever the model wrote', async () => {
+    // Only a user message is new: _lastReplyRef still names the reply of an
+    // EARLIER turn, and these lines must not be hung on it.
+    const session = turnEnded({ lastSummaryMsgCount: 2 });
+    session.chatHistory.push({ role: 'user', text: 'Actually, stop.' });
+    const [{ payload }] = await runPass(session, ANSWER);
+    expect(payload).toEqual({ toc: 'Fixed the export.', detail: 'Fixing the nightly export.', model: 'test-model' });
+  });
+
+  it('a reply whose text event carried no ref gets no spoken keys', async () => {
+    const [{ payload }] = await runPass(turnEnded({ _lastReplyRef: null }), ANSWER);
+    expect(payload).toEqual({ toc: 'Fixed the export.', detail: 'Fixing the nightly export.', model: 'test-model' });
+  });
+
+  it('a reply flushed while the model was answering does not lend its ref to this pass', async () => {
+    const session = turnEnded();
+    const [{ payload }] = await runPass(session, ANSWER, { during: () => { session._lastReplyRef = 'msg_LATER'; } });
+    expect(payload.spoken_ref).toBe('msg_A');
+  });
+
+  it('cuts over-long lines to 400 and 1,200 characters', async () => {
+    const long = (n) => Array.from({ length: n }, () => 'word').join(' ');
+    const [{ payload }] = await runPass(turnEnded(), `NEW: n\nSPOKEN: ${long(200)}\nSPOKEN_MORE: ${long(400)}\nROSTER: r`);
+    expect(payload.spoken.length).toBe(399); // 80 whole words
+    expect(payload.spoken_more.length).toBe(1199); // 240 whole words
+  });
+
+  it('spoken prose never becomes the table-of-contents line (first pass, SUMMARY variant)', async () => {
+    const answer = 'TITLE: export fix\nSUMMARY: Fixed the export.\nSPOKEN: Here is what is new: the export works.\nROSTER: Fixing the nightly export.';
+    const [{ payload }] = await runPass(turnEnded({ pinnedSummaryText: '' }), answer);
+    expect(payload.toc).toBe('Fixed the export.');
+    expect(payload.spoken).toBe('Here is what is new: the export works.');
   });
 });
