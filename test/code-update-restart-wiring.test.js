@@ -27,6 +27,14 @@ describe('code-update self-restart wiring', () => {
     expect(index).toMatch(/const CODE_UPDATE_RESTART = codeUpdateRestartEnabled\(process\.env\.MATRON_CODE_UPDATE_RESTART\)/);
   });
 
+  it('never forces a mid-turn restart unless the box opts in (deploy-1, 2026-10-03)', () => {
+    // 0 = never; the env is the only way to turn forcing on.
+    expect(index).toMatch(/const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff\(process\.env\.MATRON_CODE_UPDATE_FORCE_AFTER_MS, CODE_UPDATE_FORCE_AFTER_DEFAULT_MS\)/);
+    expect(fn).toMatch(/forceAfterMs: CODE_UPDATE_FORCE_AFTER_MS,/);
+    expect(fn).toMatch(/warnEveryMs: CODE_UPDATE_WARN_EVERY_MS,/);
+    expect(index).not.toMatch(/MAX_DEFER/);
+  });
+
   it('counts mid-turn sessions as alive && busy — the flag /sessions reports and restart_session parks on', () => {
     expect(fn).toMatch(/busySessions: \(\) => \{[^}]*s\.alive && s\.busy/);
   });

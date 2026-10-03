@@ -5,7 +5,9 @@ import path from 'node:path';
 import {
   RESTART_EXIT_CODE,
   DEFAULT_SETTLE_MS,
-  DEFAULT_MAX_DEFER_MS,
+  DEFAULT_WARN_EVERY_MS,
+  DEFAULT_FORCE_AFTER_MS,
+  parseMsOrOff,
   parseMs,
   restartEnabled,
   resolveGitDir,
@@ -183,31 +185,58 @@ describe('createCodeUpdateWatcher — a landed update', () => {
     expect(await watcher.tick()).toEqual({ action: 'restart', sha: NEW, forced: false, busy: 0, waitedMs: 120_000 });
   });
 
-  it('goes ahead mid-turn once the deferral cap is reached, and says so', async () => {
+  it('NEVER restarts while a turn is running, however long, and says so every 30 min', async () => {
+    // deploy-1, 2026-10-03 05:51 UTC: the old 30 min cap cut a production
+    // deploy shell off mid-run. A running turn is a running turn.
     const { state, watcher } = harness({ head: { sha: NEW, at: T0 - DEFAULT_SETTLE_MS }, busy: 1 });
     await watcher.tick();
-    state.now = T0 + DEFAULT_MAX_DEFER_MS - 1;
-    expect((await watcher.tick()).action).toBe('waiting');
-    state.now = T0 + DEFAULT_MAX_DEFER_MS;
-    expect(await watcher.tick()).toEqual({ action: 'restart', sha: NEW, forced: true, busy: 1, waitedMs: DEFAULT_MAX_DEFER_MS });
-    expect(state.warn.join('\n')).toMatch(/1 session\(s\) still mid-turn after 30 min — restarting onto bbbbbbb anyway/);
+    expect(state.log.join('\n')).toMatch(/Restarting when no session is mid-turn, never mid-turn\./);
+    for (let m = 1; m <= 6 * 60; m++) {
+      state.now = T0 + m * 60_000;
+      expect((await watcher.tick()).action).toBe('waiting');
+    }
+    expect(state.restarts).toEqual([]);
+    // Six hours of waiting: a warning at 30, 60, … 360 min, none before.
+    expect(state.warn).toHaveLength(12);
+    expect(state.warn[0]).toMatch(/still waiting to restart onto bbbbbbb: 1 session\(s\) mid-turn for 30 min; a running turn is never cut off/);
+    expect(state.warn[11]).toMatch(/mid-turn for 360 min/);
+    // The moment the turn ends, it goes.
+    state.busy = 0;
+    state.now = T0 + 361 * 60_000;
+    expect(await watcher.tick()).toEqual({ action: 'restart', sha: NEW, forced: false, busy: 0, waitedMs: 361 * 60_000 });
   });
 
-  it('honours a custom cap and settle window', async () => {
-    const { state, watcher } = harness({ head: { sha: NEW, at: T0 - 10_000 }, busy: 1, settleMs: 10_000, maxDeferMs: 20_000 });
+  it('forces a mid-turn restart only when a box opts in with forceAfterMs', async () => {
+    const { state, watcher } = harness({ head: { sha: NEW, at: T0 - 10_000 }, busy: 1, settleMs: 10_000, forceAfterMs: 20_000 });
+    expect((await watcher.tick()).action).toBe('waiting');
+    expect(state.log.join('\n')).toMatch(/forced after 0 min/);
+    state.now = T0 + 19_999;
     expect((await watcher.tick()).action).toBe('waiting');
     state.now = T0 + 20_000;
-    expect((await watcher.tick()).forced).toBe(true);
+    expect(await watcher.tick()).toEqual({ action: 'restart', sha: NEW, forced: true, busy: 1, waitedMs: 20_000 });
+    expect(state.warn.join('\n')).toMatch(/MATRON_CODE_UPDATE_FORCE_AFTER_MS\) — restarting onto bbbbbbb anyway/);
+  });
+
+  it('honours a custom warning interval', async () => {
+    const { state, watcher } = harness({ head: { sha: NEW, at: T0 - DEFAULT_SETTLE_MS }, busy: 2, warnEveryMs: 10_000 });
+    await watcher.tick();
+    state.now = T0 + 9_000; await watcher.tick();
+    expect(state.warn).toHaveLength(0);
+    state.now = T0 + 10_000; await watcher.tick();
+    state.now = T0 + 15_000; await watcher.tick();
+    state.now = T0 + 20_000; await watcher.tick();
+    expect(state.warn).toHaveLength(2);
+    expect(state.restarts).toEqual([]);
   });
 
   it('counts the deferral from when the update landed and settled, not from boot', async () => {
-    // Boot, then an hour later a pull: the clock for the cap starts at the pull.
+    // Boot, then an hour later a pull: the waiting clock starts at the pull.
     const { state, watcher } = harness({ head: { sha: OLD, at: T0 - 3600_000 }, busy: 1 });
     await watcher.tick();
     state.now = T0 + 3600_000;
     state.head = { sha: NEW, at: state.now - DEFAULT_SETTLE_MS };
     expect(await watcher.tick()).toEqual({ action: 'waiting', sha: NEW, busy: 1, waitedMs: 0 });
-    expect(watcher.pending).toEqual({ sha: NEW, since: state.now });
+    expect(watcher.pending).toEqual({ sha: NEW, since: state.now, warnedAt: state.now });
   });
 });
 
@@ -284,7 +313,7 @@ describe('createCodeUpdateWatcher — HEAD moving again', () => {
     state.head = { sha: NEWER, at: state.now - DEFAULT_SETTLE_MS };
     expect(await watcher.tick()).toEqual({ action: 'waiting', sha: NEWER, busy: 1, waitedMs: 0 });
     expect(state.preflights).toBe(2);
-    expect(watcher.pending).toEqual({ sha: NEWER, since: state.now });
+    expect(watcher.pending).toEqual({ sha: NEWER, since: state.now, warnedAt: state.now });
   });
 
   it('ignores ticks that land while a preflight is running', async () => {
@@ -306,9 +335,15 @@ describe('createCodeUpdateWatcher — HEAD moving again', () => {
 });
 
 describe('createCodeUpdateWatcher — defaults', () => {
-  it('uses the documented settle and cap by default', () => {
+  it('settles 5 min, warns every 30 min, and never forces unless told to', () => {
     expect(DEFAULT_SETTLE_MS).toBe(5 * 60_000);
-    expect(DEFAULT_MAX_DEFER_MS).toBe(30 * 60_000);
+    expect(DEFAULT_WARN_EVERY_MS).toBe(30 * 60_000);
+    expect(DEFAULT_FORCE_AFTER_MS).toBe(0);
+    expect(parseMsOrOff(undefined, 0)).toBe(0);
+    expect(parseMsOrOff('0', 5)).toBe(0);
+    expect(parseMsOrOff('600000', 0)).toBe(600000);
+    expect(parseMsOrOff('-1', 0)).toBe(0);
+    expect(parseMsOrOff('later', 7)).toBe(7);
     vi.restoreAllMocks();
   });
 });
