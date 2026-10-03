@@ -5354,8 +5354,9 @@ function flushResponse(session) {
     }
   }
   // Remember which ref this reply's text event carried (session._lastReplyRef)
-  // for the turn-end summary pass.
-  settleReplyRef(session, armedReply);
+  // for the turn-end summary pass — unless the pass will never see this reply
+  // (code only, kept out of chatHistory above).
+  settleReplyRef(session, armedReply, { summarised: Boolean(cleanText) });
   // Bump idle clock whenever we have assistant text to flush, regardless
   // of whether a callback is wired. The guard above is about output
   // delivery; the activity timestamp is about session liveness.

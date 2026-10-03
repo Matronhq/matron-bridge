@@ -10,6 +10,8 @@
 
 **Spec:** `/Users/danbarker/Dev/matron-apple-voice-design/docs/superpowers/specs/2026-10-03-voice-mode-carplay-design.md`, section 1 "The spoken version (matron-bridge)" and the bridge line of section 14 "Testing". Read section 1 before starting. Sections 2 to 13 are other plans.
 
+> **Superseded wording (3 Oct 2026):** the `SPOKEN` and `SPOKEN_MORE` prompt strings quoted in Tasks 1 and 2 below are the first draft. After running the real summary model they were reworded (first person, name what blocks the agent, `NONE` when there is nothing to add). The strings in `lib/summary-pass.js` and `test/summary-pass.test.js` are the current ones; do not restore the text quoted here. `settleReplyRef` also gained a `summarised` option after review (a code-only reply is not remembered).
+
 ## Global Constraints
 
 - **Names, exactly:** output lines `SPOKEN:` and `SPOKEN_MORE:`; payload keys `spoken`, `spoken_more`, `spoken_ref`. The `summary` event payload becomes `{toc, detail, model, spoken, spoken_more, spoken_ref}`.

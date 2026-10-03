@@ -97,4 +97,12 @@ describe('armReplyRef / settleReplyRef (the ref a flushed reply is published und
     expect(session._journalDurableRef).toBe('msg_A');
     expect(session._lastReplyRef).toBeNull();
   });
+
+  it('a reply the summary pass will not see is not remembered, even when its text event took the ref', () => {
+    const session = { sendCallback: () => {}, _journalStreamRef: null, _journalDurableRef: null, _lastReplyRef: 'msg_OLD' };
+    const armed = armReplyRef(session, () => 'uuid-9');
+    session._journalDurableRef = null; // sendToRoom consumed it
+    expect(settleReplyRef(session, armed, { summarised: false })).toBeNull();
+    expect(session._lastReplyRef).toBeNull();
+  });
 });

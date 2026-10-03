@@ -83,6 +83,18 @@ describe('reply ref wiring (flushResponse)', () => {
     expect(session._lastReplyRef).toBe(events[1].message_ref);
   });
 
+  it('a reply that is only a code block is published with its ref but not remembered: the summary pass never saw it', () => {
+    // flushResponse keeps code-only replies out of chatHistory, so the summary
+    // model cannot have written about one. Remembering its ref would hang a
+    // spoken line about an earlier reply on this one.
+    const { session, events } = sessionWith({ _lastReplyRef: 'msg_OLD', responseBuffer: '```sh\nls\n```' });
+    flushWith(session);
+    expect(events).toHaveLength(1);
+    expect(events[0].message_ref).toMatch(UUID);
+    expect(session.chatHistory).toEqual([]);
+    expect(session._lastReplyRef).toBeNull();
+  });
+
   it('a callback that does not publish through sendToRoom leaves nothing armed and nothing remembered', () => {
     const received = [];
     const { session } = sessionWith({ _lastReplyRef: 'msg_OLD' });
