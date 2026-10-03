@@ -118,10 +118,15 @@ describe('sessionContextWindow', () => {
   });
   it('before the first transcript id, a family alias stands in for the model it resolves to', () => {
     expect(sessionContextWindow({ alias: 'opus' })).toBe(1_000_000);
-    expect(sessionContextWindow({ alias: 'opusplan' })).toBe(1_000_000);
     expect(sessionContextWindow({ alias: 'fable' })).toBe(1_000_000);
     expect(sessionContextWindow({ alias: 'sonnet' })).toBe(200_000);
     expect(sessionContextWindow({ alias: 'haiku' })).toBe(200_000);
+  });
+  it('`opusplan` is a mixed alias (Opus in plan mode, Sonnet otherwise): the id decides, and it rests on Sonnet before any id', () => {
+    expect(sessionContextWindow({ model: 'claude-sonnet-4-6', alias: 'opusplan', contextTokens: 50_000 })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opusplan', contextTokens: 50_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ alias: 'opusplan' })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-sonnet-4-6', alias: 'opusplan[1m]' })).toBe(1_000_000);
   });
   it('a switch to another family makes the previous id stale: the alias decides until the new id arrives', () => {
     // opus[1m] -> sonnet: the alias is sonnet, the last assistant record still
