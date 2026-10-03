@@ -99,7 +99,8 @@ import {
   AUTO_CARRY_ON_TEXT as CODE_UPDATE_AUTO_CARRY_ON_TEXT, AUTO_CARRY_ON_DELAY_MS as CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
   RESTART_EXIT_CODE as CODE_UPDATE_EXIT_CODE,
   DEFAULT_POLL_MS as CODE_UPDATE_POLL_DEFAULT_MS, DEFAULT_SETTLE_MS as CODE_UPDATE_SETTLE_DEFAULT_MS,
-  DEFAULT_MAX_DEFER_MS as CODE_UPDATE_MAX_DEFER_DEFAULT_MS,
+  DEFAULT_WARN_EVERY_MS as CODE_UPDATE_WARN_EVERY_DEFAULT_MS, DEFAULT_FORCE_AFTER_MS as CODE_UPDATE_FORCE_AFTER_DEFAULT_MS,
+  parseMsOrOff as parseCodeUpdateMsOrOff,
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
@@ -292,13 +293,16 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 const RESTART_CARRY_ON_MAX_AGE_MS = parseInt(process.env.MATRON_RESTART_CARRY_ON_MAX_AGE_MS || '21600000', 10);
 // Restart onto new code by itself (lib/code-update-restart.js): poll the
 // checkout's HEAD reflog, let a landed update settle, then exit for the
-// supervisor at the first poll with no session mid-turn — or after
-// MAX_DEFER regardless. MATRON_CODE_UPDATE_RESTART=0 switches it off.
+// supervisor at the first poll with no session mid-turn — never while a
+// turn runs (deploy-1's production deploy was killed by the old 30 min cap
+// on 2026-10-03), unless MATRON_CODE_UPDATE_FORCE_AFTER_MS opts a box in.
+// MATRON_CODE_UPDATE_RESTART=0 switches it off.
 const CODE_UPDATE_RESTART = codeUpdateRestartEnabled(process.env.MATRON_CODE_UPDATE_RESTART);
 const CODE_UPDATE_POLL_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_POLL_MS, CODE_UPDATE_POLL_DEFAULT_MS);
 const CODE_UPDATE_SETTLE_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_SETTLE_MS, CODE_UPDATE_SETTLE_DEFAULT_MS);
-const CODE_UPDATE_MAX_DEFER_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_MAX_DEFER_MS, CODE_UPDATE_MAX_DEFER_DEFAULT_MS);
-// A self-restart that had to cut turns off (the deferral cap) leaves this
+const CODE_UPDATE_WARN_EVERY_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_WARN_EVERY_MS, CODE_UPDATE_WARN_EVERY_DEFAULT_MS);
+const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff(process.env.MATRON_CODE_UPDATE_FORCE_AFTER_MS, CODE_UPDATE_FORCE_AFTER_DEFAULT_MS);
+// A self-restart that had to cut turns off (FORCE_AFTER, opt-in) leaves this
 // stamp; the next boot resumes those chats by itself instead of carding
 // them. MATRON_CODE_UPDATE_AUTO_CARRY_ON=0 keeps the tap.
 const CODE_UPDATE_AUTO_CARRY_ON = codeUpdateAutoCarryOnEnabled(process.env.MATRON_CODE_UPDATE_AUTO_CARRY_ON);
@@ -9799,9 +9803,10 @@ function startCodeUpdateWatcher() {
     warn: (m) => console.warn(m),
     bootSha: boot.sha,
     settleMs: CODE_UPDATE_SETTLE_MS,
-    maxDeferMs: CODE_UPDATE_MAX_DEFER_MS,
+    warnEveryMs: CODE_UPDATE_WARN_EVERY_MS,
+    forceAfterMs: CODE_UPDATE_FORCE_AFTER_MS,
   });
-  console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, defer at most ${CODE_UPDATE_MAX_DEFER_MS}ms)`);
+  console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, ${CODE_UPDATE_FORCE_AFTER_MS > 0 ? `forced after ${CODE_UPDATE_FORCE_AFTER_MS}ms` : 'never mid-turn'})`);
   const timer = setInterval(() => {
     watcher.tick().catch(e => { try { console.warn(`[code-update] tick failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
   }, CODE_UPDATE_POLL_MS);

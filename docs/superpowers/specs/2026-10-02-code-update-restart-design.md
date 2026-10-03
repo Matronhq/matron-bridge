@@ -39,11 +39,15 @@ The bridge watches its own checkout and restarts itself.
    `restart_session` parks on). A session between turns is killed and
    resumes with its history on its next turn — what a bridge restart has
    always meant for it.
-5. **Cap the wait.** After `MATRON_CODE_UPDATE_MAX_DEFER_MS` (30 min) the
-   restart goes ahead mid-turn. The interrupted turns leave inflight markers,
-   so the next boot publishes a "Carry on" card into each chat
-   (2026-08-11 restart carry-on design). The wait is counted from when the
-   update settled, not from boot; a newer update on top restarts the clock.
+5. **Never mid-turn.** A running turn is never cut off. The first version
+   forced the restart after a 30 min cap; on 2026-10-03 at 05:51 UTC that
+   killed deploy-1's production deploy shell mid-`cap` (two sessions were
+   mid-turn for 31 min). Now the watcher keeps waiting and warns every
+   `MATRON_CODE_UPDATE_WARN_EVERY_MS` (30 min). A box can opt in to the old
+   behaviour with `MATRON_CODE_UPDATE_FORCE_AFTER_MS`: after that long the
+   restart goes ahead mid-turn and section 7 applies. The wait is counted
+   from when the update settled, not from boot; a newer update on top
+   restarts the clock.
 6. **Restart.** The ordinary `gracefulShutdown` (kill every session, flush
    the journal outbox) with exit code 75 (`EX_TEMPFAIL`). Non-zero on
    purpose: launchd's `KeepAlive { SuccessfulExit = false }` relaunches only
@@ -51,7 +55,7 @@ The bridge watches its own checkout and restarts itself.
    restart-on-failure relaunch either way.
 
 7. **Carry on by itself.** (Added the same evening; Dan asked for an
-   option.) A forced restart writes `~/.matron-bridge-self-restart.json`
+   option.) A forced restart (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`, opt-in) writes `~/.matron-bridge-self-restart.json`
    (`bootId`, `sha`, `busy`) before it exits. The next boot takes the stamp
    (read and removed) and, for every stale inflight marker whose `bootId`
    is the stamp's, publishes a notice and resumes the session with

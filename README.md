@@ -207,8 +207,10 @@ new code on disk and the old process running. The bridge notices by itself:
 it polls its checkout's HEAD reflog, lets a landed update settle for five
 minutes (so `npm install` has finished), proves the tree boots with the same
 preflight the deploy scripts run, and then exits for the supervisor to
-relaunch it at the first poll where no session is mid-turn — or after 30
-minutes regardless, in which case the interrupted chats carry on by
+relaunch it at the first poll where no session is mid-turn. A running turn
+is never cut off: the bridge keeps waiting and logs a warning every 30
+minutes. A box that would rather force the restart after a while sets
+`MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
 themselves (`MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` gives them the "Carry on"
 card instead). Sessions between turns resume with their history on their next turn,
 as with any restart. The exit code is 75, non-zero on purpose: launchd only
@@ -228,8 +230,9 @@ relaunches after a non-zero exit. See
 | `MATRON_CODE_UPDATE_RESTART` | Restart the bridge by itself once newer code is on disk in its checkout (see "Self-restart onto new code" above). `0`/`false`/`off` disables it. | on |
 | `MATRON_CODE_UPDATE_POLL_MS` | How often the checkout's HEAD reflog is read for new code | `60000` (1 minute) |
 | `MATRON_CODE_UPDATE_SETTLE_MS` | How old a HEAD move must be before the new tree is preflighted and trusted (the deploy's `npm install` runs after the pull) | `300000` (5 minutes) |
-| `MATRON_CODE_UPDATE_MAX_DEFER_MS` | Longest a landed update waits for a moment with no session mid-turn before restarting anyway | `1800000` (30 minutes) |
-| `MATRON_CODE_UPDATE_AUTO_CARRY_ON` | After a self-restart that had to cut turns off, resume those chats automatically with an `[auto-continue after bridge update]` turn instead of publishing a "Carry on" card. `0`/`false`/`off` keeps the card. | on |
+| `MATRON_CODE_UPDATE_WARN_EVERY_MS` | How often the bridge logs that it is still waiting for a running turn before it can restart onto new code | `1800000` (30 minutes) |
+| `MATRON_CODE_UPDATE_FORCE_AFTER_MS` | Opt-in: after this long waiting for a running turn, restart anyway (the turn is cut off and carries on by itself, see the next row). `0` never forces. | `0` (never) |
+| `MATRON_CODE_UPDATE_AUTO_CARRY_ON` | After a forced self-restart (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) that cut turns off, resume those chats automatically with an `[auto-continue after bridge update]` turn instead of publishing a "Carry on" card. `0`/`false`/`off` keeps the card. | on |
 | `BASH_DEFAULT_TIMEOUT_MS` | Default timeout for a bridge-spawned Claude session's Bash tool call when the model sets none. Raises Claude Code's 120000 (2 min) built-in so long Codex reviews / test suites aren't SIGTERM'd mid-run. Positive integer ms; out-of-range (>`3600000` = 1h) is clamped, malformed is ignored. Applies at session spawn — restart to take effect. | `1200000` (20 min) |
 | `BASH_MAX_TIMEOUT_MS` | Ceiling for an explicit per-call Bash timeout in a bridge-spawned Claude session. Same parsing/clamping/restart semantics as `BASH_DEFAULT_TIMEOUT_MS`; raised to the resolved default if set lower. | `1800000` (30 min) |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
