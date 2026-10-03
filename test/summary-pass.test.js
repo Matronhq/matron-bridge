@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW, SUMMARY_WINDOW_CAP } from '../lib/summary-pass.js';
 
+// Voice mode spec 2026-10-03 §1, "What is written": the two lines, word for
+// word (the spec wraps them for the page; the prompt carries each on one line).
+const SPOKEN_LINE = 'SPOKEN: <what someone listening while driving should hear about the agent\'s latest reply, 40 words at most. First, anything the agent is asking or needs decided, naming the options. Then the outcome in one sentence. Then what it will do next, only if that matters. Plain spoken English. No code, file paths, URLs, PR or issue numbers, markdown or lists, and never a password, key, token or other secret value. If the reply has a table, a diff or a long list, say it is in the chat instead of reading it.>';
+const SPOKEN_MORE_LINE = 'SPOKEN_MORE: <the next thing that listener would want if they said "tell me more", 150 words at most. Do not repeat SPOKEN. Give the reasoning behind the question or result, what each option would mean, and any risk or caveat the agent raised. Same plain spoken style and the same exclusions. Write NONE if SPOKEN already says everything.>';
+
 const msgs = (n, start = 0) => Array.from({ length: n }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: `m${start + i}` }));
 
 describe('summaryWindow', () => {
@@ -44,6 +49,22 @@ describe('buildSummaryPrompt', () => {
   it('omits the preamble when there is no prior roster', () => {
     const p = buildSummaryPrompt({ messages: msgs(2), priorRoster: null, hasCumulative: false });
     expect(p).not.toContain('previous rolling summary');
+  });
+
+  it.each([
+    ['the NEW variant', true, 'NEW'],
+    ['the first-pass SUMMARY variant', false, 'SUMMARY'],
+  ])('%s asks for SPOKEN then SPOKEN_MORE, in the spec\'s words, with ROSTER still last', (_name, hasCumulative, second) => {
+    const p = buildSummaryPrompt({ messages: msgs(2), priorRoster: null, hasCumulative });
+    const format = p.slice(p.indexOf('Format:'), p.indexOf('\n\nMessages:'));
+    const keys = format.split('\n').filter((l) => /^[A-Z_]+: </.test(l)).map((l) => l.slice(0, l.indexOf(':')));
+    expect(keys).toEqual(['TITLE', second, 'SPOKEN', 'SPOKEN_MORE', 'ROSTER']);
+    expect(format.split('\n')).toContain(SPOKEN_LINE);
+    expect(format.split('\n')).toContain(SPOKEN_MORE_LINE);
+    // The numbered list above the format block names the spoken versions too,
+    // so the model is not told "three things" and shown five keys.
+    expect(p.slice(0, p.indexOf('Format:'))).toContain('3. Two spoken versions of the agent\'s latest reply, for someone listening instead of reading');
+    expect(p.slice(0, p.indexOf('Format:'))).toContain('4. A 2-3 sentence rolling summary');
   });
 });
 
