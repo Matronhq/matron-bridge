@@ -174,9 +174,9 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
-import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
+import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW, splitSpoken, spokenPayload, spokenRefFor } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
-import { streamRefFor } from './lib/journal-stream.js';
+import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
@@ -5338,14 +5338,14 @@ function flushResponse(session) {
   }
 
   // Arm the durable ref for the very next journal mirror (the first chunk's
-  // sendToRoom) so the streamed overlay retires by ref. Only when an overlay is
-  // actually open for this session (print-mode streamed this message) AND a
-  // callback will drive sendToRoom synchronously — otherwise the arm would leak
-  // onto a later, unrelated publish. journalStreamClear (at turn-end) clears
-  // any overlay this flush didn't retire.
-  if (session._journalStreamRef && session.sendCallback) {
-    session._journalDurableRef = session._journalStreamRef;
-  }
+  // sendToRoom): the streamed overlay's ref when one is open, so the overlay
+  // retires by ref, otherwise a fresh one, so every reply's text event can be
+  // pointed at (the summary pass's spoken_ref — see lib/journal-stream.js).
+  // Only when a callback will drive sendToRoom synchronously; settleReplyRef
+  // below disarms a fresh ref that no text event took, so it cannot leak onto
+  // a later, unrelated publish. journalStreamClear (at turn-end) clears any
+  // overlay this flush didn't retire.
+  const armedReply = armReplyRef(session);
 
   if (session.sendCallback) {
     const chunks = splitMessage(text);
@@ -5353,6 +5353,10 @@ function flushResponse(session) {
       session.sendCallback(chunk);
     }
   }
+  // Remember which ref this reply's text event carried (session._lastReplyRef)
+  // for the turn-end summary pass — unless the pass will never see this reply
+  // (code only, kept out of chatHistory above).
+  settleReplyRef(session, armedReply, { summarised: Boolean(cleanText) });
   // Bump idle clock whenever we have assistant text to flush, regardless
   // of whether a callback is wired. The guard above is about output
   // delivery; the activity timestamp is about session liveness.
@@ -6416,6 +6420,11 @@ async function maybeUpdatePinnedSummary(session) {
     // prior ROSTER paragraph as a fenced context preamble.
     const { messages, nextCount } = summaryWindow(session.chatHistory, session.lastSummaryMsgCount);
     if (!messages.length) return;
+    // Which reply the spoken lines will belong to. Read here, in the same
+    // step as the window and BEFORE the model call below: that call takes
+    // seconds, and a reply flushed by the next turn meanwhile must not lend
+    // its ref to this window's lines.
+    const replyRef = spokenRefFor(messages, session._lastReplyRef);
     const prompt = buildSummaryPrompt({
       messages,
       priorRoster: session.lastRosterText || null,
@@ -6423,7 +6432,10 @@ async function maybeUpdatePinnedSummary(session) {
     });
 
     const text = await summaryModel.generate(prompt);
-    const parsed = parseTitlePassResponse(text);
+    // The spoken lines come out first; the title/summary parser gets the rest
+    // (see splitSpoken for why it must not see spoken prose).
+    const voiced = splitSpoken(text);
+    const parsed = parseTitlePassResponse(voiced.rest);
 
     // Update room name (Element sidebar truncates visually, full name visible on hover)
     if (parsed.title) {
@@ -6447,12 +6459,16 @@ async function maybeUpdatePinnedSummary(session) {
     }
 
     // TOC event: one per successful pass, anchored by its own journal seq.
+    // It also carries the spoken version of the agent's last reply for voice
+    // mode — {spoken, spoken_more?, spoken_ref}, all or none (spokenPayload).
+    // Old apps ignore the extra keys; the journal passes the payload through.
     const toc = (parsed.added || parsed.summary || '').trim();
     if (toc) {
       journalPublish(session, 'publishSummary', {
         toc: toc.slice(0, 300),
         detail: (parsed.roster || '').slice(0, 1000),
         model: summaryModel.model,
+        ...spokenPayload(voiced, replyRef),
       });
     }
 

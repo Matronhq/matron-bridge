@@ -4,6 +4,7 @@ import { PassThrough } from 'node:stream';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { CodexExecSession } from '../lib/codex-session.js';
+import { armReplyRef, settleReplyRef } from '../lib/journal-stream.js';
 
 // Exercise the real bridge handlers without importing index.js, whose
 // top-level code connects to the journal and starts the production bridge.
@@ -38,6 +39,7 @@ function harness() {
     recordConversationMessage: (s, role, text) => s.chatHistory.push({ role, text }),
     applyFallbackTitle: vi.fn(), SERVER_LABEL: 'bridge', updateRoomName: vi.fn(),
     splitMessage: text => [text],
+    armReplyRef, settleReplyRef,
   });
   vm.runInContext(['codexToolIndicator', 'handleCodexEvent', 'flushResponse'].map(functionSource).join('\n'), context);
   codex.on('event', event => context.handleCodexEvent(session, event));
