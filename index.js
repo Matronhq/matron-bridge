@@ -95,6 +95,8 @@ import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js
 import {
   createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
+  autoCarryOnEnabled as codeUpdateAutoCarryOnEnabled, writeSelfRestartStamp, takeSelfRestartStamp, selectAutoCarryOn,
+  AUTO_CARRY_ON_TEXT as CODE_UPDATE_AUTO_CARRY_ON_TEXT, AUTO_CARRY_ON_DELAY_MS as CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
   RESTART_EXIT_CODE as CODE_UPDATE_EXIT_CODE,
   DEFAULT_POLL_MS as CODE_UPDATE_POLL_DEFAULT_MS, DEFAULT_SETTLE_MS as CODE_UPDATE_SETTLE_DEFAULT_MS,
   DEFAULT_MAX_DEFER_MS as CODE_UPDATE_MAX_DEFER_DEFAULT_MS,
@@ -296,6 +298,11 @@ const CODE_UPDATE_RESTART = codeUpdateRestartEnabled(process.env.MATRON_CODE_UPD
 const CODE_UPDATE_POLL_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_POLL_MS, CODE_UPDATE_POLL_DEFAULT_MS);
 const CODE_UPDATE_SETTLE_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_SETTLE_MS, CODE_UPDATE_SETTLE_DEFAULT_MS);
 const CODE_UPDATE_MAX_DEFER_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_MAX_DEFER_MS, CODE_UPDATE_MAX_DEFER_DEFAULT_MS);
+// A self-restart that had to cut turns off (the deferral cap) leaves this
+// stamp; the next boot resumes those chats by itself instead of carding
+// them. MATRON_CODE_UPDATE_AUTO_CARRY_ON=0 keeps the tap.
+const CODE_UPDATE_AUTO_CARRY_ON = codeUpdateAutoCarryOnEnabled(process.env.MATRON_CODE_UPDATE_AUTO_CARRY_ON);
+const SELF_RESTART_STAMP_FILE = path.join(os.homedir(), '.matron-bridge-self-restart.json');
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -9331,10 +9338,14 @@ function sleepingConvoIdFor(roomId) {
 // would surface as an unhandled rejection rather than as a message to the
 // user. Same stance as journalRouteTextToSession's other non-awaiting caller,
 // the router's routeTextToSession adapter.
-async function carryOnConvo(convoId, session, _sendReply) {
+// `text` is what the resumed session receives; `resumeNotice` is what the
+// chat is told while it comes back (the automatic path after a self-restart
+// says why — the default "session was idle, your message will be delivered"
+// copy would be wrong there: no message is coming).
+async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined) {
   try {
     let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
-    if (!target || !target.alive) target = journalResumeConvo(convoId);
+    if (!target || !target.alive) target = journalResumeConvo(convoId, resumeNotice);
     if (!target) {
       // A carry-on tap always originates in a Matron journal chat (the card
       // is only ever published there — see publishRestartCarryOnCards), so
@@ -9348,7 +9359,7 @@ async function carryOnConvo(convoId, session, _sendReply) {
       journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
       return;
     }
-    await journalRouteTextToSession(target, 'carry on');
+    await journalRouteTextToSession(target, text);
   } catch (e) {
     console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
     journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
@@ -9772,6 +9783,16 @@ function startCodeUpdateWatcher() {
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
+      // Only a forced restart interrupts anything, so only it stamps. A
+      // stamp that cannot be written costs nothing but the automatic
+      // part: the interrupted chats get their card as before.
+      if (info.forced) {
+        try {
+          writeSelfRestartStamp(SELF_RESTART_STAMP_FILE, { bootId: BRIDGE_BOOT_ID, sha: info.sha, busy: info.busy });
+        } catch (e) {
+          try { console.warn(`[code-update] could not write ${SELF_RESTART_STAMP_FILE}: ${e?.message ?? e} — interrupted chats will get a carry-on card instead`); } catch { /* logging must never throw */ }
+        }
+      }
       void gracefulShutdown('code-update', { exitCode: CODE_UPDATE_EXIT_CODE });
     },
     log: (m) => console.log(m),
@@ -13036,12 +13057,35 @@ function publishRestartCarryOnCards() {
     console.warn(`[inflight] boot reconciliation failed: ${e.message}`);
     return;
   }
+  // The stamp is taken (read and removed) whether or not anything is stale,
+  // so a stale stamp from an earlier boot can never claim a later crash's
+  // interruptions.
+  const stamp = takeSelfRestartStamp(SELF_RESTART_STAMP_FILE);
   if (!stale.length) return;
   const persisted = loadPersistedSessions();
   const resumable = new Set(Object.values(persisted)
     .flatMap(rec => [rec?.journalConvoId, rec?.sessionId])
     .filter(Boolean));
+  // The previous process's self-restart onto new code cut these turns off;
+  // with the option on they carry on by themselves (lib/code-update-restart.js
+  // AUTO_CARRY_ON_TEXT), after the journal socket has said hello and the
+  // cards below have gone out. Everything else — a crash, a deploy's own
+  // restart, the option off — keeps the tap.
+  const { auto, card } = selectAutoCarryOn(stale, stamp, { enabled: CODE_UPDATE_AUTO_CARRY_ON });
+  const autoResumable = auto.filter(rec => resumable.has(rec.convoId) && isResumeConvoId(rec.convoId));
+  if (autoResumable.length) {
+    try { console.log(`[code-update] ${autoResumable.length} chat(s) cut off by the self-restart onto ${String(stamp.sha || '').slice(0, 7)} carry on by themselves in ${CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS}ms`); } catch { /* logging must never throw */ }
+    setTimeout(() => {
+      for (const rec of autoResumable) {
+        const notice = `🔄 The bridge restarted itself onto new code while this chat was mid-turn (interrupted ${formatInterruptedAgo(rec.ageMs)}) — resuming it to carry on automatically.`;
+        void carryOnConvo(rec.convoId, null, null, CODE_UPDATE_AUTO_CARRY_ON_TEXT, notice);
+      }
+    }, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS);
+  }
+  const autoSet = new Set(autoResumable);
   for (const rec of stale) {
+    if (autoSet.has(rec)) continue;
+    void card;
     // No persisted session record means there is nothing for a tap to resume,
     // so a card would be a dead button. Drop it.
     if (!resumable.has(rec.convoId)) {

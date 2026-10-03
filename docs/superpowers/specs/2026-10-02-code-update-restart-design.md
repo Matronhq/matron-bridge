@@ -50,6 +50,16 @@ The bridge watches its own checkout and restarts itself.
    after a non-zero exit; systemd's `Restart=always` and the Windows task's
    restart-on-failure relaunch either way.
 
+7. **Carry on by itself.** (Added the same evening; Dan asked for an
+   option.) A forced restart writes `~/.matron-bridge-self-restart.json`
+   (`bootId`, `sha`, `busy`) before it exits. The next boot takes the stamp
+   (read and removed) and, for every stale inflight marker whose `bootId`
+   is the stamp's, publishes a notice and resumes the session with
+   `[auto-continue after bridge update] …` 15 s after boot, instead of the
+   card. Markers from any other run (a crash, a deploy's own restart) keep
+   the tap, and `MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` keeps it for all.
+   `takeStale` now returns each marker's `bootId` for this.
+
 `MATRON_CODE_UPDATE_RESTART=0` switches the watcher off. It is also off,
 with a log line, when the directory `index.js` runs from has no HEAD reflog.
 
