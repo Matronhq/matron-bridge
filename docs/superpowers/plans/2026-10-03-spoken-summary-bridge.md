@@ -125,7 +125,7 @@ In `test/summary-pass.test.js`, add these constants after the import on line 2 (
 ```js
 // Voice mode spec 2026-10-03 §1, "What is written": the two lines, word for
 // word (the spec wraps them for the page; the prompt carries each on one line).
-const SPOKEN_LINE = 'SPOKEN: <what someone listening while driving should hear about the agent\'s latest reply, 40 words at most. First, anything the agent is asking or needs decided, naming the options. Then the outcome in one sentence. Then what it will do next, only if that matters. Plain spoken English. No code, file paths, URLs, PR or issue numbers, markdown or lists. If the reply has a table, a diff or a long list, say it is in the chat instead of reading it.>';
+const SPOKEN_LINE = 'SPOKEN: <what someone listening while driving should hear about the agent\'s latest reply, 40 words at most. First, anything the agent is asking or needs decided, naming the options. Then the outcome in one sentence. Then what it will do next, only if that matters. Plain spoken English. No code, file paths, URLs, PR or issue numbers, markdown or lists, and never a password, key, token or other secret value. If the reply has a table, a diff or a long list, say it is in the chat instead of reading it.>';
 const SPOKEN_MORE_LINE = 'SPOKEN_MORE: <the next thing that listener would want if they said "tell me more", 150 words at most. Do not repeat SPOKEN. Give the reasoning behind the question or result, what each option would mean, and any risk or caveat the agent raised. Same plain spoken style and the same exclusions. Write NONE if SPOKEN already says everything.>';
 ```
 
@@ -164,7 +164,7 @@ In `lib/summary-pass.js`, replace the whole of `buildSummaryPrompt` (line 26 to 
 // for word — it was approved as written, so change it there first. The apps
 // say SPOKEN aloud when a turn ends and SPOKEN_MORE when the listener asks
 // for more.
-const SPOKEN_FORMAT = 'SPOKEN: <what someone listening while driving should hear about the agent\'s latest reply, 40 words at most. First, anything the agent is asking or needs decided, naming the options. Then the outcome in one sentence. Then what it will do next, only if that matters. Plain spoken English. No code, file paths, URLs, PR or issue numbers, markdown or lists. If the reply has a table, a diff or a long list, say it is in the chat instead of reading it.>';
+const SPOKEN_FORMAT = 'SPOKEN: <what someone listening while driving should hear about the agent\'s latest reply, 40 words at most. First, anything the agent is asking or needs decided, naming the options. Then the outcome in one sentence. Then what it will do next, only if that matters. Plain spoken English. No code, file paths, URLs, PR or issue numbers, markdown or lists, and never a password, key, token or other secret value. If the reply has a table, a diff or a long list, say it is in the chat instead of reading it.>';
 const SPOKEN_MORE_FORMAT = 'SPOKEN_MORE: <the next thing that listener would want if they said "tell me more", 150 words at most. Do not repeat SPOKEN. Give the reasoning behind the question or result, what each option would mean, and any risk or caveat the agent raised. Same plain spoken style and the same exclusions. Write NONE if SPOKEN already says everything.>';
 
 export function buildSummaryPrompt({ messages, priorRoster, hasCumulative }) {
