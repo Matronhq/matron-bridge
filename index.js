@@ -176,7 +176,7 @@ import { createSummaryModel } from './lib/summary-model.js';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
-import { streamRefFor } from './lib/journal-stream.js';
+import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
@@ -5338,14 +5338,14 @@ function flushResponse(session) {
   }
 
   // Arm the durable ref for the very next journal mirror (the first chunk's
-  // sendToRoom) so the streamed overlay retires by ref. Only when an overlay is
-  // actually open for this session (print-mode streamed this message) AND a
-  // callback will drive sendToRoom synchronously — otherwise the arm would leak
-  // onto a later, unrelated publish. journalStreamClear (at turn-end) clears
-  // any overlay this flush didn't retire.
-  if (session._journalStreamRef && session.sendCallback) {
-    session._journalDurableRef = session._journalStreamRef;
-  }
+  // sendToRoom): the streamed overlay's ref when one is open, so the overlay
+  // retires by ref, otherwise a fresh one, so every reply's text event can be
+  // pointed at (the summary pass's spoken_ref — see lib/journal-stream.js).
+  // Only when a callback will drive sendToRoom synchronously; settleReplyRef
+  // below disarms a fresh ref that no text event took, so it cannot leak onto
+  // a later, unrelated publish. journalStreamClear (at turn-end) clears any
+  // overlay this flush didn't retire.
+  const armedReply = armReplyRef(session);
 
   if (session.sendCallback) {
     const chunks = splitMessage(text);
@@ -5353,6 +5353,9 @@ function flushResponse(session) {
       session.sendCallback(chunk);
     }
   }
+  // Remember which ref this reply's text event carried (session._lastReplyRef)
+  // for the turn-end summary pass.
+  settleReplyRef(session, armedReply);
   // Bump idle clock whenever we have assistant text to flush, regardless
   // of whether a callback is wired. The guard above is about output
   // delivery; the activity timestamp is about session liveness.
