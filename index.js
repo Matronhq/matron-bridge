@@ -12656,10 +12656,10 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The eight item_* tool routes. One matcher rather than eight blocks:
+      // The item_* tool routes. One matcher rather than a block each:
       // the handler names ARE the path segments, and the anchored alternation
       // is the allowlist (no dynamic property lookup from raw input).
-      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder|move)$/);
+      const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder|move|handover|accept|decline)$/);
       if (itemsRoute) {
         const name = itemsRoute[1];
         await respondAgentChatRoute(res, data, itemsHandlers[name],
