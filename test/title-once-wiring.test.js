@@ -51,7 +51,7 @@ describe('title generated once (maybeUpdatePinnedSummary)', () => {
     const { calls, pass } = harness();
     const s = session();
     await pass(s);
-    expect(calls.prompts[0]).toContain('TITLE: <title>');
+    expect(calls.prompts[0].system).toContain('TITLE: <title>');
     expect(calls.renames).toEqual(['[ab] export fix']);
     expect(s._llmTitleEarned).toBe(true);
     expect(calls.persisted).toContainEqual({ llmTitleEarned: true });
@@ -61,7 +61,7 @@ describe('title generated once (maybeUpdatePinnedSummary)', () => {
     const { calls, pass } = harness({ answer: 'TITLE: something else\nNEW: Shipped it.\nROSTER: Shipping the export.' });
     const s = session({ _llmTitleEarned: true, pinnedSummaryText: '• Fixed.' });
     await pass(s);
-    expect(calls.prompts[0]).not.toContain('TITLE');
+    expect(calls.prompts[0].system).not.toContain('TITLE');
     expect(calls.renames).toEqual([]);
     expect(calls.upserts).toEqual([{ summary: 'Shipping the export.' }]);
     expect(calls.published[0].payload.toc).toBe('Shipped it.');
@@ -74,7 +74,7 @@ describe('title generated once (maybeUpdatePinnedSummary)', () => {
     const s = session({ lastSummaryMsgCount: 2 });
     s.chatHistory.push({ role: 'user', text: 'Now deploy.' });
     await pass(s);
-    expect(calls.prompts[0]).not.toContain('TITLE');
+    expect(calls.prompts[0].system).not.toContain('TITLE');
     expect(calls.renames).toEqual([]);
     expect(s._llmTitleEarned).toBe(true);
   });
@@ -84,7 +84,7 @@ describe('title generated once (maybeUpdatePinnedSummary)', () => {
     const legacy = harness();
     const s1 = session({ _journalTitleHint: '[ab] export pipeline repair', lastSummaryMsgCount: 0 });
     await legacy.pass(s1);
-    expect(legacy.calls.prompts[0]).not.toContain('TITLE');
+    expect(legacy.calls.prompts[0].system).not.toContain('TITLE');
     expect(legacy.calls.renames).toEqual([]);
     // ...and the derived yes is written into the record.
     expect(legacy.calls.persisted).toContainEqual({ llmTitleEarned: true });
@@ -92,7 +92,7 @@ describe('title generated once (maybeUpdatePinnedSummary)', () => {
     const resumed = harness({ persisted: { room: { llmTitleEarned: false } } });
     const s2 = session({ _journalTitleHint: '[ab] Fix export from the resume summary', lastSummaryMsgCount: 0 });
     await resumed.pass(s2);
-    expect(resumed.calls.prompts[0]).toContain('TITLE: <title>');
+    expect(resumed.calls.prompts[0].system).toContain('TITLE: <title>');
     expect(resumed.calls.renames).toEqual(['[ab] export fix']);
     expect(s2._llmTitleEarned).toBe(true);
   });
@@ -102,7 +102,7 @@ describe('title generated once (maybeUpdatePinnedSummary)', () => {
     const s = session({ _journalTitleHint: '[ab] export pipeline repair', lastSummaryMsgCount: 2 });
     s.chatHistory.push({ role: 'user', text: 'Now deploy.' });
     await pass(s);
-    expect(calls.prompts[0]).not.toContain('TITLE');
+    expect(calls.prompts[0].system).not.toContain('TITLE');
     expect(calls.renames).toEqual([]);
   });
 
@@ -115,6 +115,6 @@ describe('title generated once (maybeUpdatePinnedSummary)', () => {
     expect(s.lastSummaryMsgCount).toBe(2);
     s.chatHistory.push({ role: 'user', text: 'Again.' });
     await pass(s);
-    expect(calls.prompts[1]).toContain('TITLE: <title>');
+    expect(calls.prompts[1].system).toContain('TITLE: <title>');
   });
 });

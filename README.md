@@ -271,7 +271,10 @@ relaunches after a non-zero exit.
 | `WHISPER_PROMPT` | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
 | `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-6-luna` by default) | — |
 | `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
-| `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |
+| `SUMMARY_PROVIDER` | `legacy` keeps OpenAI/Gemini; `anthropic` opts into Claude with legacy fallback on missing key or request failure | `legacy` |
+| `SUMMARY_ANTHROPIC_API_KEY` | Dedicated Claude summariser key; provision from the verified billing org. Does not change session authentication | — |
+| `SUMMARY_ANTHROPIC_MODEL` | Claude summariser model | `claude-haiku-5-5` |
+| `SUMMARY_MODEL` | Model override for the legacy OpenAI/Gemini provider (also used during fallback) | — |
 
 Voice notes sent in chat are transcribed by the journal at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`, see the journal's protocol doc): the bridge asks `GET /media/:id/transcript` first and only runs its own whisper when the journal has no words for the note (no key, an older journal, or a failed job).
 
@@ -422,3 +425,13 @@ matron-bridge/
 ├── package.json
 └── .env.example
 ```
+
+Claude summary rollout: provision the dedicated key through the secure credential
+store, confirm its Console billing organisation, then opt in on one bridge.
+Check titles, roster and spoken summaries, and inspect debug `summary usage`
+counts for cache reads after repeated turns. The fixed prompt prefix has a
+5-minute cache breakpoint; transcript and prior roster text are never in it.
+Cache hits depend on the model's minimum prompt length. Provider failures log a
+fallback event without prompt or response content. Roll back with
+`SUMMARY_PROVIDER=legacy` and restart the bridge. Supplying a key alone does not
+switch providers.

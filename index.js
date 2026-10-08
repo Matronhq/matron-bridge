@@ -552,6 +552,11 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 
 const summaryModel = createSummaryModel({
+  provider: process.env.SUMMARY_PROVIDER || 'legacy',
+  anthropicApiKey: process.env.SUMMARY_ANTHROPIC_API_KEY || '',
+  anthropicModel: process.env.SUMMARY_ANTHROPIC_MODEL || undefined,
+  onFallback: ({ fallbackModel }) => console.warn(`Claude summariser failed; falling back to ${fallbackModel}`),
+  onUsage: (usage) => debug(`summary usage: ${JSON.stringify(usage)}`),
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   geminiClient: genAI,
   modelOverride: process.env.SUMMARY_MODEL || '',
@@ -6769,6 +6774,7 @@ async function maybeUpdatePinnedSummary(session) {
       priorRoster: session.lastRosterText || null,
       hasCumulative: Boolean(currentSummary),
       wantTitle,
+      structured: true,
     });
 
     const text = await summaryModel.generate(prompt);

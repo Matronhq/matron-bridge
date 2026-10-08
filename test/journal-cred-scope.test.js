@@ -20,6 +20,7 @@ const SECRET_ENV = Object.freeze({
   JOURNAL_TOKEN_FILE: '/etc/matron/agent-token',
   JOURNAL_WS_URL: 'wss://journal.example/ws',
   HMAC_SECRET: 'viewer-signing-key',
+  SUMMARY_ANTHROPIC_API_KEY: 'summary-test-key',
   OPENAI_API_KEY: 'sk-summary',
   GEMINI_API_KEY: 'gemini-summary',
   MATRON_BRIDGE_API_PORT: '9812',
@@ -64,7 +65,7 @@ describe('stripBridgeOnlySecrets', () => {
   });
 
   it('targets exactly the bridge-only secrets', () => {
-    expect(BRIDGE_ONLY_SECRET_KEYS).toEqual(['HMAC_SECRET']);
+    expect(BRIDGE_ONLY_SECRET_KEYS).toEqual(['HMAC_SECRET', 'SUMMARY_ANTHROPIC_API_KEY']);
   });
 });
 
