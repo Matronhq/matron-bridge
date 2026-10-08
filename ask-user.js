@@ -7,7 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
-import { itemLine, formatItemList, formatItemDetail, formatCommentAck, withImageWarnings } from './lib/items-format.js';
+import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
@@ -1138,6 +1138,35 @@ server.tool(
     before: z.string().optional().describe('Item id to place this one before'),
   },
   async (args) => callItems('reorder', args, (d) => itemLine(d.item)),
+);
+
+server.tool(
+  'item_handover',
+  "Hand an item this conversation owns to another of the user's sessions: offer it to the target conversation (its id from agent_roster). The target is asked and accepts or declines; once it accepts, the user's replies and taps on the item go there instead of here, and the thread and history stay on the item. Use it when the user says the work belongs to another session. The Coordinator can offer any item on the user's behalf. If either side is a session only the user approves for, the user is asked on the item first. Until the target accepts, the item stays yours. Pass withdraw: true (and no to_convo) to take back a pending offer.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    to_convo: z.string().optional().describe('Conversation id of the target session, from agent_roster'),
+    note: z.string().optional().describe('Why it is going to them and what they need to know (≤2000 chars); shown in the thread and in their offer. With withdraw: the reason'),
+    withdraw: z.boolean().optional().describe('Take back this item\'s pending offer instead of making one'),
+  },
+  async (args) => callItems('handover', args, formatHandoverAck),
+);
+
+server.tool(
+  'item_accept',
+  "Accept an item another session offered to this conversation (you were told in a 📌 Handover offer turn). Accept only work this conversation should take on under its own rules. From then on the user's replies and taps on the item come here; read its thread with item_get first.",
+  { id: z.string().describe("Item id ('it_…') or '#12'") },
+  async (args) => callItems('accept', args, formatHandoverAck),
+);
+
+server.tool(
+  'item_decline',
+  "Decline an item another session offered to this conversation — it stays with them. Say why in reason (it is shown in the thread and to them).",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    reason: z.string().optional().describe('Why not (≤2000 chars)'),
+  },
+  async (args) => callItems('decline', args, formatHandoverAck),
 );
 
 // --- Missions & milestones (spec 2026-09-10) ---
