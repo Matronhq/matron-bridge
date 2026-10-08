@@ -1,0 +1,93 @@
+✽ F
+
+● Right — the retry runs in the worker, not in the scheduler. So I can run a controlled capture myself: I'll queue a
+  failing job now (with this paragraph before it), which writes a retry trace to this session's log and surfaces it to  
+you.   Once you answer, I'll read the worker's trace to see exactly how the backoff sits relative to the lease — and
+  build the fix against that real trace instead of guessing. This also live-demonstrates the bug: you'll likely
+  see the retry fire twice before the lease runs out.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+  
+  The question doubles as a real decision I need — how to handle a retry that is still scheduled once the lease
+  expires:
+
+✶ Skedaddling… (1m 6s · ↓ 4.2k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+  
+*           g
+
+           n       7
+
+✢
+
+·         i  …
+
+         l  g               3
+
+✢       d  n
+
+*      d  i
+
+✶
+
+      a  l         8
+
+✻
+
+✽    d  d
+
+    e  d
+
+✻  k  a
+
+✶ S  d
+
+*
+
+✢   e              9
+
+                            4
+
+·  k
+
+  S
+
+✢
+
+*
+
+✶
+
+✻                  10s · ↓ 4.4k tokens)
+
+✽
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Retry fix 
+
+Once a job's lease has expired while the worker is still backing off between attempts, what should happen to the retry 
+that is already scheduled for the job after the original attempt fails?
+
+❯ 1. Keep it (safety net)  
+   Run the scheduled retry anyway   and log a warning AND s ill let the next lease holder run too. Lowest risk — you
+     never lose a job even if the lease bookkeeping is wrong — but it may run twice.
+  2. Suppress the duplicate
+     Drop the scheduled retry when the lease has expired, so the new lease holder is the only runner. Cleaner
+     history, but if the new holder crashed before it started (very short lease) the job is lost.
+  3. Smart: suppress only if full
+     Drop the retry only when a new lease holder has acknowledged the job; otherwise let the scheduled retry
+     through. Best of both, but more state to get right.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+(B

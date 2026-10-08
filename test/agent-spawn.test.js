@@ -1,0 +1,664 @@
+import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'fs';
+import { createAgentSpawnHandlers } from '../lib/agent-spawn.js';
+
+// Fake publisher + recording rooms/notifyParent, modeled on agent-chat.test.js's
+// fake-publisher style. `sent` records every sendRoomOp frame in order so
+// arm-before-send sequencing is assertable.
+function mk(overrides = {}) {
+  const sent = [];
+  const notices = [];
+  const publisher = {
+    identity: overrides.identity ?? (() => ({ device_id: 7 })),
+    sendRoomOp: overrides.sendRoomOp ?? ((frame) => { sent.push(frame); return true; }),
+  };
+  const roomsCalls = [];
+  const rooms = {
+    record: (roomId, fields) => { roomsCalls.push({ roomId, fields }); },
+    isActive: () => true,
+    calls: roomsCalls,
+  };
+  const sessions = new Map([['sess-1', { roomId: 'sess-1' }]]);
+  const notifyParent = vi.fn((args) => notices.push(args));
+  const handlers = createAgentSpawnHandlers({
+    sessions,
+    publisher,
+    rooms,
+    journalConvoIdFor: overrides.journalConvoIdFor ?? (() => 'convo-1'),
+    notifyParent,
+    targetsTimeoutMs: overrides.targetsTimeoutMs ?? 20,
+    pendingTimeoutMs: overrides.pendingTimeoutMs ?? 20,
+    handledTtlMs: overrides.handledTtlMs,
+    sweepIntervalMs: overrides.sweepIntervalMs,
+    log: { warn: () => {} },
+  });
+  return { handlers, sent, notices, rooms, sessions, notifyParent };
+}
+
+describe('createAgentSpawnHandlers', () => {
+  describe('boxes', () => {
+    it('happy path — sends spawn_targets, resolves boxes on targets frame', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.boxes({ roomId: 'sess-1' });
+      // Frame sent synchronously by sendRoomOp before we can inspect it here
+      // because handlers.boxes armed the waiter first — assert the send.
+      expect(sent).toHaveLength(1);
+      expect(sent[0].op).toBe('spawn_targets');
+      expect(typeof sent[0].request_id).toBe('string');
+      const boxesPayload = [{ device_id: 2, name: 'elm', online: true, folders: [], activity: { live_sessions: 0, last_hour: [] } }];
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'targets', request_id: sent[0].request_id, boxes: boxesPayload });
+      const res = await p;
+      expect(res).toEqual({ status: 200, body: { boxes: boxesPayload } });
+    });
+
+    it('identity unknown -> 409, fails closed, no frame sent', async () => {
+      const { handlers, sent } = mk({ identity: () => null });
+      const res = await handlers.boxes({ roomId: 'sess-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/journal identity/i);
+      expect(sent).toHaveLength(0);
+    });
+
+    it('sendRoomOp returns false -> 502 journal_unreachable, waiter cleaned up', async () => {
+      let capturedRid = null;
+      const { handlers } = mk({ sendRoomOp: (frame) => { capturedRid = frame.request_id; return false; } });
+      const res = await handlers.boxes({ roomId: 'sess-1' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/journal unreachable/i);
+      // Waiter cleanup proven behaviourally: a frame arriving late for the
+      // now-abandoned request_id must not be able to resolve anything (it
+      // was already settled/removed when the send failed) — no throw either.
+      expect(capturedRid).toBeTruthy();
+      expect(() => handlers.onSpawnFrame({ kind: 'spawn', event: 'targets', request_id: capturedRid, boxes: [] })).not.toThrow();
+    });
+
+    it('timeout -> 504, waiters map ends up empty', async () => {
+      const { handlers, sent } = mk({ targetsTimeoutMs: 20 });
+      const res = await handlers.boxes({ roomId: 'sess-1' });
+      expect(res.status).toBe(504);
+      expect(sent).toHaveLength(1);
+      // Waiter cleanup proven indirectly: a late frame for the same
+      // request_id now settles nothing (no throw, no crash) because the
+      // timeout already deleted the waiter.
+      expect(() => handlers.onSpawnFrame({ kind: 'spawn', event: 'targets', request_id: sent[0].request_id, boxes: [] })).not.toThrow();
+    });
+
+    it('unknown caller session -> 404', async () => {
+      const { handlers } = mk();
+      const res = await handlers.boxes({ roomId: 'nope' });
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('sessionStart', () => {
+    const good = { roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'do the thing', topic: 'T' };
+
+    it('happy path — sends spawn_request, resolves pending status on ack', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.sessionStart(good);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toEqual({
+        op: 'spawn_request',
+        request_id: sent[0].request_id,
+        from_convo_id: 'convo-1',
+        target_device_id: 2,
+        workdir: '/w',
+        task: 'do the thing',
+        topic: 'T',
+      });
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1' });
+      const res = await p;
+      expect(res).toEqual({ status: 200, body: { status: 'pending', spawn_id: 'row-1' } });
+    });
+
+    it('a pending ack with target_waking says the box is being woken; anything but literal true is ignored', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.sessionStart(good);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1', target_waking: true });
+      const res = await p;
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('pending');
+      expect(res.body.target_waking).toBe(true);
+      expect(res.body.note).toMatch(/asleep/);
+      const p2 = handlers.sessionStart(good);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[1].request_id, spawn_id: 'row-2', target_waking: 'true' });
+      const res2 = await p2;
+      expect('target_waking' in res2.body).toBe(false);
+      expect('note' in res2.body).toBe(false);
+    });
+
+    it('validates task / topic / device_id / workdir before sending any frame', async () => {
+      const { handlers, sent } = mk();
+      const cases = [
+        { ...good, task: undefined },
+        { ...good, task: 'x'.repeat(2001) },
+        { ...good, topic: 'x'.repeat(201) },
+        { ...good, device_id: '2' },
+        { ...good, device_id: 2.5 },
+        { ...good, workdir: undefined },
+        { ...good, workdir: '' },
+      ];
+      for (const c of cases) {
+        const res = await handlers.sessionStart(c);
+        expect(res.status).toBe(400);
+      }
+      expect(sent).toHaveLength(0);
+    });
+
+    // Wire contract: the optional `model` field the journal relays to the
+    // target bridge's RPC `start`. Field name is exactly `model`.
+    it('carries a valid model alias in the spawn_request frame, normalized', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ ...good, model: 'Opus[1M]' });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].model).toBe('opus[1m]');
+    });
+
+    it('a full claude-* model name is accepted', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ ...good, model: 'claude-opus-4-8' });
+      expect(sent[0].model).toBe('claude-opus-4-8');
+    });
+
+    it('carries link: true in the spawn_request frame only when asked; a non-boolean link is a 400 with no frame', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x', link: true });
+      expect(sent[0].link).toBe(true);
+      handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x' });
+      expect('link' in sent[1]).toBe(false);
+      handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x', link: false });
+      expect('link' in sent[2]).toBe(false);
+      const bad = await handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x', link: 'yes' });
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toMatch(/link/);
+      expect(sent).toHaveLength(3);
+    });
+
+    it('omits the model key entirely when none was asked for', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart(good);
+      expect('model' in sent[0]).toBe(false);
+    });
+
+    it('rejects an unknown or non-string model before sending any frame, listing the aliases', async () => {
+      const { handlers, sent } = mk();
+      for (const model of ['gpt-5', 'opus sonnet', 42, {}]) {
+        const res = await handlers.sessionStart({ ...good, model });
+        expect(res.status).toBe(400);
+        expect(res.body.error).toMatch(/sonnet/);
+      }
+      expect(sent).toHaveLength(0);
+    });
+
+    it('journal op error: conflict maps to 409 with detail; unknown ref returns false', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.sessionStart(good);
+      expect(sent).toHaveLength(1);
+      const rid = sent[0].request_id;
+      expect(handlers.onOpError({ code: 'not-a-ref', ref: 'nonexistent-ref-xyz', detail: 'x' })).toBe(false);
+      const consumed = handlers.onOpError({ code: 'conflict', ref: rid, detail: 'too many requests awaiting user approval' });
+      expect(consumed).toBe(true);
+      const res = await p;
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe('too many requests awaiting user approval');
+    });
+
+    it('agent_unreachable -> 502 target box is offline; not_found -> 404', async () => {
+      const { handlers: h1, sent: s1 } = mk();
+      const p1 = h1.sessionStart(good);
+      h1.onOpError({ code: 'agent_unreachable', ref: s1[0].request_id, detail: 'offline' });
+      const r1 = await p1;
+      expect(r1.status).toBe(502);
+      expect(r1.body.error).toMatch(/offline/i);
+
+      const { handlers: h2, sent: s2 } = mk();
+      const p2 = h2.sessionStart(good);
+      h2.onOpError({ code: 'not_found', ref: s2[0].request_id, detail: 'no such box' });
+      const r2 = await p2;
+      expect(r2.status).toBe(404);
+    });
+
+    // The journal's error frame says ref: 'spawn_request' (the op), not the
+    // request id — the shape it actually sends. These used to match nothing
+    // and surface as "timed out waiting for the journal".
+    it('journal op error keyed by op: settles the one spawn_request in flight', async () => {
+      const { handlers } = mk({ pendingTimeoutMs: 5000 });
+      const p = handlers.sessionStart(good);
+      expect(handlers.onOpError({ code: 'conflict', ref: 'spawn_request', detail: 'too many requests awaiting user approval' })).toBe(true);
+      const res = await p;
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe('too many requests awaiting user approval');
+    });
+
+    it('journal op error keyed by op: two spawn_requests in flight is a guess, so neither is claimed', async () => {
+      const { handlers, sent } = mk({ pendingTimeoutMs: 5000 });
+      const p1 = handlers.sessionStart(good);
+      const p2 = handlers.sessionStart(good);
+      expect(handlers.onOpError({ code: 'conflict', ref: 'spawn_request' })).toBe(false);
+      // An error echoing the request id still pairs exactly.
+      expect(handlers.onOpError({ code: 'not_found', ref: 'spawn_request', requestId: sent[1].request_id })).toBe(true);
+      expect((await p2).status).toBe(404);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 's-1' });
+      expect((await p1).status).not.toBe(404);
+    });
+
+    it('journal op error with an echoed id that matches nothing is not reassigned', async () => {
+      const { handlers, sent } = mk({ pendingTimeoutMs: 5000 });
+      const p = handlers.sessionStart(good);
+      expect(handlers.onOpError({ code: 'conflict', ref: 'spawn_request', requestId: 'long-gone' })).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 's-1' });
+      expect((await p).status).not.toBe(409);
+    });
+
+    it('journal op error keyed by op: spawn_targets is not settled by a spawn_request error', async () => {
+      const { handlers, sent } = mk({ targetsTimeoutMs: 5000 });
+      const p = handlers.boxes({ roomId: 'sess-1' });
+      expect(handlers.onOpError({ code: 'conflict', ref: 'spawn_request' })).toBe(false);
+      expect(handlers.onOpError({ code: 'conflict', ref: 'spawn_targets', detail: 'spawn_targets already in flight' })).toBe(true);
+      expect((await p).status).toBe(502);
+      expect(sent).toHaveLength(1);
+    });
+
+    it('session with no journal convo id -> 409', async () => {
+      const { handlers, sent } = mk({ journalConvoIdFor: () => null });
+      const res = await handlers.sessionStart(good);
+      expect(res.status).toBe(409);
+      expect(sent).toHaveLength(0);
+    });
+
+    it('timeout -> 504', async () => {
+      const { handlers } = mk({ pendingTimeoutMs: 20 });
+      const res = await handlers.sessionStart(good);
+      expect(res.status).toBe(504);
+    });
+
+    it('mission: sent as mission_num, echoed back; absent when not given', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.sessionStart({ ...good, mission: 64 });
+      expect(sent[0].mission_num).toBe(64);
+      expect('mission' in sent[0]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1' });
+      expect(await p).toEqual({ status: 200, body: { status: 'pending', spawn_id: 'row-1', mission_num: 64 } });
+      const p2 = handlers.sessionStart(good);
+      expect('mission_num' in sent[1]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[1].request_id, spawn_id: 'row-2' });
+      await p2;
+    });
+
+    it('mission must be a positive integer; nothing is sent otherwise', async () => {
+      const { handlers, sent } = mk();
+      for (const mission of [0, -1, 1.5, '64', true]) {
+        const r = await handlers.sessionStart({ ...good, mission });
+        expect(r.status).toBe(400);
+        expect(r.body.error).toMatch(/mission must be a positive integer/);
+      }
+      expect(sent).toHaveLength(0);
+      const nullOk = handlers.sessionStart({ ...good, mission: null });
+      expect('mission_num' in sent[0]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'r' });
+      await nullOk;
+    });
+
+    it('journal refusals no_mission / mission_closed become sentences the agent can act on', async () => {
+      const a = mk();
+      const p1 = a.handlers.sessionStart({ ...good, mission: 99 });
+      a.handlers.onOpError({ code: 'no_mission', ref: a.sent[0].request_id, detail: 'x' });
+      const r1 = await p1;
+      expect(r1.status).toBe(404);
+      expect(r1.body.error).toMatch(/no mission #99/);
+      expect(r1.body.error).toMatch(/private/);
+      expect(r1.body.error).toMatch(/nothing was sent to the user/);
+      const b = mk();
+      const p2 = b.handlers.sessionStart({ ...good, mission: 61 });
+      b.handlers.onOpError({ code: 'mission_closed', ref: b.sent[0].request_id, detail: 'x' });
+      const r2 = await p2;
+      expect(r2.status).toBe(409);
+      expect(r2.body.error).toMatch(/mission #61 is closed/);
+      expect(r2.body.error).toMatch(/mission_create/);
+    });
+  });
+
+  describe('outcomes', () => {
+    async function armStarted(overrides = {}) {
+      const ctx = mk(overrides);
+      const p = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'do the thing', topic: 'T' });
+      const rid = ctx.sent[0].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: 'row-1' });
+      await p;
+      return ctx;
+    }
+
+    it('started — rooms.record called, notifyParent once, text mentions started + room id', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-1' });
+      expect(ctx.rooms.calls).toHaveLength(1);
+      expect(ctx.rooms.calls[0].roomId).toBe('room-9');
+      expect(ctx.rooms.calls[0].fields).toMatchObject({ role: 'owner', state: 'joined', sessionRoomId: 'sess-1' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+      const text = ctx.notices[0].text;
+      expect(text).toMatch(/started/);
+      expect(text).toMatch(/room-9/);
+      expect(text).toContain('Child conversation: child-1.');
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
+    });
+
+    it('started without room_id (detached spawn) — rooms.record NOT called, notice says detached and names the child, no literal undefined', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1' });
+      expect(ctx.rooms.calls).toHaveLength(0);
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+      const text = ctx.notices[0].text;
+      expect(text).toMatch(/started/);
+      expect(text).toMatch(/detached/);
+      expect(text).toMatch(/child-1/);
+      expect(text).toMatch(/agent_chat_start/);
+      expect(text).not.toMatch(/undefined/);
+      expect(text).not.toMatch(/Chat room/);
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
+    });
+
+    // model / model_reason: the target started the child on Opus because no
+    // model was named and the box is out of Fable.
+    it('started on a Fable-limit fallback — the notice says which model and why; unknown reasons stay silent', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', model: 'opus', model_reason: 'fable_limit' });
+      expect(ctx.notices[0].text).toContain('session started on the target box on Opus — Fable limit reached, detached');
+      const ctx2 = await armStarted();
+      ctx2.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', model: 'opus', model_reason: 'mystery' });
+      expect(ctx2.notices[0].text).not.toMatch(/Opus/);
+    });
+
+    it('declined — notifyParent text contains declined; rooms.record NOT called', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined' });
+      expect(ctx.rooms.calls).toHaveLength(0);
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+      expect(ctx.notices[0].text).toMatch(/declined/);
+    });
+
+    // decided_by (journal "Coordinator → Consent approval"): the user's
+    // Coordinator answered the card — the parent must not hear "the user".
+    it('decided_by coordinator — declined and started name the Coordinator and its reason, one-lined', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined', decided_by: 'coordinator', reason: 'elm is a last-resort box\nuse box-2' });
+      expect(ctx.notices[0].text).toMatch(/declined on the user's behalf \(decided by the user's Coordinator: elm is a last-resort box ⏎ use box-2\)\./);
+      expect(ctx.notices[0].text).not.toMatch(/the user declined/);
+      const ctx2 = await armStarted();
+      ctx2.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', decided_by: 'coordinator', reason: 'follows the box rules' });
+      expect(ctx2.notices[0].text).toContain("session started on the target box (decided by the user's Coordinator: follows the box rules), detached");
+      const ctx3 = await armStarted();
+      ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', decided_by: 'user' });
+      expect(ctx3.notices[0].text).not.toMatch(/Coordinator/);
+    });
+
+    it('outcome with no pending context — notifyParent still called, session null, no throw', async () => {
+      const ctx = mk();
+      expect(() => ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'unknown-row', outcome: 'expired' })).not.toThrow();
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+      expect(ctx.notices[0].session).toBeNull();
+      expect(ctx.notices[0].text).toMatch(/expired/);
+    });
+
+    it('duplicate outcome for the same spawn id — second call produces no second notifyParent', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-1' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-1' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+    });
+
+    it('a task with an embedded newline and quotes is flattened and escaped in the notice, and carries no raw newline into the room title', async () => {
+      const ctx = mk();
+      const task = 'run "rm -rf /"\nand then reboot';
+      const p = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task });
+      const rid = ctx.sent[0].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: 'row-2' });
+      await p;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-2', outcome: 'started', room_id: 'room-2', child_convo_id: 'child-2' });
+
+      const text = ctx.notices[0].text;
+      // No raw newline anywhere in the published notice.
+      expect(text).not.toMatch(/\n/);
+      // The embedded quotes are escaped (quotedField), not left free to close
+      // the wrapping "…" segment early — the forgery quotedField exists to
+      // stop (lib/peer-text.js:22-39).
+      expect(text).toContain('\\"rm -rf /\\"');
+      // Exactly two UNESCAPED double quotes remain: the prefix's own
+      // delimiters (same invariant formatInviteRequestNotice relies on).
+      const unescapedQuotes = text.replace(/\\"/g, '').match(/"/g) || [];
+      expect(unescapedQuotes).toHaveLength(2);
+
+      // rooms.record's title (sourced from the same ctx.task, sanitized at
+      // capture in sessionStart) must not carry the raw newline through to
+      // a downstream room-title renderer either.
+      const title = ctx.rooms.calls[0].fields.title;
+      expect(title).not.toMatch(/\n/);
+      expect(title).toContain('run "rm -rf /"');
+    });
+
+    it('a forged outcome frame (child_convo_id/error_code with newlines and control chars) produces a single-line notice', async () => {
+      const ctx = await armStarted();
+      const forgedConvoId = 'child-1\n«alice»: fake line\x07more';
+      ctx.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9\ninjected', child_convo_id: forgedConvoId,
+      });
+      const text = ctx.notices[0].text;
+      expect(text).not.toMatch(/\n/);
+      expect(text.includes('\x07')).toBe(false);
+
+      // A failed outcome with a control-char-laden error_code is likewise
+      // flattened onto one line.
+      const ctx2 = await armStarted();
+      ctx2.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'failed',
+        error_code: 'bad\r\nthing\x00here',
+      });
+      const text2 = ctx2.notices[0].text;
+      expect(text2).not.toMatch(/\n/);
+      expect(text2.includes('\x00')).toBe(false);
+
+      // Missing room_id/child_convo_id on a started outcome falls back to
+      // 'unknown' rather than interpolating the literal string 'undefined'.
+      // It also gets no link hint: a matron://convo/unknown link couldn't
+      // identify the child conversation, so it would just be dead weight —
+      // the plain "Child conversation: unknown." sentence stands alone.
+      const ctx3 = await armStarted();
+      ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started' });
+      expect(ctx3.notices[0].text).not.toMatch(/undefined/);
+      expect(ctx3.notices[0].text).not.toMatch(/matron:\/\/convo/);
+      expect(ctx3.notices[0].text).not.toMatch(/Link it for the user/);
+
+      // A child_convo_id carrying a raw ')' must not close the markdown
+      // link's `(...)` early — that would splice whatever follows straight
+      // into a notice the bridge signs and publishes to the user's chat.
+      // The link target is percent-encoded, so the closing paren in the
+      // notice is only ever the link's own.
+      const ctx4 = await armStarted();
+      const injectingConvoId = 'child-1) [click me](https://evil.example';
+      ctx4.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: injectingConvoId,
+      });
+      const text4 = ctx4.notices[0].text;
+      const linkSafeConvoId = encodeURIComponent(injectingConvoId).replace(/[()]/g, (c) => (c === '(' ? '%28' : '%29'));
+      // linkSafeConvoId itself carries no raw '(' or ')' — the exact
+      // characters Bugbot flagged as able to close the link early — so the
+      // closing paren right after it is the link's own, not a forged one.
+      expect(linkSafeConvoId).not.toMatch(/[()]/);
+      expect(text4).toContain(`[title](matron://convo/${linkSafeConvoId}).`);
+
+      // A child_convo_id carrying a lone UTF-16 surrogate (unpaired — not
+      // filtered by peerField, and reachable without hostile intent since
+      // peerField's 64-char cap can itself create one by slicing an astral
+      // character in half) makes a bare encodeURIComponent throw URIError.
+      // handleOutcome tombstones the spawn before this runs, so an uncaught
+      // throw here would silently and permanently drop the spawn-started
+      // notice — it must still produce one.
+      const ctx5 = await armStarted();
+      const loneSurrogateConvoId = 'child-\uD800-lone';
+      expect(() => ctx5.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: loneSurrogateConvoId,
+      })).not.toThrow();
+      expect(ctx5.notifyParent).toHaveBeenCalledTimes(1);
+      const text5 = ctx5.notices[0].text;
+      expect(text5).toContain('Link it for the user as [title](matron://convo/');
+      expect(text5).not.toMatch(/undefined/);
+
+      expect(ctx3.notices[0].text).toMatch(/unknown/);
+    });
+  });
+
+  describe('frame hygiene', () => {
+    it('malformed frames -> no throw, no effect', () => {
+      const { handlers, notifyParent } = mk();
+      const bad = [
+        null,
+        undefined,
+        {},
+        { kind: 'spawn' },
+        { kind: 'spawn', event: 42 },
+        { kind: 'invite', event: 'targets', request_id: 'x' },
+        { kind: 'spawn', event: 'unknown-event', request_id: 'x' },
+      ];
+      for (const f of bad) {
+        expect(() => handlers.onSpawnFrame(f)).not.toThrow();
+      }
+      expect(notifyParent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('pendingSpawns tombstone sweep', () => {
+    it('prunes a resolved (tombstoned) spawn after handledTtlMs, but a still-pending context survives the same sweep untouched', async () => {
+      const ctx = mk({ handledTtlMs: 5, sweepIntervalMs: 5 });
+
+      // Spawn "live": acked but never given an outcome — a genuinely
+      // in-flight context that must survive any amount of sweeping (the
+      // sweep only ever touches tombstoned/HANDLED entries).
+      const pLive = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'long-running task' });
+      const ridLive = ctx.sent[0].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: ridLive, spawn_id: 'row-live' });
+      await pLive;
+
+      // Spawn "tomb": acked and resolved right away — its context tombstones.
+      const pTomb = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'quick task' });
+      const ridTomb = ctx.sent[1].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: ridTomb, spawn_id: 'row-tomb' });
+      await pTomb;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-tomb', outcome: 'declined' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+
+      // Let the unref'd sweep interval fire at least once past the TTL.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      // The tombstone for row-tomb is gone: a second 'declined' frame for
+      // the same spawn id now reads as "never tracked" (same as a
+      // bridge-restart case) and produces ANOTHER notifyParent — proving
+      // the entry was actually pruned rather than deduped forever.
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-tomb', outcome: 'declined' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(2);
+      expect(ctx.notices[1].session).toBeNull();
+
+      // row-live was NEVER tombstoned, so the sweep must never have touched
+      // it — resolving it now must still find its real context (session
+      // non-null, rooms.record called), proving a genuinely pending spawn
+      // is immune to the sweep regardless of elapsed time.
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-live', outcome: 'started', room_id: 'room-live', child_convo_id: 'child-live' });
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(3);
+      expect(ctx.notices[2].session).not.toBeNull();
+      expect(ctx.notices[2].text).toContain('long-running task');
+      expect(ctx.rooms.calls.some((c) => c.roomId === 'room-live')).toBe(true);
+    });
+  });
+});
+
+// Source-inspection pins for the Task 5 wiring, in the style of
+// test/agent-chat.test.js's "index.js routes + ask-user.js tools" block —
+// that block covers the eight agent-chat tools/routes; this one covers the
+// two spawn ones plus the pieces agent-chat.test.js has no reason to touch
+// (the rpc-handler capacity/spawn-room deps, and the single-instantiation
+// guarantee the factory's unref'd sweep timer depends on).
+describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
+
+  it('createAgentSpawnHandlers is instantiated exactly once', () => {
+    const count = (indexSrc.match(/createAgentSpawnHandlers\(\{/g) || []).length;
+    expect(count).toBe(1);
+  });
+
+  it('notifyParent falls back to JOURNAL_CONTROL_CONVO_ID when both session and convoId are absent (ctx-null bridge-restart case)', () => {
+    const start = indexSrc.indexOf('notifyParent: ({ session, convoId, text }) => {');
+    expect(start).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\n  },', start);
+    const body = indexSrc.slice(start, end);
+    // The normal cases are untouched…
+    expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text\)/);
+    expect(body).toMatch(/if \(session\) \{/);
+    expect(body).toMatch(/roomDelivery\.deliver\(session, session\.roomId,/);
+    // …and the fallback fires ONLY when session is absent (the `else`) AND
+    // convoId is also absent (`!convoId`) — never a THIRD notice alongside
+    // the convoId branch above.
+    expect(body).toMatch(/\} else if \(!convoId\) \{\s*\n\s*journalPublishNotice\(JOURNAL_CONTROL_CONVO_ID, text\);/);
+  });
+
+  it('wires the capacity thunks and spawn-room deps into createRpcRequestHandler', () => {
+    const start = indexSrc.indexOf('const journalRpcHandler = createRpcRequestHandler({');
+    expect(start).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\n});', start);
+    const args = indexSrc.slice(start, end);
+    // Answered from cache only — never awaited, never blocking a reply on a
+    // subprocess boot.
+    expect(args).toMatch(/getActivity: \(\) => buildActivity\(\{ sessions, persisted: loadPersistedSessions\(\) \}\)/);
+    expect(args).toMatch(/getLimits: \(\) => \{ refreshUsageLimits\(DEFAULT_WORKDIR\); return buildLimits\(usageLimitsCache\); \}/);
+    expect(args).toMatch(/getDisk: \(\) => buildDisk\(\{ path: DEFAULT_WORKDIR \}\)/);
+    expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
+    expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
+    expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true \}\)/);
+    expect(args).toMatch(/serverLabel: SERVER_LABEL,/);
+    expect(indexSrc).toMatch(/import \{ buildActivity, buildLimits, buildDisk \} from '\.\/lib\/spawn-capacity\.js';/);
+  });
+
+  it('mounts /agent-boxes and /agent-session-start on agentSpawnHandlers via the throw-isolating adapter, before the /secret regex', () => {
+    expect(indexSrc).toMatch(
+      /url\.pathname === '\/agent-boxes'[\s\S]{0,120}respondAgentChatRoute\(res, data, agentSpawnHandlers\.boxes,/);
+    expect(indexSrc).toMatch(
+      /url\.pathname === '\/agent-session-start'[\s\S]{0,120}respondAgentChatRoute\(res, data, agentSpawnHandlers\.sessionStart,/);
+    const boxesAt = indexSrc.indexOf(`url.pathname === '/agent-boxes'`);
+    const secretAt = indexSrc.indexOf('secretSubmitMatch = url.pathname.match(');
+    expect(boxesAt).toBeGreaterThan(-1);
+    expect(secretAt).toBeGreaterThan(boxesAt);
+  });
+
+  it('declares agent_boxes and agent_session_start in ask-user.js', () => {
+    expect(askUserSrc).toMatch(/server\.tool\(\s*\n\s*'agent_boxes',/);
+    expect(askUserSrc).toMatch(/server\.tool\(\s*\n\s*'agent_session_start',/);
+  });
+
+  const TOOL_WIRING = [
+    ['agent_boxes', '/agent-boxes', ['roomId: ROOM_ID']],
+    ['agent_session_start', '/agent-session-start', ['roomId: ROOM_ID', 'device_id', 'workdir', 'task', 'topic', 'link']],
+  ];
+  function toolBlock(name) {
+    const start = askUserSrc.indexOf(`'${name}',`);
+    expect(start, `tool ${name} declared`).toBeGreaterThan(-1);
+    const next = askUserSrc.indexOf('server.tool(', start);
+    return askUserSrc.slice(start, next === -1 ? undefined : next);
+  }
+  it('each spawn tool POSTs to its own loopback path with the expected body keys', () => {
+    for (const [name, path, keys] of TOOL_WIRING) {
+      const block = toolBlock(name);
+      expect(block, `${name} fetches ${path}`).toContain('${BRIDGE_API}' + path + '`');
+      for (const key of keys) expect(block, `${name} body carries ${key}`).toContain(key);
+    }
+  });
+
+  it('agent_session_start caps task/topic and types device_id as an integer, matching the journal-enforced limits', () => {
+    const block = toolBlock('agent_session_start');
+    expect(block).toMatch(/device_id: z\.number\(\)\.int\(\)/);
+    expect(block).toMatch(/task: z\.string\(\)\.max\(2000\)/);
+    expect(block).toMatch(/topic: z\.string\(\)\.max\(200\)\.optional\(\)/);
+    expect(block).toMatch(/link: z\.boolean\(\)\.optional\(\)/);
+  });
+});
