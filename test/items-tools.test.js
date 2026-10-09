@@ -194,9 +194,12 @@ describe('items handlers', () => {
     const { h, client } = fixture({ get: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) });
     expect(await h.get({ roomId: '!r:s', id: '#3' })).toEqual({ status: 502, body: { error: 'journal unreachable' } });
     expect((await h.close({ roomId: '!r:s', id: 'it_1', resolution: 'done', comment: 'shipped' })).status).toBe(200);
-    expect(client.close.mock.calls[0]).toEqual(['it_1', { resolution: 'done', comment: 'shipped' }]);
+    // Each write names the calling session's conversation, so the thread can
+    // say which session wrote the note.
+    expect(client.close.mock.calls[0]).toEqual(['it_1', { resolution: 'done', as_convo_id: 'c1', comment: 'shipped' }]);
     expect((await h.close({ roomId: '!r:s', id: 'it_1', resolution: 'meh' })).status).toBe(400);
     expect((await h.reopen({ roomId: '!r:s', id: 'it_1' })).status).toBe(200);
+    expect(client.reopen.mock.calls[0]).toEqual(['it_1', { as_convo_id: 'c1' }]);
     expect((await h.reorder({ roomId: '!r:s', id: 'it_1', position: 'top' })).status).toBe(200);
     expect((await h.reorder({ roomId: '!r:s', id: 'it_1' })).status).toBe(400);
   });
@@ -271,7 +274,7 @@ describe('items handlers', () => {
     client.comment.mockResolvedValueOnce({ status: 201, data: { item: { num: 7, title: 'T', awaiting: 'user' }, comment: { id: 'ic_1', actions: ['Merge', 'Wait'] } } });
     const r = await h.comment({ roomId: '!r:s', id: 'it_1', body: 'Merge it?', actions: [' Merge ', 'Wait'] });
     expect(r.status).toBe(201);
-    expect(client.comment.mock.calls[0][1]).toEqual({ body: 'Merge it?', actions: ['Merge', 'Wait'] });
+    expect(client.comment.mock.calls[0][1]).toEqual({ body: 'Merge it?', as_convo_id: 'c1', actions: ['Merge', 'Wait'] });
     expect(client.update).not.toHaveBeenCalled();
     expect(r.body).not.toHaveProperty('actions_error');
     // awaiting:'user' alongside says the same thing — still one write.
@@ -297,7 +300,7 @@ describe('items handlers', () => {
     const { h, client } = fixture();
     const r = await h.comment({ roomId: '!r:s', id: 'it_1', body: 'fyi', actions: [], awaiting: 'agent' });
     expect(r.status).toBe(201);
-    expect(client.comment.mock.calls[0][1]).toEqual({ body: 'fyi' });
+    expect(client.comment.mock.calls[0][1]).toEqual({ body: 'fyi', as_convo_id: 'c1' });
     expect(client.update).toHaveBeenCalledWith('it_1', { awaiting: 'agent' });
   });
 
