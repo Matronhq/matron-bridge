@@ -130,4 +130,20 @@ describe('Claude summaries and the SUMMARY_PROVIDERS order', () => {
     const empty = createSummaryModel({ anthropicApiKey: 'test', fetchImpl: claudeFetch({ content: [] }) });
     await expect(empty.generate('p')).rejects.toThrow('empty completion');
   });
+
+  it('gives OpenAI a deadline and moves past a hung Gemini call', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) }));
+    await createSummaryModel({ providers: 'openai', openaiApiKey: 'test', fetchImpl }).generate('p');
+    expect(fetchImpl.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    vi.useFakeTimers();
+    try {
+      const hung = { getGenerativeModel: () => ({ generateContent: () => new Promise(() => {}) }) };
+      const result = createSummaryModel({ providers: 'gemini', geminiClient: hung }).generate('p');
+      const assertion = expect(result).rejects.toThrow('gemini: timed out');
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
