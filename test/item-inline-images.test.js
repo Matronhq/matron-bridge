@@ -193,7 +193,7 @@ describe('items handlers: inline images end to end', () => {
     const client = { comment: vi.fn(async () => ({ status: 201, data: { item: {}, comment: { id: 'ic_1' } } })) };
     const r = await handlers(f, client).comment({ roomId: '!r:s', id: 'it_1', body: '![a](a.png)' });
     expect(r.status).toBe(201);
-    expect(client.comment.mock.calls[0][1]).toEqual({ body: '![a](attachment:blob-1)', attachments: [{ blob_ref: 'blob-1', mime: 'image/png', name: 'a.png', size: 4 }] });
+    expect(client.comment.mock.calls[0][1]).toEqual({ as_convo_id: 'c1', body: '![a](attachment:blob-1)', attachments: [{ blob_ref: 'blob-1', mime: 'image/png', name: 'a.png', size: 4 }] });
     expect(r.body.image_warnings).toBeUndefined();
   });
 
