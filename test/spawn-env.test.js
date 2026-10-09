@@ -12,6 +12,7 @@ const BRIDGE_ENV = Object.freeze({
   JOURNAL_TOKEN_FILE: '/etc/matron/agent-token',
   JOURNAL_WS_URL: 'wss://journal.example/ws',
   HMAC_SECRET: 'viewer-signing-key',
+  SUMMARY_ANTHROPIC_API_KEY: 'summary-test-key',
   OPENAI_API_KEY: 'sk-user',
   SHOW_FILE_TOKEN: 'inherited-show-file',
   CLAUDECODE: '1',
@@ -169,5 +170,15 @@ describe('pathWithNodeBin', () => {
     const dir = path.dirname(exec);
     expect(pathWithNodeBin('C:\\Windows;C:\\Git\\bin', exec, ';')).toBe(`${dir};C:\\Windows;C:\\Git\\bin`);
     expect(pathWithNodeBin(`C:\\Windows;${dir}`, exec, ';')).toBe(`C:\\Windows;${dir}`);
+  });
+});
+
+
+describe('summariser credential scoping', () => {
+  it('does not pass the dedicated Claude key to either agent or Codex transport', () => {
+    for (const env of [claude(), buildCodexSpawnEnv({ baseEnv: BRIDGE_ENV }), buildCodexSpawnEnv({ baseEnv: BRIDGE_ENV, appServer: false })]) {
+      expect(env).not.toHaveProperty('SUMMARY_ANTHROPIC_API_KEY');
+      expect(Object.values(env)).not.toContain('summary-test-key');
+    }
   });
 });

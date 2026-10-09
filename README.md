@@ -269,9 +269,12 @@ relaunches after a non-zero exit.
 | `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
 | `WHISPER_LANGUAGE` | Voice-note transcription language | `en` |
 | `WHISPER_PROMPT` | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
-| `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-6-luna` by default) | — |
-| `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
-| `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |
+| `SUMMARY_PROVIDERS` | Preference order for conversation titles and rolling TOC summaries, comma-separated from `anthropic`, `openai`, `gemini`. A provider without its key is skipped; a failed request falls through to the next one. Summaries are off when none has a key | `anthropic,openai,gemini` |
+| `SUMMARY_ANTHROPIC_API_KEY` | Dedicated Claude summariser key (`claude-haiku-5-5` by default). Does not change session authentication | — |
+| `SUMMARY_ANTHROPIC_MODEL` | Claude summariser model | `claude-haiku-5-5` |
+| `OPENAI_API_KEY` | Optional OpenAI summariser key (`gpt-6-luna` by default) | — |
+| `GEMINI_API_KEY` | Optional Gemini summariser key (`gemini-3-flash-preview` by default) | — |
+| `SUMMARY_MODEL` | Model override for the OpenAI and Gemini summarisers | — |
 
 Voice notes sent in chat are transcribed by the journal at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`, see the journal's protocol doc): the bridge asks `GET /media/:id/transcript` first and only runs its own whisper when the journal has no words for the note (no key, an older journal, or a failed job).
 
@@ -422,3 +425,14 @@ matron-bridge/
 ├── package.json
 └── .env.example
 ```
+
+Claude summary rollout: with the default order, supplying
+`SUMMARY_ANTHROPIC_API_KEY` is what turns Claude on, so provision it through
+the secure credential store only once its Console billing organisation is
+confirmed, and start with one bridge. Check titles, roster and spoken
+summaries, and inspect debug `summary usage` counts for cache reads after
+repeated turns. The fixed prompt prefix has a 5-minute cache breakpoint;
+transcript and prior roster text are never in it. Cache hits depend on the
+model's minimum prompt length. Provider failures log a fallback event without
+prompt or response content. Roll back by removing the key, or by setting
+`SUMMARY_PROVIDERS=openai,gemini`, and restarting the bridge.

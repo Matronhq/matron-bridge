@@ -235,3 +235,14 @@ describe('spokenRefFor', () => {
     expect(spokenRefFor([user, reply], undefined)).toBeNull();
   });
 });
+
+
+it('keeps the Claude cache prefix stable across different transcripts and rolling summaries', () => {
+  const first = buildSummaryPrompt({ messages: msgs(2), priorRoster: 'old state', hasCumulative: true, structured: true });
+  const next = buildSummaryPrompt({ messages: msgs(2, 10), priorRoster: 'new state', hasCumulative: true, structured: true });
+  expect(first.system).toBe(next.system);
+  expect(first.system).not.toContain('old state');
+  expect(first.system).not.toContain('user: m');
+  expect(first.prompt).toContain('old state');
+  expect(next.prompt).toContain('user: m10');
+});
