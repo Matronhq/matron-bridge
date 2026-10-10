@@ -1335,8 +1335,10 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     const nStart = indexSrc.indexOf('function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {');
     expect(nStart).toBeGreaterThan(-1);
     const noticeFn = indexSrc.slice(nStart, indexSrc.indexOf('\nfunction ', nStart + 1));
-    expect(noticeFn).toContain('journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }))');
-    expect((noticeFn.match(/journalPublishNotice\(/g) || [])).toHaveLength(1);
+    expect(noticeFn).toContain('journalPublishSessionNotice(session, formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }),');
+    // payload.notice "control"; it opens the agent's turn only when that turn is injected now.
+    expect(noticeFn).toContain('{ notice: NOTICE.CONTROL, turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.PEER }');
+    expect((noticeFn.match(/journalPublishSessionNotice\(/g) || [])).toHaveLength(1);
     // Comments stripped: the ones in these functions NAME the forbidden path
     // to explain why it is forbidden.
     const strip = (src) => src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
