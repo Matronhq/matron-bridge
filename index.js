@@ -195,6 +195,7 @@ import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
+import { NOTICE, TURN_ORIGIN, noticeTag, controlTurnOrigin, canAnnounceTurn, announceTurnStart, noteTurnDispatch, noteTurnEnd, holdTurnRow, withTurnStart, withTurnRowStart, markTurnOrigin, mergedTurnOrigin, turnSeq } from './lib/turn-markers.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle, recordTitleEarned } from './lib/journal-title-seed.js';
@@ -1621,7 +1622,7 @@ const journalRpcHandler = createRpcRequestHandler({
   unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
   // meta.causes: the spawned child's opening turn names its spawn
   // (spawnedCause), so the journal can follow the child's asks back to it.
-  injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null }),
+  injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null, turnOrigin: TURN_ORIGIN.SPAWN }),
   // Coordinator session control (lib/session-control.js): resolve or resume
   // the target, park while occupied, apply through the /model, /switch,
   // /compact and turn-injection paths. Late-bound like joinMission.
@@ -1702,6 +1703,35 @@ function journalRepoField(session) {
   }
 }
 
+// The publisher as seen by code that publishes a session's rows straight to it
+// (the Codex app-server wiring's file-change diffs) instead of through
+// journalPublish: the same turn_start hook, keyed by the convo's live session.
+// Only rows of the OWNER session are marked, and only while it is still the
+// convo's live session (an agent switch keeps the convo id but replaces the
+// session). Child (subagent) convos have no session of their own, so their
+// rows pass through unchanged.
+function turnMarkedPublisher(owner) {
+  const ownerFor = (convoId) => (findSessionByClaudeSessionId(convoId) === owner ? owner : null);
+  const marked = (method) => (convoId, payload, ...rest) =>
+    journalPublisher[method](convoId, withTurnStart(ownerFor(convoId), method, payload), ...rest);
+  return Object.create(journalPublisher, {
+    publishText: { value: marked('publishText') },
+    publishDiff: { value: marked('publishDiff') },
+    // A command's tool_output is finalized after an async log upload, so it
+    // can land once its turn is over: it only takes a marker while its own
+    // turn (codex:<thread>:<turn>:<item>) has not finished.
+    finalizeToolOutput: {
+      value: (convoId, messageRef, payload, blobRef) => {
+        const session = ownerFor(convoId);
+        const turnId = typeof messageRef === 'string' ? messageRef.split(':')[2] : null;
+        const late = !turnId || !!session?.codex?.finishedTurns?.has?.(turnId);
+        return journalPublisher.finalizeToolOutput(convoId, messageRef,
+          late ? payload : withTurnStart(session, 'publishToolOutput', payload), blobRef);
+      },
+    },
+  });
+}
+
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
 // `options` is the publisher's per-frame options bag ({onDelivered,
 // onEvicted, idemKey}); it rides the buffer too, so a hook attached to a
@@ -1710,6 +1740,9 @@ function journalRepoField(session) {
 // until the convo id arrives. Most callers ignore it.
 function journalPublish(session, method, payload, options) {
   if (!JOURNAL_ENABLED) return false;
+  // The first event of an injected turn carries payload.turn_start
+  // (lib/turn-markers.js); every later event passes through unchanged.
+  payload = withTurnStart(session, method, payload);
   const convoId = journalConvoIdFor(session);
   if (convoId) {
     // Protocol requirement: a convo_upsert must reach the server before (or
@@ -2759,7 +2792,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     reminderMs: resolveSlowToolReminderMs(process.env.MATRON_SLOW_TOOL_REMINDER_MS),
     notify: ({ toolName, elapsedMs, reminder }) => {
       if (!session.alive || typeof session.sendCallback !== 'function') return;
-      session.sendCallback(renderSlowToolNotice({ toolName, elapsedMs, reminder }));
+      withJournalNotice(session.roomId, NOTICE.SLOW_TOOL, () => session.sendCallback(renderSlowToolNotice({ toolName, elapsedMs, reminder })));
     },
     log: debug,
   });
@@ -2876,16 +2909,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
-        if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
-        } else if (restarted.sendCallback) {
-          restarted.sendCallback(
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
-          );
-        }
+        withJournalNotice(roomId, NOTICE.CRASH_RESTART, () => {
+          if (restarted.sendHtml) {
+            const n = notice('warning',
+              `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+              `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+            restarted.sendHtml(n.plain, n.html);
+          } else if (restarted.sendCallback) {
+            restarted.sendCallback(
+              `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
+            );
+          }
+        });
       } else {
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
         // session up in the map, so a notice sent after sessions.delete()
@@ -3059,9 +3094,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   };
 
   if (CODEX_APP_SERVER) wireCodexAppSession(session, {
-    publisher: journalPublisher, convoIdFor: journalConvoIdFor, runningStore: subagentRunningStore,
+    publisher: turnMarkedPublisher(session), convoIdFor: journalConvoIdFor, runningStore: subagentRunningStore,
     stream: journalStream, activity: journalActivity, status: journalStatus,
-    notice: (s, message) => journalPublishNotice(journalConvoIdFor(s), message),
+    notice: (s, message, kind) => journalPublishNotice(journalConvoIdFor(s), message, kind || null),
     publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
       payload.question, escapeHtml(payload.question), payload) ?? false,
     submitAsyncAnswer: submitCodexAsyncAnswer,
@@ -3298,11 +3333,22 @@ function flushPendingSessionQueue(session) {
     deferred: deferred.length,
     summary: formatQueueSummary(queued),
   });
-  if (session.sendHtml) {
-    session.sendHtml(notice.plain, notice.html);
-  } else if (session.sendCallback) {
-    session.sendCallback(notice.plain);
-  }
+  // A batch made only of injected turns (a nudge, a reminder, a room or item
+  // turn that arrived mid-turn) is delivered NOW, so this 📬 line opens that
+  // turn; a batch with a user message in it opens on the user's own row.
+  // flushQueue refuses a dead session and a pending restart up front; neither
+  // gets a turn, so neither gets the announcement.
+  const flushCanSend = session.alive && !session._autoStopped
+    && !(typeof session._deferredCommandText === 'string' && session._deferredCommandText.startsWith('!restart'));
+  const injectedOrigin = flushCanSend && !planQueueFlush(queued).mirrorText ? mergedTurnOrigin(queued) : null;
+  if (injectedOrigin) announceTurnStart(session, injectedOrigin);
+  withJournalNotice(session.roomId, 'queue', () => {
+    if (session.sendHtml) {
+      session.sendHtml(notice.plain, notice.html);
+    } else if (session.sendCallback) {
+      session.sendCallback(notice.plain);
+    }
+  });
   const sent = flushQueue(session, queued, releaseSnapshot);
   // Only the flushed batch's notifications retire; the deferred entries keep
   // theirs, in lockstep with the queue they still describe. A failed flush
@@ -3396,6 +3442,9 @@ function finishCodexTurn(session, {
     if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
     else if (session.sendCallback) session.sendCallback(message);
   }
+  // The turn is over: drop any turn_start it left unused, before anything
+  // below dispatches the next turn (lib/turn-markers.js).
+  noteTurnEnd(session);
 
   if (!preserveQueue && !session._codexSteerPending && !session._codexUncertainSteer) {
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
@@ -3794,14 +3843,16 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // sent right after the restart was typed into a still-loading TUI
         // and dropped (Bugbot, PR #162).
         enterResumeHold(restarted);
-        if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
-        } else if (restarted.sendCallback) {
-          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
-        }
+        withJournalNotice(restarted.roomId, NOTICE.CRASH_RESTART, () => {
+          if (restarted.sendHtml) {
+            const n = notice('warning',
+              `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+              `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+            restarted.sendHtml(n.plain, n.html);
+          } else if (restarted.sendCallback) {
+            restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
+          }
+        });
       } else {
         // Notices FIRST, teardown second: sendToRoom's journal mirror looks
         // the session up in the map, so anything sent after
@@ -3879,6 +3930,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         session._operatorCompactTimer = null;
       }
     }
+    // The turn is over: drop any turn_start it left unused, before
+    // anything below dispatches the next turn (lib/turn-markers.js).
+    noteTurnEnd(session);
     // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
     // the queue (and the roomId-keyed room-delivery inbox) carries into the
     // replacement session; see dispatchDeferredCommand. This seam also
@@ -5161,6 +5215,8 @@ function handleClaudeEvent(session, event) {
                 toolStreamPumps.set(streamRegKey, {
                   pump,
                   session,
+                  // Which turn ran it, so its late finalize only marks that turn.
+                  turnSeq: turnSeq(session),
                   convoId: journalConvoId,
                   command: streamCommand,
                   logPath: liveLogPath,
@@ -5425,6 +5481,9 @@ function handleClaudeEvent(session, event) {
         void planItems.opened(session, planText, { toolUseId: planDenial.tool_use_id });
       }
 
+      // The turn is over: drop any turn_start it left unused, before
+      // anything below dispatches the next turn (lib/turn-markers.js).
+      noteTurnEnd(session);
       // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
       // the queue (and the roomId-keyed room-delivery inbox) carries into
       // the replacement session; see dispatchDeferredCommand.
@@ -5459,12 +5518,14 @@ function handleClaudeEvent(session, event) {
         const COMPACT_COOLDOWN_MS = 60_000;
         if (!session.lastCompactCompleteNotify || (now - session.lastCompactCompleteNotify) > COMPACT_COOLDOWN_MS) {
           session.lastCompactCompleteNotify = now;
-          if (session.sendHtml) {
-            const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
-            session.sendHtml(n.plain, n.html);
-          } else if (session.sendCallback) {
-            session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
-          }
+          withJournalNotice(session.roomId, NOTICE.COMPACTION, () => {
+            if (session.sendHtml) {
+              const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
+              session.sendHtml(n.plain, n.html);
+            } else if (session.sendCallback) {
+              session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
+            }
+          });
         } else {
           debug('Suppressed compaction completion notice (cooldown, last=%dms ago)', now - session.lastCompactCompleteNotify);
         }
@@ -5583,12 +5644,14 @@ function handleClaudeEvent(session, event) {
           const pendingNow = Date.now();
           session._lastManualCompactConfirm = pendingNow;
           session.lastCompactCompleteNotify = pendingNow;
-          if (session.sendHtml) {
-            const n = notice('success', doneText);
-            session.sendHtml(n.plain, n.html);
-          } else if (session.sendCallback) {
-            session.sendCallback(doneText);
-          }
+          withJournalNotice(session.roomId, NOTICE.COMPACTION, () => {
+            if (session.sendHtml) {
+              const n = notice('success', doneText);
+              session.sendHtml(n.plain, n.html);
+            } else if (session.sendCallback) {
+              session.sendCallback(doneText);
+            }
+          });
           // onTurnEnd clears busy + typing and flushes any queued messages.
           // Print-mode sessions have no onTurnEnd (no PTY); clear busy directly.
           if (session.iv && typeof session.onTurnEnd === 'function') {
@@ -5632,12 +5695,14 @@ function handleClaudeEvent(session, event) {
           if (!session._lastManualCompactConfirm || (now - session._lastManualCompactConfirm) > DUP_BOUNDARY_MS) {
             session._lastManualCompactConfirm = now;
             session.lastCompactCompleteNotify = now;
-            if (session.sendHtml) {
-              const n = notice('success', doneText);
-              session.sendHtml(n.plain, n.html);
-            } else if (session.sendCallback) {
-              session.sendCallback(doneText);
-            }
+            withJournalNotice(session.roomId, NOTICE.COMPACTION, () => {
+              if (session.sendHtml) {
+                const n = notice('success', doneText);
+                session.sendHtml(n.plain, n.html);
+              } else if (session.sendCallback) {
+                session.sendCallback(doneText);
+              }
+            });
           }
         }
       }
@@ -5890,7 +5955,11 @@ function inflightTurnOrigin(session) {
 // again here as an agent-sourced echo would duplicate it. Every other caller
 // (text the bridge injects itself, which has no other route into the
 // journal) leaves this false.
-function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, causes = null } = {}) {
+// turnOrigin: set by a caller injecting a turn the journal has no user event
+// for (a routine, a reminder, a room message...; lib/turn-markers.js), so the
+// turn's first published event carries payload.turn_start. Only meaningful
+// with skipJournalMirror: a mirrored send publishes its own user row.
+function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, causes = null, turnOrigin = null } = {}) {
   if (!session.alive || session._autoStopped) return false;
   // Backstop for the foreign-turn gate: a turn of the session's own that
   // starts while no turn is running ends any foreign turn a seam missed.
@@ -5958,7 +6027,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     // not be re-mirrored on flush (the journal already has the client's own
     // send row for it). The causes travel the same way: the flush starts the
     // turn, long after this call, and merges each held entry's (queueCauses).
-    (session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));
+    (session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markTurnOrigin(markJournalOrigin(contentBlocks), turnOrigin) : contentBlocks, causes));
     session.lastActivityAt = Date.now();
     return true;
   }
@@ -5974,7 +6043,15 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // joins that turn rather than relabelling it, and a "no causes" side counts
   // as `other`. Mid-turn input (busy) adds its causes when it has some.
   const beganTurn = beginOrJoinTurn(session, causes);
+  // A send into a turn that is still running (a queued entry's "Send now")
+  // starts no turn of its own: it neither marks the running turn with its
+  // origin nor clears that turn's own marker.
+  const busyAtDispatch = session.busy === true;
   session.busy = true;
+  // The turn_start arm is decided only once the backend has ACCEPTED the
+  // turn (markDispatched below); a refused send clears it instead, so its
+  // failure line can never read as the start of a turn that never ran.
+  const markDispatched = () => { if (!busyAtDispatch) noteTurnDispatch(session, skipJournalMirror ? turnOrigin : null); };
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
@@ -6007,12 +6084,14 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     session._codexBuildValue = null;
     const sent = (nativeCompact ? session.codex.compact() : session.codex?.send(contentBlocks)) === true;
     if (sent) {
+      markDispatched();
       commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (!skipJournalMirror && journalText) {
         journalPublishUserItem(session, 'publishText', { body: journalText, from: 'user' });
       }
     }
     if (!sent) {
+      noteTurnDispatch(session, null);
       const detail = session.codex?.lastError?.message || session._codexLastError;
       const message = detail
         ? `Could not start Codex: ${detail}`
@@ -6035,6 +6114,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
       session.iv.sendText(text);
+      markDispatched();
       commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (session.resetTimeout) session.resetTimeout();
       return true;
@@ -6042,6 +6122,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     // Defensive fallback: validation above should make this unreachable, but
     // preserve false/handled semantics if a future content rewrite removes
     // all text after activity state has started.
+    noteTurnDispatch(session, null);
     return reportSessionSendFailure(
       session,
       'Interactive mode needs a text prompt.',
@@ -6063,12 +6144,14 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     session.proc.stdin.write(jsonMsg);
   } catch (error) {
     debug(`Failed to write Claude turn: ${error.message}`);
+    noteTurnDispatch(session, null);
     return reportSessionSendFailure(
       session,
       `Could not send the message to Claude: ${error.message}`,
       { restoreJournalState: true, beganTurn },
     );
   }
+  markDispatched();
   commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
   if (session.resetTimeout) session.resetTimeout();
   return true;
@@ -6335,9 +6418,19 @@ function formatQueueSummary(queued) {
 function dispatchMergedFlush(session, queued) {
   const { blocks, mirrorText } = planQueueFlush(queued);
   if (blocks.length === 0) return false;
+  // An all-injected batch is an injected turn; one user message in it makes
+  // it the user's. When the bridge mirrors the batch as a user row (a
+  // bridge-composed continuation), that row is the turn's first event and
+  // carries the turn_start itself.
+  // Sent into a turn that is still running ("Send now"), it starts no
+  // injected turn: sendToSession leaves the running turn's marker alone, and
+  // the mirrored row carries none either.
   // One turn for the whole batch: it was started by everything in it.
-  if (!sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })) return false;
-  if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
+  const injectedOrigin = session.busy === true ? null : mergedTurnOrigin(queued);
+  if (!sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued), turnOrigin: mirrorText ? null : injectedOrigin })) return false;
+  if (mirrorText) {
+    journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user', ...(injectedOrigin ? { turn_start: { origin: injectedOrigin } } : {}) });
+  }
   for (const entry of queued) {
     for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
   }
@@ -6518,7 +6611,8 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       const count = Array.isArray(queued) ? queued.length : 0;
       journalPublishNotice(journalConvoIdFor(session), count > 1
         ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
-        : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+        : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.",
+      NOTICE.DELIVERY_FAILED);
       return false;
     }
     restore();
@@ -6746,14 +6840,33 @@ function deduplicateFilename(dir, filename) {
 // exactly the re-publish loop the return path must avoid (the journal
 // already has the user's own row for that content), so with the flag set
 // sendToRoom publishes nothing.
+// `notice` ({kind, icon, summary}, lib/system-notice.js) marks a notice the
+// apps may show as one compact row that expands to the body. A notice sent
+// through a session's own send callbacks (sendCallback / sendHtml), which
+// take no options, is tagged by its emit site wrapping the send in
+// withJournalNotice(roomId, kind, ...): the sendToRoom that send reaches
+// synchronously picks the kind up for its one publish and builds the tag.
+const journalNoticeByRoom = new Map();
+function withJournalNotice(roomId, kind, send) {
+  journalNoticeByRoom.set(roomId, kind);
+  try {
+    return send();
+  } finally {
+    journalNoticeByRoom.delete(roomId);
+  }
+}
+
 async function sendToRoom(roomId, text, html, { skipJournalMirror = false, notice = null } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
-  // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
-  // no active session (control-room chatter) are silently skipped.
+  // here is fine to mirror as-is. Rooms with no active session (control-room
+  // chatter) are silently skipped. A bridge notice sent under
+  // withJournalNotice carries its class as payload.notice.
   if (!skipJournalMirror) {
     const journalSession = sessions.get(roomId);
     if (journalSession) {
-      const payload = { body: text, from: 'assistant', ...(notice ? { notice } : {}) };
+      const taggedNotice = noticeTag(notice ?? journalNoticeByRoom.get(roomId), text);
+      journalNoticeByRoom.delete(roomId);
+      const payload = { body: text, from: 'assistant', ...(taggedNotice ? { notice: taggedNotice } : {}) };
       // Thread the streaming overlay's ref into the durable message so a
       // viewing client retires its overlay by ref (payload.message_ref is the
       // only channel the server exposes to a client — the durable event shape
@@ -6818,6 +6931,9 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
   toolStreamPumps.delete(key);
   entry.pump.stop();
   const toolUseId = entry.messageRef;
+  // A row of the turn that is still current may land after the turn ends;
+  // it keeps that turn's turn_start until it does (lib/turn-markers.js).
+  const releaseTurnRow = entry.turnSeq === turnSeq(entry.session) ? holdTurnRow(entry.session) : () => {};
   (async () => {
     try {
       // Bounded final flush BEFORE the durable finalize publish below: bytes
@@ -6887,7 +7003,7 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
         ? logBuf.subarray(Math.max(0, logBuf.length - TOOL_SNIPPET_READ_BYTES))
         : null;
       const text = tail ? decodeByteExact(tail).text : '';
-      journalPublisher.finalizeToolOutput(entry.convoId, toolUseId, {
+      const finalPayload = {
         message_ref: toolUseId,
         command: entry.command,
         exit_code: exitCode,
@@ -6896,9 +7012,16 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
         snippet: toolOutputSnippet(text),
         blob_ref: blobRef,
         live_log: true,
-      }, blobRef);
+      };
+      // The finalize lands after an async upload: it is the first row of its
+      // turn only if that turn is still the session's current one.
+      journalPublisher.finalizeToolOutput(entry.convoId, toolUseId,
+        withTurnRowStart(entry.session, entry.turnSeq, 'publishToolOutput', finalPayload),
+        blobRef);
     } catch (e) {
       try { console.warn(`[journal] tool-output finalize failed: ${e.message}`); } catch { /* logging must never throw */ }
+    } finally {
+      releaseTurnRow();
     }
   })();
 }
@@ -7359,13 +7482,13 @@ function fetchUsageLimitsText(cwd) {
 const CODEX_MODEL_FLAG_REFUSAL =
   '--model selects a Claude model alias and is Claude-only. Start Codex without --model, then use /model <model-id> in the new conversation (or /model default for your Codex config default).';
 
-function runCodexControl(session, text, reply) {
+function runCodexControl(session, text, reply, { turnOrigin = null } = {}) {
   return handleCodexControl(session, text, {
     beforeDispatch: () => journalPublisher.flushCursor(),
     reply: reply || journalSessionCommandCtx(session).sendReply,
     status: journalStatus,
     persist: extra => persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, extra),
-    send: body => sendTextToSession(session, body, { skipJournalMirror: true }),
+    send: body => sendTextToSession(session, body, { skipJournalMirror: true, turnOrigin }),
   });
 }
 
@@ -7596,9 +7719,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : '';
       const restartModelLine = restartModelFlag.model ? `\nModel: ${aliasLabel(restartModelFlag.model)}` : '';
       const restartPermNote = permissionNote(restarted);
-      await sendReply(
+      await withJournalNotice(roomId, NOTICE.RESTART, () => sendReply(
         `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`
-      );
+      ));
       break;
     }
 
@@ -8950,15 +9073,32 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // be no live session object for the target convo (e.g. a reply for a
 // session that no longer exists) or for control-convo replies (which have no
 // session at all). Fails open like every other journal call.
-// `notice` ({kind, icon, summary}, lib/system-notice.js) marks a notice the
-// apps may show as one compact row that expands to `body`.
+// `notice` ({kind, icon, summary}, lib/system-notice.js; or just a kind from
+// NOTICE, which noticeTag expands) marks a notice the apps may show as one
+// compact row that expands to `body`.
 function journalPublishNotice(convoId, body, notice = null) {
   if (!JOURNAL_ENABLED || !convoId) return;
   try {
-    journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}) });
+    // A notice into a live session's convo is an event of that session like
+    // any other, so it takes a pending turn_start exactly as journalPublish
+    // does (lib/turn-markers.js).
+    const tagged = noticeTag(notice, body);
+    const payload = { body, from: 'assistant', ...(tagged ? { notice: tagged } : {}) };
+    journalPublisher.publishText(convoId, withTurnStart(findSessionByClaudeSessionId(convoId), 'publishText', payload));
   } catch (e) {
     try { console.warn(`[journal-input] notice publish failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
+}
+
+// journalPublishNotice for a live session, with the structured keys: `notice`
+// is the line's class, and `turnOrigin` names the injected turn the line
+// opens. The line only announces the turn when the session is not inside one
+// already (a line posted mid-turn belongs to that turn); the dispatch that
+// follows then carries the same origin through sendToSession.
+function journalPublishSessionNotice(session, body, { notice, turnOrigin } = {}) {
+  if (!session) return;
+  if (turnOrigin && canAnnounceTurn(session)) announceTurnStart(session, turnOrigin);
+  journalPublishNotice(journalConvoIdFor(session), body, notice);
 }
 
 // Publish a picker card into a convo that has NO live session — the restart
@@ -9093,7 +9233,10 @@ function armOperatorCompact(session, text) {
 // causes: what started the turn this text starts (lib/turn-cause.js), or
 // null when nothing identifiable did; a queued message keeps them on its
 // queue entry for the flush.
-async function journalRouteTextToSession(session, body, { keepRestartBudget = false, causes = null } = {}) {
+// turnOrigin: the caller is injecting this text as a turn the journal shows
+// no user event for (a timer, an auto carry-on, a Coordinator /compact);
+// see sendToSession.
+async function journalRouteTextToSession(session, body, { keepRestartBudget = false, causes = null, turnOrigin = null } = {}) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
   // The user is back in the loop, so restart_session gets a fresh budget.
@@ -9101,7 +9244,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   // self-restart queues flows through there, so a session would refresh its
   // own budget every time and the cap would never bind.
   if (!keepRestartBudget) session._agentRestartCount = 0;
-  if (session.codex?.transport === 'app-server' && await runCodexControl(session, trimmed)) return;
+  if (session.codex?.transport === 'app-server' && await runCodexControl(session, trimmed, undefined, { turnOrigin })) return;
 
   // Bridge-intercepted !/ commands run FIRST, before any prompt/menu
   // resolution below — so e.g. /stop always stops the session even while a
@@ -9288,6 +9431,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       return;
     }
     const entry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
+    markTurnOrigin(entry, turnOrigin);
     if (compactJump) session.queuedMessages.unshift(entry);
     else session.queuedMessages.push(entry);
     // Post the "📨 Queued" tile (shared notifyQueuedMessage,
@@ -9315,7 +9459,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   // An idle iv /compact gets its stand-in turn-end (armOperatorCompact).
   armOperatorCompact(session, trimmed);
-  return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
+  return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes, turnOrigin });
 }
 
 // prompt_reply -> pending prompt. Resolves `choice`/`text` against whichever
@@ -9558,10 +9702,10 @@ const journalMediaRouter = createJournalMediaRouter({
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path. `cause` (one cause or a list: an item reply's, or a
 // media message's) rides on the entry for the flush (lib/turn-cause.js).
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null, cause = null }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null, cause = null, turnOrigin = null }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = tagCauses([...blocks], cause);
-  if (!mirrorToJournal) markJournalOrigin(entry);
+  if (!mirrorToJournal) markTurnOrigin(markJournalOrigin(entry), turnOrigin);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
   // The queued tile is cosmetic: the entry above IS queued and will flush at
@@ -9612,7 +9756,7 @@ const itemTurnRouter = createItemTurnRouter({
   requestTranscript: (blobRef) => journalPublisher.requestTranscript(blobRef),
   fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),
   hasLocalWhisper,
-  injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
+  injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes, turnOrigin: TURN_ORIGIN.ITEM }),
   queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
@@ -9620,6 +9764,7 @@ const itemTurnRouter = createItemTurnRouter({
     fullText: text,
     source,
     cause,
+    turnOrigin: TURN_ORIGIN.ITEM,
   }),
   publishNotice: journalPublishNotice,
   // The journal strips any client-supplied transcript, so a voice note on an
@@ -9772,14 +9917,14 @@ async function journalOnCoordinator(convoId, { role }) {
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
   const target = sessions.get(roomId) || session;
-  await deliverCoordinatorTurn(target, coordinatorTurnText(role, trackerLinksNow(COORDINATOR_BLOCK), memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir }), noticesBlockNow({ coordinator: role === 'assigned', coordinatorOnly: true })));
+  await deliverCoordinatorTurn(target, coordinatorTurnText(role, trackerLinksNow(COORDINATOR_BLOCK), memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir }), noticesBlockNow({ coordinator: role === 'assigned', coordinatorOnly: true })), TURN_ORIGIN.COORDINATOR);
 }
 
 // The injected assigned/released turn. Same inject-or-queue rule as a
 // tracker reply (lib/items-turn.js): a busy session queues it behind the
 // running turn instead of losing it. Never mirrored — the journal already
 // shows the `coordinator` marker the apps render.
-async function deliverCoordinatorTurn(session, text) {
+async function deliverCoordinatorTurn(session, text, turnOrigin) {
   if (!text || !session?.alive) return;
   if (sessionOccupiedForRoomDelivery(session)) {
     await journalQueueMedia(session, {
@@ -9787,10 +9932,11 @@ async function deliverCoordinatorTurn(session, text) {
       mirrorToJournal: false,
       preview: text.split('\n')[0],
       fullText: text,
+      turnOrigin,
     });
     return;
   }
-  if (!sendTextToSession(session, text, { skipJournalMirror: true })) {
+  if (!sendTextToSession(session, text, { skipJournalMirror: true, turnOrigin })) {
     console.warn(`[coordinator] could not deliver the coordinator turn to ${session.roomId}`);
   }
 }
@@ -10104,7 +10250,7 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
       journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
       return;
     }
-    await journalRouteTextToSession(target, text);
+    await journalRouteTextToSession(target, text, { turnOrigin: TURN_ORIGIN.CARRY_ON });
   } catch (e) {
     console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
     journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
@@ -10135,24 +10281,32 @@ async function fireTimer(record) {
   if (!session || !session.alive) session = journalResumeConvo(record.convoId);
   if (!session) {
     journalPublishNotice(record.convoId,
-      `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`);
+      `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`,
+      NOTICE.DELIVERY_FAILED);
     return;
   }
+  // The ⏰ line opens the reminder's turn when the session is free; a busy
+  // session queues the text, and the turn_start then lands on the queued
+  // turn's first event once it is actually delivered.
+  // A command-shaped user timer (/status, /model ...) may run without any
+  // agent turn, so its line is not announced as one; its turn, if any, is
+  // marked on its first event instead.
+  const commandShaped = /^[!/]/.test(String(record.text ?? '').trim());
   if (record.source === 'agent') {
     // Set by the agent through reminder_create: the delivered turn says so,
     // or the model reads its own reminder as something the user just typed.
     const repeats = record.repeat ? `, ${formatRepeat(record.repeat)}` : '';
     const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
-    journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
+    journalPublishSessionNotice(session, reminderLine, { notice: noticeMeta('reminder', reminderLine), turnOrigin: TURN_ORIGIN.REMINDER });
     // A reminder turn, naming the turn that set it (lib/reminder-tools.js).
     await journalRouteTextToSession(session,
       `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`,
-      { causes: mergeCauses([plainCause('reminder'), record.causes]) });
+      { causes: mergeCauses([plainCause('reminder'), record.causes]), turnOrigin: TURN_ORIGIN.REMINDER });
     return;
   }
   const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
-  journalPublishNotice(journalConvoIdFor(session), timerLine, noticeMeta('reminder', timerLine));
-  await journalRouteTextToSession(session, record.text, { causes: [plainCause('reminder')] });
+  journalPublishSessionNotice(session, timerLine, { notice: noticeMeta('reminder', timerLine), turnOrigin: commandShaped ? null : TURN_ORIGIN.REMINDER });
+  await journalRouteTextToSession(session, record.text, { causes: [plainCause('reminder')], turnOrigin: TURN_ORIGIN.REMINDER });
 }
 
 // Keep KEEPAWAKE_FILE in step with the persisted timers: written with the
@@ -10570,20 +10724,21 @@ async function fireAutoResume(roomId, convoId, slot) {
     }
     return;
   }
+  const turnOrigin = slot.kind === 'model_recovery' ? TURN_ORIGIN.CARRY_ON : TURN_ORIGIN.USAGE_LIMIT;
   postControlNotice(session, slot.kind === 'model_recovery'
     ? '🕒 Model switched — carrying on.'
     : slot.source === 'coordinator'
       ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
-      : '🕒 The usage limit has reset — carrying on automatically.', 'control');
+      : '🕒 The usage limit has reset — carrying on automatically.', 'control', { turnOrigin });
   try {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
-      await journalRouteTextToSession(session, '/compact');
+      await journalRouteTextToSession(session, '/compact', { turnOrigin });
     }
     // A Coordinator's after_limit_reset carry-on is a carry-on turn, naming
     // the journal's record of it; the bridge's own automatic one names no
     // cause.
     await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),
-      { causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });
+      { causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null, turnOrigin });
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
     // A thrown delivery must not lose the carry-on: put the slot back for
@@ -10778,15 +10933,20 @@ function boxLabelForControl() {
   try { return journalPublisher.identity?.()?.name || SERVER_LABEL || os.hostname(); } catch { return SERVER_LABEL || 'this box'; }
 }
 
-function postControlNotice(session, text, kind = null) {
+// Every line here is a payload.notice (default kind "control"). turnOrigin:
+// the line opens the turn the caller is about to inject (lib/turn-markers.js),
+// so it carries payload.turn_start too; a line posted while the session is
+// still inside a turn (a parked action) never does.
+function postControlNotice(session, text, kind = null, { turnOrigin = null } = {}) {
+  if (turnOrigin && canAnnounceTurn(session)) announceTurnStart(session, turnOrigin);
   const n = notice('info', text);
   // A tagged notice takes sendHtml's own path (sendToRoom), with the tag.
-  const meta = kind ? noticeMeta(kind, text) : null;
+  const meta = noticeMeta(kind || NOTICE.CONTROL, text);
   if (meta && session?.roomId && typeof session.sendHtml === 'function' && sessions.get(session.roomId) === session) {
     try { sendToRoom(session.roomId, n.plain, n.html, { notice: meta }); return; } catch { /* fall through */ }
   }
   if (session && typeof session.sendHtml === 'function') {
-    try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
+    try { withJournalNotice(session.roomId, kind || NOTICE.CONTROL, () => session.sendHtml(n.plain, n.html)); return; } catch { /* fall through */ }
   }
   journalPublishNotice(journalConvoIdFor(session), text, meta);
 }
@@ -10842,8 +11002,14 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
       postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }), controlNoticeKind(params.action));
       return { ok: true, result: { applied: 'scheduled', at: plan.at, box } };
     case 'apply': {
-      postControlNotice(session, controlNotice(params, { phase: 'now', agent: session.agent }), controlNoticeKind(params.action));
-      const r = await applyControlSteps(session, plan.steps);
+      // A turn-starting action posts its line once the turn has been
+      // accepted, so the line is that turn's first event and carries its
+      // turn_start; a refused one is posted unmarked, ahead of the refusal.
+      const turnOrigin = controlTurnOrigin(params.action);
+      const nowLine = controlNotice(params, { phase: 'now', agent: session.agent });
+      if (!turnOrigin) postControlNotice(session, nowLine, controlNoticeKind(params.action));
+      const r = await applyControlSteps(session, plan.steps, { turnOrigin });
+      if (turnOrigin && r.ok) postControlNotice(sessions.get(session.roomId) || session, nowLine, controlNoticeKind(params.action));
       if (!r.ok) {
         postControlNotice(sessions.get(session.roomId) || session, controlNotice(params, { error: r.error.detail || r.error.code, agent: session.agent }), controlNoticeKind(params.action));
         return { ok: false, error: r.error };
@@ -10861,7 +11027,7 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
 // /compact (journalRouteTextToSession: Codex native, Claude typed/stdin) and
 // a Coordinator-attributed turn (sendTextToSession). Replies these paths
 // make land in the session chat via its command context.
-async function applyControlSteps(session, steps) {
+async function applyControlSteps(session, steps, { turnOrigin = null } = {}) {
   let current = session;
   const ctx = journalSessionCommandCtx(current);
   let startedTurn = false;
@@ -10903,13 +11069,13 @@ async function applyControlSteps(session, steps) {
       // A self-compact's own command (instructions included) is the session
       // talking to itself, not the user coming back: it must not hand
       // restart_session a fresh budget.
-      await journalRouteTextToSession(current, step.command || '/compact', { keepRestartBudget: !!step.command });
+      await journalRouteTextToSession(current, step.command || '/compact', { keepRestartBudget: !!step.command, turnOrigin });
       startedTurn = true;
     } else if (step.op === 'carry_on') {
       // The planner names what started the turn (lib/session-control.js):
       // a routine turn's fires, or the carry-on / alert itself.
       const causes = step.causes ?? (step.cause ? [step.cause] : null);
-      if (!sendTextToSession(current, step.text, { skipJournalMirror: true, causes })) {
+      if (!sendTextToSession(current, step.text, { skipJournalMirror: true, causes, turnOrigin })) {
         return { ok: false, error: { code: 'gone', detail: 'the session would not take a turn' } };
       }
       startedTurn = true;
@@ -10983,9 +11149,13 @@ function drainDeferredControls(session) {
         const { params } = slots[kind];
         const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
         if (plan.kind === 'apply') {
-          postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }), controlNoticeKind(params.action));
-          const r = await applyControlSteps(current, plan.steps);
+          // Same accepted-turn ordering as the 'now' path above.
+          const turnOrigin = controlTurnOrigin(params.action);
+          const appliedLine = controlNotice(params, { phase: 'applied', agent: current.agent });
+          if (!turnOrigin) postControlNotice(current, appliedLine, controlNoticeKind(params.action));
+          const r = await applyControlSteps(current, plan.steps, { turnOrigin });
           current = sessions.get(current.roomId) || current;
+          if (turnOrigin && r.ok) postControlNotice(current, appliedLine, controlNoticeKind(params.action));
           settle(current, kind);
           if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }), controlNoticeKind(params.action));
           else if (r.startedTurn || plan.steps.some((st) => TURN_STARTING_OPS.has(st.op))) startedTurn = true;
@@ -11045,8 +11215,10 @@ function flushRoomInbox(session) {
   // own 📨 at the next turn end).
   const sent = queued - roomDelivery.pendingCount(session.roomId);
   const flushLine = flushed ? formatRoomDeliveredNotice(sent) : formatRoomDeliveryFailedNotice(sent);
-  // A failed delivery stays a full-width warning.
-  journalPublishNotice(journalConvoIdFor(session), flushLine, flushed ? noticeMeta('queue', flushLine) : null);
+  // Published right after the flush injected the coalesced turn, so the 📨
+  // line is that turn's first event and takes its turn_start. A failed
+  // delivery stays a full-width warning.
+  journalPublishSessionNotice(session, flushLine, { notice: flushed ? noticeMeta('queue', flushLine) : null });
 }
 
 // Hybrid idle/busy delivery of room messages into local sessions
@@ -11055,6 +11227,13 @@ function flushRoomInbox(session) {
 // turn at the turn-end seams (finishCodexTurn, iv onTurnEnd, print-mode
 // `case 'result'`). skipJournalMirror: the message already lives in the
 // room convo — mirroring it into the session convo would duplicate it.
+// The origin of a turn roomDelivery injects: one started only by a spawn
+// outcome (its causes) is a spawn; everything else is a room (peer) message.
+function roomTurnOrigin(causes) {
+  return Array.isArray(causes) && causes.length > 0 && causes.every((c) => c?.kind === 'spawn_outcome')
+    ? TURN_ORIGIN.SPAWN : TURN_ORIGIN.PEER;
+}
+
 const roomDelivery = createRoomDelivery({
   isBusy: (session, { foreign = false } = {}) => (foreign
     ? sessionOccupiedForForeignTurn(session)
@@ -11065,7 +11244,7 @@ const roomDelivery = createRoomDelivery({
   // room), for the turn this starts.
   injectTurn: (session, text, meta) => (meta?.foreign
     ? injectForeignRoomTurn(session, text, meta.foreign)
-    : sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null })),
+    : sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null, turnOrigin: roomTurnOrigin(meta?.causes) })),
   log: console,
 });
 
@@ -11079,7 +11258,7 @@ const foreignSessions = createForeignSessions({
   sharing: sharingClient,
   items: itemsClient,
   journalConvoIdFor,
-  sendText: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, foreign: true }),
+  sendText: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, foreign: true, turnOrigin: TURN_ORIGIN.PEER }),
   publishNotice: (convoId, text) => journalPublishNotice(convoId, text),
   isOccupied: sessionOccupiedForForeignTurn,
   flag: { set: (key) => setForeignFlag(key), clear: (key) => clearForeignFlag(key) },
@@ -11312,11 +11491,12 @@ function deliverRoomFrameTo(room, frame) {
     }
   }
   if (echoFrom) {
-    journalPublishNotice(
-      journalConvoIdFor(session),
+    // An idle session takes the message as a turn right below, so the 💬
+    // line opens it. A busy one queues it: the turn_start then waits for the
+    // flush that actually delivers it (the 📨 line).
+    journalPublishSessionNotice(session,
       formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }),
-      roomNoticeMeta({ from: echoFrom, body }),
-    );
+      { notice: roomNoticeMeta({ from: echoFrom, body }), turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.PEER });
   }
   // A reply consumed by an agent_chat_send wait already reached the agent
   // inline as the tool result — the session is busy for the whole tool call,
@@ -11374,7 +11554,7 @@ function deliverRoomFrameTo(room, frame) {
     roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, seq: frame.seq,
   });
   if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
-    journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
+    journalPublishSessionNotice(session, ROOM_MESSAGE_QUEUED_NOTICE, { notice: noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE) });
   }
 }
 
@@ -11667,7 +11847,10 @@ function journalInjectInviteRequest(frame) {
 function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {
   if (addressed) {
     const inviteLine = formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined });
-    journalPublishNotice(journalConvoIdFor(session), inviteLine, noticeMeta('invite', inviteLine));
+    // The agent's turn for the request follows through roomDelivery: the 🤝
+    // line opens it when the session is free to take it now.
+    journalPublishSessionNotice(session, inviteLine,
+      { notice: noticeMeta('invite', inviteLine), turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.PEER });
   } else {
     console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
   }
@@ -12012,7 +12195,7 @@ function journalEvictConvoInput(session) {
   roomDelivery.dropSession(session?.roomId);
   const convoId = journalConvoIdFor(session);
   if (strandedRoomMessages && convoId) {
-    journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));
+    journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages), NOTICE.DELIVERY_FAILED);
   }
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
@@ -12098,6 +12281,9 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
     const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
+    // The user's approval starts this turn, the way sendToSession's own
+    // dispatch does for a typed message: no turn_start, and a new turn.
+    noteTurnDispatch(session, null);
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
@@ -12262,12 +12448,13 @@ const secretRequests = createSecretRequests({
   // an item reply wakes one; sendToSession then parks the turn in
   // _resumeOutbox until the resumed TUI is ready to receive it.
   resumeSession: (roomId, notice) => journalResumeRoom(roomId, notice),
-  inject: (session, text) => sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true }),
+  inject: (session, text) => sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true, turnOrigin: TURN_ORIGIN.SECRET }),
   queue: (session, { text, preview }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
     preview,
     fullText: text,
+    turnOrigin: TURN_ORIGIN.SECRET,
   }),
   publishNotice: journalPublishNotice,
   // Is the turn naming this path still held for the room? A busy session
@@ -12574,8 +12761,9 @@ function journalHandleConsentFrame(frame) {
     console.warn(`[consent] a consent nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
     return;
   }
-  journalPublishNotice(journalConvoIdFor(session), text, consentNoticeMeta(frame));
-  deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[consent] nudge delivery failed: ${e.message}`));
+  journalPublishSessionNotice(session, text,
+    { notice: consentNoticeMeta(frame), turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.CONSENT });
+  deliverCoordinatorTurn(session, text, TURN_ORIGIN.CONSENT).catch((e) => console.warn(`[consent] nudge delivery failed: ${e.message}`));
 }
 
 // The three unseen_* tool routes (lib/unseen-tools.js), mounted below.
@@ -12627,8 +12815,9 @@ function journalHandleUnseenFrame(frame) {
     console.warn(`[unseen] an unseen nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
     return;
   }
-  journalPublishNotice(journalConvoIdFor(session), text, unseenNoticeMeta(frame));
-  deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[unseen] nudge delivery failed: ${e.message}`));
+  journalPublishSessionNotice(session, text,
+    { notice: unseenNoticeMeta(frame), turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.NUDGE });
+  deliverCoordinatorTurn(session, text, TURN_ORIGIN.NUDGE).catch((e) => console.warn(`[unseen] nudge delivery failed: ${e.message}`));
 }
 
 // The four memory_* tool routes (lib/memory-tools.js), mounted below.
@@ -12711,6 +12900,10 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   // lands somewhere the user can actually read it instead of being dropped
   // on the floor.
   notifyParent: ({ session, convoId, text, requestId }) => {
+    // The outcome line opens the parent's injected turn when the parent is
+    // free to take it now (roomDelivery injects below); a busy parent's turn
+    // is marked when the coalesced inbox is delivered.
+    if (session && !sessionOccupiedForRoomDelivery(session) && canAnnounceTurn(session)) announceTurnStart(session, TURN_ORIGIN.SPAWN);
     if (convoId) journalPublishNotice(convoId, text, noticeMeta('spawn', text));
     if (session) {
       // The turn names the spawn the journal decided; the 'spawn' bucket is
@@ -12758,7 +12951,9 @@ const selfRestartHandler = createSelfRestartHandler({
   queueContinuation: (session, text) => {
     // The continuation is the restarting turn's own work resumed: it names
     // that turn's causes, beside `other` for the session's own words.
-    const entry = tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)]));
+    // Tagged carry_on: the flush mirrors it as a user row, and that row
+    // carries the turn_start (see dispatchMergedFlush).
+    const entry = markTurnOrigin(tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)])), TURN_ORIGIN.CARRY_ON);
     // Lockstep with queueNotifications (PR #104): cancel and send_one address
     // the queue by notification index, so an entry with no slot of its own
     // would shift every later tile onto the wrong message. A bridge-composed
@@ -12786,8 +12981,10 @@ const selfRestartHandler = createSelfRestartHandler({
   },
   notify: (session, text) => {
     const n = notice('info', text);
-    if (session.sendHtml) session.sendHtml(n.plain, n.html);
-    else if (session.sendCallback) session.sendCallback(text);
+    withJournalNotice(session.roomId, NOTICE.RESTART, () => {
+      if (session.sendHtml) session.sendHtml(n.plain, n.html);
+      else if (session.sendCallback) session.sendCallback(text);
+    });
   },
 });
 
@@ -13746,12 +13943,14 @@ const apiServer = createServer(async (req, res) => {
           const COMPACT_COOLDOWN_MS = 60_000;
           if (!target.lastCompactStartNotify || (now - target.lastCompactStartNotify) > COMPACT_COOLDOWN_MS) {
             target.lastCompactStartNotify = now;
-            if (target.sendHtml) {
-              const n = notice('info', '🗜️ Compacting context — summarizing conversation history…');
-              target.sendHtml(n.plain, n.html);
-            } else if (target.sendCallback) {
-              target.sendCallback('🗜️ Compacting context — summarizing conversation history…');
-            }
+            withJournalNotice(target.roomId, NOTICE.COMPACTION, () => {
+              if (target.sendHtml) {
+                const n = notice('info', '🗜️ Compacting context — summarizing conversation history…');
+                target.sendHtml(n.plain, n.html);
+              } else if (target.sendCallback) {
+                target.sendCallback('🗜️ Compacting context — summarizing conversation history…');
+              }
+            });
           } else {
             debug('Suppressed compaction start notice (cooldown, last=%dms ago)', now - target.lastCompactStartNotify);
           }
