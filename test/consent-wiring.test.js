@@ -52,8 +52,10 @@ describe('consent wiring (source inspection)', () => {
     expect(fn).toContain('let session = findSessionByClaudeSessionId(convoId);');
     expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);');
     expect(fn).not.toMatch(/s\.coordinator === true/);
-    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text)');
-    expect(fn).toContain('deliverCoordinatorTurn(session, text)');
+    expect(fn).toContain('journalPublishSessionNotice(session, text,');
+    expect(fn).toContain('deliverCoordinatorTurn(session, text, TURN_ORIGIN.CONSENT)');
+    // The nudge line opens the Coordinator's turn when it is injected now.
+    expect(fn).toContain('{ notice: NOTICE.CONTROL, turnOrigin: sessionOccupiedForRoomDelivery(session) ? null : TURN_ORIGIN.CONSENT });');
   });
 
   it('registers consent_list and consent_decide, each through callConsent with its renderer', () => {

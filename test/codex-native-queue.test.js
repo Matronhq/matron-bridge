@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
 import { hasQueuedCompact } from '../lib/compact-priority.js';
 import { CodexPromptQueue } from '../lib/codex-prompts.js';
+import { mergedTurnOrigin } from '../lib/turn-markers.js';
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 function sourceOf(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -13,7 +14,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 function setup() {
   let ack;
   const session = { agent: 'codex', alive: true, busy: true, roomId: 'room', queuedMessages: [], queueNotifications: [], codex: { transport: 'app-server', steer: vi.fn(() => new Promise(resolve => { ack = resolve; })), interrupt: vi.fn() } };
-  const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, console,
+  const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, mergedTurnOrigin, console,
     sessions: new Map([['room', session]]), pendingMediaMirror: () => [], journalMirrorUserMedia: vi.fn(),
     commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), finalizeSentQueue: vi.fn(),
     journalPublishNotice: vi.fn(), journalConvoIdFor: () => 'convo', dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
@@ -82,7 +83,7 @@ describe('asynchronous question answer delivery', () => {
     const h = setup(); h.session.busy = false;
     expect(question(h)()).toBe('Tokens');
     expect(h.session.codex.steer).not.toHaveBeenCalled();
-    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true });
+    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true, turnOrigin: null });
     expect(h.context.recordUserAnswer).not.toHaveBeenCalled();
   });
   it('retains rejected answers and keeps queue notification positions aligned', async () => {
