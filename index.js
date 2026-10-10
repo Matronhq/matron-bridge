@@ -188,6 +188,7 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle, recordTitleEarned } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
+import { createLoginExpiryNotice, isLoginExpiredText, loginExpiredFromAssistantEvent, loginExpiredMessage } from './lib/login-expiry.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW, splitSpoken, spokenPayload, spokenRefFor } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
@@ -848,6 +849,26 @@ const summaryModelNag = createSummaryModelNag({
   box: os.hostname(),
   log: (m) => console.log(m),
 });
+
+// An expired Claude login posts a raw authentication error into every
+// session on the box (lib/login-expiry.js). Each one is replaced by a line
+// with the login step, and one notice per box per day goes to the tracker.
+// The box is named as agent_boxes names it: the journal identity, read when
+// the error happens because it can arrive after boot.
+function loginBoxName() {
+  try { return journalPublisher.identity?.()?.name || os.hostname(); } catch { return os.hostname(); }
+}
+const loginExpiryNotice = createLoginExpiryNotice({
+  client: itemsClient,
+  box: loginBoxName,
+  log: (m) => console.log(m),
+});
+
+function noteLoginExpired(session) {
+  console.log(`Claude login expired (room ${session.roomId})`);
+  void loginExpiryNotice.maybeFile(journalConvoIdFor(session));
+  return loginExpiredMessage(loginBoxName());
+}
 // Return path (Matron -> bridge input, this PR): where the inbound cursor is
 // persisted (survives a bridge restart — see lib/journal-publisher.js) and
 // the stable conversation Matron sends session-start/list/help commands
@@ -4736,7 +4757,9 @@ function handleClaudeEvent(session, event) {
       const isPartial = event.message?.stop_reason === null;
       const messageId = event.message?.id;
 
-      const textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
+      let textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
+      // An expired login: say what to do instead of posting the raw error.
+      if (loginExpiredFromAssistantEvent(event)) textParts = [noteLoginExpired(session)];
       // Suppress claude's "No response requested." filler. It's emitted in
       // response to internal synthetic prompts (e.g. resume-time nudges)
       // and is just noise on Matrix. Suppress only the text — fall
@@ -5137,7 +5160,11 @@ function handleClaudeEvent(session, event) {
       session.toolCalls = [];
 
       if (!session.waitingForAnswer) {
-        const text = extractTextContent(event);
+        let text = extractTextContent(event);
+        // Print mode's result repeats the error record's text (already
+        // swapped in the assistant case); a login error that only arrives
+        // here is swapped the same way.
+        if (isLoginExpiredText(text)) text = noteLoginExpired(session);
         if (text) {
           session.responseBuffer = text;
         }
