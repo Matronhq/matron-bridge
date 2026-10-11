@@ -5,6 +5,7 @@ import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhi
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
+import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
@@ -11852,6 +11853,15 @@ const handleSendAttachment = createSendAttachmentHandler({
   onLocalRoomAttachment: routeLocalRoomAttachment,
 });
 
+// share_html_page: a days-long signed viewer link that renders one HTML file
+// from the workdir as a sandboxed page. VIEWER_PAGE_BASE_URL optionally puts
+// those links on their own hostname (pointed at the same viewer).
+const handlePageLink = createPageLinkHandler({
+  sessions,
+  secret: HMAC_SECRET,
+  baseUrl: process.env.VIEWER_PAGE_BASE_URL || VIEWER_BASE_URL,
+});
+
 // The eight agent-chat room tools (lib/agent-chat.js), mounted below as thin
 // loopback routes in the /send-attachment pattern. awaitRoomMessage is the
 // per-room once-listener seam defined next to journalOnRoomFrame.
@@ -12620,6 +12630,14 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/send-attachment') {
         const { status, body: resBody } = await handleSendAttachment(data);
         debug(`send-attachment ${status} ${data?.path} ${resBody.kind || resBody.error || ''}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
+      if (url.pathname === '/page-link') {
+        const { status, body: resBody } = await handlePageLink(data);
+        debug(`page-link ${status} ${data?.path} ${resBody.error || ''}`);
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(resBody));
         return;

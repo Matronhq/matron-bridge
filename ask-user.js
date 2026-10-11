@@ -244,6 +244,36 @@ server.tool(
   }
 );
 
+server.tool(
+  'share_html_page',
+  'Get a signed link that opens one self-contained HTML file from the session working directory as a rendered web page in the user\'s browser (a report, a demo pack, a mock-up). The page runs sandboxed: its own inline script and style work, images, video and fonts can be inline data: URLs or https, links open in a new tab, but it cannot fetch from the network, submit forms, or use cookies or localStorage. Only .html/.htm files up to 25 MB. The link can be opened any number of times until it expires (default 7 days, max 30) and always shows the file as it is on disk at that moment, so keep the file in place. The link is returned, not posted: put it in your message or on the tracker item.',
+  {
+    path: z.string().describe('Path to the .html file — absolute, or relative to the session working directory'),
+    ttl_days: z.number().optional().describe('How many days the link works (default 7, max 30)'),
+  },
+  async ({ path, ttl_days }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/page-link`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, path, ...(ttl_days !== undefined ? { ttl_days } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `share_html_page failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: `Page link for ${data.path}:\n${data.url}\n\nIt works until ${new Date(data.expiresAt).toISOString()} and can be opened many times. It renders the file as it is on disk when opened, so do not move or delete it before then.`,
+        }],
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
 // --- Agent-to-agent chat rooms ---
 // Thin POST wrappers over the bridge's loopback agent-chat routes. Success
 // text is a short English rendering of the response body; errors surface
