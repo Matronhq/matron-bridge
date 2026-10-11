@@ -8849,6 +8849,10 @@ function armOperatorCompact(session, text) {
   return true;
 }
 
+// Resolves false when the text went to the session directly and the session
+// refused it (for instance, it stopped meanwhile); any other path
+// (a dispatched command, an answered prompt, a busy queue) resolves to a
+// non-false value. Only /wake reads this; other callers ignore it.
 async function journalRouteTextToSession(session, body, { keepRestartBudget = false } = {}) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
@@ -9005,8 +9009,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     // Not during an /effort-flow hold: typing now would cancel the flow's
     // pending Enter, so a TUI slash queues like text until the return.
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
-      sendTextToSession(session, trimmed, { skipJournalMirror: true });
-      return;
+      return sendTextToSession(session, trimmed, { skipJournalMirror: true });
     }
     // Busy-queue magic words — the SAME classifier and implementation the
     // old Matrix busy branch used (lib/busy-queue.js), checked at the same
@@ -9085,7 +9088,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   // An idle iv /compact gets its stand-in turn-end (armOperatorCompact).
   armOperatorCompact(session, trimmed);
-  sendTextToSession(session, trimmed, { skipJournalMirror: true });
+  return sendTextToSession(session, trimmed, { skipJournalMirror: true });
 }
 
 // prompt_reply -> pending prompt. Resolves `choice`/`text` against whichever

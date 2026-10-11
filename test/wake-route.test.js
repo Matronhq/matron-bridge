@@ -84,6 +84,47 @@ describe('wake route', () => {
     expect(deps.routeText).toHaveBeenCalledTimes(2);
   });
 
+  it('coalesces a wake that arrives while the first is still being delivered', async () => {
+    let finish;
+    const routeText = vi.fn(() => new Promise((resolve) => { finish = resolve; }));
+    const { handle } = setup({ session: { alive: true, busy: false }, routeText });
+    const first = handle();
+    const second = handle();
+    finish();
+    expect(await first).toEqual({ status: 200, body: { ok: true, resumed: false } });
+    expect(await second).toEqual({ status: 200, body: { ok: true, coalesced: true } });
+    expect(routeText).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a failed in-progress delivery to the wake that waited on it', async () => {
+    let fail;
+    const routeText = vi.fn(() => new Promise((_resolve, reject) => { fail = reject; }));
+    const { handle } = setup({ routeText });
+    const first = handle();
+    const second = handle();
+    fail(new Error('pipe closed'));
+    expect((await first).status).toBe(500);
+    expect((await second).status).toBe(500);
+  });
+
+  it('answers 500 with a failure notice when delivery throws, and a retry delivers again', async () => {
+    const session = { alive: true, busy: true };
+    const routeText = vi.fn().mockRejectedValueOnce(new Error('pipe closed')).mockResolvedValue(undefined);
+    const { handle, deps } = setup({ session, routeText });
+    expect(await handle()).toEqual({ status: 500, body: { error: 'wake delivery failed' } });
+    expect(deps.publishNotice).toHaveBeenLastCalledWith(expect.stringContaining('could not be delivered'), session);
+    expect(await handle()).toEqual({ status: 200, body: { ok: true, resumed: false } });
+    expect(routeText).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers 503 when the session refuses the text', async () => {
+    const session = { alive: true };
+    const { handle, deps } = setup({ session, routeText: vi.fn(async () => false) });
+    const res = await handle();
+    expect(res.status).toBe(503);
+    expect(deps.publishNotice).toHaveBeenLastCalledWith(expect.stringContaining('did not accept'), session);
+  });
+
   it('takes no request input: whatever is passed in, the configured text and convo are used', async () => {
     const session = { alive: true };
     const { handle, deps } = setup({ session });
