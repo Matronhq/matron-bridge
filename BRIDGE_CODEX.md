@@ -20,6 +20,7 @@ Use the Matron `ask-user` MCP server:
 - `share_sensitive_data` shares sensitive output through a secure one-time viewer link.
 - `redact_message` removes accidentally posted sensitive data from a bridge message.
 - `send_attachment` delivers an ordinary file to the conversation, or an explicitly selected agent chat room.
+- `share_html_page` returns a signed link (7 days by default, up to 30) that renders one self-contained `.html` file from the workdir as a sandboxed web page — for reports and demo packs the user should open in a browser rather than download.
 
 If the secure viewer is unconfigured, explain that it needs `HMAC_SECRET` and a public `VIEWER_BASE_URL`; never substitute plaintext chat. If tools are disabled in Plan mode, wait for the user to leave Plan mode before requesting a secret.
 

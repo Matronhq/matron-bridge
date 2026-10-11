@@ -136,6 +136,14 @@ Full spec: `docs/protocol.md` ("Journal search") in the matron-journal repo.
 
 Secure viewer links require the bridge to have `HMAC_SECRET` and `VIEWER_BASE_URL` configured. If `share_sensitive_data` or file-view links report that the viewer is not configured, tell the user that the local viewer service is running but needs a public `VIEWER_BASE_URL`, usually via Cloudflare Tunnel.
 
+## HTML pages behind a link (`share_html_page`)
+
+When the user should see an HTML file you made (a report, a demo pack, a mock-up) as a web page rather than as a file to download, call `share_html_page` with its path. You get back a signed link that renders it in their browser, can be opened many times, and lasts 7 days by default (`ttl_days`, up to 30). Put the link in your message or on the tracker item; the tool does not post it.
+
+- The file must be one self-contained `.html`/`.htm` file in your working directory, up to 25 MB. Inline the script, style, images and video (data: URLs); https images and fonts also load.
+- The page runs sandboxed: no network requests from script, no form posts, no cookies or localStorage. Links open in a new tab.
+- The link shows the file as it is on disk each time it is opened, so leave it in place until the link expires; rewriting it updates the page.
+
 ## Screenshots on GitHub (`gh --attach`)
 
 To put an image or video on a GitHub issue, pull request or comment, use the GitHub CLI's own `--attach` flag. It needs `gh` 2.99.0 or later (`gh --version`); it exists on `gh issue create`, `gh issue edit`, `gh issue comment`, `gh pr create`, `gh pr edit` and `gh pr comment`.
