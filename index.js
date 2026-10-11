@@ -104,6 +104,7 @@ import { liveLogDir, liveLogPath as liveLogPathFor } from './lib/live-log-dir.js
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
+import { createWakeHandler } from './lib/wake-route.js';
 import {
   createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
@@ -8848,6 +8849,10 @@ function armOperatorCompact(session, text) {
   return true;
 }
 
+// Resolves false when the text went to the session directly and the session
+// refused it (for instance, it stopped meanwhile); any other path
+// (a dispatched command, an answered prompt, a busy queue) resolves to a
+// non-false value. Only /wake reads this; other callers ignore it.
 async function journalRouteTextToSession(session, body, { keepRestartBudget = false } = {}) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
@@ -9004,8 +9009,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     // Not during an /effort-flow hold: typing now would cancel the flow's
     // pending Enter, so a TUI slash queues like text until the return.
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
-      sendTextToSession(session, trimmed, { skipJournalMirror: true });
-      return;
+      return sendTextToSession(session, trimmed, { skipJournalMirror: true });
     }
     // Busy-queue magic words — the SAME classifier and implementation the
     // old Matrix busy branch used (lib/busy-queue.js), checked at the same
@@ -9084,7 +9088,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   // An idle iv /compact gets its stand-in turn-end (armOperatorCompact).
   armOperatorCompact(session, trimmed);
-  sendTextToSession(session, trimmed, { skipJournalMirror: true });
+  return sendTextToSession(session, trimmed, { skipJournalMirror: true });
 }
 
 // prompt_reply -> pending prompt. Resolves `choice`/`text` against whichever
@@ -11826,6 +11830,20 @@ const pendingPlanDecisions = new Map();
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
+// POST /wake (lib/wake-route.js): wake one configured conversation with one
+// configured text, the way a timer firing does — resuming a reaped session.
+// Off unless both env vars are set; the request can choose neither.
+const handleWake = createWakeHandler({
+  convoId: process.env.MATRON_WAKE_CONVO_ID,
+  text: process.env.MATRON_WAKE_TEXT,
+  findSession: (convoId) => findSessionByClaudeSessionId(convoId),
+  resumeConvo: (convoId) => journalResumeConvo(convoId),
+  routeText: (session, text) => journalRouteTextToSession(session, text),
+  publishNotice: (message, session) => journalPublishNotice(
+    session ? journalConvoIdFor(session) : process.env.MATRON_WAKE_CONVO_ID, message),
+  isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
+});
+
 const handleSendAttachment = createSendAttachmentHandler({
   sessions,
   publisher: journalPublisher,
@@ -12315,6 +12333,27 @@ const apiServer = createServer(async (req, res) => {
         debug(`Cleaned up viewed sensitive data: ${sensitiveId}`);
       }, 60000);
     }
+    return;
+  }
+
+  // POST /wake — handled before the body is read: it takes no input, so the
+  // body is drained unread (an empty one never reaches the JSON parse below).
+  if (url.pathname === '/wake') {
+    req.resume();
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+    let result;
+    try {
+      result = await handleWake();
+    } catch (e) {
+      console.warn(`[wake] delivery failed: ${e.message}`);
+      result = { status: 500, body: { error: 'wake delivery failed' } };
+    }
+    res.writeHead(result.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result.body));
     return;
   }
 
