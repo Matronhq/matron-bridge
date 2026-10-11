@@ -9,8 +9,8 @@ const SECRET = 'page-link-secret';
 let workdir, outside, handler;
 
 beforeAll(() => {
-  workdir = realpathSync(mkdtempSync(path.join(tmpdir(), 'page-link-wd-')));
-  outside = realpathSync(mkdtempSync(path.join(tmpdir(), 'page-link-out-')));
+  workdir = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'page-link-wd-')));
+  outside = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'page-link-out-')));
   writeFileSync(path.join(workdir, 'pack.html'), '<html></html>');
   writeFileSync(path.join(workdir, 'notes.txt'), 'hi');
   writeFileSync(path.join(outside, 'other.html'), '<html></html>');

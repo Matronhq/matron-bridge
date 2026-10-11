@@ -12,7 +12,7 @@ beforeAll(async () => {
   await new Promise(r => server.on('listening', r));
   port = server.address().port;
   base = `http://127.0.0.1:${port}`;
-  tmpDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'viewer-page-test-')));
+  tmpDir = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'viewer-page-test-')));
 });
 afterAll(() => {
   server?.close();
@@ -54,6 +54,8 @@ describe('GET /page', () => {
     expect(directives).toContain("frame-ancestors 'none'");
     expect(directives).toContain("default-src 'none'");
     expect(directives.find(d => d.startsWith('connect-src'))).not.toMatch(/https|\*|'self'/);
+    // Inline script only: no third-party code that could read the token.
+    expect(directives.find(d => d.startsWith('script-src'))).not.toMatch(/https|\*|'self'|data:|blob:/);
     expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');
     expect(res.headers.get('cache-control')).toMatch(/no-store/);
