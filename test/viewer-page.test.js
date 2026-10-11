@@ -59,6 +59,7 @@ describe('GET /page', () => {
     expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');
     expect(res.headers.get('cache-control')).toMatch(/no-store/);
+    expect(res.headers.get('cache-control')).toMatch(/no-transform/);
     expect(res.headers.get('set-cookie')).toBeNull();
   });
 
