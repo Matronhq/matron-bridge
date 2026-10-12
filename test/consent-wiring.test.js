@@ -82,4 +82,12 @@ describe('consent wiring (source inspection)', () => {
     expect(coord).toMatch(/Declines are never capped/);
     expect(coord).toMatch(/Tool permission prompts and secret requests are never yours to answer/);
   });
+
+  it('the Coordinator may propose a contact request or mission share, and never answers a card', () => {
+    expect(coord).toMatch(/^## Sharing with other people: you propose, the user answers/m);
+    expect(coord).toMatch(/propose the request yourself with `contact_add`/);
+    expect(coord).toMatch(/A proposal sends nothing/);
+    expect(coord).toMatch(/You never answer a card/);
+    expect(coord).toMatch(/are never yours to answer, in either direction/);
+  });
 });
