@@ -50,6 +50,8 @@ To put an image or video on a GitHub issue, pull request or comment, use the Git
 
 ## Journal history
 
+To find old work — a mission, item, memory or project — call `search` with a description in your own words. It ranks exact matches first and labels each result with why it matched; treat `similar` results as leads to check with the matching read tool (`mission_get`, `item_get`, `memory_get` or `project_get`). Put exact names or numbers in quotes. The journal search API below finds words in the conversations themselves.
+
 The journal has a full-text search API over every one of the user's conversations, across all their boxes. To find something the user said or did in a past session, use it rather than grepping local transcripts (they only cover this box).
 
 - Base URL: the bridge-local journal proxy on the loopback API, `http://127.0.0.1:$MATRON_BRIDGE_API_PORT/journal` (`MATRON_BRIDGE_API_PORT` is in your env). The bridge adds the journal credential server-side, so do not call the remote journal host directly for search.
