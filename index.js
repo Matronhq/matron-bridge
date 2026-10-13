@@ -11,6 +11,7 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
+import { createSearchHandlers } from './lib/search-tools.js';
 import { createProjectsClient } from './lib/projects-client.js';
 import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
@@ -11926,6 +11927,16 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// The `search` tool route (spec 2026-10-12 unified search), mounted below.
+// Reuses missionsClient (createJournalRequester is shared across domains;
+// lib/missions-client.js added searchAll alongside the mission routes) — a
+// search is not scoped to this conversation, so the handler needs no
+// journalConvoIdFor.
+const searchHandlers = createSearchHandlers({
+  sessions,
+  client: missionsClient,
+});
+
 // The seven project_* tool routes (lib/projects-tools.js), mounted below.
 // project_get with no num reads this conversation's current mission through
 // the missions resolver (one cache). project_close / project_merge are the
@@ -12773,6 +12784,15 @@ const apiServer = createServer(async (req, res) => {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
+      // The `search` tool route; same one-matcher allowlist shape.
+      const searchRoute = url.pathname.match(/^\/search\/(all)$/);
+      if (searchRoute) {
+        const name = searchRoute[1];
+        await respondAgentChatRoute(res, data, searchHandlers[name],
+          (status, b) => debug(`search/${name} ${status} ${b.error || `${(b.results || []).length} results`}`));
         return;
       }
 

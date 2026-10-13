@@ -9,6 +9,7 @@ import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './li
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
+import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
@@ -1300,6 +1301,35 @@ server.tool(
   async (args) => (args.shared
     ? callSharing('shared_list', 'mission_list', {}, formatSharedMissionList)
     : callMissions('list', args, formatMissionList)),
+);
+
+// --- Unified search (spec 2026-10-12): the search tool goes through the
+// bridge loopback like every other tool (index.js mounts lib/search-tools.js
+// at /search/all); the journal is the gate and the only source of truth.
+async function callSearch(args) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/search/all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `search failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: formatSearchAll(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `search failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'search',
+  "Find a mission, item, memory or project from a description in your own words — the first thing to try when you need old work back (e.g. after your context was compacted). Results are ranked exact match first, then all words, then word stems, then 'similar' (meaning-based, verify these with mission_get). Put exact names, numbers or ids in double quotes for literal-only matching. Also lists the best-matching chats with their mission numbers; read one with the journal's /convo/:id/messages around_seq.",
+  {
+    q: z.string().min(1).max(256).describe('What you are looking for, in your own words; quote exact names'),
+    kinds: z.array(z.enum(['mission', 'item', 'memory', 'project'])).optional().describe('Limit to these kinds'),
+    limit: z.number().int().min(1).max(50).optional().describe('Default 20'),
+  },
+  async (args) => callSearch(args),
 );
 
 server.tool(
