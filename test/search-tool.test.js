@@ -65,4 +65,38 @@ describe('formatSearchAll', () => {
     expect(formatSearchAll({})).toBe('No match. Describe it differently, or put an exact name or number in quotes.');
     expect(formatSearchAll(undefined)).toBe('No match. Describe it differently, or put an exact name or number in quotes.');
   });
+
+  it('collapses whitespace in a result title and a chat title, not only in snippets', () => {
+    const out = formatSearchAll({
+      results: [{ kind: 'item', num: 1, title: 'Which   CSV\ncolumns', state: 'open', why: 'exact', snippet: 'a\n  b' }],
+      chats: [{ convo_id: 'c1', title: 'Refund  \n export', count: 1 }],
+      semantic: 'ready',
+    });
+    expect(out).toMatch(/^\[exact\] item #1 \(open\) Which CSV columns — a b$/m);
+    expect(out).toContain('- Refund export (1 matches) convo c1');
+  });
+
+  it('truncates a long snippet by code point, appends an ellipsis, and drops a dangling ** marker', () => {
+    const snippet = `${'x'.repeat(158)}**bold tail that never closes`;
+    const out = formatSearchAll({ results: [{ kind: 'item', num: 1, title: 'Long', state: 'open', why: 'exact', snippet }], semantic: 'ready' });
+    const shown = out.split(' — ')[1];
+    expect(shown.endsWith('…')).toBe(true);
+    expect((shown.match(/\*\*/g) || []).length % 2).toBe(0);
+    expect(shown).not.toContain('**');
+  });
+
+  it('never splits a surrogate pair when truncating', () => {
+    const snippet = `${'a'.repeat(159)}😀 trailing text past the cut`;
+    const out = formatSearchAll({ results: [{ kind: 'item', num: 1, title: 'Emoji', state: 'open', why: 'exact', snippet }], semantic: 'ready' });
+    const shown = out.split(' — ')[1];
+    expect(shown.endsWith('…')).toBe(true);
+    expect(shown).not.toMatch(/�/);
+    expect(Array.from(shown.slice(0, -1)).length).toBe(160);
+  });
+
+  it('a short snippet is left exactly as is, with no ellipsis', () => {
+    const out = formatSearchAll({ results: [{ kind: 'item', num: 1, title: 'Short', state: 'open', why: 'exact', snippet: 'a short one' }], semantic: 'ready' });
+    expect(out).toContain('— a short one');
+    expect(out).not.toContain('…');
+  });
 });

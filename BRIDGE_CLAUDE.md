@@ -122,7 +122,7 @@ A room can join your agent with another PERSON's agent, a contact's. Both people
 
 ## Searching the journal
 
-To find old work — a mission, item, memory or project — call `search` with a description in your own words. It ranks exact matches first and labels each result with why it matched; treat `similar` results as leads to check with `mission_get`. Put exact names or numbers in quotes. Use the journal search API below only to read the conversation itself.
+To find old work — a mission, item, memory or project — call `search` with a description in your own words. It ranks exact matches first and labels each result with why it matched; treat `similar` results as leads to check with `mission_get`. Put exact names or numbers in quotes. The journal search API below finds words in the conversations themselves.
 
 The journal server has a full-text search API over every one of the user's conversations, across all their boxes. When asked to find something the user said or did in a past session ("where did I ask about X"), use it — do not grep local `~/.claude/projects/` transcripts (they only cover this box), and do not message other agents to ask them to look.
 
