@@ -581,6 +581,19 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
     expect(deps.publishNotice.mock.calls[0][1]).toMatch(/isn't set up on this box \(whisper\.cpp missing\)/);
   });
 
+  it('whisper hearing no words (TRANSCRIBE_EMPTY) asks for a re-recording', async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+      transcribe: vi.fn(async () => {
+        throw Object.assign(new Error('empty transcription result'), { code: 'TRANSCRIBE_EMPTY' });
+      }),
+    });
+    await route(session, voice, ctx);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', EMPTY_VOICE_NOTICE);
+  });
+
   it("journal 'failed' then a local whisper error keeps the generic notice", async () => {
     const { route, deps } = makeRouter({
       fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
