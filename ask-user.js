@@ -1323,7 +1323,7 @@ async function callSearch(args) {
 
 server.tool(
   'search',
-  "Find a mission, item, memory or project from a description in your own words — the first thing to try when you need old work back (e.g. after your context was compacted). Results are ranked exact match first, then all words, then word stems, then 'similar' (meaning-based, verify these with mission_get). Put exact names, numbers or ids in double quotes for literal-only matching. Also lists the best-matching chats with their mission numbers; read one with the journal's `/journal/convo/:id/messages?around_seq=…`.",
+  "Find a mission, item, memory or project from a description in your own words — the first thing to try when you need old work back (e.g. after your context was compacted). Results are ranked exact match first, then all words, then word stems, then 'similar' (meaning-based; verify these with mission_get, item_get, memory_get or project_get, by kind). Put exact names, numbers or ids in double quotes for literal-only matching. Also lists the best-matching chats with their mission numbers; read one with the journal's `/journal/convo/:id/messages?around_seq=…`.",
   {
     q: z.string().min(1).max(256).describe('What you are looking for, in your own words; quote exact names'),
     kinds: z.array(z.enum(['mission', 'item', 'memory', 'project'])).min(1).optional().describe('Limit to these kinds'),

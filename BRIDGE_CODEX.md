@@ -50,7 +50,7 @@ To put an image or video on a GitHub issue, pull request or comment, use the Git
 
 ## Journal history
 
-To find old work — a mission, item, memory or project — call `search` with a description in your own words. It ranks exact matches first and labels each result with why it matched; treat `similar` results as leads to check with `mission_get`. Put exact names or numbers in quotes. The journal search API below finds words in the conversations themselves.
+To find old work — a mission, item, memory or project — call `search` with a description in your own words. It ranks exact matches first and labels each result with why it matched; treat `similar` results as leads to check with the matching read tool (`mission_get`, `item_get`, `memory_get` or `project_get`). Put exact names or numbers in quotes. The journal search API below finds words in the conversations themselves.
 
 The journal has a full-text search API over every one of the user's conversations, across all their boxes. To find something the user said or did in a past session, use it rather than grepping local transcripts (they only cover this box).
 

@@ -99,4 +99,10 @@ describe('formatSearchAll', () => {
     expect(out).toContain('— a short one');
     expect(out).not.toContain('…');
   });
+
+  it('keeps the semantic notice when nothing matched', () => {
+    expect(formatSearchAll({ results: [], chats: [], semantic: 'indexing' }))
+      .toBe('No match. Describe it differently, or put an exact name or number in quotes.\n\n(meaning-based matching is still indexing; results may be incomplete)');
+    expect(formatSearchAll({ results: [], chats: [], semantic: 'off' })).toMatch(/^No match\..*\n\n\(meaning-based matching is off/s);
+  });
 });
