@@ -1531,6 +1531,20 @@ function journalBufferPush(session, method, payload, options) {
   session._journalBuffer.push({ method, payload, options });
 }
 
+// The `repo` field for a session's establishing convo_upsert: the canonical
+// host/org/name of its workdir's origin remote (lib/repo-name.js), which the
+// journal matches per-org visibility on. Best-effort — no remote, or one the
+// journal would not accept, sends nothing, leaving any stored value alone.
+// Sent once per session process; the journal ignores an unchanged value.
+function journalRepoField(session) {
+  try {
+    const repo = repoNames.repoFor(session?.workdir);
+    return repo ? { repo } : {};
+  } catch {
+    return {};
+  }
+}
+
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
 // `options` is the publisher's per-frame options bag ({onDelivered,
 // onEvicted, idemKey}); it rides the buffer too, so a hook attached to a
@@ -1549,7 +1563,9 @@ function journalPublish(session, method, payload, options) {
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
-        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
+        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, ...journalRepoField(session) });
+      } else {
+        payload = { ...payload, ...journalRepoField(session) };
       }
     }
     journalPublisher[method](convoId, payload, options);
@@ -2200,7 +2216,7 @@ function journalFlushForSession(session) {
   const convoId = journalConvoIdFor(session);
   if (!convoId) return;
   session._journalConvoEstablished = true;
-  journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
+  journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, ...journalRepoField(session) });
   const buffered = session._journalBuffer;
   session._journalBuffer = null;
   if (!buffered) return;
