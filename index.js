@@ -171,7 +171,7 @@ import { createPermissionRegistry, renderPermissionCard, permissionButtons, perm
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
-import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
@@ -9202,16 +9202,26 @@ function journalRoutePromptReply(session, { choice, text }) {
   // choice sent by id round-trips correctly.
   if (session.waitingForAnswer && session.pendingQuestions?.length) {
     const q = session.pendingQuestions[session.currentQuestionIndex] || session.pendingQuestions[0];
-    const options = (q.options || []).map((opt, idx) => ({
-      id: `opt_${String.fromCharCode(97 + idx)}`,
-      label: typeof opt.label === 'string' ? opt.label : String(opt),
-    }));
+    const options = (q.options || []).map((opt, idx) => {
+      const label = typeof opt.label === 'string' ? opt.label : String(opt);
+      return { id: `opt_${String.fromCharCode(97 + idx)}`, label, value: label };
+    });
+    const freeText = typeof text === 'string' && text.trim() ? text.trim() : null;
     let answerText;
-    if (options.length > 0) {
+    if (options.length > 0 && q.multiSelect) {
+      // pick_many: Matron sends every ticked option's value in one `choice`,
+      // joined by ", ". Answer with all selected labels, comma-separated —
+      // the shape Claude Code itself uses for a multiSelect answer. A choice
+      // that does not fully resolve is still the user's answer: pass it on
+      // as free text rather than dropping it.
+      const resolved = resolvePromptChoices(options, choice);
+      const rawChoice = choice != null && String(choice).trim() ? String(choice).trim() : null;
+      answerText = resolved ? resolved.options.map(o => o.label).join(', ') : (freeText || rawChoice);
+    } else if (options.length > 0) {
       const resolved = resolvePromptChoice(options, choice);
-      answerText = resolved ? resolved.option.label : (typeof text === 'string' && text.trim() ? text.trim() : null);
+      answerText = resolved ? resolved.option.label : freeText;
     } else {
-      answerText = typeof text === 'string' && text.trim() ? text.trim() : null;
+      answerText = freeText;
     }
     if (!answerText) return null;
     const header = q.header ? `${q.header}: ` : '';
