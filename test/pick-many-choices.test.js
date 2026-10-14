@@ -25,16 +25,36 @@ describe('resolvePromptChoices (pick_many replies)', () => {
   });
 
   it('handles labels that themselves contain ", "', () => {
-    const tricky = opts('Red, green', 'Red', 'Blue');
+    const tricky = opts('Red, green', 'Blue');
     expect(resolvePromptChoices(tricky, 'Red, green').indices).toEqual([0]);
-    expect(resolvePromptChoices(tricky, 'Red, green, Blue').indices).toEqual([0, 2]);
-    expect(resolvePromptChoices(tricky, 'Red, Blue').indices).toEqual([1, 2]);
-    expect(resolvePromptChoices(tricky, 'Red, green, Red').indices).toEqual([0, 1]);
+    expect(resolvePromptChoices(tricky, 'Red, green, Blue').indices).toEqual([0, 1]);
+    const withPrefix = opts('Red, green', 'Red', 'Blue');
+    expect(resolvePromptChoices(withPrefix, 'Red, Blue').indices).toEqual([1, 2]);
+    expect(resolvePromptChoices(withPrefix, 'Red, green, Red').indices).toEqual([0, 1]);
   });
 
-  it('backtracks when the longest match leaves an unparseable rest', () => {
+  it('backtracks when an early match leaves an unparseable rest', () => {
     const tricky = opts('A, B', 'A', 'B, C');
     expect(resolvePromptChoices(tricky, 'A, B, C').indices).toEqual([1, 2]);
+  });
+
+  it('refuses an ambiguous joined string instead of guessing', () => {
+    const tricky = opts('A, B', 'A', 'B, C', 'C');
+    expect(resolvePromptChoices(tricky, 'A, B, C')).toBeNull();
+    const split = opts('Red, green', 'Red', 'green');
+    expect(resolvePromptChoices(split, 'Red, green')).toBeNull();
+    expect(resolvePromptChoices(opts('Same', 'Same'), 'Same')).toBeNull();
+  });
+
+  it('matches an option value before treating digits as a position', () => {
+    const numeric = opts('2', '3', '4');
+    expect(resolvePromptChoices(numeric, '2').indices).toEqual([0]);
+    expect(resolvePromptChoices(numeric, '2, 4').indices).toEqual([0, 2]);
+  });
+
+  it('still accepts a single option id or 1-based number', () => {
+    expect(resolvePromptChoices(options, 'opt_c').indices).toEqual([2]);
+    expect(resolvePromptChoices(options, '2').indices).toEqual([1]);
   });
 
   it('returns null when any part names no option (caller falls back to free text)', () => {
