@@ -33,7 +33,8 @@ const LAUNCHCTL_PRINT = [
   '',
 ].join('\n');
 
-describe('deploy.sh service_pid on macOS', () => {
+// deploy.sh never runs on Windows, whose runner need not have awk.
+describe.skipIf(process.platform === 'win32')('deploy.sh service_pid on macOS', () => {
   it('reads the pid from tab-indented launchctl output', () => {
     expect(servicePid(LAUNCHCTL_PRINT)).toBe('2462\n');
   });
