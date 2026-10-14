@@ -11758,8 +11758,8 @@ const secretRequests = createSecretRequests({
   removeSecretFile: (filePath) => { fs.unlink(filePath, () => {}); },
   // The file's hour starts when its turn is delivered; restamping mtime lets
   // the startup sweep count from the same moment after a restart.
-  touchSecretFile: (filePath) => {
-    const t = new Date();
+  touchSecretFile: (filePath, mtimeMs) => {
+    const t = new Date(mtimeMs);
     fs.utimes(filePath, t, t, () => {});
   },
   // Feeds the startup sweep: a submitted file is unlinked an hour later by a
@@ -11814,15 +11814,17 @@ const secretRequests = createSecretRequests({
   publishNotice: journalPublishNotice,
   // Is the turn naming this path still held for the room? A busy session
   // parks it on queuedMessages (journalQueueMedia above), a just-resumed one
-  // in _resumeOutbox (sendToSession) — and a restart carries both onto the
-  // replacement session under the same roomId. Matched on the path, which is
-  // unique per request and is not the value.
+  // in _resumeOutbox (sendToSession), and a native Codex steer holds its batch
+  // in _codexSteerPending until the steer settles (a rejected one restores
+  // it to the queue) — and a restart carries the queue onto the replacement
+  // session under the same roomId. Matched on the path, which is unique per
+  // request and is not the value.
   awaitingDelivery: (roomId, needle) => {
     const s = sessions.get(roomId);
     if (!s) return false;
     const holds = (entries) => Array.isArray(entries) && entries.some((blocks) => Array.isArray(blocks)
       && blocks.some((b) => b?.type === 'text' && typeof b.text === 'string' && b.text.includes(needle)));
-    return holds(s.queuedMessages) || holds(s._resumeOutbox);
+    return holds(s.queuedMessages) || holds(s._resumeOutbox) || holds(s._codexSteerPending?.queued);
   },
   fileTtlMs: SECRET_TTL_MS,
   log: console,

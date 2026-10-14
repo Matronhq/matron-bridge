@@ -81,6 +81,7 @@ describe('bridge wiring', () => {
     const probe = wiring.slice(wiring.indexOf('awaitingDelivery:'), wiring.indexOf('fileTtlMs:'));
     expect(probe).toContain('queuedMessages');
     expect(probe).toContain('_resumeOutbox');
+    expect(probe).toContain('_codexSteerPending?.queued');
     expect(wiring).toContain('touchSecretFile:');
   });
 

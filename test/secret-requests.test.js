@@ -115,7 +115,7 @@ function makeHarness(opts = {}) {
       return `/tmp/secrets/${secretId}.txt`;
     }),
     removeSecretFile: (p) => removed.push(p),
-    touchSecretFile: (p) => touched.push(p),
+    touchSecretFile: (p, mtimeMs) => touched.push({ path: p, mtimeMs }),
     ...(opts.awaitingDelivery ? { awaitingDelivery: opts.awaitingDelivery } : {}),
     listSecretFiles: opts.listSecretFiles ?? (() => []),
     items,
@@ -809,7 +809,7 @@ describe('submitted file lifetime', () => {
     // The turn is delivered; the hour starts now.
     state.held = false;
     await runFor(h, SECRET_DELIVERY_POLL_MS);
-    expect(h.touched).toEqual([PATH]);
+    expect(h.touched).toEqual([{ path: PATH, mtimeMs: h.clock }]);
     await runFor(h, SECRET_FILE_TTL_MS - SECRET_DELIVERY_POLL_MS);
     expect(h.removed).toEqual([]);
     await runFor(h, SECRET_DELIVERY_POLL_MS);
@@ -835,6 +835,32 @@ describe('submitted file lifetime', () => {
     await runFor(h, SECRET_FILE_MAX_TTL_MS - 10 * 60 * 1000);
     state.held = false;
     await runFor(h, 10 * 60 * 1000);
+    expect(h.removed).toEqual([PATH]);
+  });
+
+  it('restamps a late delivery no later than the ceiling minus the hour, so a restart sweep keeps the cap', async () => {
+    const { h, state } = harnessWithQueue();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    const submittedAt = h.clock;
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    await runFor(h, SECRET_FILE_MAX_TTL_MS - 10 * 60 * 1000);
+    state.held = false;
+    await runFor(h, SECRET_DELIVERY_POLL_MS);
+    expect(h.touched).toEqual([{ path: PATH, mtimeMs: submittedAt + SECRET_FILE_MAX_TTL_MS - SECRET_FILE_TTL_MS }]);
+  });
+
+  it('goes back to watching when the turn reappears on the queue after it was seen delivered', async () => {
+    const { h, state } = harnessWithQueue();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    state.held = false;
+    await runFor(h, SECRET_DELIVERY_POLL_MS);
+    // A send that failed after leaving the queue restores the turn to it.
+    state.held = true;
+    await runFor(h, SECRET_FILE_TTL_MS);
+    expect(h.removed).toEqual([]);
+    state.held = false;
+    await runFor(h, SECRET_DELIVERY_POLL_MS + SECRET_FILE_TTL_MS);
     expect(h.removed).toEqual([PATH]);
   });
 
