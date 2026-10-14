@@ -78,6 +78,13 @@ describe('resolvePromptChoices (pick_many replies)', () => {
     expect(resolvePromptChoices(many, choice)).toBeNull();
     expect(Date.now() - t0).toBeLessThan(1000);
   });
+
+  it('handles a very long choice without recursing per part', () => {
+    const choice = Array.from({ length: 50000 }, () => 'Red').join(', ') + ', Blue';
+    const t0 = Date.now();
+    expect(resolvePromptChoices(opts('Red', 'Green', 'Blue'), choice)?.indices).toEqual([0, 2]);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
 });
 
 // index.js has no unit harness for journalRoutePromptReply; assert the
