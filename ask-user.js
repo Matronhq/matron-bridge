@@ -758,9 +758,9 @@ async function callBriefing(name, args, render) {
 
 server.tool(
   'briefing_publish',
-  'Coordinator only. Publish a briefing — the sweep\'s report, a status update, or the answer to a `[routine briefing …]` turn — so the apps show it as "Latest briefing" at the top of Projects. Markdown, with conversations, items and missions as matron:// links; keep it scannable on a phone. The journal puts it in this chat as your own message, so do not also type it.',
+  'Coordinator only. Publish a briefing — the sweep\'s report, a status update, or the answer to a `[routine briefing …]` turn — so the apps show it as "Latest briefing" at the top of Projects. Markdown, with conversations, items and missions linked the way your instructions say; keep it scannable on a phone. The journal puts it in this chat as your own message, so do not also type it.',
   {
-    body: z.string().max(32768).describe('The briefing as markdown (≤32 KB): a one-line headline, then short sections, with matron:// links'),
+    body: z.string().max(32768).describe('The briefing as markdown (≤32 KB): a one-line headline, then short sections, with conversations and items linked the way your instructions say'),
   },
   async (args) => callBriefing('publish', args, formatBriefingPublishAck),
 );
