@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
+import { formatMuteAnnouncement, formatUnmuteAnnouncement, formatUserUnmuteAnnouncement, parseMuteAnnouncement, PEER_MUTED_GUIDANCE, createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
 
 function makeDelivery({ injectResult = true } = {}) {
   const injectTurn = vi.fn(() => injectResult);
@@ -513,5 +513,29 @@ describe('dropRoom', () => {
     delivery.dropRoom('!s', 'spammy');
     delivery.flush(idle, '!s');
     expect(injectTurn.mock.calls.at(-1)[1]).not.toMatch(/omitted/);
+  });
+});
+
+describe('mute announcements', () => {
+  it('the mute line carries the reason and tells the sender to go through the user', () => {
+    const line = formatMuteAnnouncement({ who: 'box-a', title: 'a ↔️ b', reason: 'looping' });
+    expect(line).toBe(`🔇 box-a muted "a ↔️ b": looping — ${PEER_MUTED_GUIDANCE}`);
+    expect(line.split('\n')).toHaveLength(1);
+    expect(PEER_MUTED_GUIDANCE).toMatch(/file a question for your user asking them to unmute/);
+    expect(PEER_MUTED_GUIDANCE).toMatch(/do not open a new chat/);
+  });
+
+  it('reads back mute and unmute lines, including the older shorter mute line', () => {
+    expect(parseMuteAnnouncement(formatMuteAnnouncement({ who: 'box-a', title: 't', reason: 'r' }))).toBe('muted');
+    expect(parseMuteAnnouncement('🔇 box-a muted "t": you are looping')).toBe('muted');
+    expect(parseMuteAnnouncement(formatUnmuteAnnouncement({ who: 'box-a', title: 't' }))).toBe('unmuted');
+    // The user tapping the card's Unmute posts its own line, which a remote
+    // bridge must also read as an unmute or its sender stays warned forever.
+    expect(parseMuteAnnouncement(formatUserUnmuteAnnouncement({ who: 'box-a' }))).toBe('unmuted');
+    expect(formatUserUnmuteAnnouncement({ who: 'box-a' })).toMatch(/agent_chat_read/);
+    expect(parseMuteAnnouncement('🔊 box-a unmuted by user — messages sent while it was muted were not delivered; catching up with agent_chat_read.')).toBe('unmuted');
+    for (const other of ['hello', '', null, 42, 'I muted "x": no', '🔇 Not delivered — this chat is muted.']) {
+      expect(parseMuteAnnouncement(other)).toBeNull();
+    }
   });
 });
