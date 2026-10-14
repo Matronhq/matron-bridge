@@ -175,7 +175,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncement } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
@@ -10807,10 +10807,23 @@ function awaitRoomMessage(chatRoomId, ms, sessionKey) {
 // routeLocalRoomMessage).
 function journalOnRoomFrame(room, frame) {
   reconcilePendingGuestOnFrame(room, frame);
+  notePeerMuteFromFrame(room, frame);
   deliverRoomFrameTo(room, frame);
   if (room.guestSessionRoomId != null && room.guestSessionRoomId !== room.sessionRoomId) {
     deliverRoomFrameTo({ ...room, sessionRoomId: room.guestSessionRoomId }, frame);
   }
+}
+
+// A remote peer's mute is held by its own bridge, which announces it in the
+// room (🔇 … muted …, 🔊 … unmuted …). Recording what it said is how
+// agent_chat_send here can tell the sender its messages are going nowhere
+// (lib/agent-rooms.js isPeerMuted). Agent frames only: a line the user types
+// that happens to look like one says nothing about the peer. Same-bridge
+// rooms read the peer's binding directly and are skipped by setPeerMuted.
+function notePeerMuteFromFrame(room, frame) {
+  if (frame.type !== 'text' || !String(frame.sender || '').startsWith('agent:')) return;
+  const said = parseMuteAnnouncement(frame.payload?.body);
+  if (said) agentRooms.setPeerMuted(frame.convo_id, said === 'muted');
 }
 
 // First-use membership reconciliation for a REMOTE guest binding stranded
