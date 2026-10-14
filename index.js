@@ -534,7 +534,7 @@ for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
   }
 }
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
-const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on disk
+const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on disk after its turn is delivered (capped at 24 h from submission)
 // Open secure-input requests, persisted like TIMERS_FILE / INFLIGHT_FILE above:
 // a request now lives 24 h (SECRET_REQUEST_TTL_MS in lib/secret-requests.js),
 // far longer than any bridge uptime guarantee, so the expiry timer is re-armed
@@ -11756,6 +11756,12 @@ const secretRequests = createSecretRequests({
     return filePath;
   },
   removeSecretFile: (filePath) => { fs.unlink(filePath, () => {}); },
+  // The file's hour starts when its turn is delivered; restamping mtime lets
+  // the startup sweep count from the same moment after a restart.
+  touchSecretFile: (filePath) => {
+    const t = new Date();
+    fs.utimes(filePath, t, t, () => {});
+  },
   // Feeds the startup sweep: a submitted file is unlinked an hour later by a
   // timer, and that timer dies with the bridge, so a restart inside the hour
   // used to strand the file on disk indefinitely.
@@ -11806,6 +11812,18 @@ const secretRequests = createSecretRequests({
     fullText: text,
   }),
   publishNotice: journalPublishNotice,
+  // Is the turn naming this path still held for the room? A busy session
+  // parks it on queuedMessages (journalQueueMedia above), a just-resumed one
+  // in _resumeOutbox (sendToSession) — and a restart carries both onto the
+  // replacement session under the same roomId. Matched on the path, which is
+  // unique per request and is not the value.
+  awaitingDelivery: (roomId, needle) => {
+    const s = sessions.get(roomId);
+    if (!s) return false;
+    const holds = (entries) => Array.isArray(entries) && entries.some((blocks) => Array.isArray(blocks)
+      && blocks.some((b) => b?.type === 'text' && typeof b.text === 'string' && b.text.includes(needle)));
+    return holds(s.queuedMessages) || holds(s._resumeOutbox);
+  },
   fileTtlMs: SECRET_TTL_MS,
   log: console,
 });

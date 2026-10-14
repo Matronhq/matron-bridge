@@ -76,6 +76,14 @@ describe('bridge wiring', () => {
     expect(wiring).toContain('journalPublishNotice(');
   });
 
+  it('lets the store see a submission turn still held on the queue or in a resume outbox', () => {
+    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    const probe = wiring.slice(wiring.indexOf('awaitingDelivery:'), wiring.indexOf('fileTtlMs:'));
+    expect(probe).toContain('queuedMessages');
+    expect(probe).toContain('_resumeOutbox');
+    expect(wiring).toContain('touchSecretFile:');
+  });
+
   it('persists the request store with owner-only permissions', () => {
     const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
     expect(wiring).toMatch(/mode: 0o600/);
