@@ -163,7 +163,7 @@ To put an image or video on a GitHub issue, pull request or comment, use the Git
 
 Browser-automation MCPs are off by default in bridge sessions because each one keeps a full headless Chrome + Xvfb alive (~400 MB) for the entire session, and most sessions don't need them. If you decide you need browser tools — e.g. to take a screenshot, drive a page, inspect network traffic, run a Lighthouse-style trace — call `restart_session` with `browser: true` and a `continue_with` message. You do not need to ask the user first.
 
-Other opt-in MCP extras use the same flag form (e.g. `/start --circleci`); which extras exist depends on this machine's `mcp-config.json` / `mcp-config.local.json`.
+Only if `restart_session` refuses (its budget is spent) or is not in your tool list, ask the user to run `/restart --browser` themselves — the manual form, also accepted by `/start`, `/resume` and `/workdir`. Other opt-in MCP extras use the same flag form (e.g. `/start --circleci`); which extras exist depends on this machine's `mcp-config.json` / `mcp-config.local.json`.
 
 Do not silently fall back to `Bash`-driven `curl`/`wget` for tasks that genuinely require a browser (interactive pages, JS rendering, screenshots) — restart with browser tools instead.
 

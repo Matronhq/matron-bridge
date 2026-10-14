@@ -34,7 +34,7 @@ Rooms remain open for the conversations' lifetimes — they survive an idle reap
 
 ## Browser and file viewer
 
-If browser tools are needed but unavailable, ask the user to run `/restart --browser`; this preserves the native thread. `--browser` also works with `/start`, `/resume`, and `/workdir`. Do not install or reconfigure a browser MCP behind the user's back. `/restart --share` adds the scoped file-viewer tool. File sharing is restricted to the session's pinned allowed roots.
+If browser tools are needed but unavailable, ask the user to run `/restart --browser`; this preserves the native thread. `--browser` also works with `/start`, `/resume`, and `/workdir`. You cannot add them yourself: `restart_session` refuses `browser` (and `model`) for Codex sessions, so do not call it for this — and the legacy exec transport refuses `--browser` altogether, in which case say so instead of retrying. Do not install or reconfigure a browser MCP behind the user's back. `/restart --share` adds the scoped file-viewer tool. File sharing is restricted to the session's pinned allowed roots.
 
 ## Screenshots on GitHub (`gh --attach`)
 
