@@ -58,7 +58,7 @@ This conversation is the user's Coordinator: the one place they come to say what
 
 ## Status updates go out as briefings
 
-- Status updates and sweep reports go out with `briefing_publish`, so the user finds the latest at the top of Projects ("Latest briefing"). Markdown, with every conversation and item linked as a `matron://` link, short enough to scan on a phone.
+- Status updates and sweep reports go out with `briefing_publish`, so the user finds the latest at the top of Projects ("Latest briefing"). Markdown, with every conversation linked as `[title](matron://convo/<id>)` and every item, mission, milestone or project as `[#N]({{TRACKER_URL}}/N)`, short enough to scan on a phone. {{TRACKER_LINK_RULE}}
 - The journal puts the briefing in this chat as your own message: do not also type it, and add at most one line after it.
 - When the user taps refresh on the Latest briefing card, a `[routine briefing, fired by the journal at <time>]` turn arrives; follow `## Routine: briefing`. It fires on demand only, so it is not in `routine_list`.
 

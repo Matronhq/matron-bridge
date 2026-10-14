@@ -32,6 +32,8 @@ import { createMemoryLookup } from './lib/memory-lookup.js';
 import { createUserDefaultsLookup, defaultDeclinedText, defaultOfferFor, defaultSavedText, effectiveDefaultEffort, effectiveDefaultModel } from './lib/user-defaults.js';
 import { createBoxDefaultsStore, createBoxDefaultsSetter, resolveDefaultAgent, boxModelFor, boxEffortFor, codexEnvDefaults } from './lib/box-defaults.js';
 import { createUserSettings } from './lib/user-settings.js';
+import { createJournalIdentity } from './lib/journal-identity.js';
+import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { createServer } from 'http';
@@ -836,7 +838,24 @@ const userSettings = createUserSettings({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
-const noticesBlockNow = ({ coordinator, coordinatorOnly = false }) => renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly });
+const noticesBlockNow = ({ coordinator, coordinatorOnly = false }) => trackerLinksNow(renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly }));
+
+// Tracker links in what agents write (lib/tracker-links.js): the journal's
+// shareable https form, `<journal>/u/<user>/<num>`, once the user's journal
+// name is known (GET /me, refreshed with the lookups above) and the journal
+// URL is https; the old matron://item form until then. Rendered into each
+// session's instructions when it spawns, like the memory block.
+const JOURNAL_IDENTITY_FILE = path.join(os.homedir(), '.matron-bridge-journal-identity.json');
+const journalIdentity = createJournalIdentity({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+  load: () => (fs.existsSync(JOURNAL_IDENTITY_FILE) ? JSON.parse(fs.readFileSync(JOURNAL_IDENTITY_FILE, 'utf-8')) : null),
+  save: (data) => atomicWriteFileSync(JOURNAL_IDENTITY_FILE, JSON.stringify(data, null, 2), { mode: 0o600 }),
+});
+const trackerUrlBaseNow = () => trackerUrlBase({ httpBase: journalHttpBase, userName: journalIdentity.name() });
+function trackerLinksNow(text) {
+  return renderTrackerLinks(text, trackerUrlBaseNow());
+}
 
 // With no summary model this box silently loses written titles, its roster
 // summary and its summary events (lib/summary-model-nag.js). Nothing said so
@@ -938,6 +957,7 @@ function handleJournalReconnect() {
   coordinatorLookup.refresh({ force: true });
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
+  journalIdentity.refresh({ force: true });
 }
 
 // Box status lives in the journal (matron-journal #82): this box's activity,
@@ -1053,6 +1073,7 @@ if (JOURNAL_ENABLED) {
   coordinatorLookup.refresh({ force: true });
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
+  journalIdentity.refresh({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
   // other publish here). No Matrix dependency: this convo has no Matrix
@@ -2257,6 +2278,7 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   coordinatorLookup.refresh();
   memoryLookup.refresh();
   userDefaults.refresh();
+  journalIdentity.refresh();
   if (JOURNAL_ENABLED && !role.known && !coordinatorUnknownWarned.has(roomId) && candidates.some((c) => typeof c === 'string' && c)) {
     coordinatorUnknownWarned.add(roomId);
     console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
@@ -2413,7 +2435,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
-  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
   const args = [
     '--print',
     '--verbose',
@@ -2825,7 +2847,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: trackerLinksNow(CODEX_BRIDGE_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -3341,7 +3363,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // prompts lib/prompt-detector.js already surfaces as Matron yes/no cards.
   const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
   if (ivRootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
-  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     ...(ivBypass ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'auto']),
@@ -9518,7 +9540,7 @@ async function journalOnCoordinator(convoId, { role }) {
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
   const target = sessions.get(roomId) || session;
-  await deliverCoordinatorTurn(target, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir }), noticesBlockNow({ coordinator: role === 'assigned', coordinatorOnly: true })));
+  await deliverCoordinatorTurn(target, coordinatorTurnText(role, trackerLinksNow(COORDINATOR_BLOCK), memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir }), noticesBlockNow({ coordinator: role === 'assigned', coordinatorOnly: true })));
 }
 
 // The injected assigned/released turn. Same inject-or-queue rule as a
@@ -12047,6 +12069,8 @@ const unseenHandlers = createUnseenHandlers({
   journalConvoIdFor,
   client: unseenClient,
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+  // Unseen items link in the same form as the session's instructions.
+  trackerBase: () => trackerUrlBaseNow(),
 });
 
 // The routine_* tool routes (lib/routines-tools.js), mounted below.
@@ -12075,7 +12099,7 @@ const briefingHandlers = createBriefingHandlers({
 // if idle-reaped, the same text left as a notice in its chat.
 function journalHandleUnseenFrame(frame) {
   if (!frame || frame.event !== 'pending') return;
-  const text = formatUnseenNudge(frame);
+  const text = formatUnseenNudge(frame, { trackerBase: trackerUrlBaseNow() });
   if (!text) return;
   const { convoId } = coordinatorLookup.snapshot();
   if (!convoId) {
