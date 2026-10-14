@@ -2122,7 +2122,7 @@ describe('mute wiring (source inspection)', () => {
     expect(clear).toBeGreaterThan(guard);
     // Both audiences are told, and both are told that nothing is replayed.
     expect(body).toMatch(/journalPublishNotice\(convoId,[\s\S]{0,300}agent_chat_read/);
-    expect(body).toMatch(/const line = `🔊 [\s\S]{0,300}agent_chat_read[\s\S]{0,200}journalPublisher\.publishText\(roomId, \{ body: line/);
+    expect(body).toMatch(/const line = formatUserUnmuteAnnouncement\(\{ who: roomMuteAgentLabel\(session\) \}\);[\s\S]{0,200}journalPublisher\.publishText\(roomId, \{ body: line/);
   });
 
   it('routes a verified tap through the roomMute flag, never by value shape', () => {

@@ -175,7 +175,7 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncement } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncement, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
@@ -11071,7 +11071,7 @@ function resolveRoomMuteTap(session, { roomId, sessionKey } = {}) {
   // replayed, so the gap is real and the agent has to go and read it.
   journalPublishNotice(convoId,
     `🔊 Unmuted "${where}" — new messages are delivered again. Anything sent while it was muted was not delivered; the agent can catch up with agent_chat_read.`);
-  const line = `🔊 ${roomMuteAgentLabel(session)} unmuted by user — messages sent while it was muted were not delivered; catching up with agent_chat_read.`;
+  const line = formatUserUnmuteAnnouncement({ who: roomMuteAgentLabel(session) });
   journalPublisher.publishText(roomId, { body: line, from: 'agent' });
   // A same-bridge peer never hears the journal echo of an own-device frame, so
   // the room line alone would reach every audience except the peer AGENT — the
