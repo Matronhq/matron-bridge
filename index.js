@@ -6545,14 +6545,14 @@ function deduplicateFilename(dir, filename) {
 // BACK into the journal as a fresh from:'assistant' text event would be
 // exactly the re-publish loop the return path must avoid (the journal
 // already has the user's own row for that content).
-async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}) {
+async function sendToRoom(roomId, text, html, { skipJournalMirror = false, notice = null } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
   // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
   // no active session (control-room chatter) are silently skipped.
   if (!skipJournalMirror) {
     const journalSession = sessions.get(roomId);
     if (journalSession) {
-      const payload = { body: text, from: 'assistant' };
+      const payload = { body: text, from: 'assistant', ...(notice ? { notice } : {}) };
       // Thread the streaming overlay's ref into the durable message so a
       // viewing client retires its overlay by ref (payload.message_ref is the
       // only channel the server exposes to a client — the durable event shape
@@ -10490,18 +10490,16 @@ function boxLabelForControl() {
 }
 
 function postControlNotice(session, text, kind = null) {
-  // A tagged notice goes straight to the journal: sendHtml's path carries
-  // only the text.
-  const meta = kind ? noticeMeta(kind, text) : null;
-  if (meta && session && JOURNAL_ENABLED) {
-    journalPublish(session, 'publishText', { body: text, from: 'assistant', notice: meta });
-    return;
-  }
   const n = notice('info', text);
+  // A tagged notice takes sendHtml's own path (sendToRoom), with the tag.
+  const meta = kind ? noticeMeta(kind, text) : null;
+  if (meta && session?.roomId && typeof session.sendHtml === 'function' && sessions.get(session.roomId) === session) {
+    try { sendToRoom(session.roomId, n.plain, n.html, { notice: meta }); return; } catch { /* fall through */ }
+  }
   if (session && typeof session.sendHtml === 'function') {
     try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
   }
-  journalPublishNotice(journalConvoIdFor(session), text);
+  journalPublishNotice(journalConvoIdFor(session), text, meta);
 }
 
 function persistControlState(session) {
