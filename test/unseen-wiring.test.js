@@ -48,7 +48,7 @@ describe('unseen wiring (source inspection)', () => {
     expect(fn).toContain('formatUnseenNudge(frame, { trackerBase: trackerUrlBaseNow() })');
     expect(fn).toContain('const { convoId } = coordinatorLookup.snapshot();');
     expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);');
-    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text)');
+    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text, unseenNoticeMeta(frame))');
     expect(fn).toContain('deliverCoordinatorTurn(session, text)');
   });
 

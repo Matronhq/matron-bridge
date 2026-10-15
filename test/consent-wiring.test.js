@@ -52,7 +52,7 @@ describe('consent wiring (source inspection)', () => {
     expect(fn).toContain('let session = findSessionByClaudeSessionId(convoId);');
     expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);');
     expect(fn).not.toMatch(/s\.coordinator === true/);
-    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text)');
+    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text, consentNoticeMeta(frame))');
     expect(fn).toContain('deliverCoordinatorTurn(session, text)');
   });
 
