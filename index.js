@@ -202,6 +202,7 @@ import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContext
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
+import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
@@ -6544,14 +6545,14 @@ function deduplicateFilename(dir, filename) {
 // BACK into the journal as a fresh from:'assistant' text event would be
 // exactly the re-publish loop the return path must avoid (the journal
 // already has the user's own row for that content).
-async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}) {
+async function sendToRoom(roomId, text, html, { skipJournalMirror = false, notice = null } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
   // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
   // no active session (control-room chatter) are silently skipped.
   if (!skipJournalMirror) {
     const journalSession = sessions.get(roomId);
     if (journalSession) {
-      const payload = { body: text, from: 'assistant' };
+      const payload = { body: text, from: 'assistant', ...(notice ? { notice } : {}) };
       // Thread the streaming overlay's ref into the durable message so a
       // viewing client retires its overlay by ref (payload.message_ref is the
       // only channel the server exposes to a client — the durable event shape
@@ -8743,10 +8744,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // be no live session object for the target convo (e.g. a reply for a
 // session that no longer exists) or for control-convo replies (which have no
 // Matrix room / session at all). Fails open like every other journal call.
-function journalPublishNotice(convoId, body) {
+// `notice` ({kind, icon, summary}, lib/system-notice.js) marks a notice the
+// apps may show as one compact row that expands to `body`.
+function journalPublishNotice(convoId, body, notice = null) {
   if (!JOURNAL_ENABLED || !convoId) return;
   try {
-    journalPublisher.publishText(convoId, { body, from: 'assistant' });
+    journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}) });
   } catch (e) {
     try { console.warn(`[journal-input] notice publish failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -9921,12 +9924,14 @@ async function fireTimer(record) {
     // Set by the agent through reminder_create: the delivered turn says so,
     // or the model reads its own reminder as something the user just typed.
     const repeats = record.repeat ? `, ${formatRepeat(record.repeat)}` : '';
-    journalPublishNotice(journalConvoIdFor(session), `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`);
+    const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
+    journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
     await journalRouteTextToSession(session,
       `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`);
     return;
   }
-  journalPublishNotice(journalConvoIdFor(session), `⏰ Timer #${record.id}: sending "${record.text}"`);
+  const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
+  journalPublishNotice(journalConvoIdFor(session), timerLine, noticeMeta('reminder', timerLine));
   await journalRouteTextToSession(session, record.text);
 }
 
@@ -10287,7 +10292,7 @@ async function fireAutoResume(roomId, convoId, slot) {
     ? '🕒 Model switched — carrying on.'
     : slot.source === 'coordinator'
       ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
-      : '🕒 The usage limit has reset — carrying on automatically.');
+      : '🕒 The usage limit has reset — carrying on automatically.', 'control');
   try {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
       await journalRouteTextToSession(session, '/compact');
@@ -10484,12 +10489,17 @@ function boxLabelForControl() {
   try { return journalPublisher.identity?.()?.name || SERVER_LABEL || os.hostname(); } catch { return SERVER_LABEL || 'this box'; }
 }
 
-function postControlNotice(session, text) {
+function postControlNotice(session, text, kind = null) {
   const n = notice('info', text);
+  // A tagged notice takes sendHtml's own path (sendToRoom), with the tag.
+  const meta = kind ? noticeMeta(kind, text) : null;
+  if (meta && session?.roomId && typeof session.sendHtml === 'function' && sessions.get(session.roomId) === session) {
+    try { sendToRoom(session.roomId, n.plain, n.html, { notice: meta }); return; } catch { /* fall through */ }
+  }
   if (session && typeof session.sendHtml === 'function') {
     try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
   }
-  journalPublishNotice(journalConvoIdFor(session), text);
+  journalPublishNotice(journalConvoIdFor(session), text, meta);
 }
 
 function persistControlState(session) {
@@ -10525,7 +10535,7 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
   const plan = planSessionControl({ params, session, canSwitch: canSwitchAgent });
   switch (plan.kind) {
     case 'error':
-      postControlNotice(session, controlNotice(params, { error: plan.detail || plan.code, agent: session.agent }));
+      postControlNotice(session, controlNotice(params, { error: plan.detail || plan.code, agent: session.agent }), controlNoticeKind(params.action));
       return { ok: false, error: { code: plan.code, ...(plan.detail ? { detail: plan.detail } : {}) } };
     case 'park':
       // The id is what the drain settles by: a print-mode recreate rebuilds
@@ -10535,18 +10545,18 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
       // (mergeParkedSlot); every other kind is latest-wins.
       session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...mergeParkedSlot(session._deferredControls?.[plan.slot.kind], plan.slot), id: randomUUID() } };
       persistControlState(session);
-      postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }));
+      postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }), controlNoticeKind(params.action));
       return { ok: true, result: { applied: 'deferred', box } };
     case 'schedule':
       session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
       persistControlState(session);
-      postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }));
+      postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }), controlNoticeKind(params.action));
       return { ok: true, result: { applied: 'scheduled', at: plan.at, box } };
     case 'apply': {
-      postControlNotice(session, controlNotice(params, { phase: 'now', agent: session.agent }));
+      postControlNotice(session, controlNotice(params, { phase: 'now', agent: session.agent }), controlNoticeKind(params.action));
       const r = await applyControlSteps(session, plan.steps);
       if (!r.ok) {
-        postControlNotice(sessions.get(session.roomId) || session, controlNotice(params, { error: r.error.detail || r.error.code, agent: session.agent }));
+        postControlNotice(sessions.get(session.roomId) || session, controlNotice(params, { error: r.error.detail || r.error.code, agent: session.agent }), controlNoticeKind(params.action));
         return { ok: false, error: r.error };
       }
       return { ok: true, result: { applied: 'now', box, ...(r.detail ? { detail: r.detail } : {}) } };
@@ -10681,22 +10691,22 @@ function drainDeferredControls(session) {
         const { params } = slots[kind];
         const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
         if (plan.kind === 'apply') {
-          postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }));
+          postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }), controlNoticeKind(params.action));
           const r = await applyControlSteps(current, plan.steps);
           current = sessions.get(current.roomId) || current;
           settle(current, kind);
-          if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }));
+          if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }), controlNoticeKind(params.action));
           else if (r.startedTurn || plan.steps.some((st) => TURN_STARTING_OPS.has(st.op))) startedTurn = true;
         } else if (plan.kind === 'park') {
           // Still not free for this one (an agent switch needs a fully idle
           // session): it simply stays in its slot for the next seam.
         } else if (plan.kind === 'error') {
           settle(current, kind);
-          postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }));
+          postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }), controlNoticeKind(params.action));
         } else if (plan.kind === 'schedule') {
           current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
           settle(current, kind);
-          postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }));
+          postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }), controlNoticeKind(params.action));
         }
       }
     } finally {
@@ -10740,10 +10750,9 @@ function flushRoomInbox(session) {
   // room go in separate turns, so some may still be waiting (they get their
   // own 📨 at the next turn end).
   const sent = queued - roomDelivery.pendingCount(session.roomId);
-  journalPublishNotice(
-    journalConvoIdFor(session),
-    flushed ? formatRoomDeliveredNotice(sent) : formatRoomDeliveryFailedNotice(sent),
-  );
+  const flushLine = flushed ? formatRoomDeliveredNotice(sent) : formatRoomDeliveryFailedNotice(sent);
+  // A failed delivery stays a full-width warning.
+  journalPublishNotice(journalConvoIdFor(session), flushLine, flushed ? noticeMeta('queue', flushLine) : null);
 }
 
 // Hybrid idle/busy delivery of room messages into local sessions
@@ -10933,7 +10942,7 @@ function deliverRoomFrameTo(room, frame) {
     if (disposition === 'muted-user' && echoFrom) {
       const convoId = live ? journalConvoIdFor(session) : sleepingConvoIdFor(room.sessionRoomId);
       if (convoId) {
-        journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }));
+        journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }), roomNoticeMeta({ from: echoFrom, body }));
         journalPublishNotice(convoId, ROOM_MUTED_NOT_DELIVERED_NOTICE);
       }
     }
@@ -10960,6 +10969,7 @@ function deliverRoomFrameTo(room, frame) {
     journalPublishNotice(
       journalConvoIdFor(session),
       formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }),
+      roomNoticeMeta({ from: echoFrom, body }),
     );
   }
   // A reply consumed by an agent_chat_send wait already reached the agent
@@ -10989,7 +10999,7 @@ function deliverRoomFrameTo(room, frame) {
         roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, foreign: { person },
       });
       if (echoFrom && queuedBeforeF === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
-        journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
+        journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
       }
     };
     foreignSessions.refreshContext(frame.convo_id).then(deliverForeign, deliverForeign);
@@ -11010,7 +11020,7 @@ function deliverRoomFrameTo(room, frame) {
     roomId: frame.convo_id, roomTitle, from, body, at: frame.ts,
   });
   if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
-    journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
+    journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
   }
 }
 
@@ -11298,7 +11308,8 @@ function journalInjectInviteRequest(frame) {
 // like the feature simply not working.
 function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {
   if (addressed) {
-    journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }));
+    const inviteLine = formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined });
+    journalPublishNotice(journalConvoIdFor(session), inviteLine, noticeMeta('invite', inviteLine));
   } else {
     console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
   }
@@ -12082,7 +12093,7 @@ function journalHandleConsentFrame(frame) {
     console.warn(`[consent] a consent nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
     return;
   }
-  journalPublishNotice(journalConvoIdFor(session), text);
+  journalPublishNotice(journalConvoIdFor(session), text, consentNoticeMeta(frame));
   deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[consent] nudge delivery failed: ${e.message}`));
 }
 
@@ -12135,7 +12146,7 @@ function journalHandleUnseenFrame(frame) {
     console.warn(`[unseen] an unseen nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
     return;
   }
-  journalPublishNotice(journalConvoIdFor(session), text);
+  journalPublishNotice(journalConvoIdFor(session), text, unseenNoticeMeta(frame));
   deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[unseen] nudge delivery failed: ${e.message}`));
 }
 
@@ -12188,7 +12199,7 @@ sessionControlHandlers = createSessionControlHandlers({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
-  notify: (convoId, text) => journalPublishNotice(convoId, text),
+  notify: (convoId, text) => journalPublishNotice(convoId, text, noticeMeta('control', text)),
   compactSelf: (d) => selfCompactHandler(d),
   log: console,
 });
@@ -12219,7 +12230,7 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   // lands somewhere the user can actually read it instead of being dropped
   // on the floor.
   notifyParent: ({ session, convoId, text }) => {
-    if (convoId) journalPublishNotice(convoId, text);
+    if (convoId) journalPublishNotice(convoId, text, noticeMeta('spawn', text));
     if (session) {
       roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
     } else if (!convoId) {
@@ -12245,7 +12256,7 @@ const selfCompactHandler = createSelfCompactHandler({
     const r = await applyControlSteps(session, [{ op: 'compact', command: params.command }]);
     if (!r.ok) throw new Error(r.error.detail || r.error.code);
   },
-  notify: (session, text) => postControlNotice(session, text),
+  notify: (session, text) => postControlNotice(session, text, 'control'),
 });
 
 // Backs the `restart_session` MCP tool: a session respawning its own agent
@@ -14193,11 +14204,11 @@ async function runPreReapHandoff(session, now, idleSince) {
       session._preReapHandoff.compactPending = false;
       return;
     }
-    postControlNotice(session, line);
+    postControlNotice(session, line, 'handoff');
     // The compaction, if any, drains at the turn-end free gate.
     return;
   }
-  if (drainPreReapCompact(session)) postControlNotice(session, line);
+  if (drainPreReapCompact(session)) postControlNotice(session, line, 'handoff');
 }
 
 // The compaction half, run from maybeFlushRoomDelivery (the shared "session
