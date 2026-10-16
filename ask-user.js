@@ -307,7 +307,7 @@ const messageLine = (m) => `${senderLabel(m.sender)}: ${m.body}${m.caption ? ` �
 
 server.tool(
   'agent_roster',
-  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start, plus each session's model, context gauge (tokens used of its window, e.g. `870k/1m 87%`) and any usage-limit stall (`stalled: usage limit, resets HH:MM UTC`), as last reported by its bridge — so you can also see which sessions are near full or out of allowance. Excludes yourself.",
+  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start, plus each session's model, context gauge (tokens used of its window, e.g. `870k/1m 87%`) and any usage-limit stall (`stalled: usage limit, resets HH:MM UTC`), as last reported by its bridge — so you can also see which sessions are near full or out of allowance. Excludes yourself. To talk with another person's agent you need nothing from here: call agent_chat_start with person.",
   {},
   async () => {
     try {
@@ -341,7 +341,7 @@ server.tool(
       // phase 2). Their titles are another person's words: quoted, one line.
       const people = (data.people || []).flatMap((p) => (p.sessions || []).map((c) => `- ${JSON.stringify(String(c.title || '').replace(/\s+/g, ' ').slice(0, 120))} — ${JSON.stringify(String(p.person || '').slice(0, 64))}'s session, convo ${c.id}`));
       const peopleBlock = people.length
-        ? `\nOther people's sessions (shared with you by their owners; a room with one needs your user's approval AND theirs, and turns their side starts run restricted — see BRIDGE_CLAUDE.md "Rooms with other people"):\n${people.join('\n')}`
+        ? `\nOther people's sessions (shared with you by their owners; a room with one needs your user's approval AND theirs, and turns their side starts run restricted — see BRIDGE_CLAUDE.md "Rooms with other people"; to ask a person without naming a session, use agent_chat_start with person):\n${people.join('\n')}`
         : '';
       return { content: [{ type: 'text', text: `${self}\nOther agents:\n${agents.join('\n') || '- none'}\nConversations:\n${convos.join('\n') || '- none'}${peopleBlock}` }] };
     } catch (err) {
@@ -352,20 +352,21 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns. To talk with another PERSON's agent (\"can we talk to bob about X\"), pass `person` and `topic` instead of target_convo_id — exactly one of the two. Your user gets one card to send it, then that person gets one card that also makes you contacts and lets them choose where to talk; do not call contact_add or session_share first. Neither Coordinator can answer either card.",
   {
-    target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
+    target_convo_id: z.string().optional().describe('Conversation id of the target session, from agent_roster. Omit when you pass person'),
+    person: z.string().max(64).optional().describe("Another person to talk with, by their name as contact_list shows it (they need not be a contact yet). Omit when you pass target_convo_id"),
     topic: z.string().optional().describe('Optional short topic for the room title'),
     justification: z.string().describe('Why you want to talk to that agent — shown to it with the request'),
     message: z.string().describe('The opening message posted into the room'),
-    mission: z.number().int().min(1).optional().describe("Only for another person's session: one of your mission numbers, already shared with them, to attach to the room. Turns their side starts may then use the tracker on that mission."),
+    mission: z.number().int().min(1).optional().describe("Only for a room with another person (person, or one of their sessions): one of your mission numbers, already shared with them, to attach to the room. Turns their side starts may then use the tracker on that mission."),
   },
-  async ({ target_convo_id, topic, justification, message, mission }) => {
+  async ({ target_convo_id, person, topic, justification, message, mission }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/agent-chat-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, target_convo_id, topic, justification, message, mission }),
+        body: JSON.stringify({ roomId: ROOM_ID, target_convo_id, person, topic, justification, message, mission }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {

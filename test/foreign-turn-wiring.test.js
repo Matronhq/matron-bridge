@@ -88,7 +88,7 @@ describe('ask-user.js tools', () => {
 
   it('registers foreign_action_request, session_share and session_unshare, and a mission on agent_chat_start', () => {
     for (const t of ['foreign_action_request', 'session_share', 'session_unshare']) expect(askUser).toContain(`'${t}',`);
-    expect(askUser).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)\.describe\("Only for another person's session/);
+    expect(askUser).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)\.describe\("Only for a room with another person/);
   });
 });
 
@@ -135,5 +135,50 @@ describe('room delivery keeps another person\'s messages in turns of their own',
     const text = formatAutoJoinedRequest({ room_id: 'r', from_name: 'alice', person: { name: 'alice' }, justification: 'talk' }, { events: [{ type: 'text', sender: 'person:alice', payload: { body: 'opening' } }] });
     expect(text).toContain('alice (another person): opening');
     expect(text).toMatch(/ANOTHER PERSON's agent/);
+  });
+});
+
+describe('talk requests: asking another person by name', () => {
+  const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
+  const coordMd = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+  const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
+  const triage = readFileSync(new URL('../coordinator/procedures/20-triage-a-consent-request.md', import.meta.url), 'utf8');
+  const section = (md, head) => {
+    const start = md.indexOf(head);
+    expect(start, head).toBeGreaterThan(-1);
+    const next = md.indexOf('\n## ', start + head.length);
+    return md.slice(start, next < 0 ? md.length : next);
+  };
+  const toolDef = askUser.slice(askUser.indexOf("'agent_chat_start',"), askUser.indexOf("'foreign_action_request',"));
+
+  it('agent_chat_start takes person or target_convo_id, and sends person to the bridge', () => {
+    expect(toolDef).toMatch(/target_convo_id: z\.string\(\)\.optional\(\)/);
+    expect(toolDef).toMatch(/person: z\.string\(\)\.max\(64\)\.optional\(\)/);
+    expect(toolDef).toMatch(/JSON\.stringify\(\{ roomId: ROOM_ID, target_convo_id, person, topic, justification, message, mission \}\)/);
+    expect(toolDef).toMatch(/exactly one/i);
+    expect(toolDef).toMatch(/Neither Coordinator can answer/);
+  });
+
+  it('BRIDGE_CLAUDE.md: "can we talk to bob" is agent_chat_start with person and topic, nothing first', () => {
+    const rooms = section(claudeMd, '## Rooms with other people');
+    expect(rooms).toMatch(/talk to bob/);
+    expect(rooms).toMatch(/`agent_chat_start` with `person` and `topic`/);
+    expect(rooms).toMatch(/Don't call `contact_add` or `session_share` first/);
+    expect(rooms).toMatch(/one card each/i);
+    expect(rooms).toMatch(/`session_share`[^\n]*standing/);
+    expect(rooms).toMatch(/Neither Coordinator can/);
+    expect(section(claudeMd, '## Sharing with other people')).toMatch(/neither can the Coordinator/);
+  });
+
+  it('BRIDGE_COORDINATOR.md: a talk goes through agent_chat_start with person, and the Coordinator still answers no card', () => {
+    const sharing = section(coordMd, '## Sharing with other people');
+    expect(sharing).toMatch(/`agent_chat_start` with `person`/);
+    expect(sharing).toMatch(/You never answer a card/);
+    expect(triage).toMatch(/talk requests/);
+    expect(triage).toMatch(/never yours to answer/);
+  });
+
+  it('BRIDGE_CODEX.md keeps Codex out of rooms with other people', () => {
+    expect(section(codexMd, '## Sharing with other people')).toMatch(/Codex session cannot hold a room with another person/);
   });
 });

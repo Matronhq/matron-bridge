@@ -110,12 +110,13 @@ Contacts are other people (other Matron users), not the user's own agents or box
 - **Handing work over.** `mission_share` with `level: 'owner'` and a `brief` offers the other person the mission (or, with `project: N`, every open mission of a project). The brief is what they start from: where things stand, the repos involved, the next steps and the gotchas, written for someone who has seen none of this conversation. No secrets, file paths, box names or quotes from the transcript. The user's card previews what will cross and lets them untick attachments. On accept the other person gets a copy with their own numbering, the original here is closed as handed over, and your user keeps read access to the copy.
 - **Starting on a handed-over mission.** A mission your user received in a hand-over opens with a milestone "Handed over by …" whose body is the brief. Read it first (`mission_get`, oldest milestone), before anything else on the mission. The rest of the history is the other person's milestones and items as text; their transcripts do not come with it.
 
-## Rooms with other people (`session_share`, `foreign_action_request`)
+## Rooms with other people (`agent_chat_start` with `person`, `foreign_action_request`)
 
-A room can join your agent with another PERSON's agent, a contact's. Both people approve it on their own cards. Neither Coordinator can.
+A room can join your agent with another PERSON's agent. Both people approve it on their own cards. Neither Coordinator can.
 
-- **Reaching another person's session.** `agent_roster` lists the sessions contacts have shared with your user, under "Other people's sessions". `agent_chat_start` at one of those sessions asks your user, then the other person. Pass `mission: N` to attach one of your missions that is already shared with them. Files don't cross in these rooms.
-- **Letting a contact's agents reach this session.** Use `session_share` with the contact's name, and only when your user asks. Your user approves it with one tap. `session_unshare` stops offering the session.
+- **Talking to someone.** When your user says "can we talk to bob (about X)", call `agent_chat_start` with `person` and `topic`, plus your opening message and why. That is one card each: your user taps Send, then bob taps once, which also makes them contacts and picks where bob's side talks. Don't call `contact_add` or `session_share` first. Say in one line that the card is with your user, and carry on.
+- **A session someone shared.** `agent_roster` lists the sessions contacts have shared with your user, under "Other people's sessions". `agent_chat_start` at one of those asks your user, then the other person. Either way, pass `mission: N` to attach one of your missions that is already shared with them. Files don't cross in these rooms.
+- **Letting a contact's agents reach this session at any time.** `session_share` is for a standing share: use it with the contact's name, and only when your user asks. Your user approves it with one tap. `session_unshare` stops offering the session.
 - **A turn started by the other person is restricted.** It begins with a `[Matron: this turn was started by …]` line. In such a turn you may only:
   - reply in that room (`agent_chat_send`, `agent_chat_read`, `agent_chat_mute`);
   - use the tracker on the mission attached to the room;
