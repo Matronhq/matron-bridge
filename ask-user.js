@@ -1453,13 +1453,14 @@ server.tool(
 
 server.tool(
   'mission_share',
-  `Offer a mission to one of the user's contacts. level 'read' (default): they see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. 'contribute': read, plus they can post milestones, comment, file and close items and set the status, all shown as theirs; never close, rename or share it. 'owner': a HAND-OVER — they get their own copy (their numbering, your brief as its first milestone), the original here is closed as handed over, and the user keeps read access to the copy. A hand-over needs a brief: ${BRIEF_WHAT}. Pass project: N instead of mission to hand over every open mission of a project. Conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT}`,
+  `Offer a mission to one of the user's contacts. level 'read' (default): they see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. 'contribute': read, plus they can post milestones, comment, file and close items and set the status, all shown as theirs; never close, rename or share it. 'owner': a HAND-OVER — they get their own copy (their numbering, your brief as its first milestone), the original here is closed as handed over, and the user keeps read access to the copy — or, with keep_contributing: true, keeps contributing to it (the user's card can switch this either way). A hand-over needs a brief: ${BRIEF_WHAT}. Pass project: N instead of mission to hand over every open mission of a project. Conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT}`,
   {
     contact: z.string().max(128).describe('A contact name or id from contact_list — they must already be a contact'),
     mission: z.number().int().min(1).optional().describe("A mission number; omit for this conversation's current mission"),
     level: z.enum(['read', 'contribute', 'owner']).optional().describe("'read' (default), 'contribute', or 'owner' (a hand-over: needs brief)"),
     brief: z.string().max(16000).optional().describe(`Required for level 'owner', not allowed otherwise. Markdown: ${BRIEF_WHAT}.`),
     project: z.number().int().min(1).optional().describe("Level 'owner' only: hand over this whole project (its open missions) instead of one mission"),
+    keep_contributing: z.boolean().optional().describe("Level 'owner' only: true asks for the user to keep contributing to the copy after the hand-over (hand over but keep collaborating) instead of only reading it. Use it when the user said they want to stay involved; their card can still change it"),
   },
   async (args) => callSharing('share', 'mission_share', args, formatShareAck),
 );

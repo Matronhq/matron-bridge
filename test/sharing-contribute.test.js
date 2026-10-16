@@ -54,6 +54,19 @@ describe('mission_share levels', () => {
     expect(client.share).toHaveBeenLastCalledWith(3, { contact: 'bob', level: 'owner', brief: 'Where it stands.', convo_id: 'c-1' });
   });
 
+  it('keep_contributing asks for the user to keep contributing to the copy, hand-over only', async () => {
+    const { h, client } = fixture();
+    expect((await h.share({ roomId: R, contact: 'bob', level: 'read', keep_contributing: true })).status).toBe(400);
+    expect((await h.share({ roomId: R, contact: 'bob', level: 'owner', brief: 'b', keep_contributing: 'yes' })).status).toBe(400);
+    expect(client.share).not.toHaveBeenCalled();
+    await h.share({ roomId: R, contact: 'bob', level: 'owner', brief: 'b', mission: 3, keep_contributing: true });
+    expect(client.share).toHaveBeenLastCalledWith(3, { contact: 'bob', level: 'owner', brief: 'b', convo_id: 'c-1', keep_level: 'contribute' });
+    await h.share({ roomId: R, contact: 'bob', level: 'owner', brief: 'b', mission: 3, keep_contributing: false });
+    expect(client.share).toHaveBeenLastCalledWith(3, { contact: 'bob', level: 'owner', brief: 'b', convo_id: 'c-1' });
+    const ack = formatShareAck({ pending: 'owner', grant: { level: 'owner', keep_level: 'contribute', grantee: { address: 'bob' }, mission: { num: 3, title: 'Spring' } } });
+    expect(ack).toMatch(/keeps contributing to the copy/);
+  });
+
   it('project: N hands over a whole project, owner level only', async () => {
     const { h, client } = fixture();
     expect((await h.share({ roomId: R, contact: 'bob', project: 2 })).status).toBe(400);
