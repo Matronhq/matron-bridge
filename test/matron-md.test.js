@@ -167,6 +167,21 @@ describe('loadMatronMd', () => {
     expect(r.truncated).toBe(true);
   });
 
+  it('reports the cap reached when the next MATRON.md is several directories deeper', () => {
+    write('repo/MATRON.md', 'a'.repeat(100));
+    write('repo/a/b/MATRON.md', 'b');
+    const r = loadMatronMd(path.join(tmp, 'repo/a/b'), { maxBytes: 100, log: { warn() {} } });
+    expect(r.files.map((f) => f.rel)).toEqual(['MATRON.md']);
+    expect(r.truncated).toBe(true);
+  });
+
+  it('does not report a cap filled exactly when no deeper file exists', () => {
+    write('repo/MATRON.md', 'a'.repeat(100));
+    fs.mkdirSync(path.join(tmp, 'repo/a/b'), { recursive: true });
+    const r = loadMatronMd(path.join(tmp, 'repo/a/b'), { maxBytes: 100, log: { warn() {} } });
+    expect(r.truncated).toBe(false);
+  });
+
   it('reads no more than the cap from a huge file', () => {
     write('repo/MATRON.md', 'x'.repeat(1024 * 1024));
     const reads = [];
