@@ -34,6 +34,14 @@ describe('createAgentInvites', () => {
       expect('target_convo_id' in op).toBe(false);
     });
 
+    it('a talk request names the person: target_person, and no target device or conversation', async () => {
+      const { inv, sendRoomOp, rooms } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', person: 'bob', talk: true });
+      inv.invite({ roomId: 'r1', targetPerson: 'bob', fromConvoId: 'c1', topic: 'cover editor', justification: 'j', mission: 4 });
+      const op = sendRoomOp.mock.calls[0][0];
+      expect(op).toEqual({ op: 'agent_invite', room_id: 'r1', target_person: 'bob', from_convo_id: 'c1', topic: 'cover editor', mission: 4, justification: 'j' });
+    });
+
     it('happy path: delivered -> idle ack -> accept answer, registry joined', async () => {
       const { inv, sendRoomOp, rooms } = makeInvites();
       rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });

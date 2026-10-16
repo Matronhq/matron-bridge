@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createAgentRooms, INVITE_TTL_MS } from '../lib/agent-rooms.js';
+import { createAgentRooms, INVITE_TTL_MS, PERSON_INVITE_TTL_MS } from '../lib/agent-rooms.js';
 
 // No fs fake needed: the registry takes plain load/save functions, so tests
 // record calls directly and round-trip persistence through the save payload.
@@ -578,5 +578,55 @@ describe('peer mute', () => {
     a.setPeerMuted('r', true);
     const b = createAgentRooms({ load: () => saved, save: () => {} });
     expect(b.isPeerMuted('r', '!a')).toBe(true);
+  });
+});
+
+describe('rooms with another person', () => {
+  const TALK = { role: 'owner', state: 'pending', sessionRoomId: '!sess1', peerDeviceId: null, person: 'bob', talk: true };
+
+  it('record keeps person and talk, and a partial re-record does not drop them', () => {
+    const { rooms, save } = makeStore();
+    rooms.record('r1', TALK);
+    expect(rooms.get('r1')).toMatchObject({ person: 'bob', talk: true });
+    rooms.record('r1', { state: 'joined' });
+    expect(rooms.get('r1')).toMatchObject({ person: 'bob', talk: true, state: 'joined' });
+    const reloaded = createAgentRooms({ load: () => save.mock.calls.at(-1)[0], log: { warn: () => {} } });
+    expect(reloaded.get('r1')).toMatchObject({ person: 'bob', talk: true });
+  });
+
+  it('an ordinary room has no person', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', REC);
+    expect(rooms.get('r1').person ?? null).toBeNull();
+  });
+
+  it('findLivePair finds a live room with the same person from the same session only', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', TALK);
+    expect(rooms.findLivePair('!sess1', { person: 'bob' })).toMatchObject({ roomId: 'r1' });
+    expect(rooms.findLivePair('!sess1', { person: 'carol' })).toBeNull();
+    expect(rooms.findLivePair('!sess2', { person: 'bob' })).toBeNull();
+    rooms.setState('r1', 'refused');
+    expect(rooms.findLivePair('!sess1', { person: 'bob' })).toBeNull();
+  });
+
+  it('a pending room with another person stays live past the ordinary invite TTL (both people answer in their own time)', () => {
+    vi.useFakeTimers();
+    try {
+      const { rooms, save } = makeStore();
+      rooms.record('r1', TALK);
+      rooms.record('r2', REC);
+      vi.advanceTimersByTime(INVITE_TTL_MS + 1);
+      expect(rooms.isActive('r1')).toBe(true);
+      expect(rooms.isActive('r2')).toBe(false);
+      expect(rooms.findLivePair('!sess1', { person: 'bob' })).toMatchObject({ roomId: 'r1' });
+      // …and survives a restart's load-time prune.
+      const reloaded = createAgentRooms({ load: () => save.mock.calls.at(-1)[0], log: { warn: () => {} } });
+      expect(reloaded.get('r1')).not.toBeNull();
+      expect(reloaded.get('r2')).toBeNull();
+      // It is still on a clock: past the person-room TTL it is gone too.
+      vi.advanceTimersByTime(PERSON_INVITE_TTL_MS);
+      expect(rooms.isActive('r1')).toBe(false);
+    } finally { vi.useRealTimers(); }
   });
 });
