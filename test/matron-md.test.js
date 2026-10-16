@@ -76,7 +76,7 @@ describe('loadMatronMd', () => {
     write('repo/editor/MATRON.md', 'Editor rules.');
     const r = loadMatronMd(path.join(tmp, 'repo/editor'));
     expect(r.files.map((f) => f.rel)).toEqual(['MATRON.md', path.join('editor', 'MATRON.md')]);
-    expect(r.files[0].bytes).toBe(Buffer.byteLength('# Root rules\n\nFile items for questions.'));
+    expect(r.files[0].bytes).toBe(Buffer.byteLength('# Root rules\n\nFile items for questions.\n'));
     expect(r.truncated).toBe(false);
     expect(r.block.startsWith('## Repository instructions for Matron sessions (MATRON.md)')).toBe(true);
     const root = r.block.indexOf('### MATRON.md\n\n# Root rules');
@@ -105,7 +105,7 @@ describe('loadMatronMd', () => {
   it('lists an empty file but adds no section for it', () => {
     write('repo/MATRON.md', '  \n');
     const r = loadMatronMd(path.join(tmp, 'repo'));
-    expect(r.files).toEqual([{ path: path.join(tmp, 'repo/MATRON.md'), rel: 'MATRON.md', bytes: 0 }]);
+    expect(r.files).toEqual([{ path: path.join(tmp, 'repo/MATRON.md'), rel: 'MATRON.md', bytes: 3 }]);
     expect(r.block).toBe('');
   });
 
@@ -121,10 +121,10 @@ describe('loadMatronMd', () => {
     write('repo/sub/MATRON.md', 'sub');
     const real = fs;
     const fsImpl = {
-      statSync: (p) => real.statSync(p),
-      readFileSync: (p, enc) => {
+      ...real,
+      openSync: (p, flags) => {
         if (p === path.join(tmp, 'repo/MATRON.md')) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
-        return real.readFileSync(p, enc);
+        return real.openSync(p, flags);
       },
     };
     const { warns, log } = recordingLog();
@@ -147,6 +147,47 @@ describe('loadMatronMd', () => {
     expect(r.block.endsWith(MATRON_MD_TRUNCATED)).toBe(true);
     expect(r.files.map((f) => f.bytes)).toEqual([60, 60]);
     expect(warns).toHaveLength(1);
+  });
+
+  it('neither reads nor lists a deeper file once the cap is reached', () => {
+    write('repo/MATRON.md', 'a'.repeat(200));
+    write('repo/sub/MATRON.md', 'b');
+    const r = loadMatronMd(path.join(tmp, 'repo/sub'), { maxBytes: 100, log: { warn() {} } });
+    expect(r.files.map((f) => f.rel)).toEqual(['MATRON.md']);
+    expect(r.block).not.toContain('### sub');
+    expect(matronMdStatusLine(r)).toBe('MATRON.md: MATRON.md (200 B), truncated');
+  });
+
+  it('reads no more than the cap from a huge file', () => {
+    write('repo/MATRON.md', 'x'.repeat(1024 * 1024));
+    const reads = [];
+    const fsImpl = { ...fs, readSync: (...a) => { reads.push(a[3]); return fs.readSync(...a); } };
+    const r = loadMatronMd(path.join(tmp, 'repo'), { fsImpl, maxBytes: 100, log: { warn() {} } });
+    expect(reads.reduce((n, x) => n + x, 0)).toBeLessThanOrEqual(104);
+    expect(r.files[0].bytes).toBe(1024 * 1024);
+    expect(r.truncated).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('follows a symlinked MATRON.md inside the repository, but not one pointing outside it', () => {
+    write('repo/docs/matron.md', 'shared rules');
+    write('outside-secret.txt', 'not for the prompt');
+    fs.symlinkSync(path.join(tmp, 'repo/docs/matron.md'), path.join(tmp, 'repo/MATRON.md'));
+    fs.mkdirSync(path.join(tmp, 'repo/sub'));
+    fs.symlinkSync(path.join(tmp, 'outside-secret.txt'), path.join(tmp, 'repo/sub/MATRON.md'));
+    const { warns, log } = recordingLog();
+    const r = loadMatronMd(path.join(tmp, 'repo/sub'), { log });
+    expect(r.files.map((f) => f.rel)).toEqual(['MATRON.md']);
+    expect(r.block).toContain('shared rules');
+    expect(r.block).not.toContain('not for the prompt');
+    expect(warns.some((w) => w.includes('points outside'))).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('finds the repository through a symlinked workdir', () => {
+    write('repo/MATRON.md', 'root rules');
+    fs.mkdirSync(path.join(tmp, 'repo/sub'));
+    fs.symlinkSync(path.join(tmp, 'repo/sub'), path.join(tmp, 'link'));
+    const r = loadMatronMd(path.join(tmp, 'link'));
+    expect(r.block).toContain('root rules');
   });
 
   it('never splits a multi-byte character at the cap', () => {
