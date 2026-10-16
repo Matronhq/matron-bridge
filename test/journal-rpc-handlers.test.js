@@ -327,6 +327,46 @@ describe('start', () => {
     ]);
   });
 
+  describe('workdir of a spawn (a start carrying a prompt)', () => {
+    const spawn = (params) => {
+      const calls = [];
+      const { handler, responses } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'x' }; },
+        injectTurn: () => true,
+      });
+      handler(REQ('start', params));
+      return { calls, responses };
+    };
+
+    it('an ordinary spawn must name its workdir: empty or absent is bad_workdir, nothing starts', () => {
+      for (const params of [{ prompt: 'do the thing' }, { prompt: 'do the thing', workdir: '' }, { prompt: 'do the thing', workdir: '', talk: 'yes' }]) {
+        const { calls, responses } = spawn(params);
+        expect(responses[0]).toMatchObject({ ok: false, error: { code: 'bad_workdir' } });
+        expect(calls).toHaveLength(0);
+      }
+    });
+
+    it('a talk spawn (talk: true) with an empty or absent workdir starts in the box default directory', () => {
+      for (const params of [{ prompt: 'a talk', talk: true }, { prompt: 'a talk', workdir: '', talk: true }]) {
+        const { calls, responses } = spawn(params);
+        expect(calls).toEqual([{ workdir: '/home/alice', mcpExtras: [] }]);
+        expect(responses[0]).toMatchObject({ ok: true });
+      }
+    });
+
+    it('a talk spawn that names a workdir is validated like any other', () => {
+      const calls = [];
+      const { handler, responses } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'x' }; },
+        injectTurn: () => true,
+        statSync: () => { throw new Error('ENOENT'); },
+      });
+      handler(REQ('start', { prompt: 'a talk', workdir: '/nope', talk: true }));
+      expect(responses[0]).toMatchObject({ ok: false, error: { code: 'bad_workdir', detail: '/nope' } });
+      expect(calls).toHaveLength(0);
+    });
+  });
+
   it('bad_workdir on a missing or non-directory path, with the resolved path as detail', () => {
     const { handler, responses } = harness({
       statSync: () => { throw new Error('ENOENT'); },
@@ -391,7 +431,7 @@ describe('start', () => {
 
     it('happy path: binds then injects, opening turn carries the task/room/from_name, responds with convo_id', () => {
       const { handler, responses, session, sequence, bound, injected } = spawnHarness();
-      handler(REQ('start', { room_id: 'room-42', prompt: 'do the thing', from_name: 'acme-app' }));
+      handler(REQ('start', { workdir: '~', room_id: 'room-42', prompt: 'do the thing', from_name: 'acme-app' }));
       expect(sequence).toEqual(['bind', 'inject']);
       expect(bound).toEqual([['room-42', session]]);
       expect(injected).toHaveLength(1);
@@ -418,7 +458,7 @@ describe('start', () => {
       const { handler, responses } = spawnHarness({
         startSession: (args) => { calls.push(args); return { journalConvoId: 'x' }; },
       });
-      handler(REQ('start', { room_id: 'room-42', prompt: '' }));
+      handler(REQ('start', { workdir: '~', room_id: 'room-42', prompt: '' }));
       expect(responses[0].error).toEqual({ code: 'bad_request', detail: 'room_id requires prompt' });
       expect(calls).toHaveLength(0);
     });
@@ -429,7 +469,7 @@ describe('start', () => {
         const { handler, responses } = spawnHarness({
           startSession: (args) => { calls.push(args); return { journalConvoId: 'x' }; },
         });
-        handler(REQ('start', { room_id: roomId, prompt: 'do the thing' }));
+        handler(REQ('start', { workdir: '~', room_id: roomId, prompt: 'do the thing' }));
         expect(responses[0].error).toEqual({ code: 'bad_request', detail: 'bad room_id' });
         expect(calls).toHaveLength(0);
       }
@@ -440,7 +480,7 @@ describe('start', () => {
       const { handler, responses } = spawnHarness({
         startSession: (args) => { calls.push(args); return { journalConvoId: 'x' }; },
       });
-      handler(REQ('start', { room_id: 'room-42', prompt: 'x'.repeat(2001) }));
+      handler(REQ('start', { workdir: '~', room_id: 'room-42', prompt: 'x'.repeat(2001) }));
       expect(responses[0].error).toEqual({ code: 'bad_request', detail: 'bad prompt' });
       expect(calls).toHaveLength(0);
     });
@@ -449,7 +489,7 @@ describe('start', () => {
       const { handler, responses, session, stopped, unbound } = spawnHarness({
         injectTurn: () => false,
       });
-      handler(REQ('start', { room_id: 'room-42', prompt: 'do the thing' }));
+      handler(REQ('start', { workdir: '~', room_id: 'room-42', prompt: 'do the thing' }));
       expect(stopped).toEqual([session]);
       expect(unbound).toEqual(['room-42']);
       expect(responses[0].ok).toBe(false);
@@ -460,7 +500,7 @@ describe('start', () => {
       const { handler, responses, session, stopped, unbound } = spawnHarness({
         bindSpawnRoom: () => { throw new Error('bind boom'); },
       });
-      handler(REQ('start', { room_id: 'room-42', prompt: 'do the thing' }));
+      handler(REQ('start', { workdir: '~', room_id: 'room-42', prompt: 'do the thing' }));
       expect(unbound).toEqual(['room-42']);
       expect(stopped).toEqual([session]);
       expect(responses[0].error).toEqual({ code: 'spawn_failed', detail: 'bind boom' });
@@ -468,7 +508,7 @@ describe('start', () => {
 
     it('detached spawn (prompt, no room_id): injects an opening turn that says there is no room, binds nothing, marks the session spawned', () => {
       const { handler, responses, session, sequence, bound, injected } = spawnHarness();
-      handler(REQ('start', { prompt: 'do the thing', from_name: 'acme-app' }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing', from_name: 'acme-app' }));
       expect(sequence).toEqual(['inject']);
       expect(bound).toHaveLength(0);
       expect(injected).toHaveLength(1);
@@ -494,7 +534,7 @@ describe('start', () => {
 
     it('detached spawn: injectTurn refusing tears the session down (no unbind — nothing was bound), spawn_failed', () => {
       const { handler, responses, session, stopped, unbound } = spawnHarness({ injectTurn: () => false });
-      handler(REQ('start', { prompt: 'do the thing' }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing' }));
       expect(stopped).toEqual([session]);
       expect(unbound).toHaveLength(0);
       expect(responses[0].error.code).toBe('spawn_failed');
@@ -504,7 +544,7 @@ describe('start', () => {
       const stopped = [];
       const session = { journalConvoId: 'convo-9' };
       const { handler, responses } = harness({ startSession: () => session, stopSession: (s) => stopped.push(s) });
-      handler(REQ('start', { prompt: 'do the thing' }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing' }));
       expect(stopped).toEqual([session]);
       expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'unsupported_mode', detail: 'spawn wiring absent' } });
     });
@@ -517,7 +557,7 @@ describe('start', () => {
         stopSession: (s) => stopped.push(s),
         // bindSpawnRoom/unbindSpawnRoom/injectTurn all default to null
       });
-      handler(REQ('start', { room_id: 'room-42', prompt: 'do the thing' }));
+      handler(REQ('start', { workdir: '~', room_id: 'room-42', prompt: 'do the thing' }));
       expect(stopped).toEqual([session]);
       expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'unsupported_mode', detail: 'spawn-room wiring absent' } });
     });
@@ -527,7 +567,7 @@ describe('start', () => {
       const { handler, responses, session, sequence, injected } = spawnHarness({
         joinMission: async (s, num) => { sequence.push('join'); joins.push([s, num]); return { status: 200, body: { mission: { num } } }; },
       });
-      handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing', mission_num: 64 }));
       await vi.waitFor(() => expect(responses).toHaveLength(1));
       expect(sequence).toEqual(['join', 'inject']);
       expect(joins).toEqual([[session, 64]]);
@@ -539,7 +579,7 @@ describe('start', () => {
       const answers = [{ status: 404, body: { error: 'not found' } }, { status: 409, body: { error: 'journal conversation not established yet' } }, { status: 200, body: {} }];
       const joinMission = vi.fn(async () => answers.shift());
       const { handler, responses, sequence } = spawnHarness({ joinMission, joinRetryDelayMs: 0 });
-      handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing', mission_num: 64 }));
       await vi.waitFor(() => expect(responses).toHaveLength(1));
       expect(joinMission).toHaveBeenCalledTimes(3);
       expect(sequence).toEqual(['inject']);
@@ -550,7 +590,7 @@ describe('start', () => {
       const warns = [];
       const joinMission = vi.fn(async () => { throw new Error('ECONNRESET'); });
       const { handler, responses, stopped, injected } = spawnHarness({ joinMission, joinRetryDelayMs: 0, log: { warn: (m) => warns.push(m), error: () => {} } });
-      handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing', mission_num: 64 }));
       await vi.waitFor(() => expect(responses).toHaveLength(1));
       expect(joinMission).toHaveBeenCalledTimes(3);
       expect(stopped).toHaveLength(0);
@@ -565,7 +605,7 @@ describe('start', () => {
         const warns = [];
         const joinMission = vi.fn(() => new Promise(() => {}));
         const { handler, responses, stopped, injected } = spawnHarness({ joinMission, log: { warn: (m) => warns.push(m), error: () => {} } });
-        handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+        handler(REQ('start', { workdir: '~', prompt: 'do the thing', mission_num: 64 }));
         await vi.advanceTimersByTimeAsync(4_999);
         expect(responses).toHaveLength(0);
         await vi.advanceTimersByTimeAsync(1);
@@ -585,7 +625,7 @@ describe('start', () => {
       try {
         const joinMission = vi.fn(() => new Promise((resolve) => setTimeout(() => resolve({ status: 502, body: {} }), 4_000)));
         const { handler, responses } = spawnHarness({ joinMission, joinRetryDelayMs: 300 });
-        handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+        handler(REQ('start', { workdir: '~', prompt: 'do the thing', mission_num: 64 }));
         await vi.advanceTimersByTimeAsync(5_000);
         expect(responses).toHaveLength(1);
         expect(joinMission).toHaveBeenCalledTimes(2);
@@ -601,7 +641,7 @@ describe('start', () => {
       const warns = [];
       const joinMission = vi.fn(async () => ({ status: 409, body: { error: 'conflict', blocked_by: 'closed' } }));
       const { handler, responses, injected } = spawnHarness({ joinMission, joinRetryDelayMs: 0, log: { warn: (m) => warns.push(m), error: () => {} } });
-      handler(REQ('start', { prompt: 'do the thing', mission_num: 61 }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing', mission_num: 61 }));
       await vi.waitFor(() => expect(responses).toHaveLength(1));
       expect(joinMission).toHaveBeenCalledTimes(1);
       expect(responses[0].ok).toBe(true);
@@ -613,8 +653,8 @@ describe('start', () => {
     it('mission_num must be a positive integer; nothing is spawned otherwise', () => {
       let started = 0;
       const { handler, responses } = spawnHarness({ startSession: () => { started += 1; return { journalConvoId: 'c' }; } });
-      handler(REQ('start', { prompt: 'x', mission_num: '64' }));
-      handler(REQ('start', { prompt: 'x', mission_num: 0 }, 'r2'));
+      handler(REQ('start', { workdir: '~', prompt: 'x', mission_num: '64' }));
+      handler(REQ('start', { workdir: '~', prompt: 'x', mission_num: 0 }, 'r2'));
       expect(started).toBe(0);
       expect(responses.map((r) => r.error)).toEqual([
         { code: 'bad_request', detail: 'bad mission_num' },
@@ -625,7 +665,7 @@ describe('start', () => {
     it('no mission_num: the start stays synchronous and never calls joinMission', () => {
       const joinMission = vi.fn();
       const { handler, responses } = spawnHarness({ joinMission });
-      handler(REQ('start', { prompt: 'do the thing' }));
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing' }));
       expect(responses).toHaveLength(1);
       expect(joinMission).not.toHaveBeenCalled();
     });
@@ -830,7 +870,7 @@ describe('start', () => {
         unbindSpawnRoom: () => {},
         injectTurn: () => true,
       });
-      handler(REQ('start', { room_id: 'room-42', prompt: 'do the thing', model: 'opus', effort: 'max' }));
+      handler(REQ('start', { workdir: '~', room_id: 'room-42', prompt: 'do the thing', model: 'opus', effort: 'max' }));
       expect(responses[0].ok).toBe(true);
       expect(calls[0].model).toBeUndefined();
       expect(calls[0].effort).toBeUndefined();
