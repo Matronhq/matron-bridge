@@ -9424,6 +9424,14 @@ const itemTurnRouter = createItemTurnRouter({
 });
 
 function journalOnItem(session, item, ctx) {
+  // Another PERSON's comment on a tracker item (sharing phase 3: a mission
+  // shared with contribute access). Never an ordinary 📌 turn: a foreign
+  // one, scoped to the item's mission, exactly like a room message from
+  // them. Not the user back in the loop either, so nothing below applies.
+  if (ctx?.person) {
+    deliverForeignItemTurn(session, item?.payload, ctx.person);
+    return;
+  }
   // Same reasoning as journalOnMedia: answering the agent's question is the
   // user back in the loop, so it refreshes the self-restart budget.
   session._agentRestartCount = 0;
@@ -10798,6 +10806,18 @@ function injectForeignRoomTurn(session, text, foreign) {
   if (session?.codex) return false;
   const turn = foreignSessions.turnFor(foreign.roomId, foreign.person, foreignSessions.cachedContext(foreign.roomId));
   return foreignSessions.inject(session, text, turn);
+}
+
+// Another person's comment on a tracker item (lib/foreign-session.js
+// deliverItemTurn). Codex has no gate, so it never takes the turn.
+function deliverForeignItemTurn(session, payload, person) {
+  if (session?.codex) {
+    journalPublishNotice(journalConvoIdFor(session), `⚠️ Not delivered: a Codex session cannot take a turn started by another person (${person}, on a tracker item). Switch this session to Claude to answer them.`);
+    return;
+  }
+  foreignSessions.deliverItemTurn(session, payload, person).catch((e) => {
+    try { console.warn(`[foreign] item turn failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+  });
 }
 
 // Per-room once-listener registry backing agent_chat_send's optional short
@@ -12929,7 +12949,7 @@ const apiServer = createServer(async (req, res) => {
 
       // The contact_* / mission_share tool routes; same one-matcher
       // allowlist shape.
-      const sharingRoute = url.pathname.match(/^\/sharing\/(contact_list|contact_add|contact_remove|contact_block|share|unshare|shares|shared_list|shared_get)$/);
+      const sharingRoute = url.pathname.match(/^\/sharing\/(contact_list|contact_add|contact_remove|contact_block|share|unshare|shares|shared_list|shared_get|shared_post|shared_status|shared_item_create|shared_item_comment|shared_item_close|shared_item_reopen)$/);
       if (sharingRoute) {
         const name = sharingRoute[1];
         await respondAgentChatRoute(res, data, sharingHandlers[name],
