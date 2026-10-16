@@ -5,6 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { SECRET_CONTEXT_MAX_LENGTH } from './lib/secret-context.js';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
@@ -46,14 +47,15 @@ server.tool(
   'Request a secret from the user via a secure web form: API keys, tokens, passwords, or whole key files (multiline: true) — anything that must not appear in chat. This tool does NOT block and returns nothing secret: it files the request in the user\'s tracker (their For you list) alongside a chat link, then returns immediately. The user has 24 hours. When they submit, you receive a turn telling you the local file path to read the value from — so carry on with other work in the meantime and never poll for it.',
   {
     label: z.string().describe('A short label describing what secret is needed, e.g. "AWS access key" or "database password"'),
+    context: z.string().trim().min(1).max(SECRET_CONTEXT_MAX_LENGTH).describe('Required non-secret explanation: identify and link the related task, explain why this credential is needed, and give the exact permissions and resource scope (or say when scope is not applicable). Displayed with the request and on the secure form. Use plain text; URLs are shown literally. The bridge adds the originating conversation automatically and labels your explanation as unverified. Never include a secret value.'),
     multiline: z.boolean().optional().describe('Render a multi-line box instead of a masked one-line field. Use for PEM keys, certificates and JSON service-account files, whose newlines a one-line field would destroy.'),
   },
-  async ({ label, multiline }) => {
+  async ({ label, context, multiline }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/secret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, roomId: ROOM_ID, multiline: multiline === true }),
+        body: JSON.stringify({ label, context, roomId: ROOM_ID, multiline: multiline === true }),
       });
 
       if (!postRes.ok) {
