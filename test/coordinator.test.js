@@ -312,6 +312,25 @@ describe('memory block plumbing (spec 2026-09-27 memories; every session since 2
   });
 });
 
+describe('MATRON.md block plumbing', () => {
+  it('sits after the notices and before the memories for an ordinary session, on Claude and Codex', () => {
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).appendSystemPrompt)
+      .toBe('BASE\n\nNOT\n\nMD\n\nMEM');
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).developerInstructions)
+      .toBe('B\n\nNOT\n\nMD\n\nMEM');
+  });
+  it('sits after the Coordinator brief and the notices, before the memories', () => {
+    expect(claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).appendSystemPrompt)
+      .toBe('BASE\n\nBLOCK\n\nNOT\n\nMD\n\nMEM');
+    expect(codexCoordinatorOptions({ coordinator: true, baseInstructions: 'B', block: 'K', baseSandbox: 'x', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).developerInstructions)
+      .toBe('B\n\nK\n\nNOT\n\nMD\n\nMEM');
+  });
+  it('an empty block appends nothing, so a repository without MATRON.md gets the same prompt as before', () => {
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', matronMdBlock: '', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE\n\nMEM');
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' }).developerInstructions).toBe('B\n\nMEM');
+  });
+});
+
 describe('renderMemoryBlock', () => {
   const m = (name, description = `Rule ${name}.`, type = 'feedback', scope) => ({ id: `me_${name}`, name, type, description, ...(scope ? { scope } : {}) });
   it('lists name (type, scope): description per memory, sorted by name, and says which scopes are listed', () => {

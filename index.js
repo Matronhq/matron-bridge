@@ -36,6 +36,7 @@ import { createJournalIdentity } from './lib/journal-identity.js';
 import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
+import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -839,6 +840,16 @@ const userSettings = createUserSettings({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
+// The "MATRON.md: …" line (lib/matron-md.js) for the messages that say what
+// a session started with; empty when the spawn found no MATRON.md.
+const matronMdNote = (session) => {
+  const line = matronMdStatusLine(session?.matronMd);
+  return line ? `\n${line}` : '';
+};
+const matronMdNoteHtml = (session) => {
+  const line = matronMdStatusLine(session?.matronMd);
+  return line ? `<br/>${escapeHtml(line)}` : '';
+};
 const noticesBlockNow = ({ coordinator, coordinatorOnly = false }) => trackerLinksNow(renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly }));
 
 // Tracker links in what agents write (lib/tracker-links.js): the journal's
@@ -2436,7 +2447,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
-  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const matronMd = loadMatronMd(cwd);
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const args = [
     '--print',
     '--verbose',
@@ -2507,6 +2519,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Known from the first turn when the spawn passed --effort (lib/effort-tracker.js).
     _effort: { level: printEffort || null, pending: null, awaitingConfirm: false },
     workdir: cwd,
+    // The MATRON.md files this spawn read (lib/matron-md.js), for the
+    // start, resume and restart messages and /status.
+    matronMd: { files: matronMd.files, truncated: matronMd.truncated },
     // The spawned session's effective env (shim prepended to PATH when
     // MATRON_CODEX_VIZ=1). The codex-viz activation guard must evaluate the
     // session's PATH, not the bridge's, to see the producer we just deployed.
@@ -2848,7 +2863,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: trackerLinksNow(CODEX_BRIDGE_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const matronMd = loadMatronMd(cwd);
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: trackerLinksNow(CODEX_BRIDGE_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -2878,6 +2894,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     roomId,
     coordinator: !!options.coordinator,
     workdir: cwd,
+    // The MATRON.md files this spawn read (lib/matron-md.js), for the
+    // start, resume and restart messages and /status.
+    matronMd: { files: matronMd.files, truncated: matronMd.truncated },
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
@@ -3364,7 +3383,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // prompts lib/prompt-detector.js already surfaces as Matron yes/no cards.
   const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
   if (ivRootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
-  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const matronMd = loadMatronMd(cwd);
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     ...(ivBypass ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'auto']),
@@ -3423,6 +3443,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     coordinator: !!options.coordinator,
     _effort: { level: ivEffort || null, pending: null, awaitingConfirm: false },
     workdir: cwd,
+    // The MATRON.md files this spawn read (lib/matron-md.js), for the
+    // start, resume and restart messages and /status.
+    matronMd: { files: matronMd.files, truncated: matronMd.truncated },
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
@@ -7275,7 +7298,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const extrasNote = shownStartExtras.length > 0 ? ` (extras: ${shownStartExtras.join(', ')})` : '';
       const permNote = permissionNote(session);
       const startModelNote = startModel ? ` on ${aliasLabel(startModel)}` : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.`);
+      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}`);
       break;
     }
 
@@ -7392,7 +7415,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const restartModelLine = restartModelFlag.model ? `\nModel: ${aliasLabel(restartModelFlag.model)}` : '';
       const restartPermNote = permissionNote(restarted);
       await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}${restartModelLine}${restartPermNote}`
+        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`
       );
       break;
     }
@@ -7727,10 +7750,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const resumePermNote = permissionNote(session);
       const resumeModelLine = resumeModelFlag.model ? `\nModel: ${aliasLabel(resumeModelFlag.model)}` : '';
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
-      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${resumeModelLine}${resumePermNote}\n\nSend any message to continue.`;
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${matronMdNote(session)}${resumeModelLine}${resumePermNote}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(session.workdir)}</code>` +
+        `Workdir: <code>${escapeHtml(session.workdir)}</code>${matronMdNoteHtml(session)}` +
         `${resumeModelFlag.model ? `<br/>Model: <code>${escapeHtml(aliasLabel(resumeModelFlag.model))}</code>` : ''}` +
         `${escapeHtml(resumePermNote)}<br/><br/>` +
         `<i>Send any message to continue.</i>`;
@@ -7816,10 +7839,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const workdirPermNote = permissionNote(session);
       const workdirModelLine = workdirModel ? `\nModel: ${aliasLabel(workdirModel)}` : '';
       await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}${workdirModelLine}`);
-      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${workdirModelLine}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
+      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${matronMdNote(session)}${workdirModelLine}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
         `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(resolved)}</code>` +
+        `Workdir: <code>${escapeHtml(resolved)}</code>${matronMdNoteHtml(session)}` +
         `${workdirModel ? `<br/>Model: <code>${escapeHtml(aliasLabel(workdirModel))}</code>` : ''}` +
         `${escapeHtml(workdirPermNote)}<br/><br/>` +
         `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
@@ -7849,7 +7872,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const busyText = session.busy ? 'yes' : 'no';
 
       const plainStatus =
-        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
+        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}${matronMdNote(session)}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}${codexDetails}`;
 
       const busyHtml = session.busy
@@ -7860,6 +7883,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<tr><td>State</td><td>${busyHtml}</td></tr>` +
         `<tr><td>Agent</td><td>${escapeHtml(agentLabel(session.agent))}</td></tr>` +
         `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
+        (matronMdFileList(session.matronMd) ? `<tr><td>MATRON.md</td><td>${escapeHtml(matronMdFileList(session.matronMd))}</td></tr>` : '') +
         `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
         `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
         `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
