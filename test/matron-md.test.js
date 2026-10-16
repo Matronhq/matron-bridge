@@ -169,8 +169,8 @@ describe('loadMatronMd', () => {
 describe('matronMdStatusLine', () => {
   it('lists each file with its size, and says when the cap cut it', () => {
     const files = [{ rel: 'MATRON.md', bytes: 3174 }, { rel: 'editor/MATRON.md', bytes: 410 }];
-    expect(matronMdStatusLine({ files, truncated: false })).toBe('MATRON.md: MATRON.md (3.1 KB), editor/MATRON.md (0.4 KB)');
-    expect(matronMdFileList({ files, truncated: true })).toBe('MATRON.md (3.1 KB), editor/MATRON.md (0.4 KB), truncated');
+    expect(matronMdStatusLine({ files, truncated: false })).toBe('MATRON.md: MATRON.md (3.1 KB), editor/MATRON.md (410 B)');
+    expect(matronMdFileList({ files, truncated: true })).toBe('MATRON.md (3.1 KB), editor/MATRON.md (410 B), truncated');
   });
 
   it('is empty when nothing was found or nothing is known', () => {
