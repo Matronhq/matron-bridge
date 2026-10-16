@@ -178,7 +178,7 @@ describe('foreign sessions, phase 3', () => {
     const [, text, turn] = r.sent[0];
     expect(turn).toEqual({ roomId: null, person: 'bob', role: 'owner', mission: { id: 'ms_1', num: 7, owner: null, title: 'Fair' }, item: { id: 'it_5', num: 5 } });
     expect(text).toMatch(/^\[Matron: this turn was started by bob, another person/);
-    expect(text).toMatch(/📌 Item #5 "Book the band" — bob \(another person\) replied:\nBand is booked/);
+    expect(text).toMatch(/📌 Item #5 "Book the band" — bob's agent \(another person\) replied:\nBand is booked/);
     // Files never cross: named, never downloaded, no path.
     expect(text).toMatch(/\[attachment quote\.pdf \(application\/pdf\) — not downloaded/);
     expect(text).not.toMatch(/\/tmp\/x/);
@@ -195,6 +195,21 @@ describe('foreign sessions, phase 3', () => {
     expect((await r.fs.check(s, { tool_name: 'Bash', tool_input: { command: 'ls' } })).decision).toBe('deny');
     expect(r.fs.routeAllowed(s, '/sharing/shared_post', {})).toBe(true);
     expect(r.fs.routeAllowed(s, '/memory/get', {})).toBe(false);
+  });
+
+  it('reads the mission from the marker, names how they wrote, and checks shared_by', async () => {
+    const r = rig();
+    const s = session();
+    const marker = { ...comment('cm_5', 'Typed it myself'), mission_id: 'ms_1', person: { name: 'alice', via: 'user' }, shared_by: { user_id: 2, name: 'alice' } };
+    await r.fs.deliverItemTurn(s, marker, 'alice');
+    expect(r.items.get).not.toHaveBeenCalled();
+    expect(s.foreignTurn).toMatchObject({ role: 'guest', contribute: true, mission: { id: 'ms_1', owner: 'alice' } });
+    expect(r.sent[0][1]).toMatch(/alice \(another person, typing themselves\) replied:/);
+    // A marker whose shared_by disagrees with the mission gets the narrowest turn.
+    const r2 = rig();
+    const s2 = session();
+    await r2.fs.deliverItemTurn(s2, { ...marker, comment: { id: 'cm_6', body: 'x' }, shared_by: { user_id: 3, name: 'carol' } }, 'carol');
+    expect(s2.foreignTurn.mission).toBe(null);
   });
 
   it('an unreadable item or mission gives the narrowest turn', async () => {
