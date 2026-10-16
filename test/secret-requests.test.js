@@ -230,7 +230,7 @@ describe('createSecretRequests.create', () => {
   });
 
   it('carries the explanation into the item, notice, signed-link input and persisted request', async () => {
-    const context = 'For [the release](https://example.com/tasks/release).\nAllow worker edits on staging only. Needed to deploy the fix.';
+    const context = 'For [the release](https://example.com/tasks/release).\nAllow worker edits on staging only.\nNeeded to deploy the fix.';
     let linkOptions;
     const h = makeHarness({ generateLink: (_id, opts) => { linkOptions = opts; return 'https://viewer.example/secret'; } });
     await h.store.create({ label: 'token', context: `  ${context}\n`, roomId: '!room', convoId: 'c' });
@@ -239,7 +239,7 @@ describe('createSecretRequests.create', () => {
     expect(h.items.calls.create[0].body).toContain('[Open originating conversation](matron://convo/c)');
     expect(h.chat[0].info.plain).toContain('[Open originating conversation](matron://convo/c)');
     expect(h.chat[0].info.html).toContain('<a href="matron://convo/c">Open originating conversation</a>');
-    expect(h.chat[0].info.html).toContain(context.replace('\n', '<br>'));
+    expect(h.chat[0].info.html).toContain(context.replaceAll('\n', '<br>'));
     expect(h.chat[0].info.html).not.toContain('href="https://example.com');
     expect(linkOptions.context).toBe(context);
     expect(linkOptions.convoId).toBe('c');
