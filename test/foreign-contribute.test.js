@@ -37,6 +37,14 @@ describe('the guest side of a contribute share', () => {
     expect((await decide(guestContrib, 'item_comment', { id: '#12', body: 'x', shared_by: 'carol' }, { lookupItem })).decision).toBe('deny');
   });
 
+  it('an item must carry the turn mission\'s id: a bare mission number never matches', async () => {
+    // Another owner's mission can share the number: only the id is proof.
+    const numberOnly = async () => ({ mission_num: 7 });
+    expect((await decide(guestContrib, 'item_comment', { id: 'it_other', body: 'x', shared_by: 'alice' }, { lookupItem: numberOnly })).decision).toBe('deny');
+    expect((await decide(guestContrib, 'item_comment', { id: 'it_other', body: 'x' }, { lookupItem: numberOnly })).decision).toBe('deny');
+    expect((await decide(guestRead, 'item_get', { id: 'it_other' }, { lookupItem: numberOnly })).decision).toBe('deny');
+  });
+
   it('still never sends files or buttons, and nothing else opens', async () => {
     expect((await decide(guestContrib, 'item_comment', { id: 'it_in', body: 'x', attachments: ['a.png'] }, { lookupItem })).decision).toBe('deny');
     expect((await decide(guestContrib, 'item_comment', { id: 'it_in', body: 'x', actions: ['Go'] }, { lookupItem })).decision).toBe('deny');
@@ -130,10 +138,12 @@ describe('both layers agree', () => {
   });
 });
 
-function rig({ busy = false, missionRow = { id: 'ms_1', num: 7, title: 'Fair', owner: { name: 'alice' }, grant: { level: 'contribute' } } } = {}) {
+function rig({ busy = false, sendOk = true, missionRow = { id: 'ms_1', num: 7, title: 'Fair', owner: { name: 'alice' }, grant: { level: 'contribute' } } } = {}) {
   const sent = [];
+  const notices = [];
   const flags = new Set();
   const occupied = { v: busy };
+  sendOk = { v: sendOk };
   const sharing = {
     personRoom: vi.fn(async () => ({ status: 200, data: { person_room: { role: 'guest', person: 'alice', room_id: 'room-2', mission: { id: 'ms_1', num: 7, owner: 'alice', title: 'Fair' } } } })),
     mission: vi.fn(async () => ({ status: 200, data: { mission: missionRow } })),
@@ -147,13 +157,13 @@ function rig({ busy = false, missionRow = { id: 'ms_1', num: 7, title: 'Fair', o
   const fs = createForeignSessions({
     sharing, items,
     journalConvoIdFor: (s) => `convo-${s.roomId}`,
-    sendText: (s, text) => { sent.push([s.roomId, text, s.foreignTurn]); return true; },
-    publishNotice: () => {},
+    sendText: (s, text) => { if (!sendOk.v) return false; sent.push([s.roomId, text, s.foreignTurn]); return true; },
+    publishNotice: (c, t) => notices.push([c, t]),
     isOccupied: () => occupied.v,
     flag: { set: (k) => flags.add(k), clear: (k) => flags.delete(k) },
     store: { load: () => ({}), save: () => {} },
   });
-  return { fs, sent, flags, occupied, sharing, items };
+  return { fs, sent, notices, flags, occupied, sharing, items, sendOk };
 }
 const session = () => ({ roomId: 'sess-b', alive: true, foreignTurn: null });
 const comment = (id, body) => ({ item_id: 'it_5', num: 5, kind: 'task', title: 'Book the band', action: 'commented', awaiting: 'agent', comment: { id, body, attachments: [{ name: 'quote.pdf', mime: 'application/pdf', blob_ref: 'b1', path: '/tmp/x' }] } });
@@ -210,6 +220,18 @@ describe('foreign sessions, phase 3', () => {
     const s2 = session();
     await r2.fs.deliverItemTurn(s2, { ...marker, comment: { id: 'cm_6', body: 'x' }, shared_by: { user_id: 3, name: 'carol' } }, 'carol');
     expect(s2.foreignTurn.mission).toBe(null);
+  });
+
+  it('a turn that could not be started is not marked delivered: the user is told, and a replay gets through', async () => {
+    const r = rig({ sendOk: false });
+    const s = session();
+    expect(await r.fs.deliverItemTurn(s, comment('cm_7', 'x'), 'bob')).toBe(false);
+    expect(r.notices).toHaveLength(1);
+    expect(r.notices[0][1]).toMatch(/Not delivered/);
+    expect(s.foreignTurn).toBe(null);
+    r.sendOk.v = true;
+    expect(await r.fs.deliverItemTurn(s, comment('cm_7', 'x'), 'bob')).toBe(true);
+    expect(r.sent).toHaveLength(1);
   });
 
   it('an unreadable item or mission gives the narrowest turn', async () => {
