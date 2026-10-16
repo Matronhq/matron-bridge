@@ -389,6 +389,18 @@ The user's consent card is the gate: once an invite is approved, the target brid
 
 A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
 
+## Repository instructions (MATRON.md)
+
+CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a repository, so instructions there about the tracker, rooms or missions confuse a run outside Matron, which has none of those tools. A repository puts such instructions in a `MATRON.md` instead, and the bridge adds it to the instructions of Matron sessions only.
+
+- **Which files.** Every `MATRON.md` from the repository root (the nearest ancestor of the workdir holding `.git`, so a worktree counts) down to the session's workdir, root first. Outside a repository, only the workdir's own `MATRON.md`. A `MATRON.md` in a subdirectory applies only to sessions whose workdir is inside it; nested files are not loaded on first touch the way Claude Code loads a nested CLAUDE.md.
+- **Where it goes.** In the system prompt the bridge already builds (`--append-system-prompt` for Claude, developer instructions for Codex), after the bridge's own instructions, the Coordinator brief and the notices block, and before the user's memories. Its heading tells the agent that it adds to CLAUDE.md and AGENTS.md and wins over them in a Matron session, and that the user's memories and the bridge's rules on sensitive data and on other people's turns win over it. It is trusted like CLAUDE.md: whatever branch is checked out supplies it.
+- **When.** Read afresh at every spawn: start, resume, `/workdir`, `/restart`, `restart_session`, a crash respawn and a bridge restart. An edit reaches a running session at its next restart; a `cd` inside a session changes nothing.
+- **Size.** At most 24 KB in total. Anything past that is cut off, with a line in the prompt saying so and a warning in the bridge log.
+- **Seeing it.** The start, resume, workdir and restart messages and `/status` list the files a session loaded, e.g. `MATRON.md: MATRON.md (3.1 KB)`.
+
+**MATRON.md or a memory?** `MATRON.md` is part of the code: reviewed in pull requests, it follows the branch and applies to everyone's Matron sessions in the repository. Use it for how to work on that repository through Matron. A `repo:<name>` memory is one user's own standing rule, changed at once and private to them. Use it for personal preferences and anything about particular machines.
+
 ## How it works
 
 1. User messages arrive via the matron-journal WebSocket connection
