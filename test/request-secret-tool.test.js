@@ -38,10 +38,21 @@ describe('request_secret MCP contract', () => {
     const { tools } = await client.listTools();
     const tool = tools.find((entry) => entry.name === 'request_secret');
     expect(tool.inputSchema.required).toContain('context');
+    expect(tool.inputSchema.properties).not.toHaveProperty('convoId');
+    expect(tool.inputSchema.properties).not.toHaveProperty('origin');
     const context = 'For the staging release: Workers Scripts Edit on the staging account, to deploy the fix.';
     const result = await client.callTool({ name: 'request_secret', arguments: { label: 'Deployment token', context, multiline: true } });
     expect(result.isError).not.toBe(true);
     expect(requests.at(-1)).toEqual({ path: '/secret', body: { label: 'Deployment token', context, roomId: 'room-fixture', multiline: true } });
+  });
+
+  it('does not forward caller-supplied conversation, URL or room overrides', async () => {
+    const context = 'For the staging release; worker edits on staging only.';
+    const result = await client.callTool({ name: 'request_secret', arguments: {
+      label: 'token', context, convoId: 'forged-conversation', origin: 'https://untrusted.example', roomId: 'forged-room',
+    } });
+    expect(result.isError).not.toBe(true);
+    expect(requests.at(-1)).toEqual({ path: '/secret', body: { label: 'token', context, roomId: 'room-fixture', multiline: false } });
   });
 
   it.each([undefined, '', ' \n ', 'x'.repeat(2001)])('rejects absent or invalid context without calling the bridge: %j', async (context) => {

@@ -186,7 +186,7 @@ import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
-import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
+import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
@@ -1140,11 +1140,12 @@ function generateFileLink(filePath, workdir) {
 // tomorrow, and a link that died first would strand a live request. `multiline`
 // rides in the signed payload so the viewer renders a textarea rather than a
 // masked one-line field — signed, so the holder cannot flip it.
-function generateSecretLink(secretId, label, roomId, { ttlMs = LINK_EXPIRY_MS, multiline = false, context } = {}) {
+function generateSecretLink(secretId, label, roomId, { ttlMs = LINK_EXPIRY_MS, multiline = false, context, convoId } = {}) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   const exp = Math.floor((Date.now() + ttlMs) / 1000);
   const payloadObj = { secretId, label, roomId, exp };
   if (context) payloadObj.context = context;
+  if (convoId) payloadObj.convoId = convoId;
   if (multiline) payloadObj.multiline = true;
   const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
@@ -11900,8 +11901,8 @@ const secretRequests = createSecretRequests({
     }
   },
   items: itemsClient,
-  generateLink: (secretId, { label, context, roomId, multiline, ttlMs }) =>
-    generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context }),
+  generateLink: (secretId, { label, context, convoId, roomId, multiline, ttlMs }) =>
+    generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context, convoId }),
   notifyChat: (record, { plain, html }) => {
     const session = record.roomId ? sessions.get(record.roomId) : null;
     if (!session) return;
@@ -12665,22 +12666,12 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/secret') {
-        const { label, context, roomId, multiline } = data;
-        if (!label || !roomId) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'label and roomId are required' }));
-          return;
-        }
-
-        const activeSession = sessions.get(roomId);
-        const created = await secretRequests.create({
-          label,
-          context,
-          roomId,
-          convoId: activeSession ? journalConvoIdFor(activeSession) : null,
-          multiline: multiline === true,
+        const created = await requestSecretForSession(data, {
+          getSession: (roomId) => sessions.get(roomId),
+          convoIdFor: journalConvoIdFor,
+          requests: secretRequests,
         });
-        // Invalid context or per-room cap: nothing was minted, filed or
+        // Invalid context/origin or per-room cap: nothing was minted, filed or
         // announced, so the caller can correct the request and retry.
         if (created.error) {
           res.writeHead(created.status || 429, { 'Content-Type': 'application/json' });

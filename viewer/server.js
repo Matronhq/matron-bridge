@@ -4,7 +4,7 @@ import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSyn
 import path from 'path';
 import { WebSocketServer } from 'ws';
 import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
-import { formatSecretContextHtml } from '../lib/secret-context.js';
+import { formatSecretContextHtml, secretConversationUrl } from '../lib/secret-context.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
@@ -99,7 +99,8 @@ function renderHtml(filename, content) {
 // the bridge byte-for-byte — the CRLF→LF conversion happens once, on the
 // bridge's submit path (lib/secret-requests.js normalizeLineEndings), so every
 // client of that API writes the same bytes. The form says so below.
-function renderSecretForm(label, token, multiline = false, context = '') {
+function renderSecretForm(label, token, multiline = false, context = '', convoId = null) {
+  const origin = secretConversationUrl(convoId);
   const field = multiline
     ? '<textarea name="value" rows="12" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Paste value here..." autofocus required></textarea>'
     : '<input type="password" name="value" placeholder="Paste secret here..." autocomplete="off" autofocus required>';
@@ -115,8 +116,12 @@ function renderSecretForm(label, token, multiline = false, context = '') {
     .card.wide { max-width: 760px; }
     h2 { margin: 0 0 8px; font-size: 18px; }
     .label { color: #8b949e; margin-bottom: 20px; font-size: 14px; }
-    .context { margin-bottom: 20px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .context a { color: #58a6ff; }
+    .origin { margin-bottom: 20px; font-size: 14px; line-height: 1.5; }
+    .origin a { color: #58a6ff; }
+    .origin .note { margin-top: 4px; }
+    .context { margin-bottom: 20px; padding: 12px; border: 1px solid #30363d; border-radius: 6px; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+    .context-heading { font-weight: 600; }
+    .context-text { margin-top: 8px; white-space: pre-wrap; }
     input[type="password"], textarea { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; box-sizing: border-box; }
     input[type="password"]:focus, textarea:focus { outline: none; border-color: #58a6ff; }
     textarea { resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
@@ -129,7 +134,10 @@ function renderSecretForm(label, token, multiline = false, context = '') {
   <div class="card${multiline ? ' wide' : ''}">
     <h2>🔐 Enter Secret</h2>
     <div class="label">${escapeHtml(label)}</div>
-    ${context ? `<div class="context">${formatSecretContextHtml(context)}</div>` : ''}
+    ${origin
+      ? `<div class="origin"><a href="${origin}" rel="noreferrer">Open originating conversation</a><div class="note">Source supplied by the bridge. Review the request in Matron before sharing a credential.</div></div>`
+      : '<div class="origin note">This older request has no conversation link. Check it in Matron before sharing a credential.</div>'}
+    ${context ? `<div class="context"><div class="context-heading">Agent’s explanation</div><div class="note">The bridge has not verified these claims or permissions.</div><div class="context-text">${formatSecretContextHtml(context)}</div></div>` : ''}
     <form method="POST" action="/secret">
       <input type="hidden" name="token" value="${escapeHtml(token)}">
       ${field}
@@ -466,7 +474,7 @@ app.get('/secret', (req, res) => {
   if (!data.secretId || !data.label) return res.status(400).send('Invalid secret token');
 
   res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
-  res.type('html').send(renderSecretForm(data.label, token, data.multiline === true, data.context));
+  res.type('html').send(renderSecretForm(data.label, token, data.multiline === true, data.context, data.convoId));
 });
 
 // The secure-input POST's own budget and its own parser. The budget exists

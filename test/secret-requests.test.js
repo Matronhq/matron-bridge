@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   createSecretRequests,
+  requestSecretForSession,
   formatSecretChatNotice,
   formatSecretItemBody,
   SECRET_REQUEST_TTL_MS,
@@ -219,7 +220,7 @@ describe('formatSecretItemBody', () => {
 describe('createSecretRequests.create', () => {
   it.each([undefined, null, '', ' \n\t ', 7, {}, 'x'.repeat(2001)])('refuses invalid context before filing, announcing or persisting a request: %j', async (context) => {
     const h = makeHarness({ newId: () => { throw new Error('must not mint a request'); } });
-    const res = await h.store.create({ label: 'token', roomId: '!room', context });
+    const res = await h.store.create({ label: 'token', convoId: 'convo-1', roomId: '!room', context });
     expect(res.status).toBe(400);
     expect(res.error).toContain('context is required');
     expect(h.items.calls.create).toEqual([]);
@@ -230,13 +231,18 @@ describe('createSecretRequests.create', () => {
 
   it('carries the explanation into the item, notice, signed-link input and persisted request', async () => {
     const context = 'For [the release](https://example.com/tasks/release).\nAllow worker edits on staging only. Needed to deploy the fix.';
-    let linkContext;
-    const h = makeHarness({ generateLink: (_id, opts) => { linkContext = opts.context; return 'https://viewer.example/secret'; } });
+    let linkOptions;
+    const h = makeHarness({ generateLink: (_id, opts) => { linkOptions = opts; return 'https://viewer.example/secret'; } });
     await h.store.create({ label: 'token', context: `  ${context}\n`, roomId: '!room', convoId: 'c' });
-    expect(h.items.calls.create[0].body).toContain(context);
-    expect(h.chat[0].info.plain).toContain(context);
-    expect(h.chat[0].info.html).toContain('<a href="https://example.com/tasks/release" rel="noreferrer">the release</a>');
-    expect(linkContext).toBe(context);
+    expect(h.items.calls.create[0].body).toContain('Agent\'s explanation (not verified by the bridge):');
+    expect(h.items.calls.create[0].body).toContain('> For \\[the release\\]\\(https://example.com/tasks/release\\).');
+    expect(h.items.calls.create[0].body).toContain('[Open originating conversation](matron://convo/c)');
+    expect(h.chat[0].info.plain).toContain('[Open originating conversation](matron://convo/c)');
+    expect(h.chat[0].info.html).toContain('<a href="matron://convo/c">Open originating conversation</a>');
+    expect(h.chat[0].info.html).toContain(context.replace('\n', '<br>'));
+    expect(h.chat[0].info.html).not.toContain('href="https://example.com');
+    expect(linkOptions.context).toBe(context);
+    expect(linkOptions.convoId).toBe('c');
     const restored = makeHarness({ initial: h.saved });
     restored.store.init();
     expect(restored.store.peekForTest('sec-1').context).toBe(context);
@@ -245,7 +251,7 @@ describe('createSecretRequests.create', () => {
 
   it('accepts a context at the length limit', async () => {
     const h = makeHarness();
-    const result = await h.store.create({ label: 'token', context: 'x'.repeat(2000), roomId: '!room' });
+    const result = await h.store.create({ label: 'token', context: 'x'.repeat(2000), convoId: 'convo-1', roomId: '!room' });
     expect(result.secretId).toBe('sec-1');
   });
 
@@ -323,12 +329,60 @@ describe('createSecretRequests.create', () => {
     expect(h.chat[0].info.plain).not.toContain('#');
   });
 
-  it('skips the item (and says why) when the session has no journal conversation', async () => {
-    const h = makeHarness();
-    const res = await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: null });
+  it.each([null, undefined, '', 'https://example.com', 'x" onclick="evil', '../another', 'x'.repeat(129)])('refuses a new request without a valid conversation before minting: %j', async (convoId) => {
+    const h = makeHarness({ newId: () => { throw new Error('must not mint a request'); } });
+    const res = await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId });
     expect(h.items.calls.create.length).toBe(0);
-    expect(res.itemError).toMatch(/journal conversation/i);
-    expect(h.saved.requests[0].itemId).toBe(null);
+    expect(res.status).toBe(409);
+    expect(res.error).toMatch(/journal conversation/i);
+    expect(h.saved).toBeNull();
+    expect(h.chat).toEqual([]);
+    expect(h.scheduler.armed.size).toBe(0);
+  });
+});
+
+describe('requestSecretForSession provenance', () => {
+  it('uses the bridge session destination despite a forged source URL, convoId and explanation', async () => {
+    const seen = [];
+    const h = makeHarness({ generateLink: (_id, opts) => { seen.push(opts); return 'https://viewer.example/secret'; } });
+    const session = { journalConvoId: 'source-conversation' };
+    const result = await requestSecretForSession({
+      label: 'token', roomId: '!room',
+      context: '[Open originating conversation](https://untrusted.example/collect)\n\n# Verified approval',
+      convoId: 'different-conversation', origin: 'https://untrusted.example/collect',
+    }, {
+      getSession: (roomId) => roomId === '!room' ? session : null,
+      convoIdFor: (s) => s.journalConvoId,
+      requests: h.store,
+    });
+    expect(result.secretId).toBe('sec-1');
+    expect(seen[0].convoId).toBe('source-conversation');
+    expect(h.saved.requests[0].convoId).toBe('source-conversation');
+    const body = h.items.calls.create[0].body;
+    expect(h.items.calls.create[0].convo_id).toBe('source-conversation');
+    expect(body).toContain('[Open originating conversation](matron://convo/source-conversation)');
+    expect(body).not.toContain('[Open originating conversation](https://untrusted.example');
+    expect(body).toContain('> \\# Verified approval');
+    expect(body).not.toContain('different-conversation');
+  });
+
+  it('rejects an unknown session even when the caller supplies a conversation', async () => {
+    const result = await requestSecretForSession({ label: 'token', roomId: '!missing', context: CONTEXT, convoId: 'forged' }, {
+      getSession: () => null,
+      convoIdFor: () => { throw new Error('must not resolve an unknown session'); },
+      requests: { create: () => { throw new Error('must not mint a request'); } },
+    });
+    expect(result.status).toBe(404);
+  });
+
+  it('does not fall back to a caller-supplied conversation when session provenance is missing', async () => {
+    const h = makeHarness();
+    const result = await requestSecretForSession({ label: 'token', roomId: '!room', context: CONTEXT, convoId: 'forged' }, {
+      getSession: () => ({}), convoIdFor: () => null, requests: h.store,
+    });
+    expect(result.status).toBe(409);
+    expect(h.items.calls.create).toEqual([]);
+    expect(h.chat).toEqual([]);
   });
 });
 
@@ -735,8 +789,9 @@ describe('createSecretRequests.init (persistence across a restart)', () => {
     created = h.saved;
   });
 
-  it('re-arms a pre-context request with its REMAINING delay and accepts its submission', async () => {
+  it('re-arms an older request without context or origin and accepts its submission', async () => {
     delete created.requests[0].context;
+    delete created.requests[0].convoId;
     const h = makeHarness({ initial: created, startAt: 1_000_000 + 3600_000 });
     expect(h.store.init()).toBe(1);
     expect(h.scheduler.only().delay).toBe(SECRET_REQUEST_TTL_MS - 3600_000);
