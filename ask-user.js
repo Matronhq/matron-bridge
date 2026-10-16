@@ -18,8 +18,9 @@ import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
 import {
   formatContactList, formatContactAddAck, formatContactEndAck, formatGrantList, formatShareAck, formatUnshareAck,
-  formatSharedMissionList, formatSharedMissionDetail, formatSharingError,
+  formatSharedMissionList, formatSharedMissionDetail, formatSharingError, formatContribAck,
 } from './lib/sharing-format.js';
+import { BRIEF_WHAT } from './lib/sharing-tools.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
@@ -1099,8 +1100,12 @@ server.tool(
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
+    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
+    mission: z.number().int().min(1).optional().describe('With shared_by: THEIR mission number to file the item on'),
   },
-  async (args) => callItems('create', args, (d) => withImageWarnings(itemLine(d.item), d)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_create', 'item_create', args, formatContribAck('Filed'))
+    : callItems('create', args, (d) => withImageWarnings(itemLine(d.item), d))),
 );
 
 server.tool(
@@ -1134,8 +1139,11 @@ server.tool(
     attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
+    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callItems('comment', args, (d) => withImageWarnings(formatCommentAck(d, args.awaiting), d)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_comment', 'item_comment', args, formatContribAck('Commented'))
+    : callItems('comment', args, (d) => withImageWarnings(formatCommentAck(d, args.awaiting), d))),
 );
 
 server.tool(
@@ -1145,8 +1153,11 @@ server.tool(
     id: z.string().describe("Item id ('it_…') or '#12'"),
     resolution: z.enum(['done', 'answered', 'decided', 'reversed', 'cancelled']),
     comment: z.string().optional().describe('Closing note, added to the thread'),
+    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callItems('close', args, (d) => itemLine(d.item)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_close', 'item_close', args, formatContribAck('Closed'))
+    : callItems('close', args, (d) => itemLine(d.item))),
 );
 
 server.tool(
@@ -1155,8 +1166,11 @@ server.tool(
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     comment: z.string().optional(),
+    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callItems('reopen', args, (d) => itemLine(d.item)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_reopen', 'item_reopen', args, formatContribAck('Reopened'))
+    : callItems('reopen', args, (d) => itemLine(d.item))),
 );
 
 server.tool(
@@ -1263,9 +1277,12 @@ server.tool(
     kind: z.enum(['user_input', 'progress']),
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
-    mission: z.number().int().min(1).optional().describe('A mission this conversation is on; omit for the current mission'),
+    mission: z.number().int().min(1).optional().describe('A mission this conversation is on; omit for the current mission. With shared_by: THEIR mission number'),
+    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callMissions('post', args, formatMilestoneAck),
+  async (args) => (args.shared_by
+    ? callSharing('shared_post', 'milestone_post', args, formatContribAck('Posted the milestone'))
+    : callMissions('post', args, formatMilestoneAck)),
 );
 
 server.tool(
@@ -1286,9 +1303,12 @@ server.tool(
   "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).",
   {
     status: z.string().describe('One short paragraph, ≤600 characters'),
-    mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission"),
+    mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission. With shared_by: THEIR mission number"),
+    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callMissions('status', args, formatStatusAck),
+  async (args) => (args.shared_by
+    ? callSharing('shared_status', 'mission_status', args, formatContribAck('Set the status'))
+    : callMissions('status', args, formatStatusAck)),
 );
 
 server.tool(
@@ -1351,7 +1371,7 @@ server.tool(
   "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's current mission, plus every mission this conversation is on (current, also on, earlier).",
   {
     num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission'),
-    shared_by: z.string().max(64).optional().describe('To read a mission another person shares with the user: their user name, with num = THEIR mission number (mission_list shared: true lists both). Read-only.'),
+    shared_by: z.string().max(64).optional().describe('To read a mission another person shares with the user: their user name, with num = THEIR mission number (mission_list shared: true lists both).'),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_get', 'mission_get', args, formatSharedMissionDetail)
@@ -1430,11 +1450,13 @@ server.tool(
 
 server.tool(
   'mission_share',
-  `Offer a mission to one of the user's contacts to read. They will see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. They cannot change anything, and conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT} Read-only is the only level so far.`,
+  `Offer a mission to one of the user's contacts. level 'read' (default): they see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. 'contribute': read, plus they can post milestones, comment, file and close items and set the status, all shown as theirs; never close, rename or share it. 'owner': a HAND-OVER — they get their own copy (their numbering, your brief as its first milestone), the original here is closed as handed over, and the user keeps read access to the copy. A hand-over needs a brief: ${BRIEF_WHAT}. Pass project: N instead of mission to hand over every open mission of a project. Conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT}`,
   {
     contact: z.string().max(128).describe('A contact name or id from contact_list — they must already be a contact'),
     mission: z.number().int().min(1).optional().describe("A mission number; omit for this conversation's current mission"),
-    level: z.enum(['read']).optional().describe("Default and only level: 'read'"),
+    level: z.enum(['read', 'contribute', 'owner']).optional().describe("'read' (default), 'contribute', or 'owner' (a hand-over: needs brief)"),
+    brief: z.string().max(16000).optional().describe(`Required for level 'owner', not allowed otherwise. Markdown: ${BRIEF_WHAT}.`),
+    project: z.number().int().min(1).optional().describe("Level 'owner' only: hand over this whole project (its open missions) instead of one mission"),
   },
   async (args) => callSharing('share', 'mission_share', args, formatShareAck),
 );

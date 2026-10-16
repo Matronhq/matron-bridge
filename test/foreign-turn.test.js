@@ -100,7 +100,7 @@ describe('decideForeignCall', () => {
     expect((await decide(guestTurn, `${A}mission_get`, { num: 7, shared_by: 'alice' })).decision).toBe('allow');
     expect((await decide(guestTurn, `${A}mission_get`, { num: 7 })).decision).toBe('deny');
     expect((await decide(guestTurn, `${A}milestone_post`, { kind: 'progress', title: 't', mission: 7 })).decision).toBe('deny');
-    const lookupItem = async () => ({ mission_num: 7 });
+    const lookupItem = async () => ({ mission_id: 'mi_1', mission_num: 7 });
     expect((await decide(guestTurn, `${A}item_get`, { id: 'it_shared' }, { lookupItem })).decision).toBe('allow');
     expect((await decide(guestTurn, `${A}item_comment`, { id: 'it_shared', body: 'x' }, { lookupItem })).decision).toBe('deny');
   });
