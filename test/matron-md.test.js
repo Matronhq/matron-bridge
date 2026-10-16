@@ -158,6 +158,15 @@ describe('loadMatronMd', () => {
     expect(matronMdStatusLine(r)).toBe('MATRON.md: MATRON.md (200 B), truncated');
   });
 
+  it('treats a cap filled exactly by one file as reached', () => {
+    write('repo/MATRON.md', 'a'.repeat(100));
+    write('repo/sub/MATRON.md', 'b');
+    const r = loadMatronMd(path.join(tmp, 'repo/sub'), { maxBytes: 100, log: { warn() {} } });
+    expect(r.files.map((f) => f.rel)).toEqual(['MATRON.md']);
+    expect(r.block).toContain('a'.repeat(100));
+    expect(r.truncated).toBe(true);
+  });
+
   it('reads no more than the cap from a huge file', () => {
     write('repo/MATRON.md', 'x'.repeat(1024 * 1024));
     const reads = [];
