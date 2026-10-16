@@ -2350,3 +2350,121 @@ describe('probeJoinedRoom', () => {
     expect(fetchMessages).toHaveBeenCalledWith('room-1', { limit: 20 });
   });
 });
+
+describe('chatStart with a person (talk request)', () => {
+  const talk = { roomId: '!sess', person: 'bob', topic: 'cover editor', justification: 'the user wants to compare notes', message: 'hello bob' };
+
+  it('requires exactly one of target_convo_id and person', async () => {
+    const { handlers, invites } = makeFixture();
+    const both = await handlers.chatStart({ ...talk, target_convo_id: 'convo-remote' });
+    expect(both.status).toBe(400);
+    expect(both.body.error).toMatch(/not both/);
+    const neither = await handlers.chatStart({ roomId: '!sess', justification: 'j', message: 'm' });
+    expect(neither.status).toBe(400);
+    expect(neither.body.error).toMatch(/target_convo_id or person/);
+    for (const person of ['', '   ', 42, 'x'.repeat(65)]) {
+      expect((await handlers.chatStart({ ...talk, person })).status).toBe(400);
+    }
+    expect(invites.invite).not.toHaveBeenCalled();
+  });
+
+  it('asks the journal by person: no device, no conversation, the 👤 title, and a record that keeps the person', async () => {
+    const { handlers, calls, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const res = await handlers.chatStart({ ...talk, mission: 3 });
+    expect(res.status).toBe(200);
+    const roomId = res.body.room_id;
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+    const args = invites.invite.mock.calls[0][0];
+    expect(args).toMatchObject({ roomId, targetPerson: 'bob', fromConvoId: 'convo-sess', topic: 'cover editor', mission: 3 });
+    expect(args.targetDeviceId).toBeUndefined();
+    expect(args.targetConvoId).toBeUndefined();
+    const upsert = calls.find((c) => c.call === 'upsertConvo');
+    expect(upsert.opts.title).toBe('M:ab ↔️ 👤 bob — cover editor');
+    const rec = calls.find((c) => c.call === 'record');
+    expect(rec.fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: null, peerName: "bob's agent", person: 'bob', talk: true, targetConvoId: null });
+    // The opening message goes into the fresh room before the ask.
+    expect(calls.findIndex((c) => c.call === 'publishText')).toBeLessThan(calls.findIndex((c) => c.call === 'invite'));
+  });
+
+  it('trims the name, and works without a roster entry for the person', async () => {
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    await handlers.chatStart({ ...talk, person: '  bob ' });
+    expect(invites.invite.mock.calls[0][0].targetPerson).toBe('bob');
+  });
+
+  it('a Codex session is refused, before any room exists', async () => {
+    const { handlers, calls, invites } = makeFixture({ session: { codex: true } });
+    const res = await handlers.chatStart(talk);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/Codex/);
+    expect(calls).toEqual([]);
+    expect(invites.invite).not.toHaveBeenCalled();
+  });
+
+  it('a bad mission is refused like on any person room', async () => {
+    const { handlers } = makeFixture();
+    expect((await handlers.chatStart({ ...talk, mission: 0 })).status).toBe(400);
+    expect((await handlers.chatStart({ ...talk, mission: 'x' })).status).toBe(400);
+  });
+
+  it('pending says the user has the card to send, then the other person gets one', async () => {
+    for (const kind of ['pending_quiet', 'pending_idle', 'pending_busy']) {
+      const { handlers } = makeFixture({ inviteOutcome: { kind } });
+      const res = await handlers.chatStart(talk);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('pending');
+      expect(res.body.note).toMatch(/your user/i);
+      expect(res.body.note).toMatch(/bob/);
+      expect(res.body.note).toMatch(/do NOT wait/);
+    }
+  });
+
+  it('accepted and refused map as for any room', async () => {
+    const ok = makeFixture({ inviteOutcome: { kind: 'accepted', peerDeviceId: 9 } });
+    expect((await ok.handlers.chatStart(talk)).body.status).toBe('accepted');
+    const no = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'not now' } });
+    const res = await no.handlers.chatStart(talk);
+    expect(res.body).toMatchObject({ status: 'refused', reason: 'not now' });
+  });
+
+  it('journal refusals become sentences, and the room is marked dead', async () => {
+    const cases = [
+      [{ kind: 'error', code: 'not_found' }, 404, /no person called "bob"|contact_list/],
+      [{ kind: 'error', code: 'conflict', detail: 'already awaiting_user' }, 409, /already awaiting_user/],
+      [{ kind: 'error', code: 'forbidden', detail: 'a private box cannot open a room with another person' }, 403, /private box/],
+      [{ kind: 'error', code: 'offline' }, 200, /offline/],
+    ];
+    for (const [outcome, status, re] of cases) {
+      const { handlers, calls, rooms } = makeFixture({ inviteOutcome: outcome });
+      const res = await handlers.chatStart(talk);
+      expect(res.status).toBe(status);
+      expect(res.body.error).toMatch(re);
+      expect(rooms.get(res.body.room_id).state).toBe('expired');
+      expect(calls.filter((c) => c.call === 'upsertConvo').at(-1).opts.sessionState).not.toBe('waiting');
+    }
+  });
+
+  it('a second ask for the same person from the same session reuses the room: one card per person', async () => {
+    const { handlers, invites, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const first = await handlers.chatStart(talk);
+    calls.length = 0;
+    const again = await handlers.chatStart({ ...talk, message: 'also this' });
+    expect(again.status).toBe(200);
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.note).toMatch(/existing room reused/);
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+    expect(calls.filter((c) => c.call === 'publishText')).toEqual([
+      { call: 'publishText', convoId: first.body.room_id, payload: { body: 'also this', from: 'agent' } },
+    ]);
+    // A different person is a different room.
+    await handlers.chatStart({ ...talk, person: 'carol' });
+    expect(invites.invite).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed on unknown identity, like a session target', async () => {
+    const { handlers, invites } = makeFixture({ publisher: { identity: () => null } });
+    const res = await handlers.chatStart(talk);
+    expect(res.status).toBe(503);
+    expect(invites.invite).not.toHaveBeenCalled();
+  });
+});
