@@ -4,6 +4,7 @@ import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSyn
 import path from 'path';
 import { WebSocketServer } from 'ws';
 import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
+import { formatSecretContextHtml } from '../lib/secret-context.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
@@ -98,7 +99,7 @@ function renderHtml(filename, content) {
 // the bridge byte-for-byte — the CRLF→LF conversion happens once, on the
 // bridge's submit path (lib/secret-requests.js normalizeLineEndings), so every
 // client of that API writes the same bytes. The form says so below.
-function renderSecretForm(label, token, multiline = false) {
+function renderSecretForm(label, token, multiline = false, context = '') {
   const field = multiline
     ? '<textarea name="value" rows="12" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Paste value here..." autofocus required></textarea>'
     : '<input type="password" name="value" placeholder="Paste secret here..." autocomplete="off" autofocus required>';
@@ -110,10 +111,12 @@ function renderSecretForm(label, token, multiline = false) {
   <title>Enter Secret</title>
   <style>
     body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 480px; width: 100%; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 544px; width: 100%; box-sizing: border-box; margin: 16px; }
     .card.wide { max-width: 760px; }
     h2 { margin: 0 0 8px; font-size: 18px; }
     .label { color: #8b949e; margin-bottom: 20px; font-size: 14px; }
+    .context { margin-bottom: 20px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .context a { color: #58a6ff; }
     input[type="password"], textarea { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; box-sizing: border-box; }
     input[type="password"]:focus, textarea:focus { outline: none; border-color: #58a6ff; }
     textarea { resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
@@ -126,6 +129,7 @@ function renderSecretForm(label, token, multiline = false) {
   <div class="card${multiline ? ' wide' : ''}">
     <h2>🔐 Enter Secret</h2>
     <div class="label">${escapeHtml(label)}</div>
+    ${context ? `<div class="context">${formatSecretContextHtml(context)}</div>` : ''}
     <form method="POST" action="/secret">
       <input type="hidden" name="token" value="${escapeHtml(token)}">
       ${field}
@@ -461,7 +465,8 @@ app.get('/secret', (req, res) => {
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.secretId || !data.label) return res.status(400).send('Invalid secret token');
 
-  res.type('html').send(renderSecretForm(data.label, token, data.multiline === true));
+  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+  res.type('html').send(renderSecretForm(data.label, token, data.multiline === true, data.context));
 });
 
 // The secure-input POST's own budget and its own parser. The budget exists

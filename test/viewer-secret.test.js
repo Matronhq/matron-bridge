@@ -71,6 +71,30 @@ function postValue(token, value) {
 }
 
 describe('GET /secret', () => {
+  it('shows context before the field, with safe task links and escaped HTML', async () => {
+    const context = 'For [the release](https://example.com/tasks/release).\nScope: staging only. <img src=x onerror=1> [unsafe](javascript:alert(1))';
+    const res = await getForm({ secretId: 'sec-1', label: 'Deployment token', context });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const html = await res.text();
+    expect(html).toContain('<a href="https://example.com/tasks/release" rel="noreferrer">the release</a>');
+    expect(html).toContain('Scope: staging only. &lt;img src=x onerror=1&gt;');
+    expect(html).not.toContain('<img src=x');
+    expect(html).not.toContain('href="javascript:');
+    expect(html.indexOf('class="context"')).toBeLessThan(html.indexOf('<input type="password"'));
+  });
+
+  it('rejects altered context unless the token is signed again', async () => {
+    const token = secretToken({ secretId: 'sec-1', label: 'token', context: 'Staging only' });
+    const [payload, signature] = token.split('.');
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    data.context = 'Production admin';
+    const altered = `${Buffer.from(JSON.stringify(data)).toString('base64url')}.${signature}`;
+    const res = await fetch(`http://127.0.0.1:${port}/secret?token=${encodeURIComponent(altered)}`);
+    expect(res.status).toBe(403);
+  });
+
   it('renders a masked single-line field by default', async () => {
     const res = await getForm({ secretId: 'sec-1', label: 'AWS access key' });
     expect(res.status).toBe(200);

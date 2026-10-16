@@ -1140,10 +1140,11 @@ function generateFileLink(filePath, workdir) {
 // tomorrow, and a link that died first would strand a live request. `multiline`
 // rides in the signed payload so the viewer renders a textarea rather than a
 // masked one-line field — signed, so the holder cannot flip it.
-function generateSecretLink(secretId, label, roomId, { ttlMs = LINK_EXPIRY_MS, multiline = false } = {}) {
+function generateSecretLink(secretId, label, roomId, { ttlMs = LINK_EXPIRY_MS, multiline = false, context } = {}) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   const exp = Math.floor((Date.now() + ttlMs) / 1000);
   const payloadObj = { secretId, label, roomId, exp };
+  if (context) payloadObj.context = context;
   if (multiline) payloadObj.multiline = true;
   const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
@@ -11899,8 +11900,8 @@ const secretRequests = createSecretRequests({
     }
   },
   items: itemsClient,
-  generateLink: (secretId, { label, roomId, multiline, ttlMs }) =>
-    generateSecretLink(secretId, label, roomId, { ttlMs, multiline }),
+  generateLink: (secretId, { label, context, roomId, multiline, ttlMs }) =>
+    generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context }),
   notifyChat: (record, { plain, html }) => {
     const session = record.roomId ? sessions.get(record.roomId) : null;
     if (!session) return;
@@ -12664,7 +12665,7 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/secret') {
-        const { label, roomId, multiline } = data;
+        const { label, context, roomId, multiline } = data;
         if (!label || !roomId) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'label and roomId are required' }));
@@ -12674,14 +12675,15 @@ const apiServer = createServer(async (req, res) => {
         const activeSession = sessions.get(roomId);
         const created = await secretRequests.create({
           label,
+          context,
           roomId,
           convoId: activeSession ? journalConvoIdFor(activeSession) : null,
           multiline: multiline === true,
         });
-        // Per-room cap: nothing was minted, filed or announced, so this is a
-        // refusal the tool can act on, not a partial request to clean up.
+        // Invalid context or per-room cap: nothing was minted, filed or
+        // announced, so the caller can correct the request and retry.
         if (created.error) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.writeHead(created.status || 429, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: created.error }));
           return;
         }

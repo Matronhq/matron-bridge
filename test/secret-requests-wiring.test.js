@@ -59,6 +59,8 @@ describe('bridge wiring', () => {
   it('signs the secret link for the request lifetime, not the file-link window', () => {
     expect(index).toMatch(/function generateSecretLink\(secretId, label, roomId, \{[^)]*ttlMs/);
     expect(index).toMatch(/multiline/);
+    expect(index).toContain('if (context) payloadObj.context = context;');
+    expect(index).toContain('generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context })');
   });
 
   // The delivery BEHAVIOUR (idle / busy / reaped / resume-failed) is unit-
