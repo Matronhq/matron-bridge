@@ -3,7 +3,7 @@ import { rateLimit } from 'express-rate-limit';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
-import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
+import { generateSignedUrl, verifyToken, readPageToken } from '../lib/viewer-tokens.js';
 import { formatSecretContextHtml, secretConversationUrl } from '../lib/secret-context.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
@@ -397,8 +397,9 @@ app.get('/page', pageLimiter, async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
-  const data = verifyToken(token);
-  if (!data || data.page !== true) return res.status(403).send('Invalid or expired token');
+  // The path and workdir are sealed inside the token (lib/viewer-tokens.js).
+  const data = readPageToken(token);
+  if (!data) return res.status(403).send('Invalid or expired token');
 
   try {
     if (!isPageFile(data.path)) throw new FileLinkDenied('not-html');
