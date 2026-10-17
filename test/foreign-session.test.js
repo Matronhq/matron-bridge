@@ -154,6 +154,26 @@ describe('Allow once', () => {
     expect((await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: 'ls more' }, why: 'y' })).status).toBe(200);
   });
 
+  it('asks filed in parallel count against the same cap', async () => {
+    const r = rig();
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    const outs = await Promise.all(Array.from({ length: ACTION_PENDING_MAX + 3 }, (_, i) =>
+      r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: `ls ${i}` }, why: 'y' })));
+    expect(outs.filter((o) => o.status === 200).length).toBe(ACTION_PENDING_MAX);
+    expect(outs.filter((o) => o.status === 429).length).toBe(3);
+    expect(r.created.length).toBe(ACTION_PENDING_MAX);
+  });
+
+  it('measures the input in bytes, so multibyte text does not slip past the cap', async () => {
+    const r = rig();
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    // Three bytes per character: a third of the cap in characters is over it in bytes.
+    const out = await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: '€'.repeat(Math.ceil(ACTION_INPUT_MAX / 3) + 10) }, why: 'y' });
+    expect(out.status).toBe(400);
+  });
+
   it('an approved call of a tool that is not a bridge route opens nothing at the route layer', async () => {
     const r = rig();
     const s = session();
