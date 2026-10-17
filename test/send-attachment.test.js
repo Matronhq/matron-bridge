@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'path';
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from 'fs';
 import { realpath } from 'fs/promises';
@@ -354,5 +354,106 @@ describe('resolveAndUploadLocalFile', () => {
     expect(r.status).toBe(502);
     expect(publisher.publishImage).not.toHaveBeenCalled();
     expect(publisher.publishFile).not.toHaveBeenCalled();
+  });
+});
+
+// A file the bridge downloaded for this conversation (a chat upload, an item
+// attachment) lives outside the workdir, in the session's own download folder
+// (lib/matron-files.js sessionDownloadDir). These run the real default
+// wiring, with MATRON_FILES_DIR pointed at a temp root.
+describe("the conversation's own downloads", () => {
+  let prevRoot;
+  let root;
+  beforeEach(() => {
+    prevRoot = process.env.MATRON_FILES_DIR;
+    root = mkdtempSync(path.join(tmpdir(), 'send-attach-files-'));
+    process.env.MATRON_FILES_DIR = root;
+  });
+  afterEach(() => {
+    if (prevRoot === undefined) delete process.env.MATRON_FILES_DIR;
+    else process.env.MATRON_FILES_DIR = prevRoot;
+  });
+
+  // A session in a repo folder called "repo", plus a file the bridge saved
+  // for it and one it saved for another conversation in the same repo.
+  function downloadsFixture() {
+    const parent = mkdtempSync(path.join(tmpdir(), 'send-attach-wd-'));
+    const workdir = path.join(parent, 'repo');
+    mkdirSync(workdir);
+    const own = path.join(root, 'repo', 'convo-own');
+    const other = path.join(root, 'repo', 'convo-other');
+    mkdirSync(own, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    writeFileSync(path.join(own, 'scan.zip'), 'zip-bytes');
+    writeFileSync(path.join(other, 'theirs.zip'), 'zip-bytes');
+    writeFileSync(path.join(root, 'repo', 'loose.txt'), 'shared project folder');
+    const session = { roomId: 'convo-own', workdir };
+    const { publisher } = makeUploadFixture();
+    return { session, workdir, own, other, publisher };
+  }
+
+  it('uploads a file the bridge saved for this conversation', async () => {
+    const { session, own, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, 'scan.zip'), publisher });
+    expect(r.ok).toBe(true);
+    expect(r.media).toMatchObject({ name: 'scan.zip', mime: 'application/zip', isImage: false });
+    expect(publisher.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({ filePath: await realpath(path.join(own, 'scan.zip')) }));
+  });
+
+  it("refuses another conversation's download in the same repo", async () => {
+    const { session, other, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(other, 'theirs.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(r.body.error).toMatch(/outside/i);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('refuses a file in the shared project folder above the conversation folder', async () => {
+    const { session, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(root, 'repo', 'loose.txt'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('refuses a ../ path that climbs out of the download folder', async () => {
+    const { session, own, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, '..', 'convo-other', 'theirs.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('still refuses a sensitive-looking file in the download folder', async () => {
+    const { session, own, publisher } = downloadsFixture();
+    writeFileSync(path.join(own, '.env'), 'SECRET=1');
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, '.env'), publisher });
+    expect(r.status).toBe(403);
+    expect(r.body.error).toMatch(/share_sensitive_data/);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('refuses a symlink in the download folder that points outside it', async () => {
+    const { session, own, other, publisher } = downloadsFixture();
+    symlinkSync(path.join(other, 'theirs.zip'), path.join(own, 'mine.zip'));
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, 'mine.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('allows nothing extra for a session with no room id', async () => {
+    const { workdir, own, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session: { workdir }, reqPath: path.join(own, 'scan.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it("send_attachment posts this conversation's download into a room", async () => {
+    const { session, own, publisher } = downloadsFixture();
+    const rooms = { get: (id) => (id === 'room-1' ? { sessionRoomId: 'convo-own', role: 'guest', state: 'joined' } : null) };
+    const handler = createSendAttachmentHandler({
+      sessions: new Map([['convo-own', session]]), publisher, rooms, journalConvoIdFor: () => null,
+    });
+    const res = await handler({ roomId: 'convo-own', path: path.join(own, 'scan.zip'), chat_room_id: 'room-1' });
+    expect(res.status).toBe(200);
+    expect(publisher.publishFile).toHaveBeenCalledWith('room-1', expect.objectContaining({ name: 'scan.zip' }));
   });
 });

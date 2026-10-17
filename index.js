@@ -127,7 +127,7 @@ import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-rec
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
-import { matronFilesDir } from './lib/matron-files.js';
+import { matronFilesDir, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -7097,9 +7097,11 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
   // the "Image saved to …" bookkeeping and the image itself — the order a
   // person would say it in. Everything below appends to the same `blocks`
   // array, i.e. the same single user turn. Saves land OUTSIDE the workdir
-  // (in ~/matron-files/<repo>/) so received files never end up committed;
-  // the absolute save path in the text block is how claude finds them.
-  const saveDir = matronFilesDir(session.workdir);
+  // (in ~/matron-files/<repo>/<conversation>/) so received files never end
+  // up committed; the absolute save path in the text block is how claude
+  // finds them. The conversation folder is also what lets this session attach
+  // the file to an item or a room later (lib/send-attachment.js).
+  const saveDir = sessionDownloadDir(session) || matronFilesDir(session.workdir);
   if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
     const imgPath = deduplicateFilename(saveDir, workdirName);
@@ -9306,7 +9308,7 @@ const journalMediaRouter = createJournalMediaRouter({
   buildVideoBlocks: async (session, { buffer, mime, name, caption }) => {
     const safeName = safeMediaFilename(name || 'video');
     const stem = safeName.replace(/\.[^.]+$/, '') || 'video';
-    const baseDir = session.iv ? ivUploadDir(session.roomId) : matronFilesDir(session.workdir);
+    const baseDir = sessionDownloadDir(session) || matronFilesDir(session.workdir);
     const outDir = deduplicateFilename(baseDir, `${stem}-frames`);
     const result = await extractVideoFrames(buffer, mime, { outDir });
     console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s, audio=${result.hasAudio}) in ${outDir}`);
@@ -9419,11 +9421,12 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
 // mirror would show the user their own reply back as a second message.
 // A file attached to a tracker item is downloaded for the agent — by the 📌
 // turn and by item_get — into the same place a file sent in chat lands (iv
-// upload dir for a PTY session, ~/matron-files/<repo>/ otherwise), so the
-// user never has to send an item's attachment a second time in chat.
+// upload dir for a PTY session, ~/matron-files/<repo>/<conversation>/
+// otherwise), so the user never has to send an item's attachment a second
+// time in chat.
 const saveItemAttachments = createItemAttachmentSaver({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
-  dirFor: (session) => (session?.iv ? ivUploadDir(session.roomId) : matronFilesDir(session?.workdir)),
+  dirFor: (session) => sessionDownloadDir(session) || matronFilesDir(session?.workdir),
   log: console,
 });
 
