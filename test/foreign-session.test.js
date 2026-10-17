@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createForeignSessions, ALLOW_LABEL, DECLINE_LABEL, ACTION_TTL_MS } from '../lib/foreign-session.js';
-import { actionHash } from '../lib/foreign-turn.js';
+import { actionHash, ACTION_INPUT_MAX, ACTION_PENDING_MAX } from '../lib/foreign-turn.js';
 
 // The stateful half of foreign turns: arming the gate, one-shot approvals,
 // the "Allow once" asks and the taps that answer them.
@@ -91,6 +91,10 @@ describe('Allow once', () => {
     const r = rig();
     const item = await asked(r, session());
     expect(item).toMatchObject({ kind: 'question', actions: [ALLOW_LABEL, DECLINE_LABEL], convo_id: 'convo-sess-a', awaiting: 'user' });
+    // Owner-only: the mission it lands on may well be shared with the very
+    // person whose turn asked for it.
+    expect(item.private).toBe(true);
+    expect(item.body).toContain('"command":"git log -3"');
     expect(Object.keys(r.saved())).toEqual(['it_1']);
     const again = rig({ stored: r.saved() });
     expect(again.fs.pendingCount()).toBe(1);
@@ -121,6 +125,43 @@ describe('Allow once', () => {
     expect((await r.fs.check(s, { tool_name: 'mcp__ask-user__memory_get', tool_input: { name: 'x' } })).decision).toBe('allow');
     expect(r.fs.routeAllowed(s, '/memory/get', {})).toBe(true);
     expect(r.fs.routeAllowed(s, '/memory/get', {})).toBe(false);
+  });
+
+  it('refuses an input the card could not show in full, rather than cutting it', async () => {
+    const r = rig();
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    const out = await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: `echo ok; ${'#'.repeat(ACTION_INPUT_MAX)}` }, why: 'big' });
+    expect(out.status).toBe(400);
+    expect(out.body.error).toMatch(/too large/);
+    expect(r.created).toEqual([]);
+    expect(r.fs.pendingCount()).toBe(0);
+  });
+
+  it('caps the asks one session may have open', async () => {
+    const r = rig();
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    for (let i = 0; i < ACTION_PENDING_MAX; i++) {
+      expect((await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: `ls ${i}` }, why: 'y' })).status).toBe(200);
+    }
+    const out = await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: 'ls more' }, why: 'y' });
+    expect(out.status).toBe(429);
+    expect(r.created.length).toBe(ACTION_PENDING_MAX);
+    // An answer frees a slot.
+    r.fs.end(s);
+    r.fs.onItemReply(s, { item_id: 'it_1', action: 'commented', comment: { action: DECLINE_LABEL } });
+    expect((await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: 'ls more' }, why: 'y' })).status).toBe(200);
+  });
+
+  it('an approved call of a tool that is not a bridge route opens nothing at the route layer', async () => {
+    const r = rig();
+    const s = session();
+    await asked(r, s);
+    r.fs.onItemReply(s, { item_id: 'it_1', action: 'commented', comment: { action: ALLOW_LABEL } });
+    expect((await r.fs.check(s, { tool_name: 'Bash', tool_input: { command: 'git log -3' } })).decision).toBe('allow');
+    expect(r.fs.routeAllowed(s, '/memory/get', {})).toBe(false);
+    expect(r.fs.routeAllowed(s, '/share-sensitive', {})).toBe(false);
   });
 
   it('Decline: a restricted turn that says so, and nothing allowed', async () => {

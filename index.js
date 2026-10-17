@@ -109,7 +109,7 @@ import { liveLogDir, liveLogPath as liveLogPathFor } from './lib/live-log-dir.js
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
-import { createWakeHandler } from './lib/wake-route.js';
+import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER } from './lib/wake-route.js';
 import {
   createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
@@ -4424,7 +4424,8 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
         }]
       }
     }) + '\n';
-    debug('Sending answer to stdin:', jsonMsg.trim());
+    // The answer can be whatever the user typed, so only its size is logged.
+    debug('Sending answer to stdin:', jsonMsg.length, 'bytes');
     writePromptAnswer(session, jsonMsg, {
       // This answer goes in via a raw tool_result stdin write (not
       // sendToSession), so record it only after stdin accepts the chunk.
@@ -12507,6 +12508,13 @@ const apiServer = createServer(async (req, res) => {
     if (req.method !== 'POST') {
       res.writeHead(405, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+    // Optional token (MATRON_WAKE_TOKEN): the loopback port is reachable by
+    // every local user, and a wake resumes a session.
+    if (!wakeTokenOk(process.env.MATRON_WAKE_TOKEN, req.headers[WAKE_TOKEN_HEADER])) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'wake token required' }));
       return;
     }
     let result;

@@ -271,6 +271,8 @@ describe('createSecretRequests.create', () => {
     expect(body.labels).toEqual(['secret']);
     expect(body.convo_id).toBe('convo-1');
     expect(body.body).toContain('[Enter secret](https://viewer.example/secret?token=t-sec-1)');
+    // Owner-only: the link must never reach anyone the mission is shared with.
+    expect(body.private).toBe(true);
   });
 
   it('posts the chat notice with the link and the item number', async () => {
