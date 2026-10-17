@@ -224,7 +224,7 @@ server.tool(
 
 server.tool(
   'send_attachment',
-  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory, and attachments are capped at 50 MB. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
+  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory or be one the bridge downloaded for this conversation (a file the user sent here, or an item attachment), and attachments are capped at 50 MB. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
   {
     path: z.string().describe('Path to the file — absolute, or relative to the session working directory'),
     caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body'),
@@ -1096,7 +1096,7 @@ server.tool(
     kind: z.enum(['task', 'question', 'decision', 'notice']).describe("notice: something the user needs to read but not decide (a blocker, key result, warning, 'needs you in a browser') — awaits the user with a built-in Seen button that closes it; don't pass actions"),
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown. For a question: the options and your recommendation. For a decision: what and why.'),
-    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     labels: z.array(z.string()).optional(),
     links: z.array(z.object({ url: z.string(), title: z.string().optional() })).optional().describe('e.g. a GitHub issue or PR'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, notice→user, task→agent, decision→nobody'),
@@ -1139,7 +1139,7 @@ server.tool(
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     body: z.string().optional().describe('Markdown'),
-    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
     shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
