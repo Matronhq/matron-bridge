@@ -899,8 +899,10 @@ const loginExpiryNotice = createLoginExpiryNotice({
 });
 
 // Posts the line as a card with a one-tap Log in button and returns '' so the
-// caller drops the raw error; a session with no way to post a card gets the
-// text line back instead. Print mode reports the error twice in one turn (the
+// caller drops the raw error; when the card is not accepted for publishing,
+// the text line comes back instead. The card is `blocking: false` like the
+// timer cards: nothing waits on it, so a user who types /login instead of
+// tapping is not left with an "unanswered" prompt. Print mode reports the error twice in one turn (the
 // error record, then the result repeating it), so the assistant case passes
 // the record's message id as `key` and the result passes nothing: one card
 // per turn.
@@ -913,9 +915,8 @@ function noteLoginExpired(session, key = null) {
   }
   if (key != null && session._loginCardKey === key) return '';
   const box = loginBoxName();
-  if (!session.sendButtonMessage) return loginExpiredMessage(box);
-  const card = loginExpiredCardText(box);
-  void session.sendButtonMessage(card, loginButtons(), 'pick_one', card, escapeHtml(card));
+  const card = { question: loginExpiredCardText(box), options: loginButtons(), mode: 'pick_one', blocking: false };
+  if (!journalPublish(session, 'publishPrompt', card)) return loginExpiredMessage(box);
   session._loginCardKey = key;
   return '';
 }
@@ -1600,8 +1601,10 @@ function journalRepoField(session) {
 // `options` is the publisher's per-frame options bag ({onDelivered,
 // onEvicted, idemKey}); it rides the buffer too, so a hook attached to a
 // pre-session-id frame still fires once the flushed frame is delivered/evicted.
+// Returns whether the frame was accepted: queued for the journal, or buffered
+// until the convo id arrives. Most callers ignore it.
 function journalPublish(session, method, payload, options) {
-  if (!JOURNAL_ENABLED) return;
+  if (!JOURNAL_ENABLED) return false;
   const convoId = journalConvoIdFor(session);
   if (convoId) {
     // Protocol requirement: a convo_upsert must reach the server before (or
@@ -1619,10 +1622,10 @@ function journalPublish(session, method, payload, options) {
         payload = { ...payload, ...journalRepoField(session) };
       }
     }
-    journalPublisher[method](convoId, payload, options);
-  } else {
-    journalBufferPush(session, method, payload, options);
+    return journalPublisher[method](convoId, payload, options) !== false;
   }
+  journalBufferPush(session, method, payload, options);
+  return true;
 }
 
 // Transactional release seam (loop #536, spec §3). Order: write-ahead a durable

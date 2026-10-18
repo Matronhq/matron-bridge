@@ -190,10 +190,16 @@ describe('login-expiry wiring (source inspection)', () => {
     expect(fn).toContain('loginExpiryNotice.maybeFile(journalConvoIdFor(session))');
   });
 
-  it('posts the card with the Log in button, falling back to the text line', () => {
+  it('posts a non-blocking card with the Log in button, falling back to the text line', () => {
     const fn = slice('function noteLoginExpired(session, key = null) {', '\n}');
-    expect(fn).toContain('if (!session.sendButtonMessage) return loginExpiredMessage(box);');
-    expect(fn).toContain("session.sendButtonMessage(card, loginButtons(), 'pick_one', card, escapeHtml(card));");
+    expect(fn).toContain("options: loginButtons(), mode: 'pick_one', blocking: false");
+    expect(fn).toContain("if (!journalPublish(session, 'publishPrompt', card)) return loginExpiredMessage(box);");
+  });
+
+  it('journalPublish reports whether the frame was accepted', () => {
+    const fn = slice('function journalPublish(session, method, payload, options) {', '\n}');
+    expect(fn).toContain('if (!JOURNAL_ENABLED) return false;');
+    expect(fn).toContain('return journalPublisher[method](convoId, payload, options) !== false;');
   });
 
   it('wires the tap to the same handler a typed /login runs', () => {
@@ -232,5 +238,13 @@ describe('login-expired card', () => {
       expect(handlePickerValue(bad, 'room-1', {}, { startLogin })).toBe(false);
     }
     expect(startLogin).not.toHaveBeenCalled();
+  });
+
+  it('reports a login that failed to start', async () => {
+    const sendReply = vi.fn();
+    const startLogin = vi.fn(() => Promise.reject(new Error('boom')));
+    handlePickerValue('login:start', 'room-1', {}, { startLogin, sendReply });
+    await new Promise(r => setTimeout(r, 0));
+    expect(sendReply).toHaveBeenCalledWith('⚠️ Could not start the login: boom');
   });
 });
