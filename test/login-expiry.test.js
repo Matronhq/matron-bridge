@@ -5,7 +5,11 @@ import {
   isLoginExpiredText,
   loginExpiredFromAssistantEvent,
   loginExpiredMessage,
+  loginExpiredCardText,
+  loginButtons,
 } from '../lib/login-expiry.js';
+import { isPickerFrame, pickerFrameValues } from '../lib/journal-input-router.js';
+import { handlePickerValue } from '../lib/picker-dispatch.js';
 
 const RAW = 'Failed to authenticate: OAuth session expired and could not be refreshed';
 
@@ -171,7 +175,9 @@ describe('login-expiry wiring (source inspection)', () => {
 
   it('swaps the error record text in the assistant case', () => {
     const c = slice("    case 'assistant': {", "    case 'result': {");
-    expect(c).toContain('if (loginExpiredFromAssistantEvent(event)) textParts = [noteLoginExpired(session)];');
+    expect(c).toContain('if (loginExpiredFromAssistantEvent(event)) {');
+    expect(c).toContain("const line = noteLoginExpired(session, messageId ?? Symbol('login-card'));");
+    expect(c).toContain('textParts = line ? [line] : [];');
   });
 
   it('swaps a login error in the print-mode result text', () => {
@@ -180,8 +186,51 @@ describe('login-expiry wiring (source inspection)', () => {
   });
 
   it('files the notice against the session conversation', () => {
-    const fn = slice('function noteLoginExpired(session) {', '\n}');
+    const fn = slice('function noteLoginExpired(session, key = null) {', '\n}');
     expect(fn).toContain('loginExpiryNotice.maybeFile(journalConvoIdFor(session))');
-    expect(fn).toContain('return loginExpiredMessage(loginBoxName());');
+  });
+
+  it('posts the card with the Log in button, falling back to the text line', () => {
+    const fn = slice('function noteLoginExpired(session, key = null) {', '\n}');
+    expect(fn).toContain('if (!session.sendButtonMessage) return loginExpiredMessage(box);');
+    expect(fn).toContain("session.sendButtonMessage(card, loginButtons(), 'pick_one', card, escapeHtml(card));");
+  });
+
+  it('wires the tap to the same handler a typed /login runs', () => {
+    expect(index).toContain('startLogin: startLoginFromButton,');
+    const fn = slice('function startLoginFromButton(session, sendReply) {', '\n}');
+    expect(fn).toContain("handleCommand(session.roomId, '!login', sendReply, ctx.sendHtml, ctx.sender)");
+  });
+});
+
+describe('login-expired card', () => {
+  it('names the box and says to tap Log in or send /login', () => {
+    const text = loginExpiredCardText('ang');
+    expect(text).toContain('ang');
+    expect(text).toContain('Tap Log in');
+    expect(text).toContain('/login');
+    expect(loginExpiredCardText('')).toContain('this box');
+  });
+
+  it('is a picker frame offering login:start', () => {
+    const payload = { question: loginExpiredCardText('ang'), options: loginButtons(), mode: 'pick_one' };
+    expect(isPickerFrame(payload)).toBe(true);
+    expect([...pickerFrameValues(payload)]).toEqual(['login:start']);
+  });
+
+  it('a tap dispatches to startLogin', () => {
+    const startLogin = vi.fn();
+    const sendReply = vi.fn();
+    const session = { roomId: 'room-1' };
+    expect(handlePickerValue('login:start', 'room-1', session, { startLogin, sendReply })).toBe(true);
+    expect(startLogin).toHaveBeenCalledWith(session, sendReply);
+  });
+
+  it('rejects any other login value without touching a seam', () => {
+    const startLogin = vi.fn();
+    for (const bad of ['login:', 'login:logout', 'login:start:1', 'login:START']) {
+      expect(handlePickerValue(bad, 'room-1', {}, { startLogin })).toBe(false);
+    }
+    expect(startLogin).not.toHaveBeenCalled();
   });
 });
