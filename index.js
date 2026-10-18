@@ -194,7 +194,7 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle, recordTitleEarned } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
-import { createLoginExpiryNotice, isLoginExpiredText, loginExpiredFromAssistantEvent, loginExpiredMessage } from './lib/login-expiry.js';
+import { createLoginExpiryNotice, isLoginExpiredText, loginExpiredFromAssistantEvent, loginExpiredMessage, loginExpiredCardText, loginButtons } from './lib/login-expiry.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW, splitSpoken, spokenPayload, spokenRefFor } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
@@ -898,10 +898,27 @@ const loginExpiryNotice = createLoginExpiryNotice({
   log: (m) => console.log(m),
 });
 
-function noteLoginExpired(session) {
+// Posts the line as a card with a one-tap Log in button and returns '' so the
+// caller drops the raw error; when the card is not accepted for publishing,
+// the text line comes back instead. The card is `blocking: false` like the
+// timer cards: nothing waits on it, so a user who types /login instead of
+// tapping is not left with an "unanswered" prompt. Print mode reports the error twice in one turn (the
+// error record, then the result repeating it), so the assistant case passes
+// the record's message id as `key` and the result passes nothing: one card
+// per turn.
+function noteLoginExpired(session, key = null) {
   console.log(`Claude login expired (room ${session.roomId})`);
   void loginExpiryNotice.maybeFile(journalConvoIdFor(session));
-  return loginExpiredMessage(loginBoxName());
+  if (key == null && session._loginCardKey != null) {
+    session._loginCardKey = null;
+    return '';
+  }
+  if (key != null && session._loginCardKey === key) return '';
+  const box = loginBoxName();
+  const card = { question: loginExpiredCardText(box), options: loginButtons(), mode: 'pick_one', blocking: false };
+  if (!journalPublish(session, 'publishPrompt', card)) return loginExpiredMessage(box);
+  session._loginCardKey = key;
+  return '';
 }
 // Return path (Matron -> bridge input, this PR): where the inbound cursor is
 // persisted (survives a bridge restart — see lib/journal-publisher.js) and
@@ -1584,8 +1601,10 @@ function journalRepoField(session) {
 // `options` is the publisher's per-frame options bag ({onDelivered,
 // onEvicted, idemKey}); it rides the buffer too, so a hook attached to a
 // pre-session-id frame still fires once the flushed frame is delivered/evicted.
+// Returns whether the frame was accepted: queued for the journal, or buffered
+// until the convo id arrives. Most callers ignore it.
 function journalPublish(session, method, payload, options) {
-  if (!JOURNAL_ENABLED) return;
+  if (!JOURNAL_ENABLED) return false;
   const convoId = journalConvoIdFor(session);
   if (convoId) {
     // Protocol requirement: a convo_upsert must reach the server before (or
@@ -1603,10 +1622,10 @@ function journalPublish(session, method, payload, options) {
         payload = { ...payload, ...journalRepoField(session) };
       }
     }
-    journalPublisher[method](convoId, payload, options);
-  } else {
-    journalBufferPush(session, method, payload, options);
+    return journalPublisher[method](convoId, payload, options) !== false;
   }
+  journalBufferPush(session, method, payload, options);
+  return true;
 }
 
 // Transactional release seam (loop #536, spec §3). Order: write-ahead a durable
@@ -4827,7 +4846,10 @@ function handleClaudeEvent(session, event) {
 
       let textParts = content.filter(b => b.type === 'text' && b.text).map(b => b.text);
       // An expired login: say what to do instead of posting the raw error.
-      if (loginExpiredFromAssistantEvent(event)) textParts = [noteLoginExpired(session)];
+      if (loginExpiredFromAssistantEvent(event)) {
+        const line = noteLoginExpired(session, messageId ?? Symbol('login-card'));
+        textParts = line ? [line] : [];
+      }
       // Suppress claude's "No response requested." filler. It's emitted in
       // response to internal synthetic prompts (e.g. resume-time nudges)
       // and is just noise on Matrix. Suppress only the text — fall
@@ -9723,7 +9745,7 @@ function journalOnPromptReply(session, answer, { username }) {
     const skipsAliveGate = typeof answer.choice === 'string'
       && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:')
         || answer.choice.startsWith('resume:') || answer.choice.startsWith('sleep:')
-        || answer.choice.startsWith('defaults:'));
+        || answer.choice.startsWith('login:') || answer.choice.startsWith('defaults:'));
     if (!session.alive && !skipsAliveGate) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
@@ -9737,6 +9759,7 @@ function journalOnPromptReply(session, answer, { username }) {
         return switchEffortAndTrack(s, arg, send);
       },
       saveDefault: saveDefaultFromButton,
+      startLogin: startLoginFromButton,
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
       sendTimerNow: sendTimerNowFromButton,
@@ -10192,6 +10215,14 @@ async function confirmSleepFromButton(session, sendReply) {
 // button is pressed.
 function cancelSleepFromButton(session, sendReply) {
   sendReply('Staying awake.');
+}
+
+// A tap on the login-expired card's Log in button (value login:start): the
+// same flow a typed /login runs, replies included. Skips the picker alive
+// gate so the !login handler's own "no active session" reply speaks instead.
+function startLoginFromButton(session, sendReply) {
+  const ctx = journalSessionCommandCtx(session);
+  return handleCommand(session.roomId, '!login', sendReply, ctx.sendHtml, ctx.sender);
 }
 
 // The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by

@@ -926,6 +926,70 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
       expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'alice' });
     });
   });
+
+  // The login-expired card is posted when Claude can't reply, and the user may
+  // tap Log in after the idle reaper took the session: a verified tap wakes
+  // the session and then dispatches as a picker tap, like a typed /login.
+  describe('login card: a verified Log in tap wakes a reaped session', () => {
+    const loginCard = (seq, sender = 'agent:box-2') => baseFrame({
+      seq, sender, type: 'prompt',
+      payload: { question: 'Claude\'s login has expired', options: [{ id: 'login-start', value: 'login:start' }] },
+    });
+    const loginReply = (targetSeq, choice = 'login:start') => baseFrame({
+      seq: 300, type: 'prompt_reply',
+      payload: { target_seq: targetSeq, choice, text: null },
+    });
+    const woken = { claudeSessionId: 'convo-1', alive: true };
+
+    it('resumes the session and routes the tap as a picker tap', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer(loginReply(20));
+      expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'alice' });
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][0]).toBe(woken);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'login:start', picker: true });
+      expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+    });
+
+    it('still works after evictConvo (session teardown)', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer.evictConvo('convo-1');
+      consumer(loginReply(20));
+      expect(deps.resumeSessionForConvo).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'login:start', picker: true });
+    });
+
+    it('is single-use: a second tap does not log in again', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer(loginReply(20));
+      consumer(loginReply(20));
+      expect(deps.routePromptReply.mock.calls.filter(c => c[1]?.picker)).toHaveLength(1);
+    });
+
+    it('does not wake anything for a login: choice no bridge card offered', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20, 'user:alice')); // a client-published lookalike
+      consumer(loginReply(20));
+      consumer(loginReply(21));
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+    });
+
+    it('does not wake anything for a value the card never offered', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer(loginReply(20, 'login:logout'));
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // The wiring half of the auto-resume seam: index.js can't be imported
