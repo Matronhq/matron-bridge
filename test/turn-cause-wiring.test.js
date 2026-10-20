@@ -28,6 +28,11 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(fnBody('async function journalQueueMedia(')).toContain('const entry = tagCauses([...blocks], cause);');
   });
 
+  it('a user\'s media message forwards its causes to both send paths', () => {
+    expect(index).toContain('injectText: (session, text, { causes = null } = {}) => sendTextToSession(session, text, { causes }),');
+    expect(index).toContain('injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),\n  // A voice note sent with the typed draft');
+  });
+
   it('an item reply\'s cause rides the inject and the queue', () => {
     expect(index).toContain("injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),");
     expect(index).toMatch(/queueText: \(session, \{ text, preview, source, cause = null \}\) => journalQueueMedia\(session, \{[\s\S]{0,160}?\n {4}cause,\n/);

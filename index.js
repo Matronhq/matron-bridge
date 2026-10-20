@@ -9403,8 +9403,9 @@ const journalMediaRouter = createJournalMediaRouter({
       ivFilename: safeName, caption, workdirName: safeName, inline,
     }).blocks;
   },
-  injectText: (session, text) => sendTextToSession(session, text),
-  injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
+  // causes: the user's media message(s) that started the turn (lib/turn-cause.js).
+  injectText: (session, text, { causes = null } = {}) => sendTextToSession(session, text, { causes }),
+  injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
   // A voice note sent with the typed draft or in a batch: its transcript
   // rides in an injectBlocks turn, so the words are mirrored on their own.
   mirrorText: (session, text) => journalPublishUserItem(session, 'publishText', { body: text, from: 'user' }),
@@ -9431,7 +9432,8 @@ const journalMediaRouter = createJournalMediaRouter({
 // Matrix-origin so flushQueue's mirrorText journal-publishes it (matching the
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
-// like the text path.
+// like the text path. `cause` (one cause or a list: an item reply's, or a
+// media message's) rides on the entry for the flush (lib/turn-cause.js).
 async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null, cause = null }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = tagCauses([...blocks], cause);

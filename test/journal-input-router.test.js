@@ -1198,7 +1198,8 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
       type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
       name: 'report.pdf', size: 1234, dims: null, caption: null, batch: null,
     });
-    expect(ctx).toEqual({ username: 'alice' });
+    // seq + convoId name the message for the turn's cause, as for text.
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
   });
 
