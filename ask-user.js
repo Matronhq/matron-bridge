@@ -669,6 +669,12 @@ server.tool(
 // the Coordinator alone.
 const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
 
+// What a routine may start on its own: the journal approves the
+// Coordinator's own spawn and chat asks from a turn this routine's fire
+// started only within it (and only when the verifier agrees).
+const ROUTINE_ENVELOPE = z.object({ spawns_per_fire: z.number().int().min(0).max(50), chats: z.boolean(), boxes: z.array(z.string().max(64)).max(32).nullable() }).nullable().optional();
+const ROUTINE_ENVELOPE_WHAT = "What this routine may start on its own: when a turn its fire started asks for a session or a chat, the journal lets the Coordinator approve that ask of its own only within the envelope — at most spawns_per_fire sessions per fire, a chat only when chats is true, and only onto the named boxes (boxes: null = any box) — and only when a verifier agrees the ask fits the routine. Anything outside it waits for the user.";
+
 async function callRoutine(name, args, render) {
   try {
     const res = await fetch(`${BRIDGE_API}/routine/${name}`, {
@@ -693,7 +699,7 @@ server.tool(
 
 server.tool(
   'routine_update',
-  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. A routine cannot switch between schedule and trigger, nor be renamed: delete it and create it afresh. Only change one when the user asks or the playbook says to.`,
+  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, envelope (what a fire of it may start on its own), or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. A routine cannot switch between schedule and trigger, nor be renamed: delete it and create it afresh. Only change one when the user asks or the playbook says to.`,
   {
     name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
     title: z.string().max(200).optional().describe('One line'),
@@ -702,6 +708,7 @@ server.tool(
     prompt: z.string().max(2000).optional().describe('The turn text the journal fires; keep it one line pointing at the playbook section'),
     enabled: z.boolean().optional().describe('false pauses, true resumes'),
     trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('For a triggered routine: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes (fire only when the reset is at least that far away, or unknown)'),
+    envelope: ROUTINE_ENVELOPE.describe(`${ROUTINE_ENVELOPE_WHAT} null clears it, so every such ask waits for the user. Widen it only when the user asks.`),
   },
   async (args) => callRoutine('update', args, (d) => formatRoutineUpdateAck(d, args)),
 );
@@ -726,6 +733,7 @@ server.tool(
     tz: z.string().max(64).optional().describe('IANA zone the schedule is in; default Europe/London'),
     prompt: z.string().max(2000).describe('The turn text the journal fires, e.g. "Routine exception-triage: follow the exception-triage-routine memory."'),
     enabled: z.boolean().optional().describe('Default true; false creates it paused'),
+    envelope: ROUTINE_ENVELOPE.describe(`${ROUTINE_ENVELOPE_WHAT} Set it here to the least the routine needs; without one, every such ask waits for the user.`),
   },
   async (args) => callRoutine('create', args, formatRoutineCreateAck),
 );
