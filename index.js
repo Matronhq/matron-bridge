@@ -122,7 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
-import { beginTurn, endTurn, mergeIntoTurn, userMessageCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
+import { beginTurn, beginOrJoinTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -4411,7 +4411,9 @@ function sendAllQuestions(session) {
 // text event — the journal already has the user's own row for it (the
 // prompt_reply payload, or the text `send` row), so mirroring again here
 // would duplicate it.
-function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
+// causes: what the answer is (the user's message, lib/turn-cause.js), for
+// the turn it starts or joins — the same as for any other send.
+function submitAnswer(session, answerText, { mirrorToJournal = true, causes = null } = {}) {
   const mode = session.waitingForAnswer;
   session.waitingForAnswer = null;
   session.pendingQuestions = null;
@@ -4420,7 +4422,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
 
   if (mode === 'text-reply') {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
-    sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal });
+    sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal, causes });
   } else {
     // Normal tool_result flow. This path only applies to print-mode stream-
     // json input. In iv-mode, user questions are surfaced and answered via the
@@ -4431,6 +4433,9 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
       return;
     }
+    // Not through sendToSession, so the turn seam is taken here: the answer
+    // begins the turn (ended by its result event) or joins the running one.
+    const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     journalSessionState(session, 'running');
@@ -4458,7 +4463,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       onError: (error) => reportSessionSendFailure(
         session,
         `Could not send the prompt answer to Claude: ${error.message}`,
-        { restoreJournalState: true },
+        { restoreJournalState: true, beganTurn },
       ),
     });
   }
@@ -5858,11 +5863,8 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // seam clears busy but keeps the running turn, so the reply typed into it
   // joins that turn rather than relabelling it, and a "no causes" side counts
   // as `other`. Mid-turn input (busy) adds its causes when it has some.
-  const turnStarts = !session.busy;
+  const beganTurn = beginOrJoinTurn(session, causes);
   session.busy = true;
-  const beganTurn = turnStarts && !session.currentTurn;
-  if (beganTurn) beginTurn(session, causes);
-  else if (turnStarts || causes) mergeIntoTurn(session, causes);
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
@@ -9061,9 +9063,9 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (q?.options?.length > 0) {
       const answer = resolveQuestionAnswer(session, trimmed);
       const header = q.header ? `${q.header}: ` : '';
-      submitAnswer(session, `${header}${answer}`, { mirrorToJournal: false });
+      submitAnswer(session, `${header}${answer}`, { mirrorToJournal: false, causes });
     } else {
-      submitAnswer(session, trimmed, { mirrorToJournal: false });
+      submitAnswer(session, trimmed, { mirrorToJournal: false, causes });
     }
     return;
   }
@@ -9082,7 +9084,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     {
       approvePlan: () => {
         const ctx = journalSessionCommandCtx(session);
-        return approvePlanBuild(session, { sendHtml: ctx.sendHtml });
+        return approvePlanBuild(session, { sendHtml: ctx.sendHtml, causes });
       },
     },
   );
@@ -9552,7 +9554,10 @@ function journalOnItem(session, item, ctx) {
   const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
   if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
     const cmdCtx = journalSessionCommandCtx(session);
-    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml }).catch((e) => {
+    // The build reply itself is what the approval's turn is for, exactly as
+    // for any other reply on an item (lib/items-turn.js).
+    const buildCause = itemCause(item?.payload);
+    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml, causes: buildCause ? [buildCause] : null }).catch((e) => {
       try { console.warn(`[plan-items] build from item reply failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
     });
     return;
@@ -11809,7 +11814,10 @@ function journalEvictConvoInput(session) {
 // `sendHtml` is the transport's reply sink for the final "▶️ Building..."
 // notice — Matrix passes its room sink, the journal passes the session
 // ctx's sendToRoom sink, which also mirrors into the journal.
-async function approvePlanBuild(session, { sendHtml }) {
+// `causes` is the approval itself (the user's message or item reply,
+// lib/turn-cause.js): every path below either starts a turn with it or adds
+// it to the one the plan is waiting in.
+async function approvePlanBuild(session, { sendHtml, causes = null }) {
   const toolUseId = session.pendingPlanDenialId;
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
   // The tracker mirror closes as decided, whichever mode settles the plan
@@ -11840,10 +11848,13 @@ async function approvePlanBuild(session, { sendHtml }) {
     }
     if (pending) {
       debug(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
+      // The hook unblocks the turn the plan was written in: the approval
+      // joins that turn, never replacing what started it.
+      if (causes) mergeIntoTurn(session, causes);
       pending.resolve({ decision: 'allow', reason: 'approved by user' });
     } else {
       debug(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
-      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.', { causes });
     }
   } else if (!toolUseId || alreadyAnswered) {
     // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
@@ -11853,7 +11864,7 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     debug(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
-    sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+    sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.', { causes });
   } else {
     // No existing tool_result — send tool_result to properly exit plan mode
     session.pendingPlan = null;
@@ -11861,6 +11872,9 @@ async function approvePlanBuild(session, { sendHtml }) {
     if (session.claudeSessionId) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
+    // A raw stdin write, not sendToSession: take the turn seam here (the
+    // result event ends the turn).
+    beginOrJoinTurn(session, causes);
     session.busy = true;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({

@@ -47,10 +47,19 @@ describe('turn causes reach sendToSession from every turn source', () => {
 
 describe('a running turn only ever gains causes', () => {
   it('a send onto a turn already on the session merges into it; only a fresh turn begins one', () => {
+    // The rule itself is lib/turn-cause.js beginOrJoinTurn (unit-tested
+    // there); every send takes it before it marks the session busy.
     const send = fnBody('function sendToSession(');
-    expect(send).toContain('const beganTurn = turnStarts && !session.currentTurn;');
-    expect(send).toContain('if (beganTurn) beginTurn(session, causes);\n  else if (turnStarts || causes) mergeIntoTurn(session, causes);');
-    expect(send.match(/beginTurn\(/g)).toHaveLength(1);
+    expect(send).toContain('const beganTurn = beginOrJoinTurn(session, causes);\n  session.busy = true;');
+    expect(send.match(/beginOrJoinTurn\(/g)).toHaveLength(1);
+    expect(send).not.toMatch(/\bbeginTurn\(/);
+  });
+
+  it('every write that makes a session busy takes the turn seam first', () => {
+    // sendToSession plus the two raw tool_result writes (a question's answer,
+    // a plan's approval); nothing else sets busy directly.
+    expect(index.match(/^\s*session\.busy = true;/gm)).toHaveLength(3);
+    expect(index.match(/beginOrJoinTurn\(session, causes\);\n\s*session\.busy = true;/g)).toHaveLength(3);
   });
 
   it('a send failure ends the turn only when that send began it', () => {
@@ -81,5 +90,43 @@ describe('a running turn only ever gains causes', () => {
 
   it('Send now on a busy Claude session reaches sendToSession with the queue\'s causes (merged there)', () => {
     expect(fnBody('function dispatchMergedFlush(')).toContain('causes: queueCauses(queued)');
+  });
+});
+
+describe('a user\'s answer or plan approval carries its causes', () => {
+  it('a typed answer to a pending question forwards the message\'s causes to submitAnswer', () => {
+    const route = fnBody('async function journalRouteTextToSession(');
+    expect(route.match(/submitAnswer\(session, [^\n]*\{ mirrorToJournal: false, causes \}\);/g)).toHaveLength(2);
+  });
+
+  it('submitAnswer: the text-reply path sends them, the tool_result path begins or joins the turn with them', () => {
+    const answer = fnBody('function submitAnswer(');
+    expect(answer).toContain('{ mirrorToJournal = true, causes = null } = {}');
+    expect(answer).toContain('sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal, causes });');
+    const seam = answer.indexOf('const beganTurn = beginOrJoinTurn(session, causes);\n    session.busy = true;');
+    expect(seam).toBeGreaterThan(answer.indexOf("if (mode === 'text-reply')"));
+    expect(seam).toBeLessThan(answer.indexOf('writePromptAnswer(session, jsonMsg'));
+    // A write stdin refuses ends the turn only when this answer began it.
+    expect(answer).toContain('{ restoreJournalState: true, beganTurn },');
+  });
+
+  it('approvePlanBuild: both text paths send the causes, the tool_result path takes the seam, the iv hook merges them', () => {
+    const build = fnBody('async function approvePlanBuild(');
+    expect(build).toContain('async function approvePlanBuild(session, { sendHtml, causes = null }) {');
+    expect(build.match(/just make the changes directly\.', \{ causes \}\);/g)).toHaveLength(2);
+    expect(build.match(/sendTextToSession\(/g)).toHaveLength(2);
+    const seam = build.indexOf('beginOrJoinTurn(session, causes);\n    session.busy = true;');
+    expect(seam).toBeGreaterThan(-1);
+    expect(seam).toBeLessThan(build.indexOf('session.proc.stdin.write(jsonMsg);'));
+    const merge = build.indexOf('if (causes) mergeIntoTurn(session, causes);');
+    expect(merge).toBeGreaterThan(-1);
+    expect(merge).toBeLessThan(build.indexOf("pending.resolve({ decision: 'allow'"));
+  });
+
+  it('a build typed in the conversation or replied on the plan item reaches approvePlanBuild with its causes', () => {
+    expect(fnBody('async function journalRouteTextToSession(')).toContain('return approvePlanBuild(session, { sendHtml: ctx.sendHtml, causes });');
+    const onItem = fnBody('function journalOnItem(');
+    expect(onItem).toContain('const buildCause = itemCause(item?.payload);');
+    expect(onItem).toContain('approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml, causes: buildCause ? [buildCause] : null })');
   });
 });

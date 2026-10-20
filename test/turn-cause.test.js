@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX,
   cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, plainCause,
-  mergeCauses, mergeTurnCauses, mergeIntoTurn, queueCauses, tagCauses, tappedAction, beginTurn, endTurn, causesForAsk,
+  mergeCauses, mergeTurnCauses, mergeIntoTurn, queueCauses, tagCauses, tappedAction, beginTurn, beginOrJoinTurn, endTurn, causesForAsk,
 } from '../lib/turn-cause.js';
 
 const NOW = Date.UTC(2026, 0, 2, 3, 4, 5, 678);
@@ -291,5 +291,40 @@ describe('mergeIntoTurn', () => {
     const s = { currentTurn: { causes: [u], startedAt: 5 } };
     mergeIntoTurn(s, null);
     expect(s.currentTurn.causes.map((c) => c.kind)).toEqual(['user_message', 'other']);
+  });
+});
+
+describe('beginOrJoinTurn', () => {
+  const u = { kind: 'user_message', ref: 'c:1', at: 1 };
+  const r = { kind: 'room_message', ref: 'room:x', at: 2 };
+
+  it('an idle session with no turn begins one with the causes, and says it did', () => {
+    const s = { busy: false, currentTurn: null };
+    expect(beginOrJoinTurn(s, [u])).toBe(true);
+    expect(s.currentTurn).toEqual({ causes: [u], startedAt: NOW });
+    // Setting busy is the caller's, after the call.
+    expect(s.busy).toBe(false);
+  });
+
+  it('a fresh turn with no causes has none (the same shape as beginTurn)', () => {
+    const s = { busy: false };
+    expect(beginOrJoinTurn(s, null)).toBe(true);
+    expect(s.currentTurn).toEqual({ causes: null, startedAt: NOW });
+  });
+
+  it('an idle session still holding a turn merges into it, even with no causes', () => {
+    const s = { busy: false, currentTurn: { causes: [r], startedAt: 5 } };
+    expect(beginOrJoinTurn(s, [u])).toBe(false);
+    expect(s.currentTurn).toEqual({ causes: [r, u], startedAt: 5 });
+    expect(beginOrJoinTurn(s, null)).toBe(false);
+    expect(s.currentTurn.causes.map((c) => c.kind)).toEqual(['room_message', 'user_message', 'other']);
+  });
+
+  it('a busy session gains causes only when there are some, and never begins a turn', () => {
+    const s = { busy: true, currentTurn: { causes: [r], startedAt: 5 } };
+    expect(beginOrJoinTurn(s, null)).toBe(false);
+    expect(s.currentTurn).toEqual({ causes: [r], startedAt: 5 });
+    expect(beginOrJoinTurn(s, [u])).toBe(false);
+    expect(s.currentTurn).toEqual({ causes: [r, u], startedAt: 5 });
   });
 });
