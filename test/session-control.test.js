@@ -3,6 +3,8 @@ import { planSessionControl, validateControlParams, controlNotice, coordinatorTu
 
 const idle = (extra = {}) => ({ alive: true, agent: 'claude', busy: false, ...extra });
 const P = (action, extra = {}) => ({ convoId: 'c1', action, fromName: 'alice-mac', ...extra });
+// A cause the planner stamped (lib/turn-cause.js): its `at` is the clock's.
+const C = (kind, ref) => expect.objectContaining(ref ? { kind, ref } : { kind });
 
 describe('validateControlParams', () => {
   it('accepts the three actions and trims', () => {
@@ -44,7 +46,7 @@ describe('planSessionControl', () => {
     expect(planSessionControl({ params: P('compact'), session: idle() })).toEqual({ kind: 'apply', steps: [{ op: 'compact' }] });
     expect(planSessionControl({ params: P('compact'), session: idle({ busy: true }) })).toEqual({ kind: 'park', slot: { kind: 'compact', params: P('compact') } });
     expect(planSessionControl({ params: P('carry_on', { message: 'finish the PR', when: 'now' }), session: idle() }))
-      .toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: '[from the Coordinator (alice-mac)] finish the PR' }] });
+      .toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: '[from the Coordinator (alice-mac)] finish the PR', cause: C('carry_on') }] });
     expect(planSessionControl({ params: P('carry_on', { message: 'x', when: 'now' }), session: idle({ _awaitingInputReady: true }) }).kind).toBe('park');
   });
   it('carry_on after the limit reset needs a stall with a reset time', () => {
@@ -131,7 +133,7 @@ describe('alert (journal-originated)', () => {
   it('plans: applies at once on an idle Coordinator, parks in its own slot when busy', () => {
     const params = validateControlParams(A()).params;
     expect(planSessionControl({ params, session: idle({ coordinator: true }) }))
-      .toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: '[alert from Alertmanager, relayed by the journal] DiskSpaceLow on elm: 12% free' }] });
+      .toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: '[alert from Alertmanager, relayed by the journal] DiskSpaceLow on elm: 12% free', cause: C('alert') }] });
     for (const k of ['busy', '_awaitingInputReady', 'waitingForAnswer', 'pendingInteractivePrompt']) {
       expect(planSessionControl({ params, session: idle({ [k]: true }) })).toEqual({ kind: 'park', slot: { kind: 'alert', params } });
     }
@@ -209,7 +211,7 @@ describe('routine (journal-originated, spec 2026-10-01 coordinator routines)', (
   it('plans: applies at once on an idle Coordinator, parks in its own slot when busy', () => {
     const params = validateControlParams(R()).params;
     expect(planSessionControl({ params, session: idle({ coordinator: true }) }))
-      .toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: routineTurnText(params) }] });
+      .toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: routineTurnText(params), causes: [C('routine', `routine:daily-sweep@${params.firedAt}`)] }] });
     for (const k of ['busy', '_awaitingInputReady', 'waitingForAnswer', 'pendingInteractivePrompt']) {
       expect(planSessionControl({ params, session: idle({ [k]: true }) })).toEqual({ kind: 'park', slot: { kind: 'routine', params } });
     }
@@ -227,11 +229,23 @@ describe('routine (journal-originated, spec 2026-10-01 coordinator routines)', (
     const third = mergeParkedSlot(both, { kind: 'routine', params: p1b });
     expect(third.params.earlier).toEqual([p2]);
     expect(routineTurnText(third.params)).toBe(`${routineTurnText(p2)}\n\n${routineTurnText(p1b)}`);
-    expect(planSessionControl({ params: third.params, session: idle() })).toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: routineTurnText(third.params) }] });
+    // One cause per routine in the merged turn: this fire first, then the earlier ones.
+    expect(planSessionControl({ params: third.params, session: idle() })).toEqual({ kind: 'apply', steps: [{
+      op: 'carry_on', text: routineTurnText(third.params),
+      causes: [C('routine', `routine:daily-sweep@${p1b.firedAt}`), C('routine', `routine:session-health@${p2.firedAt}`)],
+    }] });
     // The cap drops the oldest earlier entries first.
     const big = mergeParkedSlot({ kind: 'routine', params: { ...p1, message: 'a'.repeat(ALERT_PARKED_MAX_CHARS) } }, { kind: 'routine', params: p2 });
     expect(big.params.earlier).toBeUndefined();
     expect(mergeParkedSlot({ kind: 'alert', params: validateControlParams(A()).params }, { kind: 'routine', params: p2 })).toEqual({ kind: 'routine', params: p2 });
+  });
+  it('a routine fire with no fire time names no cause for itself (nothing the journal could look up)', () => {
+    const params = validateControlParams(R({ fired_at: undefined })).params;
+    expect(params.firedAt).toBeUndefined();
+    expect(planSessionControl({ params, session: idle() }).steps[0].causes).toBeNull();
+    const p2 = validateControlParams(R({ name: 'session-health', fired_at: '2026-10-02T07:00:00.000Z' })).params;
+    expect(planSessionControl({ params: { ...params, earlier: [p2] }, session: idle() }).steps[0].causes)
+      .toEqual([C('routine', 'routine:session-health@2026-10-02T07:00:00.000Z')]);
   });
   it('authorizes: only from the journal (device 0), only at the current Coordinator', () => {
     const params = validateControlParams(R()).params;

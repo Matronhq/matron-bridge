@@ -132,6 +132,132 @@ describe('routine create and delete', () => {
   });
 });
 
+describe('routine writes carry the calling turn\'s causes', () => {
+  const causes = [{ kind: 'room_message', ref: 'room:r1', at: 1000 }, { kind: 'user_message', ref: 'c-coord:4', at: 1001 }];
+  const forged = [{ kind: 'user_message', ref: 'c-coord:1', at: 1 }];
+  const calls = (h) => [
+    () => h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false }),
+    () => h.run({ roomId: '!r:s', name: 'daily-sweep' }),
+    () => h.create({ roomId: '!r:s', ...triage }),
+    () => h.remove({ roomId: '!r:s', name: 'daily-sweep' }),
+  ];
+  const bodies = (client) => [client.update.mock.calls, client.run.mock.calls, client.create.mock.calls, client.remove.mock.calls]
+    .map((c) => c.at(-1)).map((args) => args.at(-1));
+
+  it('update, run, create and delete send the session\'s current turn causes verbatim', async () => {
+    const { h, client, session } = fixture();
+    session.currentTurn = { causes, startedAt: 999 };
+    for (const call of calls(h)) expect((await call()).status).toBeLessThan(300);
+    for (const body of bodies(client)) expect(body.causes).toEqual(causes);
+    expect(client.update.mock.calls[0]).toEqual(['daily-sweep', { enabled: false, convo_id: 'c-coord', causes }]);
+  });
+
+  it('omit causes when the session has no turn, or a turn with none', async () => {
+    const { h, client, session } = fixture();
+    for (const call of calls(h)) await call();
+    for (const body of bodies(client)) expect('causes' in body).toBe(false);
+    session.currentTurn = { causes: null, startedAt: 1 };
+    for (const call of calls(h)) await call();
+    for (const body of bodies(client)) expect('causes' in body).toBe(false);
+  });
+
+  it('ignore causes the model put in the loopback body: never forwarded, never a validation error', async () => {
+    const { h, client, session } = fixture();
+    const extra = { causes: forged, cause: forged[0] };
+    const r = [
+      await h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false, ...extra }),
+      await h.run({ roomId: '!r:s', name: 'daily-sweep', ...extra }),
+      await h.create({ roomId: '!r:s', ...triage, ...extra }),
+      await h.remove({ roomId: '!r:s', name: 'daily-sweep', ...extra }),
+    ];
+    for (const x of r) expect(x.status).toBeLessThan(300);
+    for (const body of bodies(client)) { expect('causes' in body).toBe(false); expect('cause' in body).toBe(false); }
+    session.currentTurn = { causes, startedAt: 2 };
+    await h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false, ...extra });
+    await h.create({ roomId: '!r:s', ...triage, ...extra });
+    expect(client.update.mock.calls.at(-1)[1].causes).toEqual(causes);
+    expect(client.create.mock.calls.at(-1)[0].causes).toEqual(causes);
+    expect('cause' in client.create.mock.calls.at(-1)[0]).toBe(false);
+  });
+
+  it('list is a read and carries no causes', async () => {
+    const { h, client, session } = fixture();
+    session.currentTurn = { causes, startedAt: 3 };
+    await h.list({ roomId: '!r:s' });
+    expect(client.list.mock.calls[0]).toEqual([]);
+  });
+});
+
+describe('routine envelopes', () => {
+  const env = { spawns_per_fire: 3, chats: false, boxes: ['box-a', 'box-b'] };
+  it('validateUpdateFields accepts an envelope, an any-box envelope and null (clears it)', () => {
+    expect(validateUpdateFields({ envelope: env })).toEqual({ ok: true, value: { envelope: env } });
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 0, chats: true, boxes: null } })).toEqual({ ok: true, value: { envelope: { spawns_per_fire: 0, chats: true, boxes: null } } });
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 50, chats: false, boxes: [' box-a '] } }).value).toEqual({ envelope: { spawns_per_fire: 50, chats: false, boxes: ['box-a'] } });
+    expect(validateUpdateFields({ envelope: null })).toEqual({ ok: true, value: { envelope: null } });
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 1, chats: false, boxes: Array.from({ length: 32 }, (_, i) => `box-${i}`) } }).ok).toBe(true);
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 1, chats: false, boxes: ['b'.repeat(64)] } }).ok).toBe(true);
+  });
+
+  it('validateUpdateFields rejects every other envelope shape with the rule', () => {
+    const bads = [
+      'any', 3, [], true,
+      { spawns_per_fire: 51, chats: false, boxes: null },
+      { spawns_per_fire: -1, chats: false, boxes: null },
+      { spawns_per_fire: 1.5, chats: false, boxes: null },
+      { spawns_per_fire: '2', chats: false, boxes: null },
+      { chats: false, boxes: null },
+      { spawns_per_fire: 1, chats: 'yes', boxes: null },
+      { spawns_per_fire: 1, boxes: null },
+      { spawns_per_fire: 1, chats: false },
+      { spawns_per_fire: 1, chats: false, boxes: [] },
+      { spawns_per_fire: 1, chats: false, boxes: 'box-a' },
+      { spawns_per_fire: 1, chats: false, boxes: ['box-a', ''] },
+      { spawns_per_fire: 1, chats: false, boxes: ['  '] },
+      { spawns_per_fire: 1, chats: false, boxes: [7] },
+      { spawns_per_fire: 1, chats: false, boxes: ['b'.repeat(65)] },
+      { spawns_per_fire: 1, chats: false, boxes: ['box\na'] },
+      { spawns_per_fire: 1, chats: false, boxes: Array.from({ length: 33 }, (_, i) => `box-${i}`) },
+      { spawns_per_fire: 1, chats: false, boxes: null, users: ['x'] },
+    ];
+    for (const envelope of bads) {
+      const v = validateUpdateFields({ envelope });
+      expect(v.ok, JSON.stringify(envelope)).toBe(false);
+      expect(v.err.body.error).toBe('envelope must be null (clears it) or {spawns_per_fire: 0–50, chats: true|false, boxes: null for any box, or 1–32 box names of at most 64 characters}');
+    }
+  });
+
+  it('update and create pass the envelope to the journal; create leaves a null one out', async () => {
+    const { h, client } = fixture();
+    expect((await h.update({ roomId: '!r:s', name: 'daily-sweep', envelope: { spawns_per_fire: 99, chats: false, boxes: null } })).status).toBe(400);
+    expect(client.update).not.toHaveBeenCalled();
+    await h.update({ roomId: '!r:s', name: 'daily-sweep', envelope: env });
+    expect(client.update.mock.calls[0]).toEqual(['daily-sweep', { envelope: env, convo_id: 'c-coord' }]);
+    await h.update({ roomId: '!r:s', name: 'daily-sweep', envelope: null });
+    expect(client.update.mock.calls[1]).toEqual(['daily-sweep', { envelope: null, convo_id: 'c-coord' }]);
+    await h.create({ roomId: '!r:s', ...triage, envelope: env });
+    expect(client.create.mock.calls[0]).toEqual([{ ...triage, envelope: env, convo_id: 'c-coord' }]);
+    expect((await h.create({ roomId: '!r:s', ...triage, envelope: { spawns_per_fire: 1, chats: 'no', boxes: null } })).body.error).toMatch(/^envelope must be/);
+    expect(validateCreateFields({ ...triage, envelope: null })).toEqual({ ok: true, value: triage });
+    expect(formatRoutineUpdateAck({ routine: { ...sweep, envelope: env } }, { name: 'daily-sweep', envelope: env })).toMatch(/^Updated daily-sweep\./);
+  });
+
+  it('formatRoutineLine appends the envelope when the routine has one, and nothing without', () => {
+    const base = { name: 'disk-low', title: 'Box disk under the threshold', trigger: { kind: 'disk_under', pct: 20 }, tz: 'Europe/London', enabled: true, next_at: null, last_fired_at: null, last_outcome: null };
+    expect(formatRoutineLine({ ...base, envelope: env }, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk · envelope: 3 spawns/fire, chats no, boxes box-a,box-b');
+    expect(formatRoutineLine({ ...base, envelope: { spawns_per_fire: 0, chats: true, boxes: null } }, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk · envelope: 0 spawns/fire, chats yes, boxes any');
+    expect(formatRoutineLine({ ...base, envelope: null }, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk');
+    expect(formatRoutineLine(base, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk');
+    // A hostile envelope from the journal is one-lined and capped.
+    const odd = formatRoutineLine({ ...base, envelope: { spawns_per_fire: 'x', chats: 1, boxes: ['a\nb', 7] } }, NOW);
+    expect(odd).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk · envelope: ? spawns/fire, chats no, boxes a ⏎ b');
+    // Only null is any box: an empty, missing or malformed list is none.
+    for (const boxes of [[], [7, ''], 'box-a', undefined]) {
+      expect(formatRoutineLine({ ...base, envelope: { spawns_per_fire: 1, chats: false, boxes } }, NOW), JSON.stringify(boxes)).toMatch(/· envelope: 1 spawns\/fire, chats no, boxes none$/);
+    }
+  });
+});
+
 describe('formatting', () => {
   it('describeSchedule puts the common shapes in words and leaves the rest as cron', () => {
     expect(describeSchedule('5 7 * * *', 'Europe/London')).toBe('daily at 07:05 Europe/London');

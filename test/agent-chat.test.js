@@ -233,6 +233,33 @@ describe('createAgentChatHandlers', () => {
       expect(rooms.get(chatRoomId).state).toBe('pending');
     });
 
+    it('passes the calling session\'s turn causes to invites.invite, and none when the turn has none', async () => {
+      const causes = [{ kind: 'user_message', ref: 'convo-sess:4', at: 10 }];
+      const withTurn = makeFixture({ session: { currentTurn: { causes, startedAt: 9 } } });
+      await withTurn.handlers.chatStart(good);
+      expect(withTurn.invites.invite.mock.calls[0][0].causes).toEqual(causes);
+      const noTurn = makeFixture({ session: { currentTurn: null } });
+      await noTurn.handlers.chatStart({ ...good, causes, cause: causes[0] });
+      expect('causes' in noTurn.invites.invite.mock.calls[0][0]).toBe(false);
+      expect('cause' in noTurn.invites.invite.mock.calls[0][0]).toBe(false);
+    });
+
+    it('stamps the invite with the causes of the turn that made the call, not of a turn begun while the roster was fetched', async () => {
+      const original = [{ kind: 'room_message', ref: 'room:r-1', at: 10 }];
+      const later = [{ kind: 'user_message', ref: 'convo-sess:9', at: 20 }];
+      let session = null;
+      const f = makeFixture({
+        session: { currentTurn: { causes: original, startedAt: 9 } },
+        // The user interrupts while the roster is in flight: the old turn
+        // ends and a new one, theirs, begins before fetchRoster resolves.
+        publisher: { fetchRoster: async () => { await Promise.resolve(); session.currentTurn = { causes: later, startedAt: 19 }; return ROSTER; } },
+      });
+      session = f.sessions.get('!sess');
+      await f.handlers.chatStart(good);
+      expect(session.currentTurn.causes).toEqual(later);
+      expect(f.invites.invite.mock.calls[0][0].causes).toEqual(original);
+    });
+
     it('omits the topic suffix from the title when no topic given', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: undefined });
@@ -1057,6 +1084,16 @@ describe('createAgentChatHandlers', () => {
       expect(res.body).toMatchObject({ room_id: 'room-1', status: 'pending_busy' });
       expect(invites.join).toHaveBeenCalledWith({ roomId: 'room-1', justification: 'user handed me this room', fromConvoId: 'convo-sess' });
       expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+    });
+
+    it('passes the calling session\'s turn causes to invites.join, and none when the turn has none', async () => {
+      const causes = [{ kind: 'item_tap', ref: 'item:2@2026-01-01T00:00:00.000Z', at: 10 }];
+      const withTurn = makeFixture({ session: { currentTurn: { causes, startedAt: 9 } } });
+      await withTurn.handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j' });
+      expect(withTurn.invites.join.mock.calls[0][0].causes).toEqual(causes);
+      const noTurn = makeFixture();
+      await noTurn.handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j', causes });
+      expect('causes' in noTurn.invites.join.mock.calls[0][0]).toBe(false);
     });
 
     it('clamps the join justification to the wire cap', async () => {
@@ -2384,6 +2421,31 @@ describe('chatStart with a person (talk request)', () => {
     expect(rec.fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: null, peerName: "bob's agent", person: 'bob', talk: true, targetConvoId: null });
     // The opening message goes into the fresh room before the ask.
     expect(calls.findIndex((c) => c.call === 'publishText')).toBeLessThan(calls.findIndex((c) => c.call === 'invite'));
+  });
+
+  it('a talk request carries the calling session\'s turn causes, and none when the turn has none', async () => {
+    const causes = [{ kind: 'routine', ref: 'routine:sweep@2026-01-01T08:00:00.000Z', at: 10 }];
+    const withTurn = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, session: { currentTurn: { causes, startedAt: 9 } } });
+    await withTurn.handlers.chatStart(talk);
+    expect(withTurn.invites.invite.mock.calls[0][0].causes).toEqual(causes);
+    const noTurn = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    await noTurn.handlers.chatStart({ ...talk, causes });
+    expect('causes' in noTurn.invites.invite.mock.calls[0][0]).toBe(false);
+  });
+
+  it('a talk request is stamped with the causes of the turn that made the call, not of a turn begun while the roster was fetched', async () => {
+    const original = [{ kind: 'room_message', ref: 'room:r-1', at: 10 }];
+    const later = [{ kind: 'user_message', ref: 'convo-sess:9', at: 20 }];
+    let session = null;
+    const f = makeFixture({
+      inviteOutcome: { kind: 'pending_quiet' },
+      session: { currentTurn: { causes: original, startedAt: 9 } },
+      publisher: { fetchRoster: async () => { await Promise.resolve(); session.currentTurn = { causes: later, startedAt: 19 }; return ROSTER; } },
+    });
+    session = f.sessions.get('!sess');
+    await f.handlers.chatStart(talk);
+    expect(session.currentTurn.causes).toEqual(later);
+    expect(f.invites.invite.mock.calls[0][0].causes).toEqual(original);
   });
 
   it('trims the name, and works without a roster entry for the person', async () => {

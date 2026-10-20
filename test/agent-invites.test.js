@@ -42,6 +42,23 @@ describe('createAgentInvites', () => {
       expect(op).toEqual({ op: 'agent_invite', room_id: 'r1', target_person: 'bob', from_convo_id: 'c1', topic: 'cover editor', mission: 4, justification: 'j' });
     });
 
+    it('sends the turn\'s causes verbatim on the agent_invite frame', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      const causes = [{ kind: 'item_reply', ref: 'item:3@2026-01-01T00:00:00.000Z', at: 5 }];
+      await inv.invite({ roomId: 'r1', targetDeviceId: 7, fromConvoId: 'c1', justification: 'j', causes });
+      expect(sendRoomOp).toHaveBeenCalledWith({
+        op: 'agent_invite', room_id: 'r1', target_device_id: 7, from_convo_id: 'c1', justification: 'j', causes,
+      });
+    });
+
+    it('omits causes entirely when the turn has none', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j', causes: null });
+      await inv.invite({ roomId: 'r1', targetPerson: 'bob', justification: 'j' });
+      expect('causes' in sendRoomOp.mock.calls[0][0]).toBe(false);
+      expect('causes' in sendRoomOp.mock.calls[1][0]).toBe(false);
+    });
+
     it('happy path: delivered -> idle ack -> accept answer, registry joined', async () => {
       const { inv, sendRoomOp, rooms } = makeInvites();
       rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
@@ -353,6 +370,21 @@ describe('createAgentInvites', () => {
       expect(sendRoomOp).toHaveBeenCalledWith({
         op: 'agent_join', room_id: 'r2', from_convo_id: 'convo-mine', justification: 'j',
       });
+    });
+
+    it('sends the turn\'s causes verbatim on the agent_join frame', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      const causes = [{ kind: 'room_message', ref: 'room:r9', at: 5 }];
+      await inv.join({ roomId: 'r2', justification: 'j', fromConvoId: 'convo-mine', causes });
+      expect(sendRoomOp).toHaveBeenCalledWith({
+        op: 'agent_join', room_id: 'r2', from_convo_id: 'convo-mine', justification: 'j', causes,
+      });
+    });
+
+    it('omits causes from the agent_join frame when the turn has none', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j', causes: null });
+      expect('causes' in sendRoomOp.mock.calls[0][0]).toBe(false);
     });
 
     it('omits from_convo_id entirely when the session has no journal convo yet', async () => {

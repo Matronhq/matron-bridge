@@ -623,3 +623,58 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
     expect(fetchTranscript).not.toHaveBeenCalled();
   });
 });
+
+// Each delivery names the user's message that started the turn
+// (lib/turn-cause.js): the JOURNAL convo id and frame seq the input router
+// passes in ctx, never the session's own id.
+describe('createJournalMediaRouter — turn causes', () => {
+  const said = (convoId, seq) => expect.objectContaining({ kind: 'user_message', ref: `${convoId}:${seq}` });
+  const audio = () => ({ fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('ogg'), contentType: 'audio/ogg' })), transcribe: vi.fn(async () => 'buy milk') });
+  const voice = { type: 'file', blobRef: 'voice-1', contentType: 'audio/ogg', name: 'voice.ogg' };
+  const file = { type: 'file', blobRef: 'blob-1', contentType: 'application/pdf', name: 'report.pdf' };
+
+  it('a voice note passes one user_message cause, ref <journal convo>:<seq>', async () => {
+    const { route, deps } = makeRouter(audio());
+    await route(session, voice, { username: 'alice', seq: 7, convoId: 'jc-1' });
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: buy milk', { causes: [said('jc-1', 7)] });
+  });
+
+  it('a voice note with a caption, and a file, pass it on injectBlocks', async () => {
+    const a = makeRouter(audio());
+    await a.route(session, { ...voice, caption: 'and this' }, { username: 'alice', seq: 3, convoId: 'jc-1' });
+    expect(a.deps.injectBlocks.mock.calls[0][2]).toEqual({ causes: [said('jc-1', 3)] });
+    const f = makeRouter();
+    await f.route(session, file, { username: 'alice', seq: 4, convoId: 'jc-1' });
+    expect(f.deps.injectBlocks.mock.calls[0][2]).toEqual({ causes: [said('jc-1', 4)] });
+  });
+
+  it('a busy session queues the cause with the entry, for the flush to merge', async () => {
+    const v = makeRouter(audio());
+    await v.route({ ...session, busy: true }, voice, { username: 'alice', seq: 5, convoId: 'jc-1' });
+    expect(v.deps.queueMedia.mock.calls[0][1].cause).toEqual([said('jc-1', 5)]);
+    const f = makeRouter();
+    await f.route({ ...session, busy: true }, file, { username: 'alice', seq: 6, convoId: 'jc-1' });
+    expect(f.deps.queueMedia.mock.calls[0][1].cause).toEqual([said('jc-1', 6)]);
+  });
+
+  it('a coalesced batch passes one cause per frame, in index order', async () => {
+    const { route, deps } = makeRouter({ fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' })) });
+    const img = (index, name) => ({ type: 'image', blobRef: name, contentType: 'image/png', name, batch: { id: 'b1', index, total: 2 } });
+    await route(session, img(2, 'two.png'), { username: 'alice', seq: 12, convoId: 'jc-1' });
+    await route(session, img(1, 'one.png'), { username: 'alice', seq: 11, convoId: 'jc-1' });
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks.mock.calls[0][2]).toEqual({ causes: [said('jc-1', 11), said('jc-1', 12)] });
+  });
+
+  it('a frame without a seq (or a journal convo id) passes no cause at all', async () => {
+    const v = makeRouter(audio());
+    await v.route(session, voice, { username: 'alice', convoId: 'jc-1' });
+    expect(v.deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: buy milk');
+    const f = makeRouter();
+    await f.route(session, file, { username: 'alice', seq: 4 });
+    expect(f.deps.injectBlocks).toHaveBeenCalledWith(session, [{ type: 'text', text: 'File saved to /w/report.pdf' }]);
+    const q = makeRouter();
+    await q.route({ ...session, busy: true }, file, ctx);
+    expect(q.deps.queueMedia.mock.calls[0][1]).not.toHaveProperty('cause');
+  });
+});

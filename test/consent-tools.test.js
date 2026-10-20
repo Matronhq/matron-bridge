@@ -85,6 +85,34 @@ describe('consent handlers', () => {
     const down = fixture({ answer: { status: 0, data: { error: 'journal unreachable' } } });
     expect((await down.h.decide({ roomId: '!r:s', kind: 'chat', id: 'room-1/12', decision: 'decline', reason: 'ok' })).status).toBe(502);
   });
+
+  it('explains each refusal of an approval of the Coordinator\'s own ask, with the journal\'s why or cap', async () => {
+    // The journal's one shape: the refusal code in detail, the reason in why, the cap in cap.
+    const cases = [
+      [{ status: 403, data: { error: 'forbidden', detail: 'own_ask_unverified', why: 'started by room_message' } }, "the journal cannot tie your own request to the user's words or a routine fire (why: started by room_message) — leave it for the user"],
+      [{ status: 403, data: { error: 'forbidden', detail: 'envelope', why: 'spawns_per_fire 1 used' } }, "this request is outside the routine's envelope (spawns_per_fire 1 used) — leave it for the user or ask the user to widen the envelope"],
+      [{ status: 403, data: { error: 'forbidden', detail: 'verifier', why: 'not a step of this routine' } }, "the verifier judged this request outside the routine's remit (not a step of this routine) — leave it for the user"],
+      [{ status: 409, data: { error: 'conflict', detail: 'verifier_unavailable', why: 'no key' } }, 'the verifier could not run — the ask stays for the user'],
+      [{ status: 409, data: { error: 'conflict', detail: 'routine_cap', cap: 10 } }, "routine-born approvals are at today's cap (10) — the ask stays for the user"],
+    ];
+    for (const [answer, text] of cases) {
+      const { h } = fixture({ answer });
+      const r = await h.decide({ roomId: '!r:s', kind: 'spawn', id: 'sp-1', decision: 'approve', reason: 'started by the user' });
+      expect(r.status).toBe(answer.status);
+      expect(r.body.error).toBe(text);
+    }
+    // Only that shape: a refusal code as the top-level error is not one of these.
+    expect(formatJournalConsentError({ error: 'routine_cap', detail: '5' })).toBe('routine_cap');
+    expect(formatJournalConsentError({ error: 'conflict', detail: 5 })).toMatch(/no longer waiting/);
+    // No why: no empty parentheses; no cap: a question mark; peer-ish text one-lined and capped.
+    expect(formatJournalConsentError({ error: 'forbidden', detail: 'own_ask_unverified' })).toBe("the journal cannot tie your own request to the user's words or a routine fire — leave it for the user");
+    expect(formatJournalConsentError({ error: 'forbidden', detail: 'envelope' })).toBe("this request is outside the routine's envelope — leave it for the user or ask the user to widen the envelope");
+    expect(formatJournalConsentError({ error: 'forbidden', detail: 'verifier' })).toBe("the verifier judged this request outside the routine's remit — leave it for the user");
+    expect(formatJournalConsentError({ error: 'conflict', detail: 'routine_cap' })).toBe("routine-born approvals are at today's cap (?) — the ask stays for the user");
+    const long = formatJournalConsentError({ error: 'forbidden', detail: 'verifier', why: 'a\nb'.repeat(400) });
+    expect(long).not.toContain('\n');
+    expect(long.length).toBeLessThan(500);
+  });
 });
 
 describe('consent formatting', () => {
@@ -111,6 +139,20 @@ describe('consent formatting', () => {
     expect(text).toContain('consent_decide(kind: "chat", id: "room-1/12", decision: approve|decline, reason: …)');
     const join = formatPendingAsk({ ...chatAsk, request: 'join', to_name: 'dev-a', room_title: 'triage' }, { now: NOW });
     expect(join).toContain('asks to join dev-a\'s room "triage"');
+  });
+  it('formatPendingAsk: one "started by" line per cause the bridge stamped, ref left out when absent; none without causes', () => {
+    const causes = [{ kind: 'user_message', ref: 'c-coord:41', at: NOW - 60_000 }, { kind: 'routine', ref: 'routine:daily-sweep@1789999000000', at: NOW - 120_000 }, { kind: 'reminder', at: NOW }];
+    const spawn = formatPendingAsk({ ...spawnAsk, causes }, { now: NOW }).split('\n');
+    expect(spawn).toHaveLength(7);
+    expect(spawn.slice(3, 6)).toEqual(['  started by: user_message c-coord:41', '  started by: routine routine:daily-sweep@1789999000000', '  started by: reminder']);
+    expect(spawn[6]).toMatch(/^ {2}consent_decide\(kind: "spawn"/);
+    const chat = formatPendingAsk({ ...chatAsk, causes: [{ kind: 'item_tap', ref: 'item:7@1789999000000', at: NOW }] }, { now: NOW }).split('\n');
+    expect(chat).toHaveLength(4);
+    expect(chat[2]).toBe('  started by: item_tap item:7@1789999000000');
+    // Absent, empty or junk causes add nothing; peer text is one-lined.
+    expect(formatPendingAsk({ ...spawnAsk, causes: [] }, { now: NOW })).toBe(formatPendingAsk(spawnAsk, { now: NOW }));
+    expect(formatPendingAsk({ ...chatAsk, causes: 'user_message' }, { now: NOW })).toBe(formatPendingAsk(chatAsk, { now: NOW }));
+    expect(formatPendingAsk({ ...chatAsk, causes: [null, { ref: 'x' }, { kind: 'room_message', ref: 'a\nb' }] }, { now: NOW })).toContain('  started by: room_message a ⏎ b');
   });
   it('formatPendingList: empty, and a headed list; formatConsentNudge wraps one ask as a turn; formatDecideAck says what happened', () => {
     expect(formatPendingList({ pending: [] })).toBe('No chat or spawn requests are waiting for approval.');

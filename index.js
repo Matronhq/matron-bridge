@@ -122,6 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
+import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -3281,6 +3282,7 @@ function finishCodexTurn(session, {
   session.toolCalls = [];
   journalStreamClear(session);
   session.busy = false;
+  endTurn(session);
   // Authoritative Codex turn-end (idempotent via _codexTurnFinished above) —
   // but ONLY for a turn that actually ended on its own terms. discardOutput is
   // passed exclusively by the two teardown callers (killSession, and the
@@ -3749,6 +3751,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   session.onTurnEnd = () => {
     // A turn another person started ends here (iv-mode's turn-end seam).
     foreignSessions.end(session);
+    endTurn(session);
     debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
     // Flush the accumulated assistant text to Matrix.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
@@ -4408,7 +4411,9 @@ function sendAllQuestions(session) {
 // text event — the journal already has the user's own row for it (the
 // prompt_reply payload, or the text `send` row), so mirroring again here
 // would duplicate it.
-function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
+// causes: what the answer is (the user's message, lib/turn-cause.js), for
+// the turn it starts or joins — the same as for any other send.
+function submitAnswer(session, answerText, { mirrorToJournal = true, causes = null } = {}) {
   const mode = session.waitingForAnswer;
   session.waitingForAnswer = null;
   session.pendingQuestions = null;
@@ -4417,7 +4422,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
 
   if (mode === 'text-reply') {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
-    sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal });
+    sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal, causes });
   } else {
     // Normal tool_result flow. This path only applies to print-mode stream-
     // json input. In iv-mode, user questions are surfaced and answered via the
@@ -4428,6 +4433,9 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
       return;
     }
+    // Not through sendToSession, so the turn seam is taken here: the answer
+    // begins the turn (ended by its result event) or joins the running one.
+    const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     journalSessionState(session, 'running');
@@ -4455,7 +4463,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       onError: (error) => reportSessionSendFailure(
         session,
         `Could not send the prompt answer to Claude: ${error.message}`,
-        { restoreJournalState: true },
+        { restoreJournalState: true, beganTurn },
       ),
     });
   }
@@ -4708,6 +4716,16 @@ function handleClaudeEvent(session, event) {
   // that used to be the only defense (modelFromEvent,
   // contextTokensFromAssistantEvent) stay as belt-and-braces.
   if (isSidechainEvent(event)) return;
+
+  // Agent output with no turn on the session is a turn the bridge did not
+  // start: the harness runs one by itself (after a background task's
+  // notification, a scheduled wakeup). What prompted it is unknown, so it is
+  // counted as `other` (lib/turn-cause.js) — and a message sent while it runs
+  // merges into it instead of beginning a fresh, cleaner-looking turn. The
+  // result event (or onTurnEnd) ends it like any other.
+  if (!session.busy && !session.currentTurn && (event.type === 'assistant' || event.type === 'stream_event')) {
+    beginTurn(session, [plainCause('other')]);
+  }
 
   // Capture the current model from any event that carries message.model.
   // This is the reliable source in iv-mode, where the system/init event (and
@@ -5161,6 +5179,7 @@ function handleClaudeEvent(session, event) {
           // mode nothing else would ever clear this. Leaving it would card a
           // conversation that is over, not interrupted.
           inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+          endTurn(session);
           session.claudeSessionId = null;
           session._resumeFailed = true;
           // Clear only this provider's stale native ID. A switched
@@ -5271,6 +5290,7 @@ function handleClaudeEvent(session, event) {
       // A turn another person started ends here: disarm the gate before
       // anything else (queued input, room flush) can start the next turn.
       foreignSessions.end(session);
+      endTurn(session);
       // Authoritative print-mode turn-end seam.
       inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       clearPendingInterrupt(session);
@@ -5489,6 +5509,7 @@ function handleClaudeEvent(session, event) {
             // compact boundary (the iv branch above delegates to onTurnEnd,
             // which clears the marker there).
             inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+            endTurn(session);
             clearPendingInterrupt(session);
           }
         } else if (trigger === 'manual') {
@@ -5680,8 +5701,13 @@ function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
   }
 }
 
-function reportSessionSendFailure(session, message, { restoreJournalState = false } = {}) {
+// beganTurn: this failing send is the one that began the session's turn
+// (sendToSession's beginTurn). Only then is the turn its to end; a reject on
+// a session whose turn was already running, or one that only merged into
+// it, leaves that turn's causes where they are.
+function reportSessionSendFailure(session, message, { restoreJournalState = false, beganTurn = false } = {}) {
   session.busy = false;
+  if (beganTurn) endTurn(session);
   // Some callers (the Codex/iv/stdin dispatch failures in sendToSession) run
   // AFTER session.busy = true, so a marker for this turn already exists. The
   // dispatch failed, so no agent output is coming — clear it or the next boot
@@ -5757,7 +5783,7 @@ function flushResponse(session) {
 // again here as an agent-sourced echo would duplicate it. Every other caller
 // (Matrix messages, which have no other route into the journal) leaves this
 // false, unchanged from before.
-function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false } = {}) {
+function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, causes = null } = {}) {
   if (!session.alive || session._autoStopped) return false;
   // Backstop for the foreign-turn gate: a turn of the session's own that
   // starts while no turn is running ends any foreign turn a seam missed.
@@ -5820,8 +5846,9 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     // startResumeReadyWatcher re-enters sendToSession long after this call
     // site's skipJournalMirror flag is gone, and journal-originated text must
     // not be re-mirrored on flush (the journal already has the client's own
-    // send row for it).
-    (session._resumeOutbox ||= []).push(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks);
+    // send row for it). The causes travel the same way: the flush starts the
+    // turn, long after this call, and merges each held entry's (queueCauses).
+    (session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));
     session.lastActivityAt = Date.now();
     return true;
   }
@@ -5829,6 +5856,14 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   session.lastActivityAt = Date.now();
   session.responseBuffer = '';
   session.toolCalls = [];
+  // causes (lib/turn-cause.js): what started this turn, as the bridge saw
+  // it. A turn begins here only when none is on the session; the resume-hold
+  // early return above starts nothing. A turn already on the session only
+  // ever gains causes (mergeIntoTurn), never has them replaced: an iv prompt
+  // seam clears busy but keeps the running turn, so the reply typed into it
+  // joins that turn rather than relabelling it, and a "no causes" side counts
+  // as `other`. Mid-turn input (busy) adds its causes when it has some.
+  const beganTurn = beginOrJoinTurn(session, causes);
   session.busy = true;
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
@@ -5872,7 +5907,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
       const message = detail
         ? `Could not start Codex: ${detail}`
         : 'Codex could not accept the message. Try again or restart the session.';
-      return reportSessionSendFailure(session, message, { restoreJournalState: true });
+      return reportSessionSendFailure(session, message, { restoreJournalState: true, beganTurn });
     }
     return true;
   }
@@ -5900,7 +5935,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     return reportSessionSendFailure(
       session,
       'Interactive mode needs a text prompt.',
-      { restoreJournalState: true },
+      { restoreJournalState: true, beganTurn },
     );
   }
 
@@ -5921,7 +5956,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     return reportSessionSendFailure(
       session,
       `Could not send the message to Claude: ${error.message}`,
-      { restoreJournalState: true },
+      { restoreJournalState: true, beganTurn },
     );
   }
   commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
@@ -6187,7 +6222,8 @@ function formatQueueSummary(queued) {
 function dispatchMergedFlush(session, queued) {
   const { blocks, mirrorText } = planQueueFlush(queued);
   if (blocks.length === 0) return false;
-  if (!sendToSession(session, blocks, { skipJournalMirror: true })) return false;
+  // One turn for the whole batch: it was started by everything in it.
+  if (!sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })) return false;
   if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
   for (const entry of queued) {
     for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
@@ -6299,6 +6335,11 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     if (session._codexSteerPending) { restore(); return false; }
     const { blocks, mirrorText } = planQueueFlush(queued);
     const notifications = snapshot.notifications || (session.queueNotifications || []).slice(0, queued.length);
+    // The steered entries join the running turn: their causes merge into it
+    // (lib/turn-cause.js) before the dispatch, so an unconfirmed steer the
+    // model may still have seen is counted too. Never replaced.
+    const steerCauses = queueCauses(queued);
+    if (steerCauses) mergeIntoTurn(session, steerCauses);
     session._codexSteerPending = { queued };
     void session.codex.steer(blocks).then(sent => {
       session._codexSteerPending = false;
@@ -8947,7 +8988,10 @@ function armOperatorCompact(session, text) {
 // refused it (for instance, it stopped meanwhile); any other path
 // (a dispatched command, an answered prompt, a busy queue) resolves to a
 // non-false value. Only /wake reads this; other callers ignore it.
-async function journalRouteTextToSession(session, body, { keepRestartBudget = false } = {}) {
+// causes: what started the turn this text starts (lib/turn-cause.js), or
+// null when nothing identifiable did; a queued message keeps them on its
+// queue entry for the flush.
+async function journalRouteTextToSession(session, body, { keepRestartBudget = false, causes = null } = {}) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
   // The user is back in the loop, so restart_session gets a fresh budget.
@@ -9019,9 +9063,9 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (q?.options?.length > 0) {
       const answer = resolveQuestionAnswer(session, trimmed);
       const header = q.header ? `${q.header}: ` : '';
-      submitAnswer(session, `${header}${answer}`, { mirrorToJournal: false });
+      submitAnswer(session, `${header}${answer}`, { mirrorToJournal: false, causes });
     } else {
-      submitAnswer(session, trimmed, { mirrorToJournal: false });
+      submitAnswer(session, trimmed, { mirrorToJournal: false, causes });
     }
     return;
   }
@@ -9040,7 +9084,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     {
       approvePlan: () => {
         const ctx = journalSessionCommandCtx(session);
-        return approvePlanBuild(session, { sendHtml: ctx.sendHtml });
+        return approvePlanBuild(session, { sendHtml: ctx.sendHtml, causes });
       },
     },
   );
@@ -9076,8 +9120,11 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
           session.busy = false;
           // Esc cancels the turn: the user deliberately ended it, so there is
           // nothing to carry on. (If the Stop hook still fires, onTurnEnd's
-          // noteTurnEnd is a harmless no-op.)
+          // noteTurnEnd is a harmless no-op.) The turn's causes are cleared
+          // here too, not left to the Stop hook — it does not run when the
+          // user interrupts, and a later turn must not ask with these causes.
           inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+          endTurn(session);
         }
         ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
@@ -9103,7 +9150,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     // Not during an /effort-flow hold: typing now would cancel the flow's
     // pending Enter, so a TUI slash queues like text until the return.
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
-      return sendTextToSession(session, trimmed, { skipJournalMirror: true });
+      return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
     }
     // Busy-queue magic words — the SAME classifier and implementation the
     // old Matrix busy branch used (lib/busy-queue.js), checked at the same
@@ -9153,7 +9200,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       await ctx.sendReply('🗜️ /compact is already queued — it will run as soon as this turn finishes.');
       return;
     }
-    const entry = markJournalOrigin([{ type: 'text', text: trimmed }]);
+    const entry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
     if (compactJump) session.queuedMessages.unshift(entry);
     else session.queuedMessages.push(entry);
     // Post the SAME "📨 Queued" tile a Matrix-origin queue gets (shared
@@ -9182,7 +9229,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   // An idle iv /compact gets its stand-in turn-end (armOperatorCompact).
   armOperatorCompact(session, trimmed);
-  return sendTextToSession(session, trimmed, { skipJournalMirror: true });
+  return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
 }
 
 // prompt_reply -> pending prompt. Resolves `choice`/`text` against whichever
@@ -9290,14 +9337,16 @@ function journalRoutePromptReply(session, { choice, text }) {
 // body, {username}) interface: echoes the incoming message into the
 // session's Matrix room (so the room stays a complete transcript regardless
 // of which client sent a given message), then routes it in.
-function journalOnText(session, body, { username }) {
+function journalOnText(session, body, { username, seq, convoId }) {
   rearmPreReapHandoff(session);
   journalEchoToRoom(session, `📱 ${username} (Matron): ${body}`, `📱 <b>${escapeHtml(username)} (Matron):</b> ${escapeHtml(body)}`);
   // journalRouteTextToSession is async (command dispatch awaits
   // handleCommand) — not awaited here, matching the router's fire-and-forget
   // contract for routeTextToSession, but errors must still be caught so a
   // thrown/rejected dispatch can never crash the consumer.
-  journalRouteTextToSession(session, body).catch((e) => {
+  // The message itself is what starts the turn (lib/turn-cause.js).
+  const causes = seq != null && convoId ? [userMessageCause(convoId, seq)] : null;
+  journalRouteTextToSession(session, body, { causes }).catch((e) => {
     console.warn(`[journal-input] routing text to session failed: ${e.message}`);
     journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your message: ${e.message}`);
   });
@@ -9380,8 +9429,9 @@ const journalMediaRouter = createJournalMediaRouter({
       ivFilename: safeName, caption, workdirName: safeName, inline,
     }).blocks;
   },
-  injectText: (session, text) => sendTextToSession(session, text),
-  injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
+  // causes: the user's media message(s) that started the turn (lib/turn-cause.js).
+  injectText: (session, text, { causes = null } = {}) => sendTextToSession(session, text, { causes }),
+  injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
   // A voice note sent with the typed draft or in a batch: its transcript
   // rides in an injectBlocks turn, so the words are mirrored on their own.
   mirrorText: (session, text) => journalPublishUserItem(session, 'publishText', { body: text, from: 'user' }),
@@ -9408,10 +9458,11 @@ const journalMediaRouter = createJournalMediaRouter({
 // Matrix-origin so flushQueue's mirrorText journal-publishes it (matching the
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
-// like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null }) {
+// like the text path. `cause` (one cause or a list: an item reply's, or a
+// media message's) rides on the entry for the flush (lib/turn-cause.js).
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null, cause = null }) {
   if (!session.queuedMessages) session.queuedMessages = [];
-  const entry = [...blocks];
+  const entry = tagCauses([...blocks], cause);
   if (!mirrorToJournal) markJournalOrigin(entry);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
@@ -9457,13 +9508,14 @@ const itemTurnRouter = createItemTurnRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   saveAttachments: saveItemAttachments,
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
-  injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
-  queueText: (session, { text, preview, source }) => journalQueueMedia(session, {
+  injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
+  queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
     preview,
     fullText: text,
     source,
+    cause,
   }),
   publishNotice: journalPublishNotice,
   // The journal strips any client-supplied transcript, so a voice note on an
@@ -9502,7 +9554,10 @@ function journalOnItem(session, item, ctx) {
   const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
   if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
     const cmdCtx = journalSessionCommandCtx(session);
-    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml }).catch((e) => {
+    // The build reply itself is what the approval's turn is for, exactly as
+    // for any other reply on an item (lib/items-turn.js).
+    const buildCause = itemCause(item?.payload);
+    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml, causes: buildCause ? [buildCause] : null }).catch((e) => {
       try { console.warn(`[plan-items] build from item reply failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
     });
     return;
@@ -9988,12 +10043,13 @@ async function fireTimer(record) {
     const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
     journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
     await journalRouteTextToSession(session,
-      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`);
+      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`,
+      { causes: [plainCause('reminder')] });
     return;
   }
   const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
   journalPublishNotice(journalConvoIdFor(session), timerLine, noticeMeta('reminder', timerLine));
-  await journalRouteTextToSession(session, record.text);
+  await journalRouteTextToSession(session, record.text, { causes: [plainCause('reminder')] });
 }
 
 // Keep KEEPAWAKE_FILE in step with the persisted timers: written with the
@@ -10366,7 +10422,10 @@ async function fireAutoResume(roomId, convoId, slot) {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
       await journalRouteTextToSession(session, '/compact');
     }
-    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));
+    // A Coordinator's after_limit_reset carry-on is a carry-on turn; the
+    // bridge's own automatic one names no cause.
+    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),
+      { causes: slot.source === 'coordinator' ? [plainCause('carry_on')] : null });
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
     // A thrown delivery must not lose the carry-on: put the slot back for
@@ -10686,7 +10745,10 @@ async function applyControlSteps(session, steps) {
       await journalRouteTextToSession(current, step.command || '/compact', { keepRestartBudget: !!step.command });
       startedTurn = true;
     } else if (step.op === 'carry_on') {
-      if (!sendTextToSession(current, step.text, { skipJournalMirror: true })) {
+      // The planner names what started the turn (lib/session-control.js):
+      // a routine turn's fires, or the carry-on / alert itself.
+      const causes = step.causes ?? (step.cause ? [step.cause] : null);
+      if (!sendTextToSession(current, step.text, { skipJournalMirror: true, causes })) {
         return { ok: false, error: { code: 'gone', detail: 'the session would not take a turn' } };
       }
       startedTurn = true;
@@ -10834,9 +10896,11 @@ const roomDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
   // A turn another person started (meta.foreign) is armed and banner'd by
   // foreignSessions before it is sent; every other room turn is as before.
+  // meta.causes: the messages' causes (a spawn outcome's request, else the
+  // room), for the turn this starts.
   injectTurn: (session, text, meta) => (meta?.foreign
     ? injectForeignRoomTurn(session, text, meta.foreign)
-    : sendTextToSession(session, text, { skipJournalMirror: true })),
+    : sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null })),
   log: console,
 });
 
@@ -11750,7 +11814,10 @@ function journalEvictConvoInput(session) {
 // `sendHtml` is the transport's reply sink for the final "▶️ Building..."
 // notice — Matrix passes its room sink, the journal passes the session
 // ctx's sendToRoom sink, which also mirrors into the journal.
-async function approvePlanBuild(session, { sendHtml }) {
+// `causes` is the approval itself (the user's message or item reply,
+// lib/turn-cause.js): every path below either starts a turn with it or adds
+// it to the one the plan is waiting in.
+async function approvePlanBuild(session, { sendHtml, causes = null }) {
   const toolUseId = session.pendingPlanDenialId;
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
   // The tracker mirror closes as decided, whichever mode settles the plan
@@ -11781,10 +11848,15 @@ async function approvePlanBuild(session, { sendHtml }) {
     }
     if (pending) {
       debug(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
+      // The hook unblocks the turn the plan was written in: the approval
+      // joins that turn, never replacing what started it. Only a turn still
+      // on the session: a decision left over from an interrupted turn must
+      // not leave a turn behind that nothing will end (joinHeldTurn).
+      joinHeldTurn(session, causes);
       pending.resolve({ decision: 'allow', reason: 'approved by user' });
     } else {
       debug(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
-      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.', { causes });
     }
   } else if (!toolUseId || alreadyAnswered) {
     // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
@@ -11794,7 +11866,7 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     debug(`[PLAN-DEBUG] Plan approved — sending as text message${alreadyAnswered ? ' (tool_result already in history)' : ''}`);
-    sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.');
+    sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.', { causes });
   } else {
     // No existing tool_result — send tool_result to properly exit plan mode
     session.pendingPlan = null;
@@ -11802,6 +11874,9 @@ async function approvePlanBuild(session, { sendHtml }) {
     if (session.claudeSessionId) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
+    // A raw stdin write, not sendToSession: take the turn seam here (the
+    // result event ends the turn).
+    const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({
@@ -11822,8 +11897,20 @@ async function approvePlanBuild(session, { sendHtml }) {
       }
     }) + '\n';
     debug(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
-    session.proc.stdin.write(jsonMsg);
-    if (session.resetTimeout) session.resetTimeout();
+    // Same delivery as submitAnswer's tool_result: a write stdin refuses
+    // (no stdin, a synchronous throw, or a failed write callback) clears
+    // busy and the in-flight marker, and ends the turn when this approval
+    // began it, so a later send cannot inherit the approval's causes.
+    writePromptAnswer(session, jsonMsg, {
+      onDelivered: () => {
+        if (session.resetTimeout) session.resetTimeout();
+      },
+      onError: (error) => reportSessionSendFailure(
+        session,
+        `Could not send the plan approval to Claude: ${error.message}`,
+        { restoreJournalState: true, beganTurn },
+      ),
+    });
   }
   const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
   await sendHtml(buildNotice.plain, buildNotice.html);
@@ -12310,10 +12397,13 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   // always exists (upserted at boot when JOURNAL_ENABLED), so the notice
   // lands somewhere the user can actually read it instead of being dropped
   // on the floor.
-  notifyParent: ({ session, convoId, text }) => {
+  notifyParent: ({ session, convoId, text, requestId }) => {
     if (convoId) journalPublishNotice(convoId, text, noticeMeta('spawn', text));
     if (session) {
-      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
+      // The turn names the spawn the journal decided; the 'spawn' bucket is
+      // no real room, so with no request id there is no cause at all.
+      const cause = typeof requestId === 'string' && requestId ? spawnOutcomeCause(requestId) : null;
+      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now(), cause });
     } else if (!convoId) {
       journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
     }
@@ -14278,7 +14368,7 @@ async function runPreReapHandoff(session, now, idleSince) {
   // precedes it in the chat), or after the compaction started.
   if (plan.compact) session._preReapHandoff.compactPending = true;
   if (plan.statusTurn) {
-    if (!sendTextToSession(session, handoffTurnText({ idleMinutes }), { skipJournalMirror: true })) {
+    if (!sendTextToSession(session, handoffTurnText({ idleMinutes }), { skipJournalMirror: true, causes: [plainCause('handoff')] })) {
       debug(`pre-reap handoff for ${roomId}: the session would not take the status turn`);
       session._preReapHandoff.compactPending = false;
       return;
@@ -14300,7 +14390,7 @@ function drainPreReapCompact(session) {
   if (!mark || !mark.compactPending) return false;
   if (!session.alive || session._autoStopped || controlOccupied(session)) return false;
   mark.compactPending = false;
-  journalRouteTextToSession(session, '/compact').catch((e) => {
+  journalRouteTextToSession(session, '/compact', { causes: [plainCause('handoff')] }).catch((e) => {
     try { console.warn(`[pre-reap-handoff] compact failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ }
   });
   return true;

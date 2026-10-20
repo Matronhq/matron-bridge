@@ -1954,7 +1954,7 @@ describe('index.js /interrupt endpoint — flush status (source inspection)', ()
 describe('index.js journal busy caller — queued-tile notification wiring (source inspection)', () => {
   it('the journal busy branch posts the tile via notifyQueuedMessage with the journal ctx sink', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('const entry = markJournalOrigin([{ type: \'text\', text: trimmed }]);');
+    const start = src.indexOf('const entry = tagCauses(markJournalOrigin([{ type: \'text\', text: trimmed }]), causes);');
     expect(start).toBeGreaterThan(-1);
     const window = src.slice(start, start + 1200);
     expect(window).toMatch(/notifyQueuedMessage\(session, preview, \{/);
