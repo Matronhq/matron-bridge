@@ -104,9 +104,9 @@ describe('room delivery keeps another person\'s messages in turns of their own',
   it('idle: a foreign message is injected with its meta', () => {
     const { d, calls } = make();
     d.deliver({ alive: true }, 'k', foreign('hi'));
-    expect(calls[0].meta).toEqual({ foreign: { roomId: 'r-tim', person: 'tim' } });
+    expect(calls[0].meta.foreign).toEqual({ roomId: 'r-tim', person: 'tim' });
     d.deliver({ alive: true }, 'k', own('hey'));
-    expect(calls[1].meta).toBeUndefined();
+    expect(calls[1].meta.foreign).toBeUndefined();
   });
 
   it('busy then flush: own batch first, each foreign room on its own later turn', () => {
@@ -118,15 +118,15 @@ describe('room delivery keeps another person\'s messages in turns of their own',
     d.deliver(s, 'k', foreign('d'));
     s.busy = false;
     d.flush(s, 'k');
-    expect(calls[0].meta).toBeUndefined();
+    expect(calls[0].meta.foreign).toBeUndefined();
     expect(calls[0].text).toContain('b');
     expect(calls[0].text).not.toContain("tim's agent");
     expect(d.pendingCount('k')).toBe(3);
     d.flush(s, 'k');
-    expect(calls[1].meta).toEqual({ foreign: { roomId: 'r-tim', person: 'tim' } });
+    expect(calls[1].meta.foreign).toEqual({ roomId: 'r-tim', person: 'tim' });
     expect(calls[1].text).toMatch(/2 messages/);
     d.flush(s, 'k');
-    expect(calls[2].meta).toEqual({ foreign: { roomId: 'r-ann', person: 'tim' } });
+    expect(calls[2].meta.foreign).toEqual({ roomId: 'r-ann', person: 'tim' });
     expect(d.pendingCount('k')).toBe(0);
   });
 

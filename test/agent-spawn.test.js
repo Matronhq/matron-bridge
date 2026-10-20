@@ -370,6 +370,8 @@ describe('createAgentSpawnHandlers', () => {
       expect(ctx.rooms.calls[0].roomId).toBe('room-9');
       expect(ctx.rooms.calls[0].fields).toMatchObject({ role: 'owner', state: 'joined', sessionRoomId: 'sess-1' });
       expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+      // The spawn the journal decided, for the parent turn's cause.
+      expect(ctx.notices[0].requestId).toBe('row-1');
       const text = ctx.notices[0].text;
       expect(text).toMatch(/started/);
       expect(text).toMatch(/room-9/);
@@ -624,13 +626,16 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
   });
 
   it('notifyParent falls back to JOURNAL_CONTROL_CONVO_ID when both session and convoId are absent (ctx-null bridge-restart case)', () => {
-    const start = indexSrc.indexOf('notifyParent: ({ session, convoId, text }) => {');
+    const start = indexSrc.indexOf('notifyParent: ({ session, convoId, text, requestId }) => {');
     expect(start).toBeGreaterThan(-1);
     const end = indexSrc.indexOf('\n  },', start);
     const body = indexSrc.slice(start, end);
     // The normal cases are untouched…
     expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text, noticeMeta\('spawn', text\)\)/);
     expect(body).toMatch(/if \(session\) \{/);
+    // …and the parent's turn names the spawn the journal decided (none without an id).
+    expect(body).toContain("const cause = typeof requestId === 'string' && requestId ? spawnOutcomeCause(requestId) : null;");
+    expect(body).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{ roomId: 'spawn',[^\n]*, cause \}\);/);
     expect(body).toMatch(/roomDelivery\.deliver\(session, session\.roomId,/);
     // …and the fallback fires ONLY when session is absent (the `else`) AND
     // convoId is also absent (`!convoId`) — never a THIRD notice alongside

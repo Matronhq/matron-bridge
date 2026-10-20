@@ -122,7 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
-import { beginTurn, endTurn } from './lib/turn-cause.js';
+import { beginTurn, endTurn, userMessageCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -5827,8 +5827,9 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     // startResumeReadyWatcher re-enters sendToSession long after this call
     // site's skipJournalMirror flag is gone, and journal-originated text must
     // not be re-mirrored on flush (the journal already has the client's own
-    // send row for it).
-    (session._resumeOutbox ||= []).push(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks);
+    // send row for it). The causes travel the same way: the flush starts the
+    // turn, long after this call, and merges each held entry's (queueCauses).
+    (session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));
     session.lastActivityAt = Date.now();
     return true;
   }
@@ -6200,7 +6201,8 @@ function formatQueueSummary(queued) {
 function dispatchMergedFlush(session, queued) {
   const { blocks, mirrorText } = planQueueFlush(queued);
   if (blocks.length === 0) return false;
-  if (!sendToSession(session, blocks, { skipJournalMirror: true })) return false;
+  // One turn for the whole batch: it was started by everything in it.
+  if (!sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })) return false;
   if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
   for (const entry of queued) {
     for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
@@ -8960,7 +8962,10 @@ function armOperatorCompact(session, text) {
 // refused it (for instance, it stopped meanwhile); any other path
 // (a dispatched command, an answered prompt, a busy queue) resolves to a
 // non-false value. Only /wake reads this; other callers ignore it.
-async function journalRouteTextToSession(session, body, { keepRestartBudget = false } = {}) {
+// causes: what started the turn this text starts (lib/turn-cause.js), or
+// null when nothing identifiable did; a queued message keeps them on its
+// queue entry for the flush.
+async function journalRouteTextToSession(session, body, { keepRestartBudget = false, causes = null } = {}) {
   const trimmed = (body || '').trim();
   if (!trimmed) return;
   // The user is back in the loop, so restart_session gets a fresh budget.
@@ -9119,7 +9124,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     // Not during an /effort-flow hold: typing now would cancel the flow's
     // pending Enter, so a TUI slash queues like text until the return.
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
-      return sendTextToSession(session, trimmed, { skipJournalMirror: true });
+      return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
     }
     // Busy-queue magic words — the SAME classifier and implementation the
     // old Matrix busy branch used (lib/busy-queue.js), checked at the same
@@ -9169,7 +9174,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       await ctx.sendReply('🗜️ /compact is already queued — it will run as soon as this turn finishes.');
       return;
     }
-    const entry = markJournalOrigin([{ type: 'text', text: trimmed }]);
+    const entry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
     if (compactJump) session.queuedMessages.unshift(entry);
     else session.queuedMessages.push(entry);
     // Post the SAME "📨 Queued" tile a Matrix-origin queue gets (shared
@@ -9198,7 +9203,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   // An idle iv /compact gets its stand-in turn-end (armOperatorCompact).
   armOperatorCompact(session, trimmed);
-  return sendTextToSession(session, trimmed, { skipJournalMirror: true });
+  return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
 }
 
 // prompt_reply -> pending prompt. Resolves `choice`/`text` against whichever
@@ -9306,14 +9311,16 @@ function journalRoutePromptReply(session, { choice, text }) {
 // body, {username}) interface: echoes the incoming message into the
 // session's Matrix room (so the room stays a complete transcript regardless
 // of which client sent a given message), then routes it in.
-function journalOnText(session, body, { username }) {
+function journalOnText(session, body, { username, seq, convoId }) {
   rearmPreReapHandoff(session);
   journalEchoToRoom(session, `📱 ${username} (Matron): ${body}`, `📱 <b>${escapeHtml(username)} (Matron):</b> ${escapeHtml(body)}`);
   // journalRouteTextToSession is async (command dispatch awaits
   // handleCommand) — not awaited here, matching the router's fire-and-forget
   // contract for routeTextToSession, but errors must still be caught so a
   // thrown/rejected dispatch can never crash the consumer.
-  journalRouteTextToSession(session, body).catch((e) => {
+  // The message itself is what starts the turn (lib/turn-cause.js).
+  const causes = seq != null && convoId ? [userMessageCause(convoId, seq)] : null;
+  journalRouteTextToSession(session, body, { causes }).catch((e) => {
     console.warn(`[journal-input] routing text to session failed: ${e.message}`);
     journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your message: ${e.message}`);
   });
@@ -9425,9 +9432,9 @@ const journalMediaRouter = createJournalMediaRouter({
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null, cause = null }) {
   if (!session.queuedMessages) session.queuedMessages = [];
-  const entry = [...blocks];
+  const entry = tagCauses([...blocks], cause);
   if (!mirrorToJournal) markJournalOrigin(entry);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
@@ -9473,13 +9480,14 @@ const itemTurnRouter = createItemTurnRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   saveAttachments: saveItemAttachments,
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
-  injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
-  queueText: (session, { text, preview, source }) => journalQueueMedia(session, {
+  injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
+  queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
     preview,
     fullText: text,
     source,
+    cause,
   }),
   publishNotice: journalPublishNotice,
   // The journal strips any client-supplied transcript, so a voice note on an
@@ -10004,12 +10012,13 @@ async function fireTimer(record) {
     const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
     journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
     await journalRouteTextToSession(session,
-      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`);
+      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`,
+      { causes: [plainCause('reminder')] });
     return;
   }
   const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
   journalPublishNotice(journalConvoIdFor(session), timerLine, noticeMeta('reminder', timerLine));
-  await journalRouteTextToSession(session, record.text);
+  await journalRouteTextToSession(session, record.text, { causes: [plainCause('reminder')] });
 }
 
 // Keep KEEPAWAKE_FILE in step with the persisted timers: written with the
@@ -10382,7 +10391,10 @@ async function fireAutoResume(roomId, convoId, slot) {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
       await journalRouteTextToSession(session, '/compact');
     }
-    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));
+    // A Coordinator's after_limit_reset carry-on is a carry-on turn; the
+    // bridge's own automatic one names no cause.
+    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),
+      { causes: slot.source === 'coordinator' ? [plainCause('carry_on')] : null });
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
     // A thrown delivery must not lose the carry-on: put the slot back for
@@ -10702,7 +10714,10 @@ async function applyControlSteps(session, steps) {
       await journalRouteTextToSession(current, step.command || '/compact', { keepRestartBudget: !!step.command });
       startedTurn = true;
     } else if (step.op === 'carry_on') {
-      if (!sendTextToSession(current, step.text, { skipJournalMirror: true })) {
+      // The planner names what started the turn (lib/session-control.js):
+      // a routine turn's fires, or the carry-on / alert itself.
+      const causes = step.causes ?? (step.cause ? [step.cause] : null);
+      if (!sendTextToSession(current, step.text, { skipJournalMirror: true, causes })) {
         return { ok: false, error: { code: 'gone', detail: 'the session would not take a turn' } };
       }
       startedTurn = true;
@@ -10850,9 +10865,11 @@ const roomDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
   // A turn another person started (meta.foreign) is armed and banner'd by
   // foreignSessions before it is sent; every other room turn is as before.
+  // meta.causes: the messages' causes (a spawn outcome's request, else the
+  // room), for the turn this starts.
   injectTurn: (session, text, meta) => (meta?.foreign
     ? injectForeignRoomTurn(session, text, meta.foreign)
-    : sendTextToSession(session, text, { skipJournalMirror: true })),
+    : sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null })),
   log: console,
 });
 
@@ -12326,10 +12343,13 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   // always exists (upserted at boot when JOURNAL_ENABLED), so the notice
   // lands somewhere the user can actually read it instead of being dropped
   // on the floor.
-  notifyParent: ({ session, convoId, text }) => {
+  notifyParent: ({ session, convoId, text, requestId }) => {
     if (convoId) journalPublishNotice(convoId, text, noticeMeta('spawn', text));
     if (session) {
-      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
+      // The turn names the spawn the journal decided; the 'spawn' bucket is
+      // no real room, so with no request id there is no cause at all.
+      const cause = typeof requestId === 'string' && requestId ? spawnOutcomeCause(requestId) : null;
+      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now(), cause });
     } else if (!convoId) {
       journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
     }
@@ -14294,7 +14314,7 @@ async function runPreReapHandoff(session, now, idleSince) {
   // precedes it in the chat), or after the compaction started.
   if (plan.compact) session._preReapHandoff.compactPending = true;
   if (plan.statusTurn) {
-    if (!sendTextToSession(session, handoffTurnText({ idleMinutes }), { skipJournalMirror: true })) {
+    if (!sendTextToSession(session, handoffTurnText({ idleMinutes }), { skipJournalMirror: true, causes: [plainCause('handoff')] })) {
       debug(`pre-reap handoff for ${roomId}: the session would not take the status turn`);
       session._preReapHandoff.compactPending = false;
       return;
@@ -14316,7 +14336,7 @@ function drainPreReapCompact(session) {
   if (!mark || !mark.compactPending) return false;
   if (!session.alive || session._autoStopped || controlOccupied(session)) return false;
   mark.compactPending = false;
-  journalRouteTextToSession(session, '/compact').catch((e) => {
+  journalRouteTextToSession(session, '/compact', { causes: [plainCause('handoff')] }).catch((e) => {
     try { console.warn(`[pre-reap-handoff] compact failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ }
   });
   return true;

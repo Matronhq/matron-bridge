@@ -204,7 +204,15 @@ describe('createJournalInputConsumer', () => {
     const [session, body, ctx] = deps.routeTextToSession.mock.calls[0];
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(body).toBe('hello there');
-    expect(ctx).toEqual({ username: 'alice' });
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
+  });
+
+  it('hands routeTextToSession the frame\'s seq and convo id, so the turn can name the message that started it', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ seq: 42, payload: { body: 'go' } }));
+    const [, , ctx] = deps.routeTextToSession.mock.calls[0];
+    expect(ctx).toMatchObject({ seq: 42, convoId: 'convo-1', username: 'alice' });
   });
 
   it('skips a text event with no usable body (missing/non-string), logs, never throws', () => {
@@ -246,7 +254,7 @@ describe('createJournalInputConsumer', () => {
     const [session, body, ctx] = deps.routeTextToSession.mock.calls[0];
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(body).toBe('📌 Task #1 "x" — alice commented:\nhi');
-    expect(ctx).toEqual({ username: 'alice' });
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
   });
 
   it('routes a prompt_reply event for a known session to routePromptReply with target_seq/choice/text', () => {
@@ -312,7 +320,7 @@ describe('createJournalInputConsumer', () => {
     consumer(baseFrame({ convo_id: 'convo-1', payload: { body: 'new /tmp/foo' } }));
     expect(deps.handleControlCommand).not.toHaveBeenCalled();
     expect(deps.routeTextToSession).toHaveBeenCalledWith(
-      { claudeSessionId: 'convo-1' }, 'new /tmp/foo', { username: 'alice' },
+      { claudeSessionId: 'convo-1' }, 'new /tmp/foo', { username: 'alice', seq: 1, convoId: 'convo-1' },
     );
   });
 
@@ -690,7 +698,7 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
     consumer(baseFrame({ payload: { body: '  hello again  ' } }));
     expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'alice' });
     expect(deps.routeTextToSession).toHaveBeenCalledWith(
-      { claudeSessionId: 'convo-1', resumed: true }, 'hello again', { username: 'alice' },
+      { claudeSessionId: 'convo-1', resumed: true }, 'hello again', { username: 'alice', seq: 1, convoId: 'convo-1' },
     );
     expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
   });

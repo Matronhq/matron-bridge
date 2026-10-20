@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX,
   cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, plainCause,
-  mergeCauses, queueCauses, beginTurn, endTurn, causesForAsk,
+  mergeCauses, queueCauses, tagCauses, tappedAction, beginTurn, endTurn, causesForAsk,
 } from '../lib/turn-cause.js';
 
 const NOW = Date.UTC(2026, 0, 2, 3, 4, 5, 678);
@@ -154,6 +154,43 @@ describe('queueCauses', () => {
     expect(queueCauses([])).toBeNull();
     expect(queueCauses(null)).toBeNull();
     expect(queueCauses([null])).toBeNull();
+  });
+});
+
+describe('tagCauses', () => {
+  it('attaches the merged causes to a blocks array without them showing in JSON or iteration', () => {
+    const c1 = userMessageCause('c', 1);
+    const entry = tagCauses([{ type: 'text', text: 'a' }], [c1]);
+    expect(entry.cause).toEqual([c1]);
+    expect(JSON.stringify(entry)).toBe('[{"type":"text","text":"a"}]');
+    expect(Object.keys(entry)).toEqual(['0']);
+    expect(queueCauses([entry, tagCauses([{ type: 'text', text: 'b' }], [roomMessageCause('r')])])).toEqual([c1, roomMessageCause('r')]);
+  });
+
+  it('a send with no causes leaves the entry untagged', () => {
+    const entry = tagCauses([{ type: 'text', text: 'a' }], null);
+    expect(entry.cause).toBeUndefined();
+    expect(tagCauses([{ type: 'text', text: 'a' }], []).cause).toBeUndefined();
+  });
+
+  it('re-tagging replaces the earlier causes', () => {
+    const entry = tagCauses([], [plainCause('reminder')]);
+    tagCauses(entry, [plainCause('alert')]);
+    expect(entry.cause.map((c) => c.kind)).toEqual(['alert']);
+  });
+});
+
+describe('tappedAction', () => {
+  it('the tap label on the comment, or under comment.meta from an older journal', () => {
+    expect(tappedAction({ action: 'Merge' })).toBe('Merge');
+    expect(tappedAction({ meta: { action: 'Go' } })).toBe('Go');
+  });
+
+  it('null for a typed reply, a blank label or no comment', () => {
+    expect(tappedAction({ body: 'x' })).toBeNull();
+    expect(tappedAction({ action: '   ' })).toBeNull();
+    expect(tappedAction(null)).toBeNull();
+    expect(tappedAction({ meta: 'x' })).toBeNull();
   });
 });
 

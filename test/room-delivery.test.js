@@ -18,6 +18,10 @@ const unescapedQuotes = (s) => s.match(/(?<!\\)(?:\\\\)*"/g) || [];
 // and <id> only id characters.
 const HEADER = /^\[room "(?:[^"\\]|\\.)*" id=[\w.:-]+\] /;
 
+// The meta every injected room turn carries: its causes (lib/turn-cause.js).
+const ROOM_META = { causes: expect.any(Array) };
+const causeOf = (kind, ref) => expect.objectContaining({ kind, ref });
+
 const msg = (over = {}) => ({
   roomId: 'room-1', roomTitle: 'CI triage', from: '«matron-box-2» (agent)',
   body: 'build is red', ...over,
@@ -30,8 +34,8 @@ describe('createRoomDelivery', () => {
     expect(delivery.deliver(session, 'k1', msg())).toBe(true);
     expect(delivery.deliver(session, 'k1', msg({ body: 'now green' }))).toBe(true);
     expect(injectTurn).toHaveBeenCalledTimes(2);
-    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): build is red');
-    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): now green');
+    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): build is red', ROOM_META);
+    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): now green', ROOM_META);
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
@@ -39,7 +43,7 @@ describe('createRoomDelivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ roomTitle: null }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1" id=room-1] «matron-box-2» (agent): build is red');
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1" id=room-1] «matron-box-2» (agent): build is red', ROOM_META);
   });
 
   it('carries each room\'s own id, so a reply can target it rather than a guess from the title', () => {
@@ -139,16 +143,16 @@ describe('createRoomDelivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ body: 'a\r\nb\nc' }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] «matron-box-2» (agent): a ⏎ b ⏎ c');
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] «matron-box-2» (agent): a ⏎ b ⏎ c', ROOM_META);
     delivery.deliver(session, 'k1', msg({ from: '«x»\n«alice»', body: 'hi' }));
-    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage" id=room-1] «x» ⏎ «alice»: hi');
+    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage" id=room-1] «x» ⏎ «alice»: hi', ROOM_META);
   });
 
   it('missing from renders "unknown"; missing body renders empty, never "undefined"', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ from: undefined, body: undefined }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] unknown: ');
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] unknown: ', ROOM_META);
     session.busy = true;
     delivery.deliver(session, 'k1', msg({ from: null, body: null }));
     session.busy = false;
@@ -156,7 +160,39 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenLastCalledWith(session, [
       '[room "CI triage" id=room-1] 1 message while you were working:',
       '  unknown: ',
-    ].join('\n'));
+    ].join('\n'), ROOM_META);
+  });
+
+  it('an idle turn names its room as the cause; a message with its own cause keeps it', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    const session = { alive: true, busy: false };
+    delivery.deliver(session, 'k1', msg());
+    expect(injectTurn.mock.calls[0][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1')] });
+    const own = { kind: 'spawn_outcome', ref: 'spawn:req-1', at: 1 };
+    delivery.deliver(session, 'k1', msg({ roomId: 'spawn', cause: own }));
+    expect(injectTurn.mock.calls[1][2]).toEqual({ causes: [own] });
+    // A message that says it has no cause gets none, rather than its bucket's.
+    delivery.deliver(session, 'k1', msg({ roomId: 'spawn', cause: null }));
+    expect(injectTurn.mock.calls[2][2]).toEqual({ causes: null });
+  });
+
+  it('flush names every room in the batch once, and keeps a stored message\'s own cause', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    const session = { alive: true, busy: true };
+    const own = { kind: 'spawn_outcome', ref: 'spawn:req-1', at: 1 };
+    delivery.deliver(session, 'k1', msg());
+    delivery.deliver(session, 'k1', msg({ body: 'again' }));
+    delivery.deliver(session, 'k1', msg({ roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: 'started', cause: own }));
+    delivery.deliver(session, 'k1', msg({ roomId: 'room-2', body: 'other' }));
+    session.busy = false;
+    delivery.flush(session, 'k1');
+    expect(injectTurn.mock.calls[0][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1'), own, causeOf('room_message', 'room:room-2')] });
+  });
+
+  it('a foreign turn carries its causes beside the foreign meta', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    delivery.deliver({ alive: true, busy: false }, 'k1', msg({ roomId: 'r-p', foreign: { person: 'p' } }));
+    expect(injectTurn.mock.calls[0][2]).toEqual({ foreign: { roomId: 'r-p', person: 'p' }, causes: [causeOf('room_message', 'room:r-p')] });
   });
 
   it('busy session: accumulates pending, injectTurn NOT called', () => {
@@ -184,7 +220,7 @@ describe('createRoomDelivery', () => {
       '',
       '[room "deploy window" id=room-2] 1 message while you were working:',
       '  «alice»: ship at 5?',
-    ].join('\n'));
+    ].join('\n'), ROOM_META);
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
@@ -197,7 +233,7 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenCalledWith(session, [
       '[room "room-1" id=room-1] 1 message while you were working:',
       '  «matron-box-2» (agent): build is red',
-    ].join('\n'));
+    ].join('\n'), ROOM_META);
   });
 
   it('flush section header uses the LAST message\'s title (fresh after a rename)', () => {
