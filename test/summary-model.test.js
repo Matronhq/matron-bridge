@@ -200,12 +200,33 @@ describe('the journal summariser', () => {
     expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({ prompt: 'compact this' });
   });
 
-  it('reports usage and the model the journal used', async () => {
+  it('reports usage and returns the model the journal used with the text', async () => {
     const onUsage = vi.fn();
     const m = createSummaryModel({ ...journal(), fetchImpl: vi.fn(async () => ok(' text ', 'some-model')), onUsage });
+    await expect(m.generateWithModel('p')).resolves.toEqual({ text: 'text', model: 'some-model' });
     await expect(m.generate('p')).resolves.toBe('text');
     expect(onUsage).toHaveBeenCalledWith({ model: 'some-model', ...usage });
-    expect(m.model).toBe('some-model');
+    expect(m.model).toBe('journal');
+  });
+
+  it('keeps each concurrent call paired with its own model', async () => {
+    // Call A asks first and is answered last, by a different model than B;
+    // B falls through to OpenAI. Nothing shared may leak between them.
+    const releases = [];
+    const fetchImpl = vi.fn((url, opts) => {
+      if (url !== SUMMARISE_URL) return Promise.resolve(openaiOk);
+      const { prompt } = JSON.parse(opts.body);
+      return new Promise((resolve) => releases.push({ prompt, resolve }));
+    });
+    const m = createSummaryModel({ ...journal(), openaiApiKey: 'test', fetchImpl });
+    const a = m.generateWithModel('first');
+    const b = m.generateWithModel('second');
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    releases.find((r) => r.prompt === 'second').resolve(fail(502));
+    await expect(b).resolves.toEqual({ text: 'from openai', model: 'gpt-6-luna' });
+    releases.find((r) => r.prompt === 'first').resolve(ok('from journal', 'model-a'));
+    await expect(a).resolves.toEqual({ text: 'from journal', model: 'model-a' });
+    expect(m.model).toBe('journal');
   });
 
   it('treats an empty text as a failure', async () => {
@@ -224,10 +245,9 @@ describe('the journal summariser', () => {
     const fetchImpl = vi.fn(async (url) => (url === SUMMARISE_URL ? journalResponse() : openaiOk));
     const onFallback = vi.fn();
     const m = createSummaryModel({ ...journal(), openaiApiKey: 'test', fetchImpl, onFallback });
-    await expect(m.generate({ system: 's', prompt: 'p' })).resolves.toBe('from openai');
+    await expect(m.generateWithModel({ system: 's', prompt: 'p' })).resolves.toEqual({ text: 'from openai', model: 'gpt-6-luna' });
     expect(onFallback).toHaveBeenCalledWith({ provider: 'journal', fallbackModel: 'gpt-6-luna' });
     expect(JSON.stringify(onFallback.mock.calls)).not.toContain('private');
-    expect(m.model).toBe('gpt-6-luna');
   });
 
   it('rejects with the status only, never the body', async () => {

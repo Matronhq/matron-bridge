@@ -6940,7 +6940,9 @@ async function maybeUpdatePinnedSummary(session) {
       structured: true,
     });
 
-    const text = await summaryModel.generate(prompt);
+    // The model travels with the text: another session's pass may finish
+    // in between, so nothing shared is read after this await.
+    const { text, model: writtenBy } = await summaryModel.generateWithModel(prompt);
     // The spoken lines come out first; the title/summary parser gets the rest
     // (see splitSpoken for why it must not see spoken prose).
     const voiced = splitSpoken(text);
@@ -6978,7 +6980,7 @@ async function maybeUpdatePinnedSummary(session) {
       journalPublish(session, 'publishSummary', {
         toc: toc.slice(0, 300),
         detail: (parsed.roster || '').slice(0, 1000),
-        model: summaryModel.model,
+        model: writtenBy,
         ...spokenPayload(voiced, replyRef),
       });
     }
