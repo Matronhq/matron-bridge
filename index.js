@@ -5164,6 +5164,7 @@ function handleClaudeEvent(session, event) {
           // mode nothing else would ever clear this. Leaving it would card a
           // conversation that is over, not interrupted.
           inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+          endTurn(session);
           session.claudeSessionId = null;
           session._resumeFailed = true;
           // Clear only this provider's stale native ID. A switched
