@@ -150,6 +150,7 @@ describe('Claude summaries and the SUMMARY_PROVIDERS order', () => {
 
 describe('the journal summariser', () => {
   const BASE = 'https://journal.example.com';
+  const SUMMARISE_URL = `${BASE}/summarise`;
   const usage = { inputTokens: 40, outputTokens: 12, cacheReadTokens: 300, cacheWriteTokens: 5 };
   const ok = (text = 'TITLE: from journal', model = 'claude-haiku-5-5') => ({
     ok: true, status: 200, headers: new Headers(), json: async () => ({ text, model, usage }),
@@ -220,7 +221,7 @@ describe('the journal summariser', () => {
     ['401', () => fail(401)],
     ['a network error', () => { throw new Error('sensitive transport detail'); }],
   ])('falls through to the next provider on %s', async (_label, journalResponse) => {
-    const fetchImpl = vi.fn(async (url) => (url.startsWith(BASE) ? journalResponse() : openaiOk));
+    const fetchImpl = vi.fn(async (url) => (url === SUMMARISE_URL ? journalResponse() : openaiOk));
     const onFallback = vi.fn();
     const m = createSummaryModel({ ...journal(), openaiApiKey: 'test', fetchImpl, onFallback });
     await expect(m.generate({ system: 's', prompt: 'p' })).resolves.toBe('from openai');
@@ -239,9 +240,9 @@ describe('the journal summariser', () => {
     let clock;
     const now = () => clock;
     const setup = (journalResponse) => {
-      const fetchImpl = vi.fn(async (url) => (url.startsWith(BASE) ? journalResponse() : openaiOk));
+      const fetchImpl = vi.fn(async (url) => (url === SUMMARISE_URL ? journalResponse() : openaiOk));
       const m = createSummaryModel({ ...journal({ now }), openaiApiKey: 'test', fetchImpl });
-      const journalCalls = () => fetchImpl.mock.calls.filter(([u]) => u.startsWith(BASE)).length;
+      const journalCalls = () => fetchImpl.mock.calls.filter(([u]) => u === SUMMARISE_URL).length;
       return { m, journalCalls };
     };
 
