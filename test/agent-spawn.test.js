@@ -304,7 +304,16 @@ describe('createAgentSpawnHandlers', () => {
       const causes = [{ kind: 'user_message', ref: 'convo-1:12', at: 1000 }, { kind: 'reminder', at: 1001 }];
       sessions.get('sess-1').currentTurn = { causes, startedAt: 999 };
       const p = handlers.sessionStart(good);
-      expect(sent[0].causes).toEqual(causes);
+      expect(sent[0]).toEqual({
+        op: 'spawn_request',
+        request_id: sent[0].request_id,
+        from_convo_id: 'convo-1',
+        target_device_id: 2,
+        workdir: '/w',
+        task: 'do the thing',
+        topic: 'T',
+        causes,
+      });
       handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1' });
       await p;
     });

@@ -5493,6 +5493,7 @@ function handleClaudeEvent(session, event) {
             // compact boundary (the iv branch above delegates to onTurnEnd,
             // which clears the marker there).
             inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+            endTurn(session);
             clearPendingInterrupt(session);
           }
         } else if (trigger === 'manual') {
@@ -9087,8 +9088,11 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
           session.busy = false;
           // Esc cancels the turn: the user deliberately ended it, so there is
           // nothing to carry on. (If the Stop hook still fires, onTurnEnd's
-          // noteTurnEnd is a harmless no-op.)
+          // noteTurnEnd is a harmless no-op.) The turn's causes are cleared
+          // here too, not left to the Stop hook — it does not run when the
+          // user interrupts, and a later turn must not ask with these causes.
           inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+          endTurn(session);
         }
         ctx.sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
