@@ -11876,7 +11876,7 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
     }
     // A raw stdin write, not sendToSession: take the turn seam here (the
     // result event ends the turn).
-    beginOrJoinTurn(session, causes);
+    const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({
@@ -11897,8 +11897,20 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
       }
     }) + '\n';
     debug(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
-    session.proc.stdin.write(jsonMsg);
-    if (session.resetTimeout) session.resetTimeout();
+    // Same delivery as submitAnswer's tool_result: a write stdin refuses
+    // (no stdin, a synchronous throw, or a failed write callback) clears
+    // busy and the in-flight marker, and ends the turn when this approval
+    // began it, so a later send cannot inherit the approval's causes.
+    writePromptAnswer(session, jsonMsg, {
+      onDelivered: () => {
+        if (session.resetTimeout) session.resetTimeout();
+      },
+      onError: (error) => reportSessionSendFailure(
+        session,
+        `Could not send the plan approval to Claude: ${error.message}`,
+        { restoreJournalState: true, beganTurn },
+      ),
+    });
   }
   const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
   await sendHtml(buildNotice.plain, buildNotice.html);

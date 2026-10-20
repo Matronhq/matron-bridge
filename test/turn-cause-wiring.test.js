@@ -115,9 +115,18 @@ describe('a user\'s answer or plan approval carries its causes', () => {
     expect(build).toContain('async function approvePlanBuild(session, { sendHtml, causes = null }) {');
     expect(build.match(/just make the changes directly\.', \{ causes \}\);/g)).toHaveLength(2);
     expect(build.match(/sendTextToSession\(/g)).toHaveLength(2);
-    const seam = build.indexOf('beginOrJoinTurn(session, causes);\n    session.busy = true;');
+    const seam = build.indexOf('const beganTurn = beginOrJoinTurn(session, causes);\n    session.busy = true;');
     expect(seam).toBeGreaterThan(-1);
-    expect(seam).toBeLessThan(build.indexOf('session.proc.stdin.write(jsonMsg);'));
+    const write = build.indexOf('writePromptAnswer(session, jsonMsg, {');
+    expect(write).toBeGreaterThan(seam);
+    // The raw write goes only through writePromptAnswer, whose onError
+    // ends the turn this approval began (as submitAnswer's does).
+    expect(build).not.toContain('stdin.write(');
+    const failure = build.slice(write);
+    expect(failure).toMatch(/onError: \(error\) => reportSessionSendFailure\(\n\s*session,\n\s*`Could not send the plan approval to Claude: \$\{error\.message\}`,\n\s*\{ restoreJournalState: true, beganTurn \},\n\s*\),/);
+    expect(failure).toMatch(/onDelivered: \(\) => \{\n\s*if \(session\.resetTimeout\) session\.resetTimeout\(\);\n\s*\},/);
+    // The Building notice still follows every path.
+    expect(build.indexOf("notice('success', '▶️ Building...'")).toBeGreaterThan(write);
     // Only into a turn still on the session (lib/turn-cause.js joinHeldTurn):
     // a decision left from an interrupted turn must not create one.
     const merge = build.indexOf('joinHeldTurn(session, causes);');
