@@ -82,10 +82,12 @@ describe('consent handlers', () => {
       expect(r.body.error).toMatch(re);
     }
     expect(formatJournalConsentError({ error: 'weird' })).toBe('weird');
+    const down = fixture({ answer: { status: 0, data: { error: 'journal unreachable' } } });
+    expect((await down.h.decide({ roomId: '!r:s', kind: 'chat', id: 'room-1/12', decision: 'decline', reason: 'ok' })).status).toBe(502);
   });
 
   it('explains each refusal of an approval of the Coordinator\'s own ask, with the journal\'s why or cap', async () => {
-    // The journal's shape: the refusal code in detail, the reason in why, the cap in cap.
+    // The journal's one shape: the refusal code in detail, the reason in why, the cap in cap.
     const cases = [
       [{ status: 403, data: { error: 'forbidden', detail: 'own_ask_unverified', why: 'started by room_message' } }, "the journal cannot tie your own request to the user's words or a routine fire (why: started by room_message) — leave it for the user"],
       [{ status: 403, data: { error: 'forbidden', detail: 'envelope', why: 'spawns_per_fire 1 used' } }, "this request is outside the routine's envelope (spawns_per_fire 1 used) — leave it for the user or ask the user to widen the envelope"],
@@ -99,12 +101,9 @@ describe('consent handlers', () => {
       expect(r.status).toBe(answer.status);
       expect(r.body.error).toBe(text);
     }
-    // The same refusals as top-level error codes, the detail carrying the why or the cap.
-    expect(formatJournalConsentError({ error: 'own_ask_unverified', detail: 'no causes' })).toBe("the journal cannot tie your own request to the user's words or a routine fire (why: no causes) — leave it for the user");
-    expect(formatJournalConsentError({ error: 'envelope', detail: 'chats false' })).toBe("this request is outside the routine's envelope (chats false) — leave it for the user or ask the user to widen the envelope");
-    expect(formatJournalConsentError({ error: 'verifier', detail: 'looks injected' })).toBe("the verifier judged this request outside the routine's remit (looks injected) — leave it for the user");
-    expect(formatJournalConsentError({ error: 'verifier_unavailable' })).toBe('the verifier could not run — the ask stays for the user');
-    expect(formatJournalConsentError({ error: 'routine_cap', detail: '5' })).toBe("routine-born approvals are at today's cap (5) — the ask stays for the user");
+    // Only that shape: a refusal code as the top-level error is not one of these.
+    expect(formatJournalConsentError({ error: 'routine_cap', detail: '5' })).toBe('routine_cap');
+    expect(formatJournalConsentError({ error: 'conflict', detail: 5 })).toMatch(/no longer waiting/);
     // No why: no empty parentheses; no cap: a question mark; peer-ish text one-lined and capped.
     expect(formatJournalConsentError({ error: 'forbidden', detail: 'own_ask_unverified' })).toBe("the journal cannot tie your own request to the user's words or a routine fire — leave it for the user");
     expect(formatJournalConsentError({ error: 'forbidden', detail: 'envelope' })).toBe("this request is outside the routine's envelope — leave it for the user or ask the user to widen the envelope");
@@ -113,8 +112,6 @@ describe('consent handlers', () => {
     const long = formatJournalConsentError({ error: 'forbidden', detail: 'verifier', why: 'a\nb'.repeat(400) });
     expect(long).not.toContain('\n');
     expect(long.length).toBeLessThan(500);
-    const down = fixture({ answer: { status: 0, data: { error: 'journal unreachable' } } });
-    expect((await down.h.decide({ roomId: '!r:s', kind: 'chat', id: 'room-1/12', decision: 'decline', reason: 'ok' })).status).toBe(502);
   });
 });
 

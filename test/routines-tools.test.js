@@ -195,6 +195,10 @@ describe('routine envelopes', () => {
     // A hostile envelope from the journal is one-lined and capped.
     const odd = formatRoutineLine({ ...base, envelope: { spawns_per_fire: 'x', chats: 1, boxes: ['a\nb', 7] } }, NOW);
     expect(odd).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk · envelope: ? spawns/fire, chats no, boxes a ⏎ b');
+    // Only null is any box: an empty, missing or malformed list is none.
+    for (const boxes of [[], [7, ''], 'box-a', undefined]) {
+      expect(formatRoutineLine({ ...base, envelope: { spawns_per_fire: 1, chats: false, boxes } }, NOW), JSON.stringify(boxes)).toMatch(/· envelope: 1 spawns\/fire, chats no, boxes none$/);
+    }
   });
 });
 
