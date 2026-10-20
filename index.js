@@ -122,7 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
-import { beginTurn, endTurn, userMessageCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
+import { beginTurn, endTurn, mergeIntoTurn, userMessageCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -4712,6 +4712,16 @@ function handleClaudeEvent(session, event) {
   // contextTokensFromAssistantEvent) stay as belt-and-braces.
   if (isSidechainEvent(event)) return;
 
+  // Agent output with no turn on the session is a turn the bridge did not
+  // start: the harness runs one by itself (after a background task's
+  // notification, a scheduled wakeup). What prompted it is unknown, so it is
+  // counted as `other` (lib/turn-cause.js) — and a message sent while it runs
+  // merges into it instead of beginning a fresh, cleaner-looking turn. The
+  // result event (or onTurnEnd) ends it like any other.
+  if (!session.busy && !session.currentTurn && (event.type === 'assistant' || event.type === 'stream_event')) {
+    beginTurn(session, [plainCause('other')]);
+  }
+
   // Capture the current model from any event that carries message.model.
   // This is the reliable source in iv-mode, where the system/init event (and
   // thus session.initData.model) never arrives.
@@ -5686,9 +5696,13 @@ function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
   }
 }
 
-function reportSessionSendFailure(session, message, { restoreJournalState = false } = {}) {
+// beganTurn: this failing send is the one that began the session's turn
+// (sendToSession's beginTurn). Only then is the turn its to end; a reject on
+// a session whose turn was already running, or one that only merged into
+// it, leaves that turn's causes where they are.
+function reportSessionSendFailure(session, message, { restoreJournalState = false, beganTurn = false } = {}) {
   session.busy = false;
-  endTurn(session);
+  if (beganTurn) endTurn(session);
   // Some callers (the Codex/iv/stdin dispatch failures in sendToSession) run
   // AFTER session.busy = true, so a marker for this turn already exists. The
   // dispatch failed, so no agent output is coming — clear it or the next boot
@@ -5838,12 +5852,17 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   session.responseBuffer = '';
   session.toolCalls = [];
   // causes (lib/turn-cause.js): what started this turn, as the bridge saw
-  // it. Recorded only when a turn really starts here; mid-turn input (busy)
-  // keeps the running turn's causes, and the resume-hold early return above
-  // starts nothing.
+  // it. A turn begins here only when none is on the session; the resume-hold
+  // early return above starts nothing. A turn already on the session only
+  // ever gains causes (mergeIntoTurn), never has them replaced: an iv prompt
+  // seam clears busy but keeps the running turn, so the reply typed into it
+  // joins that turn rather than relabelling it, and a "no causes" side counts
+  // as `other`. Mid-turn input (busy) adds its causes when it has some.
   const turnStarts = !session.busy;
   session.busy = true;
-  if (turnStarts) beginTurn(session, causes);
+  const beganTurn = turnStarts && !session.currentTurn;
+  if (beganTurn) beginTurn(session, causes);
+  else if (turnStarts || causes) mergeIntoTurn(session, causes);
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
@@ -5886,7 +5905,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
       const message = detail
         ? `Could not start Codex: ${detail}`
         : 'Codex could not accept the message. Try again or restart the session.';
-      return reportSessionSendFailure(session, message, { restoreJournalState: true });
+      return reportSessionSendFailure(session, message, { restoreJournalState: true, beganTurn });
     }
     return true;
   }
@@ -5914,7 +5933,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     return reportSessionSendFailure(
       session,
       'Interactive mode needs a text prompt.',
-      { restoreJournalState: true },
+      { restoreJournalState: true, beganTurn },
     );
   }
 
@@ -5935,7 +5954,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     return reportSessionSendFailure(
       session,
       `Could not send the message to Claude: ${error.message}`,
-      { restoreJournalState: true },
+      { restoreJournalState: true, beganTurn },
     );
   }
   commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
@@ -6314,6 +6333,11 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     if (session._codexSteerPending) { restore(); return false; }
     const { blocks, mirrorText } = planQueueFlush(queued);
     const notifications = snapshot.notifications || (session.queueNotifications || []).slice(0, queued.length);
+    // The steered entries join the running turn: their causes merge into it
+    // (lib/turn-cause.js) before the dispatch, so an unconfirmed steer the
+    // model may still have seen is counted too. Never replaced.
+    const steerCauses = queueCauses(queued);
+    if (steerCauses) mergeIntoTurn(session, steerCauses);
     session._codexSteerPending = { queued };
     void session.codex.steer(blocks).then(sent => {
       session._codexSteerPending = false;

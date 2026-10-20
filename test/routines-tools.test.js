@@ -132,6 +132,62 @@ describe('routine create and delete', () => {
   });
 });
 
+describe('routine writes carry the calling turn\'s causes', () => {
+  const causes = [{ kind: 'room_message', ref: 'room:r1', at: 1000 }, { kind: 'user_message', ref: 'c-coord:4', at: 1001 }];
+  const forged = [{ kind: 'user_message', ref: 'c-coord:1', at: 1 }];
+  const calls = (h) => [
+    () => h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false }),
+    () => h.run({ roomId: '!r:s', name: 'daily-sweep' }),
+    () => h.create({ roomId: '!r:s', ...triage }),
+    () => h.remove({ roomId: '!r:s', name: 'daily-sweep' }),
+  ];
+  const bodies = (client) => [client.update.mock.calls, client.run.mock.calls, client.create.mock.calls, client.remove.mock.calls]
+    .map((c) => c.at(-1)).map((args) => args.at(-1));
+
+  it('update, run, create and delete send the session\'s current turn causes verbatim', async () => {
+    const { h, client, session } = fixture();
+    session.currentTurn = { causes, startedAt: 999 };
+    for (const call of calls(h)) expect((await call()).status).toBeLessThan(300);
+    for (const body of bodies(client)) expect(body.causes).toEqual(causes);
+    expect(client.update.mock.calls[0]).toEqual(['daily-sweep', { enabled: false, convo_id: 'c-coord', causes }]);
+  });
+
+  it('omit causes when the session has no turn, or a turn with none', async () => {
+    const { h, client, session } = fixture();
+    for (const call of calls(h)) await call();
+    for (const body of bodies(client)) expect('causes' in body).toBe(false);
+    session.currentTurn = { causes: null, startedAt: 1 };
+    for (const call of calls(h)) await call();
+    for (const body of bodies(client)) expect('causes' in body).toBe(false);
+  });
+
+  it('ignore causes the model put in the loopback body: never forwarded, never a validation error', async () => {
+    const { h, client, session } = fixture();
+    const extra = { causes: forged, cause: forged[0] };
+    const r = [
+      await h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false, ...extra }),
+      await h.run({ roomId: '!r:s', name: 'daily-sweep', ...extra }),
+      await h.create({ roomId: '!r:s', ...triage, ...extra }),
+      await h.remove({ roomId: '!r:s', name: 'daily-sweep', ...extra }),
+    ];
+    for (const x of r) expect(x.status).toBeLessThan(300);
+    for (const body of bodies(client)) { expect('causes' in body).toBe(false); expect('cause' in body).toBe(false); }
+    session.currentTurn = { causes, startedAt: 2 };
+    await h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false, ...extra });
+    await h.create({ roomId: '!r:s', ...triage, ...extra });
+    expect(client.update.mock.calls.at(-1)[1].causes).toEqual(causes);
+    expect(client.create.mock.calls.at(-1)[0].causes).toEqual(causes);
+    expect('cause' in client.create.mock.calls.at(-1)[0]).toBe(false);
+  });
+
+  it('list is a read and carries no causes', async () => {
+    const { h, client, session } = fixture();
+    session.currentTurn = { causes, startedAt: 3 };
+    await h.list({ roomId: '!r:s' });
+    expect(client.list.mock.calls[0]).toEqual([]);
+  });
+});
+
 describe('routine envelopes', () => {
   const env = { spawns_per_fire: 3, chats: false, boxes: ['box-a', 'box-b'] };
   it('validateUpdateFields accepts an envelope, an any-box envelope and null (clears it)', () => {

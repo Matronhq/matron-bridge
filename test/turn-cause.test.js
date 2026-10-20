@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX,
   cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, plainCause,
-  mergeCauses, queueCauses, tagCauses, tappedAction, beginTurn, endTurn, causesForAsk,
+  mergeCauses, mergeTurnCauses, mergeIntoTurn, queueCauses, tagCauses, tappedAction, beginTurn, endTurn, causesForAsk,
 } from '../lib/turn-cause.js';
 
 const NOW = Date.UTC(2026, 0, 2, 3, 4, 5, 678);
@@ -127,11 +127,33 @@ describe('mergeCauses', () => {
     expect(mergeCauses([[r1, r2]])).toEqual([r1]);
   });
 
-  it('caps at CAUSES_MAX (8) causes, keeping the first', () => {
+  it('caps at CAUSES_MAX (8): the first 7 and a truncation marker in the last slot', () => {
     const many = Array.from({ length: 12 }, (_, i) => ({ kind: 'room_message', ref: `room:${i}`, at: i }));
     const out = mergeCauses([many]);
     expect(out).toHaveLength(CAUSES_MAX);
-    expect(out.map((c) => c.ref)).toEqual(many.slice(0, 8).map((c) => c.ref));
+    expect(out.slice(0, 7)).toEqual(many.slice(0, 7));
+    expect(out[7]).toEqual({ kind: 'other', ref: 'truncated', at: NOW });
+  });
+
+  it('a dropped later cause leaves the marker: 8 user messages + 1 reminder -> 7 user messages + other/truncated', () => {
+    const users = Array.from({ length: 8 }, (_, i) => userMessageCause('c', i));
+    const out = mergeCauses([users, [plainCause('reminder')]]);
+    expect(out.map((c) => c.kind)).toEqual([...Array(7).fill('user_message'), 'other']);
+    expect(out.slice(0, 7)).toEqual(users.slice(0, 7));
+    expect(out[7]).toMatchObject({ kind: 'other', ref: 'truncated' });
+  });
+
+  it('exactly CAUSES_MAX distinct causes are kept whole, with no marker', () => {
+    const eight = Array.from({ length: 8 }, (_, i) => userMessageCause('c', i));
+    expect(mergeCauses([eight, eight])).toEqual(eight);
+  });
+
+  it('a truncated list merged again stays capped and keeps its marker', () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ kind: 'room_message', ref: `room:${i}`, at: i }));
+    const once = mergeCauses([many]);
+    const twice = mergeCauses([once, [plainCause('alert')]]);
+    expect(twice).toHaveLength(CAUSES_MAX);
+    expect(twice[7]).toMatchObject({ kind: 'other', ref: 'truncated' });
   });
 
   it('null when nothing is left', () => {
@@ -223,5 +245,51 @@ describe('turn state', () => {
   it('causesForAsk is null for a session that never began a turn', () => {
     expect(causesForAsk({})).toBeNull();
     expect(causesForAsk(null)).toBeNull();
+  });
+});
+
+describe('mergeTurnCauses', () => {
+  const u = { kind: 'user_message', ref: 'c:1', at: 1 };
+  const r = { kind: 'room_message', ref: 'room:x', at: 2 };
+
+  it('keeps the existing causes first and adds the incoming ones', () => {
+    expect(mergeTurnCauses([r], [u])).toEqual([r, u]);
+    expect(mergeTurnCauses([u, r], [u])).toEqual([u, r]);
+  });
+
+  it('a side with no causes counts as other, so unknown origin is never dropped', () => {
+    expect(mergeTurnCauses(null, [u])).toEqual([{ kind: 'other', at: NOW }, u]);
+    expect(mergeTurnCauses([u], null)).toEqual([u, { kind: 'other', at: NOW }]);
+    expect(mergeTurnCauses(null, null)).toEqual([{ kind: 'other', at: NOW }]);
+    expect(mergeTurnCauses([], [u])).toEqual([{ kind: 'other', at: NOW }, u]);
+    expect(mergeTurnCauses([u], [])).toEqual([u, { kind: 'other', at: NOW }]);
+  });
+
+  it('never drops an untrusted existing cause for a trusted incoming one', () => {
+    const out = mergeTurnCauses([r, plainCause('other')], [u]);
+    expect(out.map((c) => c.kind)).toEqual(['room_message', 'other', 'user_message']);
+  });
+});
+
+describe('mergeIntoTurn', () => {
+  const u = { kind: 'user_message', ref: 'c:1', at: 1 };
+  const r = { kind: 'room_message', ref: 'room:x', at: 2 };
+
+  it('merges into the running turn, keeping its start time', () => {
+    const s = { currentTurn: { causes: [r], startedAt: 5 } };
+    mergeIntoTurn(s, [u]);
+    expect(s.currentTurn).toEqual({ causes: [r, u], startedAt: 5 });
+  });
+
+  it('a session with no turn gets one whose causes start with other', () => {
+    const s = {};
+    mergeIntoTurn(s, [u]);
+    expect(s.currentTurn).toEqual({ causes: [{ kind: 'other', at: NOW }, u], startedAt: NOW });
+  });
+
+  it('incoming none adds other, never clears', () => {
+    const s = { currentTurn: { causes: [u], startedAt: 5 } };
+    mergeIntoTurn(s, null);
+    expect(s.currentTurn.causes.map((c) => c.kind)).toEqual(['user_message', 'other']);
   });
 });

@@ -44,3 +44,42 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(2);
   });
 });
+
+describe('a running turn only ever gains causes', () => {
+  it('a send onto a turn already on the session merges into it; only a fresh turn begins one', () => {
+    const send = fnBody('function sendToSession(');
+    expect(send).toContain('const beganTurn = turnStarts && !session.currentTurn;');
+    expect(send).toContain('if (beganTurn) beginTurn(session, causes);\n  else if (turnStarts || causes) mergeIntoTurn(session, causes);');
+    expect(send.match(/beginTurn\(/g)).toHaveLength(1);
+  });
+
+  it('a send failure ends the turn only when that send began it', () => {
+    const report = fnBody('function reportSessionSendFailure(');
+    expect(report).toContain('{ restoreJournalState = false, beganTurn = false } = {}');
+    expect(report).toContain('if (beganTurn) endTurn(session);');
+    expect(report.match(/endTurn\(/g)).toHaveLength(1);
+    const send = fnBody('function sendToSession(');
+    // The three dispatch failures after the turn starts pass the flag; the
+    // validation rejects before it pass nothing, so they never end a turn.
+    expect(send.match(/\{ restoreJournalState: true, beganTurn \}/g)).toHaveLength(3);
+    expect(send.match(/reportSessionSendFailure\(/g)).toHaveLength(7);
+  });
+
+  it('agent output with no turn on the session begins one of unknown origin', () => {
+    const handler = fnBody('function handleClaudeEvent(');
+    const guard = handler.indexOf("if (!session.busy && !session.currentTurn && (event.type === 'assistant' || event.type === 'stream_event')) {\n    beginTurn(session, [plainCause('other')]);");
+    expect(guard).toBeGreaterThan(handler.indexOf('if (isSidechainEvent(event)) return;'));
+    expect(guard).toBeLessThan(handler.indexOf('switch (event.type)'));
+  });
+
+  it('a Codex steer merges its entries\' causes into the running turn before it dispatches', () => {
+    const flush = fnBody('function flushQueue(');
+    const merge = flush.indexOf('const steerCauses = queueCauses(queued);\n    if (steerCauses) mergeIntoTurn(session, steerCauses);');
+    expect(merge).toBeGreaterThan(-1);
+    expect(merge).toBeLessThan(flush.indexOf('session.codex.steer(blocks)'));
+  });
+
+  it('Send now on a busy Claude session reaches sendToSession with the queue\'s causes (merged there)', () => {
+    expect(fnBody('function dispatchMergedFlush(')).toContain('causes: queueCauses(queued)');
+  });
+});
