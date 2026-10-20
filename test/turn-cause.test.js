@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX,
   cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, plainCause,
-  mergeCauses, mergeTurnCauses, mergeIntoTurn, queueCauses, tagCauses, tappedAction, beginTurn, beginOrJoinTurn, endTurn, causesForAsk,
+  mergeCauses, mergeTurnCauses, mergeIntoTurn, queueCauses, tagCauses, tappedAction, beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, causesForAsk,
 } from '../lib/turn-cause.js';
 
 const NOW = Date.UTC(2026, 0, 2, 3, 4, 5, 678);
@@ -326,5 +326,35 @@ describe('beginOrJoinTurn', () => {
     expect(s.currentTurn).toEqual({ causes: [r], startedAt: 5 });
     expect(beginOrJoinTurn(s, [u])).toBe(false);
     expect(s.currentTurn).toEqual({ causes: [r, u], startedAt: 5 });
+  });
+});
+
+describe('joinHeldTurn', () => {
+  const u = { kind: 'user_message', ref: 'c:1', at: 1 };
+  const r = { kind: 'room_message', ref: 'room:x', at: 2 };
+
+  it('a live plan hook: the approval\'s causes merge into the turn it blocks', () => {
+    const s = { busy: true, currentTurn: { causes: [r], startedAt: 5 } };
+    expect(joinHeldTurn(s, [u])).toBe(true);
+    expect(s.currentTurn).toEqual({ causes: [r, u], startedAt: 5 });
+  });
+
+  it('a stale plan decision on an idle session with no turn leaves no turn behind', () => {
+    const s = { busy: false, currentTurn: null };
+    expect(joinHeldTurn(s, [u])).toBe(false);
+    expect(s.currentTurn).toBeNull();
+    // …so the next send begins a fresh turn with its own causes instead of
+    // merging into a dangling user-caused one.
+    expect(beginOrJoinTurn(s, [r])).toBe(true);
+    expect(s.currentTurn.causes).toEqual([r]);
+  });
+
+  it('no causes changes nothing, with or without a turn', () => {
+    const held = { currentTurn: { causes: [r], startedAt: 5 } };
+    expect(joinHeldTurn(held, null)).toBe(false);
+    expect(held.currentTurn).toEqual({ causes: [r], startedAt: 5 });
+    const none = {};
+    expect(joinHeldTurn(none, null)).toBe(false);
+    expect(none.currentTurn).toBeUndefined();
   });
 });

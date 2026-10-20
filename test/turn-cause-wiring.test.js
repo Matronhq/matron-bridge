@@ -118,9 +118,12 @@ describe('a user\'s answer or plan approval carries its causes', () => {
     const seam = build.indexOf('beginOrJoinTurn(session, causes);\n    session.busy = true;');
     expect(seam).toBeGreaterThan(-1);
     expect(seam).toBeLessThan(build.indexOf('session.proc.stdin.write(jsonMsg);'));
-    const merge = build.indexOf('if (causes) mergeIntoTurn(session, causes);');
+    // Only into a turn still on the session (lib/turn-cause.js joinHeldTurn):
+    // a decision left from an interrupted turn must not create one.
+    const merge = build.indexOf('joinHeldTurn(session, causes);');
     expect(merge).toBeGreaterThan(-1);
     expect(merge).toBeLessThan(build.indexOf("pending.resolve({ decision: 'allow'"));
+    expect(build).not.toMatch(/mergeIntoTurn\(/);
   });
 
   it('a build typed in the conversation or replied on the plan item reaches approvePlanBuild with its causes', () => {

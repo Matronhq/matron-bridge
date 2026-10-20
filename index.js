@@ -122,7 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
-import { beginTurn, beginOrJoinTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
+import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -11849,8 +11849,10 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
     if (pending) {
       debug(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
       // The hook unblocks the turn the plan was written in: the approval
-      // joins that turn, never replacing what started it.
-      if (causes) mergeIntoTurn(session, causes);
+      // joins that turn, never replacing what started it. Only a turn still
+      // on the session: a decision left over from an interrupted turn must
+      // not leave a turn behind that nothing will end (joinHeldTurn).
+      joinHeldTurn(session, causes);
       pending.resolve({ decision: 'allow', reason: 'approved by user' });
     } else {
       debug(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
