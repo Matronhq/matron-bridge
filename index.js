@@ -560,17 +560,6 @@ const BRIDGE_NOTICES_MD_PATH = process.env.BRIDGE_NOTICES_MD_PATH || DEFAULT_BRI
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 
-const summaryModel = createSummaryModel({
-  providers: process.env.SUMMARY_PROVIDERS || undefined,
-  anthropicApiKey: process.env.SUMMARY_ANTHROPIC_API_KEY || '',
-  anthropicModel: process.env.SUMMARY_ANTHROPIC_MODEL || undefined,
-  onFallback: ({ provider, fallbackModel }) => console.warn(`Summariser ${provider} failed; falling back to ${fallbackModel}`),
-  onUsage: (usage) => debug(`summary usage: ${JSON.stringify(usage)}`),
-  openaiApiKey: process.env.OPENAI_API_KEY || '',
-  geminiClient: genAI,
-  modelOverride: process.env.SUMMARY_MODEL || '',
-});
-
 function loadBridgeSystemPrompt() {
   try {
     return fs.readFileSync(BRIDGE_CLAUDE_MD_PATH, 'utf-8').trim();
@@ -655,6 +644,22 @@ const journalHttpBase = JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl
 const itemsClient = createItemsClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
+});
+
+// Titles and rolling summaries (lib/summary-model.js). The journal is the
+// default summariser, reached with the same base URL and bearer token as the
+// clients here; local provider keys are optional fallbacks.
+const summaryModel = createSummaryModel({
+  providers: process.env.SUMMARY_PROVIDERS || undefined,
+  journalBaseUrl: journalHttpBase,
+  journalToken: _journalToken,
+  anthropicApiKey: process.env.SUMMARY_ANTHROPIC_API_KEY || '',
+  anthropicModel: process.env.SUMMARY_ANTHROPIC_MODEL || undefined,
+  onFallback: ({ provider, fallbackModel }) => console.warn(`Summariser ${provider} failed; falling back to ${fallbackModel}`),
+  onUsage: (usage) => debug(`summary usage: ${JSON.stringify(usage)}`),
+  openaiApiKey: process.env.OPENAI_API_KEY || '',
+  geminiClient: genAI,
+  modelOverride: process.env.SUMMARY_MODEL || '',
 });
 
 // Missions & milestones (spec 2026-09-10): same base URL and token as the
