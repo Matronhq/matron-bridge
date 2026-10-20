@@ -122,6 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
+import { beginTurn, endTurn } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -3281,6 +3282,7 @@ function finishCodexTurn(session, {
   session.toolCalls = [];
   journalStreamClear(session);
   session.busy = false;
+  endTurn(session);
   // Authoritative Codex turn-end (idempotent via _codexTurnFinished above) —
   // but ONLY for a turn that actually ended on its own terms. discardOutput is
   // passed exclusively by the two teardown callers (killSession, and the
@@ -3749,6 +3751,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   session.onTurnEnd = () => {
     // A turn another person started ends here (iv-mode's turn-end seam).
     foreignSessions.end(session);
+    endTurn(session);
     debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
     // Flush the accumulated assistant text to Matrix.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
@@ -5271,6 +5274,7 @@ function handleClaudeEvent(session, event) {
       // A turn another person started ends here: disarm the gate before
       // anything else (queued input, room flush) can start the next turn.
       foreignSessions.end(session);
+      endTurn(session);
       // Authoritative print-mode turn-end seam.
       inflightMarker.noteTurnEnd(journalConvoIdFor(session));
       clearPendingInterrupt(session);
@@ -5682,6 +5686,7 @@ function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
 
 function reportSessionSendFailure(session, message, { restoreJournalState = false } = {}) {
   session.busy = false;
+  endTurn(session);
   // Some callers (the Codex/iv/stdin dispatch failures in sendToSession) run
   // AFTER session.busy = true, so a marker for this turn already exists. The
   // dispatch failed, so no agent output is coming — clear it or the next boot
@@ -5757,7 +5762,7 @@ function flushResponse(session) {
 // again here as an agent-sourced echo would duplicate it. Every other caller
 // (Matrix messages, which have no other route into the journal) leaves this
 // false, unchanged from before.
-function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false } = {}) {
+function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, causes = null } = {}) {
   if (!session.alive || session._autoStopped) return false;
   // Backstop for the foreign-turn gate: a turn of the session's own that
   // starts while no turn is running ends any foreign turn a seam missed.
@@ -5829,7 +5834,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   session.lastActivityAt = Date.now();
   session.responseBuffer = '';
   session.toolCalls = [];
+  // causes (lib/turn-cause.js): what started this turn, as the bridge saw
+  // it. Recorded only when a turn really starts here; mid-turn input (busy)
+  // keeps the running turn's causes, and the resume-hold early return above
+  // starts nothing.
+  const turnStarts = !session.busy;
   session.busy = true;
+  if (turnStarts) beginTurn(session, causes);
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');

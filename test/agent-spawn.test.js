@@ -299,6 +299,32 @@ describe('createAgentSpawnHandlers', () => {
       await nullOk;
     });
 
+    it('causes: the calling session\'s current turn causes ride on the frame verbatim', async () => {
+      const { handlers, sent, sessions } = mk();
+      const causes = [{ kind: 'user_message', ref: 'convo-1:12', at: 1000 }, { kind: 'reminder', at: 1001 }];
+      sessions.get('sess-1').currentTurn = { causes, startedAt: 999 };
+      const p = handlers.sessionStart(good);
+      expect(sent[0].causes).toEqual(causes);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1' });
+      await p;
+    });
+
+    it('causes: omitted from the frame when the turn has none, and never taken from the request body', async () => {
+      const { handlers, sent, sessions } = mk();
+      sessions.get('sess-1').currentTurn = null;
+      const forged = [{ kind: 'user_message', ref: 'convo-1:1', at: 1 }];
+      const p1 = handlers.sessionStart({ ...good, causes: forged, cause: forged[0] });
+      expect('causes' in sent[0]).toBe(false);
+      expect('cause' in sent[0]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1' });
+      await p1;
+      sessions.get('sess-1').currentTurn = { causes: null, startedAt: 1 };
+      const p2 = handlers.sessionStart(good);
+      expect('causes' in sent[1]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[1].request_id, spawn_id: 'row-2' });
+      await p2;
+    });
+
     it('journal refusals no_mission / mission_closed become sentences the agent can act on', async () => {
       const a = mk();
       const p1 = a.handlers.sessionStart({ ...good, mission: 99 });
