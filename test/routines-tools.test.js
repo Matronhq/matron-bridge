@@ -307,6 +307,7 @@ describe('formatting', () => {
     expect(unverified).toMatch(/tap on one of this conversation's items/);
     expect(unverified).not.toMatch(/delete routines/);
     expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified' })).not.toMatch(/\(\)/);
+    expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified', why: '   ' })).not.toMatch(/\(\)/);
     expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'not_coordinator' })).toMatch(/not list this conversation as the Coordinator/);
     expect(formatJournalRoutinesError({ error: 'forbidden' })).toMatch(/delete routines/);
     expect(validateUpdateFields({ enabled: true, name: 'x', roomId: 'r' })).toEqual({ ok: true, value: { enabled: true } });
