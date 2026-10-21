@@ -38,12 +38,19 @@ describe('items tracker wiring', () => {
   it('hands the 📌 turn router the journal transcript seams and the ONE local-whisper check', () => {
     // Without these an item voice note never asks the journal again and,
     // with hasLocalWhisper defaulting to false, gets no words at all.
-    const turn = index.slice(index.indexOf('const itemTurnRouter = createItemTurnRouter({'), index.indexOf('function journalOnItem('));
-    expect(turn).toContain('requestTranscript: (blobRef) => journalPublisher.requestTranscript(blobRef),');
-    expect(turn).toContain('fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),');
-    expect(turn).toMatch(/^\s*hasLocalWhisper,$/m);
+    // Comments stripped, both slice bounds checked, whitespace-tolerant
+    // tokens: the same idiom as the chat media router's wiring test.
+    const code = index.replace(/^\s*\/\/.*$/gm, '');
+    const start = code.indexOf('const itemTurnRouter = createItemTurnRouter(');
+    const end = code.indexOf('function journalOnItem(', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const turn = code.slice(start, end);
+    expect(turn).toMatch(/requestTranscript:\s*\((\w+)\)\s*=>\s*journalPublisher\.requestTranscript\(\s*\1\s*\)/);
+    expect(turn).toMatch(/fetchTranscript:\s*\((\w+),\s*(\w+)\)\s*=>\s*journalPublisher\.fetchTranscript\(\s*\1,\s*\2\s*\)/);
+    expect(turn).toMatch(/^\s*hasLocalWhisper\s*(,|:\s*hasLocalWhisper\b)/m);
     // The same constant the chat media router uses, defined once.
-    expect(index.match(/const hasLocalWhisper = /g)).toHaveLength(1);
+    expect(code.match(/const\s+hasLocalWhisper\s*=/g)).toHaveLength(1);
   });
 
   it('registers every item_* tool, each posting through callItems', () => {

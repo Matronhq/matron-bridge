@@ -132,6 +132,18 @@ describe('holding a turn for the journal transcript', () => {
     expect(injected[0].text).toContain('[voice note v.m4a — (transcription failed)]');
   });
 
+  it('a queued retry whose wait GET comes back empty (journal restarted) is busy, not absent', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const fetchTranscript = vi.fn(async () => null);
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(fetchTranscript).toHaveBeenCalledOnce();
+    expect(deps.log.warn).toHaveBeenCalledWith(expect.stringContaining('journal: busy'));
+    expect(deps.log.warn).not.toHaveBeenCalledWith(expect.stringContaining('journal: absent'));
+    expect(injected[0].text).toContain('[voice note v.m4a — (transcription failed)]');
+    expect(deps.setTranscript).not.toHaveBeenCalled();
+  });
+
   it('no local whisper: a retry still pending is waited on twice, then the turn goes out without words', async () => {
     const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
     const fetchTranscript = vi.fn(async () => ({ status: 'pending' }));

@@ -880,6 +880,38 @@ describe('createJournalMediaRouter — journal first, local whisper only when in
     expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: got there');
   });
 
+  // A journal that already answered 'pending' and then drops a wait (it
+  // restarted mid-deploy, a proxy 5xx on the hold) was working on the note:
+  // that is busy, never "install whisper on this box".
+  it('voice: pending at upload, then the wait GET returns null, no local whisper → JOURNAL_BUSY_NOTICE, not the install hint', async () => {
+    const fetchTranscript = sequence({ status: 'pending' }, null);
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript: vi.fn(), hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(fetchTranscript).toHaveBeenCalledTimes(2);
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', JOURNAL_BUSY_NOTICE);
+  });
+
+  it('voice: a queued retry, then the wait GET returns null, no local whisper → JOURNAL_BUSY_NOTICE', async () => {
+    const fetchTranscript = sequence({ status: 'failed' }, null);
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', JOURNAL_BUSY_NOTICE);
+  });
+
+  it('voice: a dropped wait GET on a box with whisper still falls back to it', async () => {
+    const fetchTranscript = sequence({ status: 'pending' }, null);
+    const { route, deps } = makeRouter({
+      fetchTranscript,
+      requestTranscript: vi.fn(),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+    });
+    await route(session, voice, ctx);
+    expect(deps.transcribe).toHaveBeenCalledTimes(1);
+  });
+
   it('JOURNAL_BUSY_NOTICE says the journal may still be working, to wait a couple of minutes or send shorter notes', () => {
     expect(JOURNAL_BUSY_NOTICE).toMatch(/may still be working/i);
     expect(JOURNAL_BUSY_NOTICE).toMatch(/couple of minutes/i);
