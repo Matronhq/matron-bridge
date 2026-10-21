@@ -184,7 +184,7 @@ import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/ro
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
-import { createJournalMediaRouter } from './lib/journal-media.js';
+import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
@@ -9365,6 +9365,10 @@ function journalOnText(session, body, { username, seq, convoId }) {
 // file/image injection passes skipJournalMirror; a voice note's transcript IS
 // published (as the user's message, via sendTextToSession) so it's visible in
 // the journal too, mirroring what the Matrix m.audio path records.
+// Whether this box has whisper installed (model file + CLI). Local
+// transcription is an opt-in fallback behind the journal; nothing here
+// installs it.
+const hasLocalWhisper = () => localWhisperAvailable({ modelPath: WHISPER_MODEL_PATH });
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
@@ -9374,7 +9378,7 @@ const journalMediaRouter = createJournalMediaRouter({
   // bridge never installs it.
   fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),
   requestTranscript: (blobRef) => journalPublisher.requestTranscript(blobRef),
-  hasLocalWhisper: () => localWhisperAvailable({ modelPath: WHISPER_MODEL_PATH }),
+  hasLocalWhisper,
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
@@ -9390,18 +9394,14 @@ const journalMediaRouter = createJournalMediaRouter({
     console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s, audio=${result.hasAudio}) in ${outDir}`);
     // Narration: the user's commentary track, timestamped to cross-reference
     // the frame names. The journal's (journalNarration, from the router) when
-    // it has one; otherwise this box's whisper, only when it is installed.
-    // Best-effort — a whisper failure loses the narration, never the frames —
-    // and skipped outright when the recording has no audio stream (mic-off
-    // screen recordings, the common case).
-    let narration = journalNarration;
-    if (journalNarration === null && result.hasAudio && localWhisperAvailable({ modelPath: WHISPER_MODEL_PATH })) {
-      try {
-        narration = await transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() });
-      } catch (e) {
-        console.warn(`[journal-media] video narration transcription failed for ${safeName}: ${e.message} — delivering frames without it`);
-      }
-    }
+    // it has one; otherwise this box's whisper, only when it is installed and
+    // the recording has audio (see chooseNarration).
+    const narration = await chooseNarration({
+      journalNarration,
+      hasAudio: result.hasAudio,
+      hasLocalWhisper,
+      transcribeSegments: async () => transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
+    });
     const blocks = [];
     if (caption) blocks.push({ type: 'text', text: caption });
     blocks.push({
