@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { createJournalMediaRouter, EMPTY_VOICE_NOTICE, JOURNAL_FAILED_NOTICE } from '../lib/journal-media.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
@@ -7,10 +8,14 @@ const silentLog = { warn: () => {}, error: () => {} };
 // save/build + inject sinks) is a mock, so the fetch -> transcribe/save ->
 // inject flow is exercised without a journal server, whisper, or a real claude
 // session. The returned routeMedia is async and must never throw/reject.
+// The harness box has local whisper installed (hasLocalWhisper true), which is
+// what the transcribe-here tests below are about; the journal-first tests
+// override it to false.
 function makeRouter(overrides = {}) {
   const deps = {
     fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('bytes'), contentType: 'application/pdf' })),
     transcribe: vi.fn(async () => 'hello world'),
+    hasLocalWhisper: vi.fn(() => true),
     buildSavedBlocks: vi.fn(() => [{ type: 'text', text: 'File saved to /w/report.pdf' }]),
     injectText: vi.fn(() => true),
     injectBlocks: vi.fn(() => true),
@@ -533,18 +538,29 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
     }));
   });
 
+  // A box with local whisper: anything short of the journal's words falls back
+  // to it — but failed/none ask the journal to try again first, and pending
+  // waits once more, before this box spends a whisper run.
   it.each([
-    ['failed', { status: 'failed' }],
-    ['none (journal has no cloud transcriber)', { status: 'none' }],
-    ['still pending after the wait', { status: 'pending' }],
-    ['done but empty', { status: 'done', transcript: '   ' }],
-    ['null (older journal, network error)', null],
-  ])('falls back to fetch + local whisper when the journal answer is %s', async (_label, answer) => {
+    ['failed, and failed again on the retry', { status: 'failed' }, { status: 'pending' }, [{ status: 'failed' }], 1],
+    ['none (journal has no cloud transcriber), and none on the retry', { status: 'none' }, { status: 'none' }, [], 1],
+    ['still pending after waiting once more', { status: 'pending' }, null, [{ status: 'pending' }], 0],
+    ['done but empty', { status: 'done', transcript: '   ' }, null, [], 0],
+    ['null (older journal, network error)', null, null, [], 0],
+  ])('falls back to fetch + local whisper when the journal answer is %s', async (_label, first, posted, later, posts) => {
+    const answers = [first, ...later];
+    const fetchTranscript = vi.fn(async () => (answers.length > 1 ? answers.shift() : answers[0]));
+    const requestTranscript = vi.fn(async () => posted);
     const { route, deps } = makeRouter({
-      fetchTranscript: vi.fn(async () => answer),
+      fetchTranscript,
+      requestTranscript,
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
     });
     await route(session, voice, ctx);
+    expect(fetchTranscript.mock.calls[0]).toEqual(['vn-1']);
+    expect(fetchTranscript).toHaveBeenCalledTimes(1 + later.length);
+    for (const call of fetchTranscript.mock.calls.slice(1)) expect(call).toEqual(['vn-1', { waitS: 30 }]);
+    expect(requestTranscript).toHaveBeenCalledTimes(posts);
     expect(deps.fetchMedia).toHaveBeenCalledWith('vn-1');
     expect(deps.transcribe).toHaveBeenCalledTimes(1);
     expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: hello world');
@@ -552,16 +568,17 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
 
   // A silent 0.07 s note: the journal's transcriber marked it 'failed', the
   // bridge fell back to a whisper this box doesn't have, and the user was told
-  // to install whisper. The recording was the problem, so say that.
-  it("journal 'failed' on a box without whisper asks for a re-recording, not an install", async () => {
+  // to install whisper. The recording was the problem, so say that — once the
+  // journal has failed it twice.
+  it("journal 'failed' twice on a box without whisper asks for a re-recording, not an install", async () => {
     const { route, deps } = makeRouter({
+      hasLocalWhisper: () => false,
       fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
-      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
-      transcribe: vi.fn(async () => {
-        throw Object.assign(new Error('no whisper-cli'), { code: 'TRANSCRIBE_UNAVAILABLE', dependency: 'whisper.cpp' });
-      }),
+      requestTranscript: vi.fn(async () => ({ status: 'pending' })),
     });
     await route(session, voice, ctx);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.fetchMedia).not.toHaveBeenCalled();
     expect(deps.injectText).not.toHaveBeenCalled();
     expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', JOURNAL_FAILED_NOTICE);
   });
@@ -571,14 +588,29 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
     ['null (older journal, network error)', null],
   ])('journal answer %s on a box without whisper still names the install gap', async (_label, answer) => {
     const { route, deps } = makeRouter({
+      hasLocalWhisper: () => false,
       fetchTranscript: vi.fn(async () => answer),
+      requestTranscript: vi.fn(async () => answer),
+    });
+    await route(session, voice, ctx);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/isn't set up on this box \(whisper\.cpp missing\)/);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/install-whisper\.sh/);
+  });
+
+  // A box whose whisper is installed but whose ffmpeg is not: the engine names
+  // the missing piece, and that is still the notice.
+  it('a local whisper that turns out unusable names the missing dependency', async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'none' })),
+      requestTranscript: vi.fn(async () => ({ status: 'none' })),
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
       transcribe: vi.fn(async () => {
-        throw Object.assign(new Error('no whisper-cli'), { code: 'TRANSCRIBE_UNAVAILABLE', dependency: 'whisper.cpp' });
+        throw Object.assign(new Error('ffmpeg is not installed'), { code: 'TRANSCRIBE_UNAVAILABLE', dependency: 'ffmpeg' });
       }),
     });
     await route(session, voice, ctx);
-    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/isn't set up on this box \(whisper\.cpp missing\)/);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/isn't set up on this box \(ffmpeg missing\)/);
   });
 
   it('whisper hearing no words (TRANSCRIBE_EMPTY) asks for a re-recording', async () => {
@@ -621,6 +653,271 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
     await route(session, { type: 'image', blobRef: 'i', contentType: 'image/png', name: 'a.png' }, ctx);
     await route(session, { type: 'file', blobRef: 'o', contentType: 'application/octet-stream', name: 'a.bin' }, ctx);
     expect(fetchTranscript).not.toHaveBeenCalled();
+  });
+});
+
+// The journal is the transcriber: a bridge asks it, asks it again when it has
+// nothing, and runs whisper itself only when whisper is actually installed
+// here (hasLocalWhisper). The notice says which of those ran out.
+describe('createJournalMediaRouter — journal first, local whisper only when installed', () => {
+  const voice = { type: 'file', blobRef: 'vn-2', contentType: 'audio/mp4', name: 'note.m4a' };
+  const sequence = (...answers) => vi.fn(async () => (answers.length > 1 ? answers.shift() : answers[0]));
+
+  it('voice: journal failed → POST retry → done delivers words, local transcribe never called', async () => {
+    const fetchTranscript = sequence({ status: 'failed' }, { status: 'done', transcript: ' second time lucky ' });
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript });
+    await route(session, voice, ctx);
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    expect(requestTranscript).toHaveBeenCalledWith('vn-2');
+    expect(fetchTranscript.mock.calls).toEqual([['vn-2'], ['vn-2', { waitS: 30 }]]);
+    expect(deps.fetchMedia).not.toHaveBeenCalled();
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: second time lucky');
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('voice: a retry that answers done at once delivers without another wait', async () => {
+    const fetchTranscript = sequence({ status: 'failed' });
+    const requestTranscript = vi.fn(async () => ({ status: 'done', transcript: 'already there' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(fetchTranscript).toHaveBeenCalledTimes(1);
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: already there');
+  });
+
+  it('voice: journal failed twice, no local whisper → JOURNAL_FAILED_NOTICE', async () => {
+    const fetchTranscript = sequence({ status: 'failed' }, { status: 'failed' });
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.fetchMedia).not.toHaveBeenCalled();
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', JOURNAL_FAILED_NOTICE);
+    expect(JOURNAL_FAILED_NOTICE).toMatch(/journal couldn't transcribe/i);
+    expect(JOURNAL_FAILED_NOTICE.startsWith("🎤 The journal couldn't transcribe that voice note")).toBe(true);
+  });
+
+  it('voice: journal failed, retry none, local whisper available → local transcribe called once', async () => {
+    const fetchTranscript = sequence({ status: 'failed' }, { status: 'none' });
+    const requestTranscript = vi.fn(async () => ({ status: 'none' }));
+    const { route, deps } = makeRouter({
+      fetchTranscript,
+      requestTranscript,
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+      transcribe: vi.fn(async () => 'heard it here'),
+    });
+    await route(session, voice, ctx);
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    expect(deps.transcribe).toHaveBeenCalledTimes(1);
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: heard it here');
+  });
+
+  it('voice: a retry the journal could not queue (none, busy) is not waited on', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'none' }));
+    const requestTranscript = vi.fn(async () => ({ status: 'none', reason: 'busy' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(fetchTranscript).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/install-whisper\.sh/);
+  });
+
+  // Review focus: an older journal has the GET but answers the retry POST 404
+  // (requestTranscript null). The journal never got a second go, so on a box
+  // without whisper the actionable answer is the install hint — never the
+  // "journal couldn't transcribe" ask to re-record.
+  it.each([
+    ['fetchTranscript null (older journal)', null, null],
+    ['GET failed, POST 404 (older journal)', { status: 'failed' }, null],
+    ['GET none, POST 404 (older journal)', { status: 'none' }, null],
+  ])('voice: %s, no local whisper → install hint', async (_label, got, posted) => {
+    const fetchTranscript = vi.fn(async () => got);
+    const requestTranscript = vi.fn(async () => posted);
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    const notice = deps.publishNotice.mock.calls[0][1];
+    expect(notice).not.toBe(JOURNAL_FAILED_NOTICE);
+    expect(notice).toMatch(/isn't set up on this box/);
+    expect(notice).toMatch(/install-whisper\.sh/);
+    // Asked again only when the journal answered at all.
+    expect(requestTranscript).toHaveBeenCalledTimes(got ? 1 : 0);
+  });
+
+  it("voice: journal 'failed' with no retry wired and no local whisper → install hint", async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
+      hasLocalWhisper: () => false,
+    });
+    await route(session, voice, ctx);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/install-whisper\.sh/);
+  });
+
+  it('voice: journal none (busy) → retry → pending then done within the second wait', async () => {
+    const fetchTranscript = sequence(
+      { status: 'none' },
+      { status: 'pending' },
+      { status: 'done', transcript: 'worth the wait' },
+    );
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    expect(fetchTranscript.mock.calls).toEqual([['vn-2'], ['vn-2', { waitS: 30 }], ['vn-2', { waitS: 30 }]]);
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: worth the wait');
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('voice: a journal still pending after every wait, no local whisper → a notice, no words', async () => {
+    const fetchTranscript = sequence({ status: 'failed' }, { status: 'pending' });
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(fetchTranscript).toHaveBeenCalledTimes(3);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+  });
+
+  it('voice: the journal done with no words, no local whisper → the empty-note notice', async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'done', transcript: '  ' })),
+      requestTranscript: vi.fn(async () => ({ status: 'done', transcript: '  ' })),
+      hasLocalWhisper: () => false,
+    });
+    await route(session, voice, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', EMPTY_VOICE_NOTICE);
+  });
+
+  it('voice: a throwing requestTranscript is a missing retry, never a throw', async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
+      requestTranscript: vi.fn(async () => { throw new Error('boom'); }),
+      hasLocalWhisper: () => false,
+    });
+    await route(session, voice, ctx);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/install-whisper\.sh/);
+  });
+
+  it('voice: unwired hasLocalWhisper means no local whisper (it is opt-in)', async () => {
+    const deps = {
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/ogg' })),
+      transcribe: vi.fn(async () => 'never'),
+      buildSavedBlocks: vi.fn(() => []),
+      injectText: vi.fn(() => true),
+      injectBlocks: vi.fn(() => true),
+      echoToRoom: vi.fn(),
+      publishNotice: vi.fn(),
+      log: silentLog,
+    };
+    const route = createJournalMediaRouter(deps);
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg' }, ctx);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/install-whisper\.sh/);
+  });
+
+  it('voice: audio only the store calls audio, no local whisper → install hint, no transcribe', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+      hasLocalWhisper: () => false,
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: null, name: 'v.m4a' }, ctx);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.buildSavedBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/install-whisper\.sh/);
+  });
+
+  it('voice: a throwing hasLocalWhisper counts as no local whisper', async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => null),
+      hasLocalWhisper: () => { throw new Error('fs gone'); },
+    });
+    await route(session, voice, ctx);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/install-whisper\.sh/);
+  });
+
+  const videoFetch = () => vi.fn(async () => ({ buffer: Buffer.from('mov'), contentType: 'video/quicktime' }));
+  const video = { type: 'file', blobRef: 'vid-2', contentType: 'video/quicktime', name: 'clip.mov' };
+  const videoBlocks = [{ type: 'text', text: '🎬 Video attached: clip.mov' }];
+
+  it('video: journal done with segments → buildVideoBlocks receives narration [{start:1.2,text:\'b\'}]', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: 'b', segments: [{ start_ms: 1200, text: 'b' }] }));
+    const requestTranscript = vi.fn(async () => null);
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript, requestTranscript,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(fetchTranscript).toHaveBeenCalledWith('vid-2');
+    expect(requestTranscript).not.toHaveBeenCalled();
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toEqual([{ start: 1.2, text: 'b' }]);
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, videoBlocks);
+  });
+
+  it('video: journal failed → POST + one wait → done with segments is the narration', async () => {
+    const fetchTranscript = sequence({ status: 'failed' }, { status: 'done', transcript: 'a b', segments: [{ start_ms: 0, text: 'a' }, { start_ms: 65_500, text: 'b' }] });
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript, requestTranscript,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    expect(fetchTranscript.mock.calls).toEqual([['vid-2'], ['vid-2', { waitS: 30 }]]);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toEqual([{ start: 0, text: 'a' }, { start: 65.5, text: 'b' }]);
+  });
+
+  it('video: journal none and no local whisper → narration null, frames still delivered', async () => {
+    const fetchTranscript = sequence({ status: 'none' }, { status: 'pending' });
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript, requestTranscript, hasLocalWhisper: () => false,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    // POST and wait once — not twice, a video's narration is a nice-to-have.
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    expect(fetchTranscript.mock.calls).toEqual([['vid-2'], ['vid-2', { waitS: 30 }]]);
+    expect(deps.buildVideoBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toBeNull();
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, videoBlocks);
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('video: an older journal (null) skips the retry and passes narration null', async () => {
+    const fetchTranscript = vi.fn(async () => null);
+    const requestTranscript = vi.fn(async () => null);
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript, requestTranscript,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(fetchTranscript).toHaveBeenCalledTimes(1);
+    expect(requestTranscript).not.toHaveBeenCalled();
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toBeNull();
+  });
+
+  it('video: a throwing fetchTranscript still delivers the frames', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      fetchTranscript: vi.fn(async () => { throw new Error('boom'); }),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toBeNull();
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, videoBlocks);
+  });
+
+  it('video: unwired fetchTranscript passes narration null (the builder decides)', async () => {
+    const { route, deps } = makeRouter({ fetchMedia: videoFetch(), buildVideoBlocks: vi.fn(async () => videoBlocks) });
+    await route(session, video, ctx);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toBeNull();
   });
 });
 
@@ -676,5 +973,29 @@ describe('createJournalMediaRouter — turn causes', () => {
     const q = makeRouter();
     await q.route({ ...session, busy: true }, file, ctx);
     expect(q.deps.queueMedia.mock.calls[0][1]).not.toHaveProperty('cause');
+  });
+});
+
+// index.js wiring (source inspection): the chat media router is journal-first
+// and only reaches for local whisper where it is installed.
+describe('index.js journal media router wiring (source inspection)', () => {
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const start = indexSrc.indexOf('const journalMediaRouter = createJournalMediaRouter({');
+  const wiring = indexSrc.slice(start, indexSrc.indexOf('buildSavedBlocks:', start));
+
+  it('imports localWhisperAvailable from lib/transcribe.js', () => {
+    expect(indexSrc).toMatch(/import \{[^}]*\blocalWhisperAvailable\b[^}]*\} from '\.\/lib\/transcribe\.js'/);
+  });
+
+  it('passes requestTranscript, a fetchTranscript that forwards its wait, and hasLocalWhisper', () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(wiring).toMatch(/requestTranscript: \(blobRef\) => journalPublisher\.requestTranscript\(blobRef\)/);
+    expect(wiring).toMatch(/fetchTranscript: \(blobRef, opts\) => journalPublisher\.fetchTranscript\(blobRef, opts\)/);
+    expect(wiring).toMatch(/hasLocalWhisper: \(\) => localWhisperAvailable\(\{ modelPath: WHISPER_MODEL_PATH \}\)/);
+  });
+
+  it('runs local video narration only when the journal had none and whisper is installed', () => {
+    expect(wiring).toMatch(/buildVideoBlocks: async \(session, \{ buffer, mime, name, caption, narration: journalNarration = null \}\)/);
+    expect(wiring).toMatch(/journalNarration === null && result\.hasAudio && localWhisperAvailable\(\{ modelPath: WHISPER_MODEL_PATH \}\)/);
   });
 });
