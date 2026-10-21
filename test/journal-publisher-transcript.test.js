@@ -68,10 +68,17 @@ describe('journal publisher transcript requests', () => {
     expect(reqs[0].headers.authorization).toBe('Bearer tok-r');
   });
 
-  it('requestTranscript passes waitS through as ?wait=', async () => {
-    await setup((_entry, res) => json(res, 200, { status: 'done', transcript: 'hi', segments: [] }));
-    await pub.requestTranscript('vn-2', { waitS: 5 });
+  it('requestTranscript passes waitS through as ?wait= and returns segments', async () => {
+    const answer = { status: 'done', transcript: 'hi', segments: [{ start_ms: 0, text: 'hi' }] };
+    await setup((_entry, res) => json(res, 200, answer));
+    expect(await pub.requestTranscript('vn-2', { waitS: 5 })).toEqual(answer);
     expect(server.received.filter((r) => r.url.startsWith('/media/')).map((r) => r.url)).toEqual(['/media/vn-2/transcript?wait=5']);
+  });
+
+  it('requestTranscript: a network failure is null and warns, never throws', async () => {
+    await setup((_entry, res) => res.socket.destroy());
+    await expect(pub.requestTranscript('x')).resolves.toBeNull();
+    expect(transcriptWarnings()).toHaveLength(1);
   });
 
   it('requestTranscript: 404 → null', async () => {
