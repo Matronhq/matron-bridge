@@ -297,6 +297,19 @@ describe('formatting', () => {
     expect(formatRoutineRunAck({ delivered: false, reason: 'no_coordinator' }, 'daily-sweep')).toMatch(/no Coordinator/);
     expect(formatRoutineRunAck({ delivered: false, reason: 'busy' }, 'daily-sweep')).toMatch(/try again/);
     expect(formatJournalRoutinesError({ error: 'conflict', blocked_by: 'cap' })).toMatch(/maximum/);
+    // The journal's provenance gate on a Coordinator's routine write: say what
+    // it needs (the user's own ask) and carry the journal's why, never the
+    // generic "delete routines" wording that sends operators hunting for a
+    // missing deployment.
+    const unverified = formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified', why: 'started by agent' });
+    expect(unverified).toMatch(/user's own ask/);
+    expect(unverified).toMatch(/\(started by agent\)/);
+    expect(unverified).toMatch(/tap on one of this conversation's items/);
+    expect(unverified).not.toMatch(/delete routines/);
+    expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified' })).not.toMatch(/\(\)/);
+    expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified', why: '   ' })).not.toMatch(/\(\)/);
+    expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'not_coordinator' })).toMatch(/not list this conversation as the Coordinator/);
+    expect(formatJournalRoutinesError({ error: 'forbidden' })).toMatch(/delete routines/);
     expect(validateUpdateFields({ enabled: true, name: 'x', roomId: 'r' })).toEqual({ ok: true, value: { enabled: true } });
     expect(validateUpdateFields({ trigger: { kind: 'context_over', pct: 55 } })).toEqual({ ok: true, value: { trigger: { kind: 'context_over', pct: 55 } } });
     expect(validateUpdateFields({ trigger: { kind: 'stalled' } })).toEqual({ ok: true, value: { trigger: { kind: 'stalled' } } });
