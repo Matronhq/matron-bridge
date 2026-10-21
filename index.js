@@ -9515,8 +9515,8 @@ const itemTurnRouter = createItemTurnRouter({
   saveAttachments: saveItemAttachments,
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   // Same order as a chat voice note: the journal's words first (asked again
-  // when its upload-time job failed or its follow-up never came), this box's
-  // whisper only where it is installed.
+  // whenever the marker carries no words), this box's whisper only where it
+  // is installed.
   requestTranscript: (blobRef) => journalPublisher.requestTranscript(blobRef),
   fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),
   hasLocalWhisper,

@@ -31,6 +31,13 @@ function harness(opts = {}) {
 }
 const session = { journalConvoId: 'c1', busy: false };
 const tick = () => new Promise((r) => setTimeout(r, 5));
+const until = async (cond) => { for (let i = 0; i < 200 && !cond(); i++) await tick(); expect(cond()).toBe(true); };
+// A journal wait the test releases by hand: the retry is in flight until then.
+function deferredWait(answer) {
+  let release;
+  const gate = new Promise((r) => { release = () => r(answer); });
+  return { fetchTranscript: vi.fn(() => gate), release };
+}
 
 describe('holding a turn for the journal transcript', () => {
   it('a follow-up is turn-worthy; a plain updated marker still is not', () => {
@@ -193,6 +200,54 @@ describe('holding a turn for the journal transcript', () => {
     await route(session, { payload: followUp() }, { username: 'alice' });
     expect(injected).toHaveLength(1);
     expect(deps.setTranscript).toHaveBeenCalledOnce();
+  });
+
+  it('a replayed frame or follow-up for a delivered comment never asks the journal again', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: 'retry words' }));
+    // A long hold: a replayed `commented` frame that waited would time the test out.
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript, holdTimeoutMs: 60_000 });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(injected).toHaveLength(1);
+    expect(requestTranscript).toHaveBeenCalledOnce();
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    await route(session, { payload: pending() }, { username: 'alice' });
+    expect(requestTranscript).toHaveBeenCalledOnce();
+    expect(fetchTranscript).toHaveBeenCalledOnce();
+    expect(deps.setTranscript).toHaveBeenCalledOnce();
+    expect(injected).toHaveLength(1);
+  });
+
+  it('hold timeout, retry pending, the journal follow-up lands during the wait: one turn, one write-back', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { fetchTranscript, release } = deferredWait({ status: 'done', transcript: 'retry words' });
+    const { route, deps, injected } = harness({ holdTimeoutMs: 20, requestTranscript, fetchTranscript });
+    const run = route(session, { payload: pending() }, { username: 'alice' });
+    await until(() => fetchTranscript.mock.calls.length === 1);
+    // The follow-up comes after the hold gave up, while the retry is waiting.
+    const late = route(session, { payload: followUp() }, { username: 'alice' });
+    await tick();
+    expect(injected).toHaveLength(0);
+    release();
+    await Promise.all([run, late]);
+    expect(injected).toHaveLength(1);
+    expect(injected[0].text).toContain('transcript: retry words');
+    expect(deps.setTranscript.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(requestTranscript).toHaveBeenCalledOnce();
+  });
+
+  it('a typed reply behind a held-then-retrying note is delivered after it, in marker order', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { fetchTranscript, release } = deferredWait({ status: 'done', transcript: 'the note' });
+    const { route, injected } = harness({ holdTimeoutMs: 20, requestTranscript, fetchTranscript });
+    const a = route(session, { payload: pending('ic_a') }, { username: 'alice' });
+    const c = route(session, { payload: { ...base, action: 'commented', comment: { id: 'ic_c', body: 'typed', attachments: [] } } }, { username: 'alice' });
+    await until(() => fetchTranscript.mock.calls.length === 1);
+    await tick();
+    expect(injected).toHaveLength(0);
+    release();
+    await Promise.all([a, c]);
+    expect(injected.map((i) => i.text.split('\n')[1])).toEqual(['[voice note v.m4a — transcript: the note]', 'typed']);
   });
 
   it('no follow-up in time and no journal answer: falls back to local whisper, and a late follow-up is not a second turn', async () => {
