@@ -11,6 +11,9 @@ const followUp = (id = 'ic_1', over = {}) => ({
   ...base, action: 'updated', transcription: 'done', for_action: 'commented',
   comment: { id, body: '', attachments: [audio({ transcript: 'use option A', transcript_status: 'done' })] }, ...over,
 });
+const failedFollowUp = (id = 'ic_1') => followUp(id, {
+  transcription: 'failed', comment: { id, body: '', attachments: [audio({ transcript_status: 'failed' })] },
+});
 
 function harness(opts = {}) {
   const injected = [];
@@ -55,19 +58,145 @@ describe('holding a turn for the journal transcript', () => {
     expect(deps.setTranscript).not.toHaveBeenCalled();
   });
 
-  it('on transcription:failed the turn is released and this bridge tries its own whisper', async () => {
-    const { route, deps, injected } = harness();
+  it('failed follow-up, retry fails, local whisper available → local transcribe, PATCH once', async () => {
+    // The journal's retry route is missing (an older journal: 404 -> null),
+    // so this box's own whisper — installed here — is the fallback.
+    const requestTranscript = vi.fn(async () => null);
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript: vi.fn(), hasLocalWhisper: () => true });
     const run = route(session, { payload: pending() }, { username: 'alice' });
     await tick();
-    await route(session, { payload: followUp('ic_1', { transcription: 'failed', comment: { id: 'ic_1', body: '', attachments: [audio({ transcript_status: 'failed' })] } }) }, { username: 'alice' });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
     await run;
+    expect(requestTranscript).toHaveBeenCalledWith('b1');
     expect(injected).toHaveLength(1);
     expect(injected[0].text).toContain('transcript: local whisper words');
+    expect(deps.transcribe).toHaveBeenCalledOnce();
+    expect(deps.setTranscript).toHaveBeenCalledOnce();
+    expect(deps.setTranscript).toHaveBeenCalledWith('it_1', 'ic_1', { blob_ref: 'b1', transcript: 'local whisper words' });
+  });
+
+  it('failed follow-up, the retry fails too, local whisper available → local transcribe after ONE wait', async () => {
+    // A box with whisper gives the journal one wait, not two: it can do the
+    // job itself (the same rule as a chat voice note).
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const fetchTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript, hasLocalWhisper: () => true });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(fetchTranscript).toHaveBeenCalledOnce();
+    expect(fetchTranscript).toHaveBeenCalledWith('b1', { waitS: 30 });
+    expect(deps.transcribe).toHaveBeenCalledOnce();
+    expect(deps.setTranscript).toHaveBeenCalledOnce();
+    expect(injected[0].text).toContain('transcript: local whisper words');
+  });
+
+  it('failed follow-up → retry → journal words PATCHed back once, local transcribe not called', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: '  use option B  ' }));
+    // Local whisper IS installed: the journal's words still win, so it never runs.
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript, hasLocalWhisper: () => true });
+    const run = route(session, { payload: pending() }, { username: 'alice' });
+    await tick();
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    await run;
+    expect(requestTranscript).toHaveBeenCalledOnce();
+    expect(requestTranscript).toHaveBeenCalledWith('b1');
+    expect(fetchTranscript).toHaveBeenCalledWith('b1', { waitS: 30 });
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.fetchMedia).not.toHaveBeenCalled();
+    expect(deps.setTranscript).toHaveBeenCalledOnce();
+    expect(deps.setTranscript).toHaveBeenCalledWith('it_1', 'ic_1', { blob_ref: 'b1', transcript: 'use option B' });
+    expect(injected).toHaveLength(1);
+    expect(injected[0].text).toContain('[voice note v.m4a — transcript: use option B]');
+  });
+
+  it('failed follow-up, retry fails, no local whisper → "(transcription failed)" and no PATCH', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const fetchTranscript = vi.fn(async () => ({ status: 'failed' }));
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript });
+    const run = route(session, { payload: pending() }, { username: 'alice' });
+    await tick();
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    await run;
+    expect(requestTranscript).toHaveBeenCalledOnce();
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.fetchMedia).not.toHaveBeenCalled();
+    expect(deps.setTranscript).not.toHaveBeenCalled();
+    expect(injected).toHaveLength(1);
+    expect(injected[0].text).toContain('[voice note v.m4a — (transcription failed)]');
+  });
+
+  it('no local whisper: a retry still pending is waited on twice, then the turn goes out without words', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const fetchTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(fetchTranscript).toHaveBeenCalledTimes(2);
+    expect(fetchTranscript.mock.calls.every((c) => c[0] === 'b1' && c[1]?.waitS === 30)).toBe(true);
+    expect(deps.setTranscript).not.toHaveBeenCalled();
+    expect(injected[0].text).toContain('(transcription failed)');
+  });
+
+  it('no local whisper: words on the second wait are delivered and PATCHed once', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const fetchTranscript = vi.fn()
+      .mockResolvedValueOnce({ status: 'pending' })
+      .mockResolvedValueOnce({ status: 'done', transcript: 'slow words' });
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(fetchTranscript).toHaveBeenCalledTimes(2);
+    expect(deps.setTranscript).toHaveBeenCalledOnce();
+    expect(injected[0].text).toContain('transcript: slow words');
+  });
+
+  it('a journal too busy to queue the retry is not waited on', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'none', reason: 'busy' }));
+    const fetchTranscript = vi.fn();
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(fetchTranscript).not.toHaveBeenCalled();
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(injected[0].text).toContain('(transcription failed)');
+  });
+
+  it('a journal done with no words and no local whisper writes nothing back and renders the empty marker', async () => {
+    const requestTranscript = vi.fn(async () => ({ status: 'done', transcript: '   ' }));
+    const { route, deps, injected } = harness({ requestTranscript, fetchTranscript: vi.fn() });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.setTranscript).not.toHaveBeenCalled();
+    expect(injected[0].text).toContain('[voice note v.m4a — (no transcript)]');
+  });
+
+  it('a retry that throws, and a hasLocalWhisper that throws, still deliver the turn', async () => {
+    const requestTranscript = vi.fn(async () => { throw new Error('boom'); });
+    const { route, deps, injected } = harness({ requestTranscript, hasLocalWhisper: () => { throw new Error('stat failed'); } });
+    await route(session, { payload: failedFollowUp() }, { username: 'alice' });
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(injected).toHaveLength(1);
+    expect(injected[0].text).toContain('(transcription failed)');
+  });
+
+  it('hold timeout → retry path, not immediate local whisper', async () => {
+    // The journal's follow-up never came: ask it again before running
+    // whisper here, even on a box that has whisper.
+    const requestTranscript = vi.fn(async () => ({ status: 'done', transcript: 'late journal words' }));
+    const fetchTranscript = vi.fn();
+    const { route, deps, injected } = harness({ holdTimeoutMs: 20, requestTranscript, fetchTranscript, hasLocalWhisper: () => true });
+    await route(session, { payload: pending() }, { username: 'alice' });
+    expect(requestTranscript).toHaveBeenCalledWith('b1');
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.setTranscript).toHaveBeenCalledOnce();
+    expect(deps.setTranscript).toHaveBeenCalledWith('it_1', 'ic_1', { blob_ref: 'b1', transcript: 'late journal words' });
+    expect(injected).toHaveLength(1);
+    expect(injected[0].text).toContain('transcript: late journal words');
+    // A late follow-up is still not a second turn, nor a second write-back.
+    await route(session, { payload: followUp() }, { username: 'alice' });
+    expect(injected).toHaveLength(1);
     expect(deps.setTranscript).toHaveBeenCalledOnce();
   });
 
-  it('no follow-up in time: falls back to local whisper, and a late follow-up is not a second turn', async () => {
-    const { route, deps, injected } = harness({ holdTimeoutMs: 20 });
+  it('no follow-up in time and no journal answer: falls back to local whisper, and a late follow-up is not a second turn', async () => {
+    const { route, deps, injected } = harness({ holdTimeoutMs: 20, hasLocalWhisper: () => true });
     await route(session, { payload: pending() }, { username: 'alice' });
     expect(injected).toHaveLength(1);
     expect(injected[0].text).toContain('transcript: local whisper words');
@@ -134,10 +263,20 @@ describe('holding a turn for the journal transcript', () => {
     ]);
   });
 
-  it('a journal without whisper (no status field) behaves exactly as before', async () => {
-    const { route, deps, injected } = harness();
+  it('a journal without whisper (no status field) behaves exactly as before on a box with whisper', async () => {
+    const { route, deps, injected } = harness({ hasLocalWhisper: () => true });
     await route(session, { payload: { ...base, action: 'commented', comment: { id: 'ic_1', body: '', attachments: [audio()] } } }, { username: 'alice' });
     expect(injected).toHaveLength(1);
     expect(deps.transcribe).toHaveBeenCalledOnce();
+  });
+
+  it('a box without whisper never fetches or transcribes the audio itself', async () => {
+    const { route, deps, injected } = harness();
+    await route(session, { payload: { ...base, action: 'commented', comment: { id: 'ic_1', body: '', attachments: [audio()] } } }, { username: 'alice' });
+    expect(injected).toHaveLength(1);
+    expect(deps.fetchMedia).not.toHaveBeenCalled();
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.setTranscript).not.toHaveBeenCalled();
+    expect(injected[0].text).toContain('(transcription failed)');
   });
 });

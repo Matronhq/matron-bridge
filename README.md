@@ -20,11 +20,11 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 - Claude Code CLI and/or Codex CLI installed and authenticated
 - A [matron-journal](https://github.com/Matronhq/matron-journal) server, plus the Matron app signed in to it (to pair the bridge by QR code) or an agent token minted on the journal server with `matron-admin agent add <user> <device-name>`
 
-**Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm). For voice notes: `setup/install-whisper.sh` will install the rest.
+**Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm), and `apt-get install ffmpeg` for the key frames of videos sent in chat. Voice notes are transcribed by the journal, so whisper is optional: `setup/install-whisper.sh` installs it (and ffmpeg) as a local fallback.
 
-**macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@22`. For voice notes: `setup/install-whisper.sh` will run `brew install whisper-cpp ffmpeg` automatically.
+**macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@22`, plus `brew install ffmpeg` for the key frames of videos sent in chat. Voice notes are transcribed by the journal, so whisper is optional: `setup/install-whisper.sh` runs `brew install whisper-cpp ffmpeg` for a local fallback.
 
-**Windows (10 1809+ / Server 2019+):** [Node.js 22+](https://nodejs.org) (`winget install OpenJS.NodeJS.LTS`), [Git for Windows](https://git-scm.com/downloads/win) (`winget install Git.Git` — Git Bash is what gives Claude Code its Bash tool; without it sessions get the PowerShell tool and live Bash output is off), and Claude Code via the native installer (`irm https://claude.ai/install.ps1 | iex`), logged in (`claude`) as the user who will run the bridge. If Claude Code cannot find Git Bash, set `CLAUDE_CODE_GIT_BASH_PATH` in `%USERPROFILE%\.claude\settings.json` (see the [Claude Code setup docs](https://code.claude.com/docs/en/setup#set-up-on-windows)). Not available on Windows: the Codex backend and voice-note transcription.
+**Windows (10 1809+ / Server 2019+):** [Node.js 22+](https://nodejs.org) (`winget install OpenJS.NodeJS.LTS`), [Git for Windows](https://git-scm.com/downloads/win) (`winget install Git.Git` — Git Bash is what gives Claude Code its Bash tool; without it sessions get the PowerShell tool and live Bash output is off), and Claude Code via the native installer (`irm https://claude.ai/install.ps1 | iex`), logged in (`claude`) as the user who will run the bridge. If Claude Code cannot find Git Bash, set `CLAUDE_CODE_GIT_BASH_PATH` in `%USERPROFILE%\.claude\settings.json` (see the [Claude Code setup docs](https://code.claude.com/docs/en/setup#set-up-on-windows)). Not available on Windows: the Codex backend and the local whisper fallback (voice notes are still transcribed by the journal).
 
 For public file and secret viewer links on macOS, install `cloudflared` if you want to publish the local viewer through Cloudflare Tunnel:
 
@@ -277,9 +277,9 @@ relaunches after a non-zero exit.
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
-| `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
-| `WHISPER_LANGUAGE` | Voice-note transcription language | `en` |
-| `WHISPER_PROMPT` | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
+| `WHISPER_MODEL_PATH` | whisper.cpp model for the optional local voice-note fallback. Used only when this file, and the `whisper-cli` built beside it, exist; the journal transcribes first, and the bridge never installs whisper itself | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
+| `WHISPER_LANGUAGE` | Language for the local whisper fallback | `en` |
+| `WHISPER_PROMPT` | Vocabulary hint for the local whisper fallback, passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
 | `SUMMARY_PROVIDERS` | Preference order for conversation titles and rolling TOC summaries, comma-separated from `anthropic`, `openai`, `gemini`. A provider without its key is skipped; a failed request falls through to the next one. Summaries are off when none has a key | `anthropic,openai,gemini` |
 | `SUMMARY_ANTHROPIC_API_KEY` | Dedicated Claude summariser key (`claude-haiku-5-5` by default). Does not change session authentication | — |
 | `SUMMARY_ANTHROPIC_MODEL` | Claude summariser model | `claude-haiku-5-5` |
@@ -287,7 +287,7 @@ relaunches after a non-zero exit.
 | `GEMINI_API_KEY` | Optional Gemini summariser key (`gemini-3-flash-preview` by default) | — |
 | `SUMMARY_MODEL` | Model override for the OpenAI and Gemini summarisers | — |
 
-Voice notes sent in chat are transcribed by the journal at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`, see the journal's protocol doc): the bridge asks `GET /media/:id/transcript` first and only runs its own whisper when the journal has no words for the note (no key, an older journal, or a failed job).
+Voice notes are transcribed by the journal at upload, with a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`) or its own whisper (see the journal's protocol doc). For a voice note sent in chat the bridge asks `GET /media/:id/transcript`; when the journal has no words for it (its job failed, or never ran) the bridge asks it to try again with `POST /media/:id/transcript` and waits for the answer. A voice note on a tracker item follows the same order, and the words are written back to the item's comment. Only when the journal still has no words does the bridge run its own whisper, and only where it is installed (see `WHISPER_MODEL_PATH`); otherwise a chat voice note is not delivered and the user is told why, and a tracker item's turn goes out with `(transcription failed)` in place of the words. Videos sent in chat arrive as key frames, which needs ffmpeg and ffprobe on this machine, narrated from the journal's timestamped transcript of their audio, or by the local whisper fallback where installed.
 
 ## Memory & MCP tuning
 
@@ -441,7 +441,7 @@ matron-bridge/
 ├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
-├── setup/                # OS-dispatching installer, service, whisper
+├── setup/                # OS-dispatching installer, service, optional local whisper
 ├── hooks/                # Claude Code hooks used by bridge sessions
 ├── test/                 # Vitest suite
 ├── SECURITY.md

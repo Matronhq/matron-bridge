@@ -9514,6 +9514,12 @@ const itemTurnRouter = createItemTurnRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   saveAttachments: saveItemAttachments,
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
+  // Same order as a chat voice note: the journal's words first (asked again
+  // when its upload-time job failed or its follow-up never came), this box's
+  // whisper only where it is installed.
+  requestTranscript: (blobRef) => journalPublisher.requestTranscript(blobRef),
+  fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),
+  hasLocalWhisper,
   injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
   queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
