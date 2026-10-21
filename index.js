@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn, execFileSync } from 'child_process';
-import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt } from './lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt, localWhisperAvailable } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
@@ -184,7 +184,7 @@ import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/ro
 import { quotedField } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
-import { createJournalMediaRouter } from './lib/journal-media.js';
+import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
@@ -9365,19 +9365,27 @@ function journalOnText(session, body, { username, seq, convoId }) {
 // file/image injection passes skipJournalMirror; a voice note's transcript IS
 // published (as the user's message, via sendTextToSession) so it's visible in
 // the journal too, mirroring what the Matrix m.audio path records.
+// Whether this box has whisper installed (model file + CLI). Local
+// transcription is an opt-in fallback behind the journal; nothing here
+// installs it.
+const hasLocalWhisper = () => localWhisperAvailable({ modelPath: WHISPER_MODEL_PATH });
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
-  // A journal with a cloud transcriber has the words already; this box's
-  // whisper is the fallback (older journal, no key, failed or slow job).
-  fetchTranscript: (blobRef) => journalPublisher.fetchTranscript(blobRef),
+  // The journal is the transcriber: it has the words already (transcribed at
+  // upload) or is asked to try again. This box's whisper is an opt-in
+  // fallback, used only where its model file and CLI actually exist — the
+  // bridge never installs it.
+  fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),
+  requestTranscript: (blobRef) => journalPublisher.requestTranscript(blobRef),
+  hasLocalWhisper,
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
   // where the file itself would have been saved (iv upload dir / matron
   // files dir).
   // Throws propagate to the router, which falls back to raw-file delivery.
-  buildVideoBlocks: async (session, { buffer, mime, name, caption }) => {
+  buildVideoBlocks: async (session, { buffer, mime, name, caption, narration: journalNarration = null }) => {
     const safeName = safeMediaFilename(name || 'video');
     const stem = safeName.replace(/\.[^.]+$/, '') || 'video';
     const baseDir = sessionDownloadDir(session) || matronFilesDir(session.workdir);
@@ -9385,17 +9393,15 @@ const journalMediaRouter = createJournalMediaRouter({
     const result = await extractVideoFrames(buffer, mime, { outDir });
     console.log(`[journal-media] video frames: ${safeName} -> ${result.frames.length} (${result.kind}/${result.strategy}, ${Math.round(result.durationSeconds)}s, audio=${result.hasAudio}) in ${outDir}`);
     // Narration: the user's commentary track, timestamped to cross-reference
-    // the frame names. Best-effort — a whisper failure loses the narration,
-    // never the frames — and skipped outright when the recording has no
-    // audio stream (mic-off screen recordings, the common case).
-    let narration = null;
-    if (result.hasAudio) {
-      try {
-        narration = await transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() });
-      } catch (e) {
-        console.warn(`[journal-media] video narration transcription failed for ${safeName}: ${e.message} — delivering frames without it`);
-      }
-    }
+    // the frame names. The journal's (journalNarration, from the router) when
+    // it has one; otherwise this box's whisper, only when it is installed and
+    // the recording has audio (see chooseNarration).
+    const narration = await chooseNarration({
+      journalNarration,
+      hasAudio: result.hasAudio,
+      hasLocalWhisper,
+      transcribeSegments: async () => transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
+    });
     const blocks = [];
     if (caption) blocks.push({ type: 'text', text: caption });
     blocks.push({
@@ -9508,6 +9514,12 @@ const itemTurnRouter = createItemTurnRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   saveAttachments: saveItemAttachments,
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
+  // Same order as a chat voice note: the journal's words first (asked again
+  // whenever the marker carries no words), this box's whisper only where it
+  // is installed.
+  requestTranscript: (blobRef) => journalPublisher.requestTranscript(blobRef),
+  fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),
+  hasLocalWhisper,
   injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
   queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],

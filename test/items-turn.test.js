@@ -133,6 +133,10 @@ describe('createItemTurnRouter', () => {
       publishNotice: vi.fn(),
       setTranscript: vi.fn(async () => ({ status: 200, data: {} })),
       getItem: vi.fn(async () => ({ status: 200, data: { item: { body: 'fetched body' }, comments: [] } })),
+      // These tests exercise this box's own whisper: it is installed, and no
+      // journal retry route is wired (test/items-turn-hold.test.js covers
+      // the journal-first order).
+      hasLocalWhisper: () => true,
       log: { warn: () => {}, error: () => {} },
       ...over,
     };
