@@ -825,13 +825,66 @@ describe('createJournalMediaRouter — journal first, local whisper only when in
     expect(JOURNAL_BUSY_NOTICE).not.toMatch(/install-whisper/);
   });
 
-  it('voice: pending at upload and still pending after the extra wait, no local whisper → the journal-busy notice', async () => {
+  // A note the journal is already working on (pending at upload) gets the
+  // same patience as one it was asked to retry: its whisper fallback can take
+  // a couple of minutes. Total extra waits stay at most waits + 1 (no
+  // whisper: 3 → 20 + 30 + 30 + 30 s), so the worst case is unchanged.
+  it('voice: pending at upload, no local whisper → two more waits, then the journal-busy notice', async () => {
     const fetchTranscript = vi.fn(async () => ({ status: 'pending' }));
     const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
     const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
     await route(session, voice, ctx);
+    expect(fetchTranscript.mock.calls).toEqual([['vn-2'], ['vn-2', { waitS: 30 }], ['vn-2', { waitS: 30 }]]);
     expect(requestTranscript).not.toHaveBeenCalled();
     expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', JOURNAL_BUSY_NOTICE);
+  });
+
+  it('voice: pending at upload, done on the second extra wait, no local whisper → delivered', async () => {
+    const fetchTranscript = sequence({ status: 'pending' }, { status: 'pending' }, { status: 'done', transcript: 'long note' });
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript: vi.fn(), hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(fetchTranscript).toHaveBeenCalledTimes(3);
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: long note');
+  });
+
+  it('voice: pending at upload, local whisper installed → one more wait, then local whisper', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({
+      fetchTranscript,
+      requestTranscript: vi.fn(),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+    });
+    await route(session, voice, ctx);
+    expect(fetchTranscript.mock.calls).toEqual([['vn-2'], ['vn-2', { waitS: 30 }]]);
+    expect(deps.transcribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('voice: pending twice, then failed, no local whisper → POST and one wait (the shared budget), ~110 s worst case', async () => {
+    const fetchTranscript = sequence({ status: 'pending' }, { status: 'pending' }, { status: 'failed' }, { status: 'pending' });
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(requestTranscript).toHaveBeenCalledTimes(1);
+    // 1 default GET + 3 waits of 30 s in all.
+    expect(fetchTranscript).toHaveBeenCalledTimes(4);
+    expect(fetchTranscript.mock.calls.slice(1).every((c) => c[1] && c[1].waitS === 30)).toBe(true);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', JOURNAL_BUSY_NOTICE);
+  });
+
+  it('voice: pending once, then failed, no local whisper → POST and two waits', async () => {
+    const fetchTranscript = sequence({ status: 'pending' }, { status: 'failed' }, { status: 'pending' }, { status: 'done', transcript: 'got there' });
+    const requestTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const { route, deps } = makeRouter({ fetchTranscript, requestTranscript, hasLocalWhisper: () => false });
+    await route(session, voice, ctx);
+    expect(fetchTranscript).toHaveBeenCalledTimes(4);
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: got there');
+  });
+
+  it('JOURNAL_BUSY_NOTICE says the journal may still be working, to wait a couple of minutes or send shorter notes', () => {
+    expect(JOURNAL_BUSY_NOTICE).toMatch(/may still be working/i);
+    expect(JOURNAL_BUSY_NOTICE).toMatch(/couple of minutes/i);
+    expect(JOURNAL_BUSY_NOTICE).toMatch(/shorter/i);
+    expect(JOURNAL_BUSY_NOTICE).not.toMatch(/install-whisper/);
   });
 
   it('voice: the journal heard no words and an installed whisper turns out unusable → the empty-note notice', async () => {
@@ -981,6 +1034,51 @@ describe('createJournalMediaRouter — journal first, local whisper only when in
     expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toBeNull();
     expect(deps.injectBlocks).toHaveBeenCalledWith(session, videoBlocks);
     expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('video: pending at upload and still pending after the one extra wait → narration null, no POST', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'pending' }));
+    const requestTranscript = vi.fn();
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript, requestTranscript,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(fetchTranscript.mock.calls).toEqual([['vid-2'], ['vid-2', { waitS: 30 }]]);
+    expect(requestTranscript).not.toHaveBeenCalled();
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toBeNull();
+  });
+
+  // Segments the bridge can't read are an unknown, not the journal saying it
+  // heard nothing: null keeps local narration possible.
+  it('video: done with only malformed segments → narration null', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: 'x', segments: [{ start_ms: 'soon', text: 'x' }, { start_ms: 5, text: '  ' }, null] }));
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toBeNull();
+  });
+
+  it('video: done with an empty segments list → narration [] (the journal heard nothing)', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: '', segments: [] }));
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toEqual([]);
+  });
+
+  it('video: done with some malformed segments keeps the good ones', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: 'a', segments: [{ start_ms: 'x', text: 'bad' }, { start_ms: 2000, text: 'a' }] }));
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(), fetchTranscript,
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, video, ctx);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].narration).toEqual([{ start: 2, text: 'a' }]);
   });
 
   it('video: an older journal (null) skips the retry and passes narration null', async () => {
@@ -1138,7 +1236,13 @@ describe('index.js journal media router wiring (source inspection)', () => {
   });
 
   it('passes hasLocalWhisper, requestTranscript, and a fetchTranscript that forwards its wait', () => {
-    expect(wiring).toMatch(/\bhasLocalWhisper\b\s*(,|:\s*hasLocalWhisper\b)/);
+    // The router's own options end where the video builder begins, so a
+    // hasLocalWhisper inside the builder's chooseNarration call can't stand
+    // in for a missing router option.
+    const optionsEnd = wiring.indexOf('buildVideoBlocks:');
+    expect(optionsEnd).toBeGreaterThan(-1);
+    const routerOptions = wiring.slice(0, optionsEnd);
+    expect(routerOptions).toMatch(/\bhasLocalWhisper\b\s*(,|:\s*hasLocalWhisper\b)/);
     expect(wiring).toMatch(/requestTranscript:\s*\((\w+)\)\s*=>\s*journalPublisher\.requestTranscript\(\s*\1\s*\)/);
     expect(wiring).toMatch(/fetchTranscript:\s*\((\w+),\s*(\w+)\)\s*=>\s*journalPublisher\.fetchTranscript\(\s*\1,\s*\2\s*\)/);
   });
