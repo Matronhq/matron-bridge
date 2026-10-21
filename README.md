@@ -280,11 +280,11 @@ relaunches after a non-zero exit.
 | `WHISPER_MODEL_PATH` | whisper.cpp model for the optional local voice-note fallback. Used only when this file, and the `whisper-cli` built beside it, exist; the journal transcribes first, and the bridge never installs whisper itself | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
 | `WHISPER_LANGUAGE` | Language for the local whisper fallback | `en` |
 | `WHISPER_PROMPT` | Vocabulary hint for the local whisper fallback, passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
-| `SUMMARY_PROVIDERS` | Preference order for conversation titles and rolling TOC summaries, comma-separated from `anthropic`, `openai`, `gemini`. A provider without its key is skipped; a failed request falls through to the next one. Summaries are off when none has a key | `anthropic,openai,gemini` |
-| `SUMMARY_ANTHROPIC_API_KEY` | Dedicated Claude summariser key (`claude-haiku-5-5` by default). Does not change session authentication | — |
+| `SUMMARY_PROVIDERS` | Preference order for conversation titles and rolling TOC summaries, comma-separated from `journal`, `anthropic`, `openai`, `gemini`. `journal` asks the journal (`POST /summarise`, with the bridge's journal token), which holds the provider key server-side, so a bridge connected to a journal needs no summary key of its own. A provider without its key (or, for `journal`, without a journal URL and token) is skipped; a failed request falls through to the next one. After a 404 or 503 the journal is skipped for 10 minutes, and after a 429 for as long as `Retry-After` says. Summaries are off when no provider is available | `journal,anthropic,openai,gemini` |
+| `SUMMARY_ANTHROPIC_API_KEY` | Optional local fallback: dedicated Claude summariser key (`claude-haiku-5-5` by default). Does not change session authentication | — |
 | `SUMMARY_ANTHROPIC_MODEL` | Claude summariser model | `claude-haiku-5-5` |
-| `OPENAI_API_KEY` | Optional OpenAI summariser key (`gpt-6-luna` by default) | — |
-| `GEMINI_API_KEY` | Optional Gemini summariser key (`gemini-3-flash-preview` by default) | — |
+| `OPENAI_API_KEY` | Optional local fallback: OpenAI summariser key (`gpt-6-luna` by default) | — |
+| `GEMINI_API_KEY` | Optional local fallback: Gemini summariser key (`gemini-3-flash-preview` by default) | — |
 | `SUMMARY_MODEL` | Model override for the OpenAI and Gemini summarisers | — |
 
 Voice notes are transcribed by the journal: at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`), falling back to its own whisper when the cloud call fails; tracker-item voice notes also use the journal's whisper when it has no key (see the journal's protocol doc). For a voice note sent in chat the bridge asks `GET /media/:id/transcript`; when the journal has no words for it (its job failed, or never ran) the bridge asks it to try again with `POST /media/:id/transcript` and waits for the answer. A voice note on a tracker item follows the same order, and the words are written back to the item's comment. Only when the journal still has no words does the bridge run its own whisper, and only where it is installed (see `WHISPER_MODEL_PATH`); otherwise a chat voice note is not delivered (any text typed with it still is) and the user is told why, and a tracker item's turn goes out with `(transcription failed)` in place of the words (`(no transcript)` when the journal heard none). Videos sent in chat arrive as key frames, which needs ffmpeg and ffprobe on this machine, narrated from the journal's timestamped transcript of their audio, or by the local whisper fallback where installed.
@@ -449,13 +449,21 @@ matron-bridge/
 └── .env.example
 ```
 
-Claude summary rollout: with the default order, supplying
-`SUMMARY_ANTHROPIC_API_KEY` is what turns Claude on, so provision it through
-the secure credential store only once its Console billing organisation is
-confirmed, and start with one bridge. Check titles, roster and spoken
-summaries, and inspect debug `summary usage` counts for cache reads after
-repeated turns. The fixed prompt prefix has a 5-minute cache breakpoint;
-transcript and prior roster text are never in it. Cache hits depend on the
-model's minimum prompt length. Provider failures log a fallback event without
-prompt or response content. Roll back by removing the key, or by setting
-`SUMMARY_PROVIDERS=openai,gemini`, and restarting the bridge.
+Summaries come from the journal by default: the bridge posts the prompt to
+the journal's `POST /summarise` under its own journal token, and the journal
+calls the model with a key it holds server-side, so no provider key needs to
+sit on the box. Local keys are fallbacks only, used when the journal has no
+key, is rate limited, fails upstream, or predates the route. To keep a box on
+local keys only, set `SUMMARY_PROVIDERS` without `journal` (for example
+`anthropic,openai,gemini`).
+
+Local Claude fallback: supplying `SUMMARY_ANTHROPIC_API_KEY` is what turns it
+on, so provision it through the secure credential store only once its
+Console billing organisation is confirmed, and start with one bridge. Check
+titles, roster and spoken summaries, and inspect debug `summary usage` counts
+for cache reads after repeated turns. The fixed prompt prefix has a 5-minute
+cache breakpoint; transcript and prior roster text are never in it. Cache
+hits depend on the model's minimum prompt length. Provider failures log a
+fallback event without prompt or response content. Roll back by removing the
+key, or by setting `SUMMARY_PROVIDERS` to an order without `anthropic`, and
+restarting the bridge.
