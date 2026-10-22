@@ -15,3 +15,13 @@ describe('item_get: a reply the user cancelled before it was sent', () => {
     expect(text).not.toContain('(no text)');
   });
 });
+
+describe('item_get on another person\'s item: a reply they cancelled', () => {
+  it('marks it as cancelled', () => {
+    const text = formatItemDetail({
+      item: { id: 'it_1', num: 3, title: 'T', state: 'open', owner: { name: 'bob' } },
+      comments: [{ id: 'ic_1', author: 'user', kind: 'comment', body: '', attachments: [], withdrawn: true, created_at: Date.UTC(2026, 0, 1, 9) }],
+    });
+    expect(text).toContain('- [bob, 2026-01-01 09:00] (a reply cancelled before it was sent)');
+  });
+});
