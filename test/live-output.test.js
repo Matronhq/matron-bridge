@@ -81,7 +81,7 @@ describe('LiveOutputStore', () => {
 });
 
 describe('markComplete in a shared directory', () => {
-  it('writes the sentinel owner-only', () => {
+  it.skipIf(process.platform === 'win32')('writes the sentinel owner-only', () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'lo-'));
     try {
       const store = createLiveOutputStore();
