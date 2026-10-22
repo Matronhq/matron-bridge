@@ -21,7 +21,9 @@ const MAX_BYTES = parseInt(process.env.MATRON_LIVE_OUTPUT_MAX_BYTES || String(50
 
 const dir = path.dirname(logPath);
 if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-const log = createWriteStream(logPath);
+// Owner-only: the log holds everything the command printed, and /tmp is
+// shared with every other account on the machine.
+const log = createWriteStream(logPath, { mode: 0o600 });
 
 log.on('error', err => {
   process.stderr.write(`[matron-tee: log write error: ${err.message}]\n`);

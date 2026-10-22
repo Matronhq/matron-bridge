@@ -234,6 +234,7 @@ import { wireCodexAppSession } from './lib/codex-app-wiring.js';
 import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
+import { loopbackRefusal } from './lib/loopback-guard.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -12545,6 +12546,14 @@ function validateShowFileBody(data) {
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
+
+  // Browsers have no business here (lib/loopback-guard.js).
+  const refusal = loopbackRefusal(req.headers);
+  if (refusal) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `refused: ${refusal}` }));
+    return;
+  }
 
   // Journal read proxy: only the allowlisted /journal/* read routes; any
   // other path returns null and falls through to the dispatch below. Guarded:
