@@ -32,8 +32,8 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(route).toContain('submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false, causes });');
     // iv and Codex: the answer joins the turn that is waiting on it.
     expect(route.match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(3);
-    // A typed answer into an iv or Codex prompt joins it the same way.
-    expect(fnBody('async function journalRouteTextToSession(').match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(2);
+    // A typed answer into an iv prompt (classified or not) or a Codex one joins it the same way.
+    expect(fnBody('async function journalRouteTextToSession(').match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(4);
   });
 
   it('queued and resume-held messages keep their causes, and the flush that sends them merges them', () => {

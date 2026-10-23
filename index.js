@@ -9092,11 +9092,13 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (/^\d{1,3}$/.test(trimmed)) {
       session.pendingUnclassifiedPrompt = false;
       session.iv.respondToPrompt({ kind: 'numbered', key: trimmed }, { resetDetector: false });
+      joinHeldTurn(session, causes);
       return;
     }
     if (/^[a-zA-Z]$/.test(trimmed)) {
       session.pendingUnclassifiedPrompt = false;
       session.iv.respondToPrompt({ kind: 'lettered', key: trimmed }, { resetDetector: false });
+      joinHeldTurn(session, causes);
       return;
     }
     // Not a valid selector — do NOT type it into the still-open menu (same
