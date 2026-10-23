@@ -2547,3 +2547,47 @@ describe('coordinator events', () => {
     expect(seams.onCoordinatorEvent).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('createJournalInputConsumer — user: frames must be the owner', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: vi.fn((id) => id === 'control-1'),
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => ({ claudeSessionId: 'convo-1' })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  it('routes the owner and drops another user once the owner is known', () => {
+    const onForeignUser = vi.fn();
+    const deps = makeDeps({ ownerName: () => 'alice', onForeignUser });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:alice' }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    consumer(baseFrame({ sender: 'user:bob', seq: 2 }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(onForeignUser).toHaveBeenCalledWith('bob');
+    consumer(baseFrame({ sender: 'user:bob', convo_id: 'control-1', payload: { body: '/start' } }));
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('keeps the old behaviour while the owner is unknown', () => {
+    const deps = makeDeps({ ownerName: () => null });
+    createJournalInputConsumer(deps)(baseFrame({ sender: 'user:bob' }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops another user in a room', () => {
+    const routeRoomFrame = vi.fn();
+    const deps = makeDeps({ ownerName: () => 'alice', roomFor: (id) => (id === 'room-1' ? { roomId: 'room-1' } : null), routeRoomFrame });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ convo_id: 'room-1', sender: 'user:bob' }));
+    expect(routeRoomFrame).not.toHaveBeenCalled();
+    consumer(baseFrame({ convo_id: 'room-1', sender: 'user:alice' }));
+    expect(routeRoomFrame).toHaveBeenCalledTimes(1);
+  });
+});

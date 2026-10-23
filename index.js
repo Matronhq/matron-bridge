@@ -11722,6 +11722,17 @@ const journalInputConsumer = createJournalInputConsumer({
   roomFor: (convoId) => (agentRooms.isActive(convoId) ? agentRooms.get(convoId) : null),
   routeRoomFrame: journalOnRoomFrame,
   selfAgentName: () => journalPublisher.identity()?.name || null,
+  ownerName: () => journalIdentity.name(),
+  // Another user's name on a `user:` frame: re-ask /me in case the owner
+  // was renamed, at most once a minute.
+  onForeignUser: (() => {
+    let last = 0;
+    return () => {
+      if (Date.now() - last < 60_000) return;
+      last = Date.now();
+      journalIdentity.refresh({ force: true });
+    };
+  })(),
   selfAgentDeviceId: () => journalPublisher.identity()?.deviceId ?? null,
   // Queued-release universal echo-ack (spec §3 step 5): the echo of our own
   // release is the true commit signal — flip the outbox record `acked` in
