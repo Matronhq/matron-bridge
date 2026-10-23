@@ -2110,7 +2110,8 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     const rd = src.indexOf('createRoomDelivery({');
     expect(rd).toBeGreaterThan(-1);
     const rdEnd = src.indexOf('});', rd);
-    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: sessionOccupiedForRoomDelivery/);
+    // Another person's turn uses the stricter gate (no turn running at all).
+    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: \(session, \{ foreign = false \} = \{\}\) => \(foreign\s*\? sessionOccupiedForForeignTurn\(session\)\s*: sessionOccupiedForRoomDelivery\(session\)\)/);
     // The injected turn must not re-mirror into the session's own convo.
     expect(src.slice(rd, rdEnd)).toMatch(/skipJournalMirror: true/);
   });
@@ -2224,7 +2225,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(count).toBeGreaterThan(-1);
       expect(flush).toBeGreaterThan(count);
       // Nothing queued => nothing to close, and no notice at all.
-      expect(body).toMatch(/if \(!queued\) return;/);
+      expect(body).toMatch(/if \(!queued \|\| flushed === null\) return;/);
       // A refused inject must say so rather than leave the ⏳ hanging.
       // A flush is one turn's worth (own messages and each other person's
       // room go separately), so the notice counts what actually went out.

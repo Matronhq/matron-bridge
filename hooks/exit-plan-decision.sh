@@ -29,6 +29,7 @@ PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 # slightly-shorter timer and reply with decision=deny on expiry so we never
 # exceed this curl ceiling.
 RESP=$(curl -s --max-time 1800 -X POST "http://127.0.0.1:${PORT}/plan-decision" \
+  -H @"${MATRON_BRIDGE_API_HEADER_FILE:-/dev/null}" \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg plan "$PLAN" \
         '{session_id:$sid,tool_use_id:$tuid,plan:$plan}')")

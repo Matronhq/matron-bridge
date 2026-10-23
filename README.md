@@ -267,6 +267,7 @@ relaunches after a non-zero exit.
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
+| `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset | on |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
 | `MATRON_WAKE_CONVO_ID` | Conversation that `POST /wake` on the internal API wakes. Lets a scheduled job on the same machine wake one conversation with a fixed text, resuming its session if it was idle-stopped; the request can choose neither the conversation nor the text. Off unless both this and `MATRON_WAKE_TEXT` are set | — |
 | `MATRON_WAKE_TEXT` | The exact text `POST /wake` delivers to `MATRON_WAKE_CONVO_ID` | — |

@@ -5,6 +5,7 @@ import path from 'path';
 import { WebSocketServer } from 'ws';
 import { generateSignedUrl, verifyToken, readPageToken } from '../lib/viewer-tokens.js';
 import { formatSecretContextHtml, secretConversationUrl } from '../lib/secret-context.js';
+import { viewerApiKey, VIEWER_KEY_HEADER_NAME } from '../lib/api-auth.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
@@ -416,6 +417,12 @@ app.get('/page', pageLimiter, async (req, res) => {
 });
 
 const BRIDGE_API_PORT = process.env.MATRON_BRIDGE_API_PORT || 9802;
+// The bridge's loopback API takes the viewer by a key derived from the HMAC
+// secret both services share (lib/api-auth.js).
+const bridgeAuth = () => {
+  const key = viewerApiKey(SECRET || '');
+  return key ? { [VIEWER_KEY_HEADER_NAME]: key } : {};
+};
 
 app.get('/action', async (req, res) => {
   const { token } = req.query;
@@ -443,7 +450,7 @@ app.get('/action', async (req, res) => {
 
     const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}${endpoint}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...bridgeAuth() },
       body: JSON.stringify(body),
     });
 
@@ -508,7 +515,7 @@ app.post('/secret', secretLimiter, secretFormParser, async (req, res) => {
   try {
     const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/secret/${data.secretId}/submit`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...bridgeAuth() },
       body: JSON.stringify({ value }),
     });
 
@@ -604,7 +611,7 @@ app.post('/sensitive/reveal', revealLimiter, async (req, res) => {
   }
 
   try {
-    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/sensitive/${data.sensitiveId}`);
+    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/sensitive/${data.sensitiveId}`, { headers: bridgeAuth() });
 
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));

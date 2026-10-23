@@ -235,6 +235,7 @@ import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
+import { createApiAuth, viewerApiKey, apiAuthRefusal } from './lib/api-auth.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -756,6 +757,28 @@ const journalReadProxy = createJournalReadProxy({
   token: _journalToken,
   capabilityToken: JOURNAL_PROXY_CAP_TOKEN,
 });
+
+// Per-session tokens for the loopback API (lib/api-auth.js): each session's
+// children get a 0600 header file in a private mkdtemp dir, removed on exit.
+// MATRON_BRIDGE_API_AUTH=off turns the check off (the tokens are still
+// issued), for a rollback without a code change.
+const API_AUTH_ENFORCED = process.env.MATRON_BRIDGE_API_AUTH !== 'off';
+let API_AUTH_DIR = null;
+try {
+  API_AUTH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-api-'));
+  process.once('exit', () => { try { fs.rmSync(API_AUTH_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+} catch (e) {
+  console.warn(`[api] could not create the session token directory: ${e.message}`);
+}
+const apiAuth = createApiAuth({ dir: API_AUTH_DIR, viewerKey: viewerApiKey(process.env.HMAC_SECRET || '') });
+if (!API_AUTH_ENFORCED) console.warn('[api] MATRON_BRIDGE_API_AUTH=off: loopback API session tokens are not checked');
+// The session's header file path, '' when it could not be written.
+function apiHeaderFileFor(roomId) {
+  try { return apiAuth.ensure(roomId); } catch (e) {
+    console.warn(`[api] could not write the session token file for ${roomId}: ${e.message}`);
+    return '';
+  }
+}
 
 // Which conversation is the user's Coordinator (spec 2026-09-23 §2a):
 // GET /coordinator on the same host and token as the items/missions
@@ -2490,7 +2513,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     // Additive inline settings: the bridge's hooks (and, when gated, the MCP
     // permission gate hook) merge with the on-disk settings, which all load.
-    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId) })),
+    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) })),
   ];
   const printModel = options.model === null
     ? undefined
@@ -2520,6 +2543,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    apiHeaderFile: apiHeaderFileFor(roomId),
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
@@ -2909,9 +2933,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       apiPort: API_PORT,
       appServer: CODEX_APP_SERVER,
       journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+      apiHeaderFile: apiHeaderFileFor(roomId),
     }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
-      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
+      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId) }) : {},
   });
   codex.planMode = CODEX_APP_SERVER && persisted?.codexPlanMode === true;
 
@@ -3395,7 +3420,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       // round. The hook+/plan-decision flow remains in print-mode only.
       PreToolUse: [
         // The foreign-turn gate (lib/foreign-turn.js), first and on every tool.
-        foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId) }),
+        foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
         { matcher: 'Bash', hooks: [ivHook('matron-bash-tee')] },
       ],
       Stop: [{
@@ -3440,6 +3465,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    apiHeaderFile: apiHeaderFileFor(roomId),
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
@@ -12568,6 +12594,21 @@ function validateShowFileBody(data) {
   return null;
 }
 
+// The session a loopback API request acts for, by roomId (most routes), by
+// the hook's room query (/foreign-check), or by Claude session id (the
+// Stop/PreCompact/plan hooks). Null when it names none, or names a Claude
+// session no live session has (those routes do nothing then).
+function apiNamedRoom(url, data) {
+  if (url.pathname === '/foreign-check') return url.searchParams.get('room') || null;
+  if (typeof data?.roomId === 'string') return data.roomId;
+  if (typeof data?.session_id === 'string' && data.session_id) {
+    for (const [roomId, s] of sessions) {
+      if (s.claudeSessionId === data.session_id) return roomId;
+    }
+  }
+  return null;
+}
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -12602,6 +12643,23 @@ const apiServer = createServer(async (req, res) => {
       return;
     }
   }
+
+  // Session tokens (lib/api-auth.js). The routes with a credential of their
+  // own keep it (the journal proxy above; /wake, /shutdown and /show-file
+  // below); every other route needs a session token, and a request that
+  // names a session needs that session's. The viewer's key opens only the
+  // routes the viewer calls.
+  const apiCaller = apiAuth.caller(req.headers);
+  const ownCredentialRoute = url.pathname === '/wake' || url.pathname === '/shutdown' || url.pathname === '/show-file';
+  const refuseApiCall = (namedRoomId) => {
+    if (!API_AUTH_ENFORCED || ownCredentialRoute) return false;
+    const r = apiAuthRefusal({ caller: apiCaller, method: req.method, pathname: url.pathname, namedRoomId });
+    if (!r) return false;
+    res.writeHead(r.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: r.error }));
+    return true;
+  };
+  if (req.method === 'GET' && refuseApiCall(null)) return;
 
   // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
   // uses it (request_secret is non-blocking now); it stays so a
@@ -12785,6 +12843,8 @@ const apiServer = createServer(async (req, res) => {
 
     try {
       const data = JSON.parse(body);
+
+      if (refuseApiCall(apiNamedRoom(url, data))) return;
 
       // Foreign turns (lib/foreign-turn.js): the hook's question, answered
       // before the generic gate below (its body is the hook input, not a
