@@ -189,6 +189,20 @@ describe('createRoomDelivery', () => {
     expect(injectTurn.mock.calls[0][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1'), own, causeOf('room_message', 'room:room-2')] });
   });
 
+  it('a batch names each room once, spanning the seqs of its messages', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    const session = { alive: true, busy: true };
+    delivery.deliver(session, 'k1', msg({ seq: 12 }));
+    delivery.deliver(session, 'k1', msg({ roomId: 'room-2', body: 'other', seq: 13 }));
+    delivery.deliver(session, 'k1', msg({ body: 'again', seq: 20 }));
+    session.busy = false;
+    delivery.flush(session, 'k1');
+    expect(injectTurn.mock.calls[0][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1@12-20'), causeOf('room_message', 'room:room-2@13')] });
+    // One message on an idle session names its own seq.
+    delivery.deliver({ alive: true, busy: false }, 'k2', msg({ seq: 31 }));
+    expect(injectTurn.mock.calls[1][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1@31')] });
+  });
+
   it('a foreign turn carries its causes beside the foreign meta', () => {
     const { delivery, injectTurn } = makeDelivery();
     delivery.deliver({ alive: true, busy: false }, 'k1', msg({ roomId: 'r-p', foreign: { person: 'p' } }));

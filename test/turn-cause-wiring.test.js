@@ -22,6 +22,20 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(route.match(/sendTextToSession\(session, trimmed, \{ skipJournalMirror: true, causes \}\)/g)).toHaveLength(2);
   });
 
+  it('a tap on a question card names the user\'s reply row, on every answer path', () => {
+    const onReply = fnBody('function journalOnPromptReply(');
+    expect(onReply).toContain('const causes = seq != null && replyConvoId ? [userMessageCause(replyConvoId, seq)] : null;');
+    expect(onReply).toContain('journalRoutePromptReply(session, answer, { causes })');
+    const route = fnBody('function journalRoutePromptReply(');
+    expect(route).toContain('{ causes = null } = {}');
+    // print mode: the raw tool_result answer takes the turn seam with them.
+    expect(route).toContain('submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false, causes });');
+    // iv and Codex: the answer joins the turn that is waiting on it.
+    expect(route.match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(3);
+    // A typed answer into an iv prompt (classified or not) or a Codex one joins it the same way.
+    expect(fnBody('async function journalRouteTextToSession(').match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(4);
+  });
+
   it('queued and resume-held messages keep their causes, and the flush that sends them merges them', () => {
     expect(fnBody('function sendToSession(')).toContain('(session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));');
     expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })');
@@ -40,8 +54,19 @@ describe('turn causes reach sendToSession from every turn source', () => {
 
   it('room turns forward their causes; reminders and timers are reminder turns', () => {
     expect(index).toContain('sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null })');
+    // Each delivered room message carries its seq, for the per-room span the
+    // turn's cause names (lib/room-delivery.js), and a reply consumed inline
+    // by a wait joins the running turn with its own.
+    const deliverTo = fnBody('function deliverRoomFrameTo(');
+    expect(deliverTo.match(/at: frame\.ts, seq: frame\.seq,/g)).toHaveLength(2);
+    expect(deliverTo).toContain('joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);');
     const fire = fnBody('async function fireTimer(');
-    expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(2);
+    // The user's /timer is a reminder turn; the agent's own reminder names
+    // the turn that set it beside it.
+    expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(1);
+    expect(fire).toContain("{ causes: mergeCauses([plainCause('reminder'), record.causes]) }");
+    // A self-restart's continuation names the restarting turn's causes beside `other`.
+    expect(index).toContain("const entry = tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)]));");
   });
 });
 

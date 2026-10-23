@@ -122,7 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
-import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
+import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, mergeCauses, causesForAsk, userMessageCause, itemCause, plainCause, spawnOutcomeCause, carryOnCause, roomMessageCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -9076,6 +9076,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ text: trimmed });
+    if (answer && !asyncQuestion) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     if (!answer) journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
     return;
@@ -9083,6 +9084,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
     session.pendingUnclassifiedPrompt = false;
+    joinHeldTurn(session, causes);
     return;
   }
 
@@ -9090,11 +9092,13 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (/^\d{1,3}$/.test(trimmed)) {
       session.pendingUnclassifiedPrompt = false;
       session.iv.respondToPrompt({ kind: 'numbered', key: trimmed }, { resetDetector: false });
+      joinHeldTurn(session, causes);
       return;
     }
     if (/^[a-zA-Z]$/.test(trimmed)) {
       session.pendingUnclassifiedPrompt = false;
       session.iv.respondToPrompt({ kind: 'lettered', key: trimmed }, { resetDetector: false });
+      joinHeldTurn(session, causes);
       return;
     }
     // Not a valid selector — do NOT type it into the still-open menu (same
@@ -9287,11 +9291,18 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 // records the user's answer, so mirroring it again would duplicate it.
 // Returns the resolved answer's label (for the Matrix echo), or null if
 // nothing could be resolved (no pending prompt, or an unmatched choice with
-// no usable free text).
-function journalRoutePromptReply(session, { choice, text }) {
+// no usable free text). `causes` names the user's reply row: a raw
+// tool_result answer takes it as its turn seam (submitAnswer), and an answer
+// typed into a prompt the running turn is waiting on joins that turn
+// (joinHeldTurn), so what the agent asks for next is credited to the tap.
+function journalRoutePromptReply(session, { choice, text }, { causes = null } = {}) {
   if (session.codexPrompts?.active) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ choice, text });
+    // A synchronous answer continues the turn that asked; an async one is
+    // sent as a message of its own (submitCodexAsyncAnswer), which names no
+    // cause yet.
+    if (answer && !asyncQuestion) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     return answer;
   }
@@ -9313,6 +9324,7 @@ function journalRoutePromptReply(session, { choice, text }) {
         const resp = promptResponseForButton(p, resolved.index);
         if (resp) {
           if (session.iv.respondToPrompt(resp) !== true) return null;
+          joinHeldTurn(session, causes);
           // Same effort-confirmation settle as the typed-reply path.
           if (noteEffortConfirmationAnswer(session, p, resolved.option.label)) persistEffortLevel(session);
           session.pendingInteractivePrompt = null;
@@ -9339,6 +9351,7 @@ function journalRoutePromptReply(session, { choice, text }) {
         onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
       });
       if (!dispatched) return null;
+      joinHeldTurn(session, causes);
       session.pendingInteractivePrompt = null;
       return freeText;
     }
@@ -9373,7 +9386,7 @@ function journalRoutePromptReply(session, { choice, text }) {
     }
     if (!answerText) return null;
     const header = q.header ? `${q.header}: ` : '';
-    submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false });
+    submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false, causes });
     return answerText;
   }
 
@@ -9782,7 +9795,7 @@ function journalOnMedia(session, media, ctx) {
 
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
 // {target_seq, choice, text}, {username}) interface.
-function journalOnPromptReply(session, answer, { username }) {
+function journalOnPromptReply(session, answer, { username, seq, convoId: replyConvoId }) {
   rearmPreReapHandoff(session);
   // Command-replay guard: a prompt answer has side effects (keystrokes into
   // the TUI / a tool_result write), so an ungraceful crash inside the
@@ -9886,10 +9899,13 @@ function journalOnPromptReply(session, answer, { username }) {
     });
     return;
   }
-  // Not a picker command — resolve it as an answer to a pending prompt.
+  // Not a picker command — resolve it as an answer to a pending prompt. The
+  // user's reply row is what the answer's turn carries on with
+  // (lib/turn-cause.js), cited like a typed message.
+  const causes = seq != null && replyConvoId ? [userMessageCause(replyConvoId, seq)] : null;
   let label;
   try {
-    label = journalRoutePromptReply(session, answer);
+    label = journalRoutePromptReply(session, answer, { causes });
   } catch (e) {
     console.warn(`[journal-input] routing prompt_reply failed: ${e.message}`);
     journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your answer: ${e.message}`);
@@ -10101,9 +10117,10 @@ async function fireTimer(record) {
     const repeats = record.repeat ? `, ${formatRepeat(record.repeat)}` : '';
     const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
     journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
+    // A reminder turn, naming the turn that set it (lib/reminder-tools.js).
     await journalRouteTextToSession(session,
       `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`,
-      { causes: [plainCause('reminder')] });
+      { causes: mergeCauses([plainCause('reminder'), record.causes]) });
     return;
   }
   const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
@@ -10490,10 +10507,11 @@ async function fireAutoResume(roomId, convoId, slot) {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
       await journalRouteTextToSession(session, '/compact');
     }
-    // A Coordinator's after_limit_reset carry-on is a carry-on turn; the
-    // bridge's own automatic one names no cause.
+    // A Coordinator's after_limit_reset carry-on is a carry-on turn, naming
+    // the journal's record of it; the bridge's own automatic one names no
+    // cause.
     await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),
-      { causes: slot.source === 'coordinator' ? [plainCause('carry_on')] : null });
+      { causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
     // A thrown delivery must not lose the carry-on: put the slot back for
@@ -10744,7 +10762,7 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
       postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }), controlNoticeKind(params.action));
       return { ok: true, result: { applied: 'deferred', box } };
     case 'schedule':
-      session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+      session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator', ...(plan.carryOnId ? { carryOnId: plan.carryOnId } : {}) };
       persistControlState(session);
       postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }), controlNoticeKind(params.action));
       return { ok: true, result: { applied: 'scheduled', at: plan.at, box } };
@@ -10903,7 +10921,7 @@ function drainDeferredControls(session) {
           settle(current, kind);
           postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }), controlNoticeKind(params.action));
         } else if (plan.kind === 'schedule') {
-          current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+          current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator', ...(plan.carryOnId ? { carryOnId: plan.carryOnId } : {}) };
           settle(current, kind);
           postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }), controlNoticeKind(params.action));
         }
@@ -11204,7 +11222,14 @@ function deliverRoomFrameTo(room, frame) {
   }
   // Another person's reply is never consumed inline by an agent_chat_send
   // wait (see the person block below).
-  if (!person && roomReplyWaiters.resolve(replyWaiterKey(frame.convo_id, room.sessionRoomId), { from, body })) return;
+  // A reply consumed inline reaches the agent inside its running turn, so
+  // the turn takes the message's cause as a delivered one would — for the
+  // journal to see a relay of the Coordinator's; the Coordinator's own turn
+  // is left as it was.
+  if (!person && roomReplyWaiters.resolve(replyWaiterKey(frame.convo_id, room.sessionRoomId), { from, body })) {
+    if (session.coordinator !== true) joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);
+    return;
+  }
   if (person) {
     // Never consumed inline by an agent_chat_send wait (above): that would
     // put another person's words into a turn of this user's, unrestricted.
@@ -11213,7 +11238,7 @@ function deliverRoomFrameTo(room, frame) {
     const deliverForeign = () => {
       const queuedBeforeF = roomDelivery.pendingCount(session.roomId);
       roomDelivery.deliver(session, session.roomId, {
-        roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, foreign: { person },
+        roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, seq: frame.seq, foreign: { person },
       });
       if (echoFrom && queuedBeforeF === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
         journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
@@ -11233,8 +11258,9 @@ function deliverRoomFrameTo(room, frame) {
   // busy-means-queued line published earlier would be a lie in exactly the
   // case the agent responded fastest.
   const queuedBefore = roomDelivery.pendingCount(session.roomId);
+  // The frame's seq names the message for the turn's cause (lib/turn-cause.js).
   roomDelivery.deliver(session, session.roomId, {
-    roomId: frame.convo_id, roomTitle, from, body, at: frame.ts,
+    roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, seq: frame.seq,
   });
   if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
     journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
@@ -12526,7 +12552,9 @@ const selfRestartHandler = createSelfRestartHandler({
   // bridge-composed text, so the flush's mirror is what shows the user what
   // the session told itself to do.
   queueContinuation: (session, text) => {
-    const entry = [{ type: 'text', text }];
+    // The continuation is the restarting turn's own work resumed: it names
+    // that turn's causes, beside `other` for the session's own words.
+    const entry = tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)]));
     // Lockstep with queueNotifications (PR #104): cancel and send_one address
     // the queue by notification index, so an entry with no slot of its own
     // would shift every later tile onto the wrong message. A bridge-composed

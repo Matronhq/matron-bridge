@@ -265,6 +265,18 @@ describe('createJournalInputConsumer', () => {
     const [session, answer, ctx] = deps.routePromptReply.mock.calls[0];
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(answer).toEqual({ target_seq: 5, choice: 'opt_a', text: null });
+    // The reply row itself, which the answer's turn cites as its cause.
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
+  });
+
+  it('only an answer to a pending prompt names its reply row; a picker tap does not', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ seq: 7, type: 'prompt', sender: 'agent:box-a', payload: { question: 'Model?', mode: 'pick_one', options: [{ id: 'model-sonnet', label: 'Sonnet', value: 'model:sonnet' }] } }));
+    consumer(baseFrame({ seq: 8, type: 'prompt_reply', payload: { target_seq: 7, choice: 'model:sonnet', text: null } }));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    const [, answer, ctx] = deps.routePromptReply.mock.calls[0];
+    expect(answer.picker).toBe(true);
     expect(ctx).toEqual({ username: 'alice' });
   });
 
@@ -275,7 +287,7 @@ describe('createJournalInputConsumer', () => {
     expect(deps.routePromptReply).toHaveBeenCalledWith(
       { claudeSessionId: 'convo-1' },
       { target_seq: undefined, choice: null, text: null },
-      { username: 'alice' },
+      { username: 'alice', seq: 1, convoId: 'convo-1' },
     );
   });
 
@@ -1457,7 +1469,7 @@ describe('createJournalInputConsumer — queue-action-shaped labels are ordinary
     expect(deps.routePromptReply).toHaveBeenCalledWith(
       expect.anything(),
       { target_seq: 10, choice: 'cancel:2', text: null },
-      { username: 'alice' },
+      { username: 'alice', seq: 100, convoId: 'convo-1' },
     );
   });
 

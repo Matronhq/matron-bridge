@@ -191,6 +191,27 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
+  it('a room post names its session and turn causes beside the payload; a bare publish does not', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    const causes = [{ kind: 'carry_on', ref: 'carry_on:co_0123456789abcdef', at: 1 }];
+    pub.publishText('room-1', { body: 'hi', from: 'agent' }, { provenance: { fromConvoId: 'convo-a', causes } });
+    pub.publishFile('room-1', { blob_ref: 'b1', name: 'x.zip' }, { provenance: { fromConvoId: 'convo-a', causes: null } });
+    pub.publishText('convo-a', { body: 'plain', from: 'assistant' });
+    // Causes without a session say nothing the journal could attribute.
+    pub.publishText('room-1', { body: 'orphan', from: 'agent' }, { provenance: { fromConvoId: null, causes } });
+    await waitFor(() => fake.received.filter((f) => f.op === 'publish').length >= 4);
+    const [text, file, plain, orphan] = fake.received.filter((f) => f.op === 'publish');
+    expect(text).toMatchObject({ convo_id: 'room-1', payload: { body: 'hi', from: 'agent' }, from_convo_id: 'convo-a', causes });
+    expect(text.payload.causes).toBeUndefined();
+    expect(file).toMatchObject({ type: 'file', from_convo_id: 'convo-a' });
+    expect('causes' in file).toBe(false);
+    expect('from_convo_id' in plain).toBe(false);
+    expect('from_convo_id' in orphan || 'causes' in orphan).toBe(false);
+    pub.close();
+    await fake.close();
+  });
+
   it('covers publishPrompt and publishToolOutput with the right types', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
