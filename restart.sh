@@ -43,8 +43,9 @@ fi
 
 echo "Stopping existing bridge processes..."
 
-# Kill by process pattern
-pkill -f 'node.*matron-bridge/index\.js' 2>/dev/null || true
+# Kill by process pattern. On macOS the bridge runs from a node copy named
+# matron-bridge (bin/run-named-node), so match that executable name as well.
+pkill -f '(node|matron-bridge).*matron-bridge/index\.js' 2>/dev/null || true
 
 # Kill anything holding our port
 PORT_PID=$(lsof -ti :$PORT 2>/dev/null)
@@ -53,9 +54,10 @@ if [ -n "$PORT_PID" ]; then
   kill $PORT_PID 2>/dev/null || true
 fi
 
-# Also kill any 'node index.js' started from this directory.
+# Also kill any 'node index.js' (or 'matron-bridge index.js') started from
+# this directory.
 # lsof works on both Linux and macOS; /proc/$pid/cwd is Linux-only.
-pgrep -f "node index.js" | while read pid; do
+pgrep -f '(node|matron-bridge) index\.js' | while read pid; do
   PROC_CWD=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}')
   if [ "$PROC_CWD" = "$(pwd)" ]; then
     echo "Killing bridge PID $pid (cwd match)"
@@ -78,7 +80,7 @@ LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge"
 mkdir -p -m 700 "$LOG_DIR"
 chmod 700 "$LOG_DIR"
 LOG_FILE="$LOG_DIR/matron-bridge.log"
-nohup node index.js > "$LOG_FILE" 2>&1 &
+nohup ./bin/run-named-node matron-bridge index.js > "$LOG_FILE" 2>&1 &
 NEW_PID=$!
 sleep 1
 
