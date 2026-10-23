@@ -10386,6 +10386,15 @@ function sessionOccupiedForRoomDelivery(session) {
     || effortFlowHoldsInput(session);
 }
 
+// A turn another person starts needs more: no turn of any kind may still be
+// running. One the harness started by itself, or one an unacknowledged
+// interrupt left behind, has busy false but will still end with a result,
+// and that turn-end seam disarms the foreign gate (foreignSessions.end). So
+// the foreign turn waits for that seam instead of starting under it.
+function sessionOccupiedForForeignTurn(session) {
+  return sessionOccupiedForRoomDelivery(session) || !!session.currentTurn;
+}
+
 // The one shared room-flush gate used by every turn-end/idle seam (and the
 // journalOnRoomFrame self-heal): flush the coalesced room inbox ONLY when
 // the session is genuinely free, by the SAME composite predicate that routes
@@ -10896,7 +10905,9 @@ function flushRoomInbox(session) {
   // and no notice to publish (the ordinary idle path never queued anything).
   const queued = roomDelivery.pendingCount(session.roomId);
   const flushed = roomDelivery.flush(session, session.roomId);
-  if (!queued) return;
+  // null: another person's turn is waiting for a running turn to end; it
+  // stays queued for the next seam, with nothing to report yet.
+  if (!queued || flushed === null) return;
   // A flush delivers one turn's worth: own messages and each other person's
   // room go in separate turns, so some may still be waiting (they get their
   // own 📨 at the next turn end).
@@ -10913,7 +10924,9 @@ function flushRoomInbox(session) {
 // `case 'result'`). skipJournalMirror: the message already lives in the
 // room convo — mirroring it into the session convo would duplicate it.
 const roomDelivery = createRoomDelivery({
-  isBusy: sessionOccupiedForRoomDelivery,
+  isBusy: (session, { foreign = false } = {}) => (foreign
+    ? sessionOccupiedForForeignTurn(session)
+    : sessionOccupiedForRoomDelivery(session)),
   // A turn another person started (meta.foreign) is armed and banner'd by
   // foreignSessions before it is sent; every other room turn is as before.
   // meta.causes: the messages' causes (a spawn outcome's request, else the
@@ -10936,7 +10949,7 @@ const foreignSessions = createForeignSessions({
   journalConvoIdFor,
   sendText: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, foreign: true }),
   publishNotice: (convoId, text) => journalPublishNotice(convoId, text),
-  isOccupied: sessionOccupiedForRoomDelivery,
+  isOccupied: sessionOccupiedForForeignTurn,
   flag: { set: (key) => setForeignFlag(key), clear: (key) => clearForeignFlag(key) },
   store: {
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
