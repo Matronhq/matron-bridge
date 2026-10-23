@@ -77,7 +77,7 @@ describe('briefings wiring', () => {
         const r = await handlers[op](body);
         return { status: r.status, ok: r.status >= 200 && r.status < 300, json: async () => r.body };
       };
-      return { posts, call: new Function('fetch', 'BRIDGE_API', 'ROOM_ID', 'missionIdemKey', `${src}\nreturn callBriefing;`)(fetch, 'http://bridge', '!r:s', missionIdemKey) };
+      return { posts, call: new Function('bridgeFetch', 'BRIDGE_API', 'ROOM_ID', 'missionIdemKey', `${src}\nreturn callBriefing;`)(fetch, 'http://bridge', '!r:s', missionIdemKey) };
     };
     const publishBriefing = vi.fn(async () => ({ status: 201, data: { briefing: { id: 'br_1', convo_id: 'c1', seq: 9 } } }));
     const h = createBriefingHandlers({ sessions: new Map([['!r:s', { roomId: '!r:s', journalConvoId: 'c1', coordinator: true }]]), journalConvoIdFor: (s) => s.journalConvoId, client: { publishBriefing } });

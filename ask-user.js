@@ -25,9 +25,17 @@ import { BRIEF_WHAT } from './lib/sharing-tools.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
+import { readApiHeaderFile } from './lib/api-header-file.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
+// This session's loopback API token (lib/api-auth.js), sent on every bridge
+// call. Read per call: the file is written before the session spawns, and a
+// read is cheap next to the request.
+function bridgeFetch(url, opts = {}) {
+  const auth = readApiHeaderFile(process.env.MATRON_BRIDGE_API_HEADER_FILE);
+  return fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...auth } });
+}
 const POLL_INTERVAL_MS = 500;
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
 // same env var through the same validation, keeping one expiry for the whole
@@ -52,7 +60,7 @@ server.tool(
   },
   async ({ label, context, multiline }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/secret`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/secret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ label, context, roomId: ROOM_ID, multiline: multiline === true }),
@@ -100,7 +108,7 @@ server.tool(
     const deny = (message) => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'deny', message }) }] });
     const allow = () => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'allow', updatedInput: input ?? {} }) }] });
     try {
-      const postRes = await fetch(`${BRIDGE_API}/permission-request`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/permission-request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, toolName: tool_name, input: input ?? {} }),
@@ -125,7 +133,7 @@ server.tool(
         // deadline; only the deadline itself resolves the request (→ deny).
         let status;
         try {
-          const pollRes = await fetch(`${BRIDGE_API}/permission-request/${requestId}`, {
+          const pollRes = await bridgeFetch(`${BRIDGE_API}/permission-request/${requestId}`, {
             signal: AbortSignal.timeout(BRIDGE_FETCH_TIMEOUT_MS),
           });
           if (!pollRes.ok) continue;
@@ -159,7 +167,7 @@ server.tool(
   },
   async ({ label, content, ttl, filename, download, one_time }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/share-sensitive`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/share-sensitive`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -199,7 +207,7 @@ server.tool(
   },
   async ({ eventId, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/redact-message`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/redact-message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, eventId, reason }),
@@ -232,7 +240,7 @@ server.tool(
   },
   async ({ path, caption, chat_room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/send-attachment`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/send-attachment`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, path, caption, ...(chat_room_id ? { chat_room_id } : {}) }),
@@ -257,7 +265,7 @@ server.tool(
   },
   async ({ path, ttl_days }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/page-link`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/page-link`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, path, ...(ttl_days !== undefined ? { ttl_days } : {}) }),
@@ -313,7 +321,7 @@ server.tool(
   {},
   async () => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-roster`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-roster`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID }),
@@ -365,7 +373,7 @@ server.tool(
   },
   async ({ target_convo_id, person, topic, justification, message, mission }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-start`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, target_convo_id, person, topic, justification, message, mission }),
@@ -391,7 +399,7 @@ server.tool(
   },
   async ({ tool_name, tool_input, why }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/foreign-action-request`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-action-request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, tool_name, tool_input, why }),
@@ -411,7 +419,7 @@ server.tool(
   { contact: z.string().describe('A contact name from contact_list') },
   async ({ contact }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/session-share`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/session-share`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, contact }),
@@ -432,7 +440,7 @@ server.tool(
   { contact: z.string().describe('The contact name') },
   async ({ contact }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/session-unshare`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/session-unshare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, contact }),
@@ -452,7 +460,7 @@ server.tool(
   {},
   async () => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-boxes`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-boxes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID }),
@@ -486,7 +494,7 @@ server.tool(
   },
   async ({ device_id, workdir, task, topic, agent, model, effort, link, mission }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-session-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(link === true ? { link: true } : {}), ...(mission ? { mission } : {}) }),
@@ -517,7 +525,7 @@ server.tool(
   },
   async ({ device_id, agent, model, effort }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/box-defaults-set`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/box-defaults-set`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, device_id, ...(agent !== undefined ? { agent } : {}), ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) }),
@@ -577,7 +585,7 @@ const CONSENT_WHAT = "Consent approval is for the user's Coordinator only (the j
 
 async function callConsent(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/consent/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/consent/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -615,7 +623,7 @@ server.tool(
 // lib/unseen-tools.js at /unseen/<op>); the journal is the gate.
 async function callUnseen(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/unseen/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/unseen/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -677,7 +685,7 @@ const ROUTINE_ENVELOPE_WHAT = "What this routine may start on its own: when a tu
 
 async function callRoutine(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/routine/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/routine/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -755,7 +763,7 @@ server.tool(
 async function callBriefing(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args, idem_key: missionIdemKey({ op: `briefing_${name}`, roomId: ROOM_ID, body: args?.body }) };
   try {
-    const res = await fetch(`${BRIDGE_API}/briefing/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/briefing/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -785,7 +793,7 @@ function compactSelfText(parked) {
 
 async function sessionControlCall(route, body, name) {
   try {
-    const postRes = await fetch(`${BRIDGE_API}${route}`, {
+    const postRes = await bridgeFetch(`${BRIDGE_API}${route}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...body }),
@@ -820,7 +828,7 @@ server.tool(
   },
   async ({ continue_with, browser, model, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/restart-session`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/restart-session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -855,7 +863,7 @@ server.tool(
   },
   async ({ focus, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/compact-self`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/compact-self`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, ...(focus ? { focus } : {}), ...(reason ? { reason } : {}) }),
@@ -881,7 +889,7 @@ server.tool(
   },
   async ({ room_id, message, wait_seconds }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-send`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, message, ...(wait_seconds != null ? { wait_seconds } : {}) }),
@@ -906,7 +914,7 @@ server.tool(
   },
   async ({ room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-accept`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-accept`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id }),
@@ -944,7 +952,7 @@ server.tool(
   },
   async ({ room_id, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-refuse`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-refuse`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, ...(reason ? { reason } : {}) }),
@@ -972,7 +980,7 @@ server.tool(
   },
   async ({ room_id, justification }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-join`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, justification }),
@@ -1007,7 +1015,7 @@ server.tool(
   },
   async ({ room_id, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-mute`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-mute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, reason }),
@@ -1031,7 +1039,7 @@ server.tool(
   },
   async ({ room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-unmute`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-unmute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id }),
@@ -1056,7 +1064,7 @@ server.tool(
   },
   async ({ room_id, limit }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-read`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-read`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, ...(limit != null ? { limit } : {}) }),
@@ -1084,7 +1092,7 @@ server.tool(
 // a sentence keeps the model working instead of retrying blindly.
 async function callItems(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/items/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/items/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -1242,7 +1250,7 @@ async function callMissions(name, args, render) {
     payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body, name: args?.name, mission: args?.mission });
   }
   try {
-    const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/missions/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1339,7 +1347,7 @@ server.tool(
 // at /search/all); the journal is the gate and the only source of truth.
 async function callSearch(args) {
   try {
-    const res = await fetch(`${BRIDGE_API}/search/all`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/search/all`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -1418,7 +1426,7 @@ const SHARING_WHAT = "Contacts are other PEOPLE (other Matron users), not the us
 
 async function callSharing(name, tool, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/sharing/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/sharing/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -1501,7 +1509,7 @@ async function callProjects(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   if (name === 'create') payload.idem_key = missionIdemKey({ op: 'project_create', roomId: ROOM_ID, title: args?.title, body: args?.body });
   try {
-    const res = await fetch(`${BRIDGE_API}/projects/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/projects/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1587,7 +1595,7 @@ server.tool(
 // lib/memory-tools.js at /memory/<op>), the items/missions shape.
 async function callMemory(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/memory/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/memory/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -1643,7 +1651,7 @@ await server.connect(transport);
 // (lib/reminder-tools.js). Same shape as callItems.
 async function callReminders(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/reminders/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/reminders/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),

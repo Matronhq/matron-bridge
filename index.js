@@ -235,6 +235,7 @@ import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
+import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -756,6 +757,41 @@ const journalReadProxy = createJournalReadProxy({
   token: _journalToken,
   capabilityToken: JOURNAL_PROXY_CAP_TOKEN,
 });
+
+// Per-session tokens for the loopback API (lib/api-auth.js): each session's
+// children get a 0600 header file in a private mkdtemp dir, removed on exit.
+// MATRON_BRIDGE_API_AUTH=off turns the check off (the tokens are still
+// issued), for a rollback without a code change.
+const API_AUTH_ENFORCED = process.env.MATRON_BRIDGE_API_AUTH !== 'off';
+let API_AUTH_DIR = null;
+try {
+  API_AUTH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-api-'));
+  process.once('exit', () => { try { fs.rmSync(API_AUTH_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+} catch (e) {
+  console.warn(`[api] could not create the session token directory: ${e.message}`);
+}
+const apiAuth = createApiAuth({ dir: API_AUTH_DIR, viewerKey: viewerApiKey(process.env.HMAC_SECRET || '') });
+if (!API_AUTH_ENFORCED) console.warn('[api] MATRON_BRIDGE_API_AUTH=off: loopback API session tokens are not checked');
+// The operator token, for the owner's own scripts outside any session
+// (lib/api-auth.js). Written once this process holds the API port (a second
+// start that cannot bind must not replace the live bridge's file), and
+// removed on exit only while it is still this process's.
+function publishOperatorToken() {
+  const file = operatorHeaderPath();
+  try {
+    apiAuth.writeOperatorFile(file);
+    process.once('exit', () => { try { apiAuth.removeOperatorFile(file); } catch { /* best effort */ } });
+  } catch (e) {
+    console.warn(`[api] could not write the operator token file: ${e.message}`);
+  }
+}
+// The session's header file path, '' when it could not be written.
+function apiHeaderFileFor(roomId) {
+  try { return apiAuth.ensure(roomId); } catch (e) {
+    console.warn(`[api] could not write the session token file for ${roomId}: ${e.message}`);
+    return '';
+  }
+}
 
 // Which conversation is the user's Coordinator (spec 2026-09-23 §2a):
 // GET /coordinator on the same host and token as the items/missions
@@ -2490,7 +2526,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     // Additive inline settings: the bridge's hooks (and, when gated, the MCP
     // permission gate hook) merge with the on-disk settings, which all load.
-    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId) })),
+    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) })),
   ];
   const printModel = options.model === null
     ? undefined
@@ -2520,6 +2556,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    apiHeaderFile: apiHeaderFileFor(roomId),
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
@@ -2909,9 +2946,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       apiPort: API_PORT,
       appServer: CODEX_APP_SERVER,
       journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+      apiHeaderFile: apiHeaderFileFor(roomId),
     }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
-      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
+      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId) }) : {},
   });
   codex.planMode = CODEX_APP_SERVER && persisted?.codexPlanMode === true;
 
@@ -3395,7 +3433,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       // round. The hook+/plan-decision flow remains in print-mode only.
       PreToolUse: [
         // The foreign-turn gate (lib/foreign-turn.js), first and on every tool.
-        foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId) }),
+        foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
         { matcher: 'Bash', hooks: [ivHook('matron-bash-tee')] },
       ],
       Stop: [{
@@ -3440,6 +3478,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    apiHeaderFile: apiHeaderFileFor(roomId),
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
@@ -10386,6 +10425,15 @@ function sessionOccupiedForRoomDelivery(session) {
     || effortFlowHoldsInput(session);
 }
 
+// A turn another person starts needs more: no turn of any kind may still be
+// running. One the harness started by itself, or one an unacknowledged
+// interrupt left behind, has busy false but will still end with a result,
+// and that turn-end seam disarms the foreign gate (foreignSessions.end). So
+// the foreign turn waits for that seam instead of starting under it.
+function sessionOccupiedForForeignTurn(session) {
+  return sessionOccupiedForRoomDelivery(session) || !!session.currentTurn;
+}
+
 // The one shared room-flush gate used by every turn-end/idle seam (and the
 // journalOnRoomFrame self-heal): flush the coalesced room inbox ONLY when
 // the session is genuinely free, by the SAME composite predicate that routes
@@ -10896,7 +10944,9 @@ function flushRoomInbox(session) {
   // and no notice to publish (the ordinary idle path never queued anything).
   const queued = roomDelivery.pendingCount(session.roomId);
   const flushed = roomDelivery.flush(session, session.roomId);
-  if (!queued) return;
+  // null: another person's turn is waiting for a running turn to end; it
+  // stays queued for the next seam, with nothing to report yet.
+  if (!queued || flushed === null) return;
   // A flush delivers one turn's worth: own messages and each other person's
   // room go in separate turns, so some may still be waiting (they get their
   // own 📨 at the next turn end).
@@ -10913,7 +10963,9 @@ function flushRoomInbox(session) {
 // `case 'result'`). skipJournalMirror: the message already lives in the
 // room convo — mirroring it into the session convo would duplicate it.
 const roomDelivery = createRoomDelivery({
-  isBusy: sessionOccupiedForRoomDelivery,
+  isBusy: (session, { foreign = false } = {}) => (foreign
+    ? sessionOccupiedForForeignTurn(session)
+    : sessionOccupiedForRoomDelivery(session)),
   // A turn another person started (meta.foreign) is armed and banner'd by
   // foreignSessions before it is sent; every other room turn is as before.
   // meta.causes: the messages' causes (a spawn outcome's request, else the
@@ -10936,7 +10988,7 @@ const foreignSessions = createForeignSessions({
   journalConvoIdFor,
   sendText: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, foreign: true }),
   publishNotice: (convoId, text) => journalPublishNotice(convoId, text),
-  isOccupied: sessionOccupiedForRoomDelivery,
+  isOccupied: sessionOccupiedForForeignTurn,
   flag: { set: (key) => setForeignFlag(key), clear: (key) => clearForeignFlag(key) },
   store: {
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
@@ -11722,6 +11774,17 @@ const journalInputConsumer = createJournalInputConsumer({
   roomFor: (convoId) => (agentRooms.isActive(convoId) ? agentRooms.get(convoId) : null),
   routeRoomFrame: journalOnRoomFrame,
   selfAgentName: () => journalPublisher.identity()?.name || null,
+  ownerName: () => journalIdentity.name(),
+  // Another user's name on a `user:` frame: re-ask /me in case the owner
+  // was renamed, at most once a minute.
+  onForeignUser: (() => {
+    let last = 0;
+    return () => {
+      if (Date.now() - last < 60_000) return;
+      last = Date.now();
+      journalIdentity.refresh({ force: true });
+    };
+  })(),
   selfAgentDeviceId: () => journalPublisher.identity()?.deviceId ?? null,
   // Queued-release universal echo-ack (spec §3 step 5): the echo of our own
   // release is the true commit signal — flip the outbox record `acked` in
@@ -12544,6 +12607,18 @@ function validateShowFileBody(data) {
   return null;
 }
 
+// The session a loopback API request acts for (lib/api-auth.js).
+function apiNamedRoom(url, data) {
+  return namedSessionRoom({
+    roomQuery: url.pathname === '/foreign-check' ? url.searchParams.get('room') : null,
+    data,
+    roomForClaudeSession: (id) => {
+      for (const [roomId, s] of sessions) if (s.claudeSessionId === id) return roomId;
+      return null;
+    },
+  });
+}
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -12578,6 +12653,23 @@ const apiServer = createServer(async (req, res) => {
       return;
     }
   }
+
+  // Session tokens (lib/api-auth.js). The routes with a credential of their
+  // own keep it (the journal proxy above; /wake, /shutdown and /show-file
+  // below); every other route needs a session token, and a request that
+  // names a session needs that session's. The viewer's key opens only the
+  // routes the viewer calls.
+  const apiCaller = apiAuth.caller(req.headers);
+  const ownCredentialRoute = url.pathname === '/wake' || url.pathname === '/shutdown' || url.pathname === '/show-file';
+  const refuseApiCall = (namedRoomId) => {
+    if (!API_AUTH_ENFORCED || ownCredentialRoute) return false;
+    const r = apiAuthRefusal({ caller: apiCaller, method: req.method, pathname: url.pathname, namedRoomId });
+    if (!r) return false;
+    res.writeHead(r.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: r.error }));
+    return true;
+  };
+  if (req.method === 'GET' && refuseApiCall(null)) return;
 
   // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
   // uses it (request_secret is non-blocking now); it stays so a
@@ -12761,6 +12853,8 @@ const apiServer = createServer(async (req, res) => {
 
     try {
       const data = JSON.parse(body);
+
+      if (refuseApiCall(apiNamedRoom(url, data))) return;
 
       // Foreign turns (lib/foreign-turn.js): the hook's question, answered
       // before the generic gate below (its body is the hook input, not a
@@ -13540,6 +13634,7 @@ const apiServer = createServer(async (req, res) => {
 
 apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
+  publishOperatorToken();
 });
 
 function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.agent)) {

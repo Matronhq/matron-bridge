@@ -575,3 +575,35 @@ describe('mute announcements', () => {
     }
   });
 });
+
+describe('a turn another person starts waits for any running turn', () => {
+  function rig() {
+    const injectTurn = vi.fn(() => true);
+    const delivery = createRoomDelivery({
+      isBusy: (s, { foreign = false } = {}) => !!s.busy || (foreign && !!s.currentTurn),
+      injectTurn,
+      log: { warn: () => {} },
+    });
+    return { delivery, injectTurn };
+  }
+
+  it('queues a foreign message while a harness-started turn runs, and keeps it queued at a flush until that turn ends', () => {
+    const { delivery, injectTurn } = rig();
+    const s = { alive: true, busy: false, currentTurn: { causes: null } };
+    expect(delivery.deliver(s, 'k1', msg({ roomId: 'r-p', foreign: { person: 'p' } }))).toBe(true);
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.flush(s, 'k1')).toBe(null);
+    expect(delivery.pendingCount('k1')).toBe(1);
+    s.currentTurn = null;
+    expect(delivery.flush(s, 'k1')).toBe(true);
+    expect(injectTurn.mock.calls[0][2].foreign).toEqual({ roomId: 'r-p', person: 'p' });
+    expect(delivery.pendingCount('k1')).toBe(0);
+  });
+
+  it('own room messages are not held back by a running turn', () => {
+    const { delivery, injectTurn } = rig();
+    const s = { alive: true, busy: false, currentTurn: { causes: null } };
+    delivery.deliver(s, 'k1', msg());
+    expect(injectTurn).toHaveBeenCalledTimes(1);
+  });
+});

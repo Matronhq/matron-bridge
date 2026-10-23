@@ -175,7 +175,8 @@ describe('index.js wiring', () => {
   });
 
   it('refreshes the name at boot and on every hello_ok (forced) and at each spawn', () => {
-    expect(index.match(/journalIdentity\.refresh\(\{ force: true \}\);/g)?.length).toBe(2);
+    // Plus one, throttled, when a `user:` frame carries another name.
+    expect(index.match(/journalIdentity\.refresh\(\{ force: true \}\);/g)?.length).toBe(3);
     expect(index).toMatch(/userDefaults\.refresh\(\);\n\s*journalIdentity\.refresh\(\);/);
   });
 
