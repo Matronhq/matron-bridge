@@ -70,8 +70,13 @@ afterEach(() => {
 
 describe('bin/run-named-node', () => {
   it('is an executable POSIX sh script', () => {
-    expect(fs.statSync(LAUNCHER).mode & 0o111).not.toBe(0);
-    expect(fs.readFileSync(LAUNCHER, 'utf8').split('\n')[0]).toBe('#!/bin/sh');
+    const fd = fs.openSync(LAUNCHER, 'r');
+    try {
+      expect(fs.fstatSync(fd).mode & 0o111).not.toBe(0);
+      expect(fs.readFileSync(fd, 'utf8').split('\n')[0]).toBe('#!/bin/sh');
+    } finally {
+      fs.closeSync(fd);
+    }
   });
 
   it('copies node under the given name and execs the script with it', () => {
@@ -104,10 +109,17 @@ describe('bin/run-named-node', () => {
     run(['matron-test', 'a.js']);
     const copy = path.join(binDir, 'matron-test');
     const upgraded = `${FAKE_NODE}# upgraded\n`;
-    fs.writeFileSync(fakeNode, upgraded);
-    // Same mtime as the old copy, so only the size gives the change away.
-    const { atime, mtime } = fs.statSync(copy);
-    fs.utimesSync(fakeNode, atime, mtime);
+    // Rewrite node but keep its mtime (which the copy shares, via cp -p), so
+    // only the size gives the change away.
+    const fd = fs.openSync(fakeNode, 'r+');
+    try {
+      const { atime, mtime } = fs.fstatSync(fd);
+      fs.ftruncateSync(fd, 0);
+      fs.writeSync(fd, upgraded, 0);
+      fs.futimesSync(fd, atime, mtime);
+    } finally {
+      fs.closeSync(fd);
+    }
     const res = run(['matron-test', 'b.js']);
     expect(parse(res.stdout).argv0).toBe(copy);
     expect(fs.readFileSync(copy, 'utf8')).toBe(upgraded);
