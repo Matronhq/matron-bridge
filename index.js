@@ -9037,6 +9037,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ text: trimmed });
+    if (answer) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     if (!answer) journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
     return;
@@ -9044,6 +9045,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
     session.pendingUnclassifiedPrompt = false;
+    joinHeldTurn(session, causes);
     return;
   }
 
@@ -9248,11 +9250,15 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 // records the user's answer, so mirroring it again would duplicate it.
 // Returns the resolved answer's label (for the Matrix echo), or null if
 // nothing could be resolved (no pending prompt, or an unmatched choice with
-// no usable free text).
-function journalRoutePromptReply(session, { choice, text }) {
+// no usable free text). `causes` names the user's reply row: a raw
+// tool_result answer takes it as its turn seam (submitAnswer), and an answer
+// typed into a prompt the running turn is waiting on joins that turn
+// (joinHeldTurn), so what the agent asks for next is credited to the tap.
+function journalRoutePromptReply(session, { choice, text }, { causes = null } = {}) {
   if (session.codexPrompts?.active) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ choice, text });
+    if (answer) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     return answer;
   }
@@ -9274,6 +9280,7 @@ function journalRoutePromptReply(session, { choice, text }) {
         const resp = promptResponseForButton(p, resolved.index);
         if (resp) {
           if (session.iv.respondToPrompt(resp) !== true) return null;
+          joinHeldTurn(session, causes);
           // Same effort-confirmation settle as the typed-reply path.
           if (noteEffortConfirmationAnswer(session, p, resolved.option.label)) persistEffortLevel(session);
           session.pendingInteractivePrompt = null;
@@ -9300,6 +9307,7 @@ function journalRoutePromptReply(session, { choice, text }) {
         onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
       });
       if (!dispatched) return null;
+      joinHeldTurn(session, causes);
       session.pendingInteractivePrompt = null;
       return freeText;
     }
@@ -9334,7 +9342,7 @@ function journalRoutePromptReply(session, { choice, text }) {
     }
     if (!answerText) return null;
     const header = q.header ? `${q.header}: ` : '';
-    submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false });
+    submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false, causes });
     return answerText;
   }
 
@@ -9743,7 +9751,7 @@ function journalOnMedia(session, media, ctx) {
 
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
 // {target_seq, choice, text}, {username}) interface.
-function journalOnPromptReply(session, answer, { username }) {
+function journalOnPromptReply(session, answer, { username, seq, convoId: replyConvoId }) {
   rearmPreReapHandoff(session);
   // Command-replay guard: a prompt answer has side effects (keystrokes into
   // the TUI / a tool_result write), so an ungraceful crash inside the
@@ -9847,10 +9855,13 @@ function journalOnPromptReply(session, answer, { username }) {
     });
     return;
   }
-  // Not a picker command — resolve it as an answer to a pending prompt.
+  // Not a picker command — resolve it as an answer to a pending prompt. The
+  // user's reply row is what the answer's turn carries on with
+  // (lib/turn-cause.js), cited like a typed message.
+  const causes = seq != null && replyConvoId ? [userMessageCause(replyConvoId, seq)] : null;
   let label;
   try {
-    label = journalRoutePromptReply(session, answer);
+    label = journalRoutePromptReply(session, answer, { causes });
   } catch (e) {
     console.warn(`[journal-input] routing prompt_reply failed: ${e.message}`);
     journalPublishNotice(journalConvoIdFor(session), `⚠️ Could not deliver your answer: ${e.message}`);

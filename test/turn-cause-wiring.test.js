@@ -22,6 +22,20 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(route.match(/sendTextToSession\(session, trimmed, \{ skipJournalMirror: true, causes \}\)/g)).toHaveLength(2);
   });
 
+  it('a tap on a question card names the user\'s reply row, on every answer path', () => {
+    const onReply = fnBody('function journalOnPromptReply(');
+    expect(onReply).toContain('const causes = seq != null && replyConvoId ? [userMessageCause(replyConvoId, seq)] : null;');
+    expect(onReply).toContain('journalRoutePromptReply(session, answer, { causes })');
+    const route = fnBody('function journalRoutePromptReply(');
+    expect(route).toContain('{ causes = null } = {}');
+    // print mode: the raw tool_result answer takes the turn seam with them.
+    expect(route).toContain('submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false, causes });');
+    // iv and Codex: the answer joins the turn that is waiting on it.
+    expect(route.match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(3);
+    // A typed answer into an iv or Codex prompt joins it the same way.
+    expect(fnBody('async function journalRouteTextToSession(').match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(2);
+  });
+
   it('queued and resume-held messages keep their causes, and the flush that sends them merges them', () => {
     expect(fnBody('function sendToSession(')).toContain('(session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));');
     expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })');
