@@ -128,3 +128,20 @@ describe('operator token', () => {
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 });
+
+describe('operator token file ownership', () => {
+  it('removes the file only while it holds this process\'s token', () => {
+    const base = tmp();
+    try {
+      const file = operatorHeaderPath({ XDG_STATE_HOME: base });
+      const first = createApiAuth();
+      const second = createApiAuth();
+      first.writeOperatorFile(file);
+      second.writeOperatorFile(file);
+      expect(first.removeOperatorFile(file)).toBe(false);
+      expect(fs.existsSync(file)).toBe(true);
+      expect(second.removeOperatorFile(file)).toBe(true);
+      expect(fs.existsSync(file)).toBe(false);
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+});

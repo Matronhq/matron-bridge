@@ -773,12 +773,14 @@ try {
 const apiAuth = createApiAuth({ dir: API_AUTH_DIR, viewerKey: viewerApiKey(process.env.HMAC_SECRET || '') });
 if (!API_AUTH_ENFORCED) console.warn('[api] MATRON_BRIDGE_API_AUTH=off: loopback API session tokens are not checked');
 // The operator token, for the owner's own scripts outside any session
-// (lib/api-auth.js): rewritten each boot, removed on exit.
-{
+// (lib/api-auth.js). Written once this process holds the API port (a second
+// start that cannot bind must not replace the live bridge's file), and
+// removed on exit only while it is still this process's.
+function publishOperatorToken() {
   const file = operatorHeaderPath();
   try {
     apiAuth.writeOperatorFile(file);
-    process.once('exit', () => { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } });
+    process.once('exit', () => { try { apiAuth.removeOperatorFile(file); } catch { /* best effort */ } });
   } catch (e) {
     console.warn(`[api] could not write the operator token file: ${e.message}`);
   }
@@ -13632,6 +13634,7 @@ const apiServer = createServer(async (req, res) => {
 
 apiServer.listen(API_PORT, '127.0.0.1', () => {
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
+  publishOperatorToken();
 });
 
 function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.agent)) {
