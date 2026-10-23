@@ -235,7 +235,7 @@ import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
-import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom } from './lib/api-auth.js';
+import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -772,6 +772,17 @@ try {
 }
 const apiAuth = createApiAuth({ dir: API_AUTH_DIR, viewerKey: viewerApiKey(process.env.HMAC_SECRET || '') });
 if (!API_AUTH_ENFORCED) console.warn('[api] MATRON_BRIDGE_API_AUTH=off: loopback API session tokens are not checked');
+// The operator token, for the owner's own scripts outside any session
+// (lib/api-auth.js): rewritten each boot, removed on exit.
+{
+  const file = operatorHeaderPath();
+  try {
+    apiAuth.writeOperatorFile(file);
+    process.once('exit', () => { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } });
+  } catch (e) {
+    console.warn(`[api] could not write the operator token file: ${e.message}`);
+  }
+}
 // The session's header file path, '' when it could not be written.
 function apiHeaderFileFor(roomId) {
   try { return apiAuth.ensure(roomId); } catch (e) {

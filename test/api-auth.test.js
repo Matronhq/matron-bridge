@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApiAuth, apiAuthRefusal, viewerApiKey, isViewerRoute, namedSessionRoom, NAMES_CONFLICT } from '../lib/api-auth.js';
+import { createApiAuth, apiAuthRefusal, viewerApiKey, isViewerRoute, namedSessionRoom, NAMES_CONFLICT, operatorHeaderPath } from '../lib/api-auth.js';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'api-auth-'));
@@ -86,5 +86,45 @@ describe('namedSessionRoom', () => {
     expect(named).toBe(NAMES_CONFLICT);
     expect(apiAuthRefusal({ caller: { kind: 'session', roomId: 'room-a' }, method: 'POST', pathname: '/turn-end', namedRoomId: named }).status).toBe(403);
     expect(namedSessionRoom({ data: { roomId: 'room-a', session_id: 'sid-a' }, roomForClaudeSession: lookup })).toBe('room-a');
+  });
+});
+
+describe('operator token', () => {
+  it('is written owner-only under the state directory and opens only POST /sessions', () => {
+    const base = tmp();
+    try {
+      const auth = createApiAuth();
+      const file = operatorHeaderPath({ XDG_STATE_HOME: base }, '/nowhere');
+      expect(file).toBe(path.join(base, 'matron-bridge', 'api-operator.header'));
+      auth.writeOperatorFile(file);
+      if (process.platform !== 'win32') {
+        expect(fs.statSync(file).mode & 0o077).toBe(0);
+        expect(fs.statSync(path.dirname(file)).mode & 0o077).toBe(0);
+      }
+      const h = readApiHeaderFile(file);
+      const caller = auth.caller(Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v])));
+      expect(caller).toEqual({ kind: 'operator' });
+      expect(apiAuthRefusal({ caller, method: 'POST', pathname: '/sessions' })).toBe(null);
+      expect(apiAuthRefusal({ caller, method: 'POST', pathname: '/send', namedRoomId: 'room-a' }).status).toBe(403);
+      // A second boot replaces the file rather than writing through it.
+      createApiAuth().writeOperatorFile(file);
+      expect(auth.caller(Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v])))).toEqual({ kind: 'operator' });
+      expect(readApiHeaderFile(file)).not.toEqual(h);
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('replaces a planted link instead of following it', () => {
+    if (process.platform === 'win32') return;
+    const base = tmp();
+    try {
+      const file = operatorHeaderPath({ XDG_STATE_HOME: base });
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      const victim = path.join(base, 'victim');
+      fs.writeFileSync(victim, 'keep');
+      fs.symlinkSync(victim, file);
+      createApiAuth().writeOperatorFile(file);
+      expect(fs.readFileSync(victim, 'utf8')).toBe('keep');
+      expect(fs.lstatSync(file).isSymbolicLink()).toBe(false);
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 });
