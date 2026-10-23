@@ -105,7 +105,7 @@ describe('projects wiring', () => {
         const r = await handlers[op](JSON.parse(init.body));
         return { status: r.status, ok: r.status >= 200 && r.status < 300, json: async () => r.body };
       };
-      return new Function('fetch', 'BRIDGE_API', 'ROOM_ID', 'missionIdemKey', 'formatProjectBlocked', 'formatProjectJournalError', `${src}\nreturn callProjects;`)(
+      return new Function('bridgeFetch', 'BRIDGE_API', 'ROOM_ID', 'missionIdemKey', 'formatProjectBlocked', 'formatProjectJournalError', `${src}\nreturn callProjects;`)(
         fetch, 'http://bridge', '!r:s', () => 'k', formatProjectBlocked, formatProjectJournalError);
     };
     const journal = (status, data) => vi.fn(async () => ({ status, data }));

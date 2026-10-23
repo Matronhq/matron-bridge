@@ -3,6 +3,7 @@
 // (POST /foreign-check); `{}` -> no output, a deny -> print it; bridge
 // unreachable -> deny while the turn's flag file exists, nothing otherwise.
 import fs from 'node:fs';
+import { readApiHeaderFile } from '../lib/api-header-file.js';
 
 const DENY = {
   hookSpecificOutput: {
@@ -18,6 +19,7 @@ function parseArgs(argv) {
     if (argv[i] === '--port') out.port = argv[i + 1];
     if (argv[i] === '--room') out.room = argv[i + 1];
     if (argv[i] === '--flag') out.flag = argv[i + 1];
+    if (argv[i] === '--auth') out.auth = argv[i + 1];
   }
   return out;
 }
@@ -29,7 +31,7 @@ async function readStdin() {
 }
 
 async function main() {
-  const { port, room, flag } = parseArgs(process.argv.slice(2));
+  const { port, room, flag, auth } = parseArgs(process.argv.slice(2));
   const input = await readStdin();
   // The bridge's answer is the truth; the flag file decides only when the
   // bridge cannot be reached (present -> deny, absent -> nothing).
@@ -38,7 +40,7 @@ async function main() {
   if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535 || !room) return fallback();
   try {
     const res = await fetch(`http://127.0.0.1:${portNum}/foreign-check?room=${encodeURIComponent(room)}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: input, signal: AbortSignal.timeout(10_000),
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...readApiHeaderFile(auth) }, body: input, signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return fallback();
     const data = await res.json();

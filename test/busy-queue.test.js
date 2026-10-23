@@ -1785,9 +1785,8 @@ describe('queued-release publisher wiring', () => {
 
   it('the router rejects agent-authored release echoes at its user-sender guard', () => {
     const src = readFileSync(new URL('../lib/journal-input-router.js', import.meta.url), 'utf-8');
-    expect(src).toMatch(
-      /if \(typeof sender !== ['"]string['"] \|\| !sender\.startsWith\(['"]user:['"]\)\) return;/,
-    );
+    expect(src).toMatch(/if \(!isOwnerSender\(sender\)\) return;/);
+    expect(src).toMatch(/if \(typeof sender !== ['"]string['"] \|\| !sender\.startsWith\(['"]user:['"]\)\) return false;/);
   });
 });
 

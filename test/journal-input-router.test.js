@@ -2122,7 +2122,8 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     const rd = src.indexOf('createRoomDelivery({');
     expect(rd).toBeGreaterThan(-1);
     const rdEnd = src.indexOf('});', rd);
-    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: sessionOccupiedForRoomDelivery/);
+    // Another person's turn uses the stricter gate (no turn running at all).
+    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: \(session, \{ foreign = false \} = \{\}\) => \(foreign\s*\? sessionOccupiedForForeignTurn\(session\)\s*: sessionOccupiedForRoomDelivery\(session\)\)/);
     // The injected turn must not re-mirror into the session's own convo.
     expect(src.slice(rd, rdEnd)).toMatch(/skipJournalMirror: true/);
   });
@@ -2236,7 +2237,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(count).toBeGreaterThan(-1);
       expect(flush).toBeGreaterThan(count);
       // Nothing queued => nothing to close, and no notice at all.
-      expect(body).toMatch(/if \(!queued\) return;/);
+      expect(body).toMatch(/if \(!queued \|\| flushed === null\) return;/);
       // A refused inject must say so rather than leave the ⏳ hanging.
       // A flush is one turn's worth (own messages and each other person's
       // room go separately), so the notice counts what actually went out.
@@ -2557,5 +2558,49 @@ describe('coordinator events', () => {
     onEvent(baseFrame({ type: 'coordinator', payload: { role: 'assigned' } }));
     expect(routeRoomFrame).not.toHaveBeenCalled();
     expect(seams.onCoordinatorEvent).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('createJournalInputConsumer — user: frames must be the owner', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: vi.fn((id) => id === 'control-1'),
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => ({ claudeSessionId: 'convo-1' })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  it('routes the owner and drops another user once the owner is known', () => {
+    const onForeignUser = vi.fn();
+    const deps = makeDeps({ ownerName: () => 'alice', onForeignUser });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:alice' }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    consumer(baseFrame({ sender: 'user:bob', seq: 2 }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(onForeignUser).toHaveBeenCalledWith('bob');
+    consumer(baseFrame({ sender: 'user:bob', convo_id: 'control-1', payload: { body: '/start' } }));
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('keeps the old behaviour while the owner is unknown', () => {
+    const deps = makeDeps({ ownerName: () => null });
+    createJournalInputConsumer(deps)(baseFrame({ sender: 'user:bob' }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops another user in a room', () => {
+    const routeRoomFrame = vi.fn();
+    const deps = makeDeps({ ownerName: () => 'alice', roomFor: (id) => (id === 'room-1' ? { roomId: 'room-1' } : null), routeRoomFrame });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ convo_id: 'room-1', sender: 'user:bob' }));
+    expect(routeRoomFrame).not.toHaveBeenCalled();
+    consumer(baseFrame({ convo_id: 'room-1', sender: 'user:alice' }));
+    expect(routeRoomFrame).toHaveBeenCalledTimes(1);
   });
 });

@@ -17,8 +17,8 @@ const fnBody = (src, sig) => {
 
 describe('index.js wiring', () => {
   it('every Claude session gets the gate: print spawns and iv settings name the flag path', () => {
-    expect(index).toMatch(/buildPrintSessionSettings\(\{ bypass: bypassMode, hooksDir: [\s\S]{0,120}?foreignFlag: foreignFlagPath\(roomId\) \}\)/);
-    expect(index).toMatch(/foreignGateEntry\(\{ hooksDir: path\.join\(__dirname, 'hooks'\), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath\(roomId\) \}\)/);
+    expect(index).toMatch(/buildPrintSessionSettings\(\{ bypass: bypassMode, hooksDir: [\s\S]{0,120}?foreignFlag: foreignFlagPath\(roomId\), apiHeaderFile: apiHeaderFileFor\(roomId\) \}\)/);
+    expect(index).toMatch(/foreignGateEntry\(\{ hooksDir: path\.join\(__dirname, 'hooks'\), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath\(roomId\), apiHeaderFile: apiHeaderFileFor\(roomId\) \}\)/);
   });
 
   it('a foreign turn ends at the print and iv turn-end seams, before the queue or room flush', () => {
