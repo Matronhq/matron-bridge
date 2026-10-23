@@ -153,6 +153,7 @@ OLD_PID=$(service_pid)
 # be created first by another user.
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge"
 mkdir -p -m 700 "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 echo "${OLD_PID:-none}" > "$STATE_DIR/deploy-oldpid"
 step "restart $TARGET  (old PID: ${OLD_PID:-none})"
 service_restart

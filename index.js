@@ -235,7 +235,7 @@ import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
-import { createApiAuth, viewerApiKey, apiAuthRefusal } from './lib/api-auth.js';
+import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom } from './lib/api-auth.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -12594,19 +12594,16 @@ function validateShowFileBody(data) {
   return null;
 }
 
-// The session a loopback API request acts for, by roomId (most routes), by
-// the hook's room query (/foreign-check), or by Claude session id (the
-// Stop/PreCompact/plan hooks). Null when it names none, or names a Claude
-// session no live session has (those routes do nothing then).
+// The session a loopback API request acts for (lib/api-auth.js).
 function apiNamedRoom(url, data) {
-  if (url.pathname === '/foreign-check') return url.searchParams.get('room') || null;
-  if (typeof data?.roomId === 'string') return data.roomId;
-  if (typeof data?.session_id === 'string' && data.session_id) {
-    for (const [roomId, s] of sessions) {
-      if (s.claudeSessionId === data.session_id) return roomId;
-    }
-  }
-  return null;
+  return namedSessionRoom({
+    roomQuery: url.pathname === '/foreign-check' ? url.searchParams.get('room') : null,
+    data,
+    roomForClaudeSession: (id) => {
+      for (const [roomId, s] of sessions) if (s.claudeSessionId === id) return roomId;
+      return null;
+    },
+  });
 }
 
 const apiServer = createServer(async (req, res) => {

@@ -76,6 +76,7 @@ echo "Starting bridge..."
 # Log to a per-user directory, not a fixed name in the shared /tmp.
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge"
 mkdir -p -m 700 "$LOG_DIR"
+chmod 700 "$LOG_DIR"
 LOG_FILE="$LOG_DIR/matron-bridge.log"
 nohup node index.js > "$LOG_FILE" 2>&1 &
 NEW_PID=$!

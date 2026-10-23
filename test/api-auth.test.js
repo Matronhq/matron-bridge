@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApiAuth, apiAuthRefusal, viewerApiKey, isViewerRoute } from '../lib/api-auth.js';
+import { createApiAuth, apiAuthRefusal, viewerApiKey, isViewerRoute, namedSessionRoom, NAMES_CONFLICT } from '../lib/api-auth.js';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'api-auth-'));
@@ -69,5 +69,22 @@ describe('readApiHeaderFile', () => {
       fs.writeFileSync(path.join(dir, 'bad'), 'not a header');
       expect(readApiHeaderFile(path.join(dir, 'bad'))).toEqual({});
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('namedSessionRoom', () => {
+  const lookup = (id) => ({ 'sid-a': 'room-a', 'sid-b': 'room-b' })[id] ?? null;
+  it('takes the session from roomId, the room query or the Claude session id', () => {
+    expect(namedSessionRoom({ data: { roomId: 'room-a' } })).toBe('room-a');
+    expect(namedSessionRoom({ roomQuery: 'room-a', data: {} })).toBe('room-a');
+    expect(namedSessionRoom({ data: { session_id: 'sid-b' }, roomForClaudeSession: lookup })).toBe('room-b');
+    expect(namedSessionRoom({ data: { session_id: 'sid-x' }, roomForClaudeSession: lookup })).toBe(null);
+    expect(namedSessionRoom({ data: {} })).toBe(null);
+  });
+  it('a request naming two sessions matches neither', () => {
+    const named = namedSessionRoom({ data: { roomId: 'room-a', session_id: 'sid-b' }, roomForClaudeSession: lookup });
+    expect(named).toBe(NAMES_CONFLICT);
+    expect(apiAuthRefusal({ caller: { kind: 'session', roomId: 'room-a' }, method: 'POST', pathname: '/turn-end', namedRoomId: named }).status).toBe(403);
+    expect(namedSessionRoom({ data: { roomId: 'room-a', session_id: 'sid-a' }, roomForClaudeSession: lookup })).toBe('room-a');
   });
 });
