@@ -471,7 +471,7 @@ server.tool(
       }
       const boxes = data.boxes || [];
       if (!boxes.length) return { content: [{ type: 'text', text: 'No boxes found.' }] };
-      return { content: [{ type: 'text', text: boxes.map(formatBox).join('\n\n') }] };
+      return { content: [{ type: 'text', text: boxes.map((b) => formatBox(b)).join('\n\n') }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -675,7 +675,7 @@ server.tool(
 // routine_delete go through the bridge loopback (index.js mounts
 // lib/routines-tools.js at /routine/<op>); the journal allows the writes to
 // the Coordinator alone.
-const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
+const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk, a weekly allowance about to reset with room left), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
 
 // What a routine may start on its own: the journal approves the
 // Coordinator's own spawn and chat asks from a turn this routine's fire
@@ -715,7 +715,7 @@ server.tool(
     tz: z.string().max(64).optional().describe('IANA zone the schedule is in, e.g. Europe/London'),
     prompt: z.string().max(2000).optional().describe('The turn text the journal fires; keep it one line pointing at the playbook section'),
     enabled: z.boolean().optional().describe('false pauses, true resumes'),
-    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('For a triggered routine: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes (fire only when the reset is at least that far away, or unknown)'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under', 'allowance_expiring']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional(), from_hours: z.number().int().min(0).max(168).optional(), to_hours: z.number().int().min(0).max(168).optional() }).optional().describe('For a triggered routine: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes (fire only when the reset is at least that far away, or unknown), allowance_expiring takes pct (weekly meter under it) and optionally from_hours/to_hours (reset that far away, default 6–12)'),
     envelope: ROUTINE_ENVELOPE.describe(`${ROUTINE_ENVELOPE_WHAT} null clears it, so every such ask waits for the user. Widen it only when the user asks.`),
   },
   async (args) => callRoutine('update', args, (d) => formatRoutineUpdateAck(d, args)),
@@ -737,7 +737,7 @@ server.tool(
     name: z.string().max(64).describe('New slug: lowercase letters, digits and dashes, e.g. "exception-triage"'),
     title: z.string().max(200).describe('One line, shown in the apps'),
     schedule: z.string().max(64).optional().describe('Five cron fields: minute hour day-of-month month day-of-week, e.g. "30 8,16 * * *" (08:30 and 16:30). Give this or trigger.'),
-    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('Instead of a schedule: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under', 'allowance_expiring']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional(), from_hours: z.number().int().min(0).max(168).optional(), to_hours: z.number().int().min(0).max(168).optional() }).optional().describe('Instead of a schedule: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes, allowance_expiring takes pct and optionally from_hours/to_hours (default 6–12)'),
     tz: z.string().max(64).optional().describe('IANA zone the schedule is in; default Europe/London'),
     prompt: z.string().max(2000).describe('The turn text the journal fires, e.g. "Routine exception-triage: follow the exception-triage-routine memory."'),
     enabled: z.boolean().optional().describe('Default true; false creates it paused'),
