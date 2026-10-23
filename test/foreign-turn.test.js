@@ -198,3 +198,12 @@ describe('the flag file', () => {
     expect(() => setForeignFlag('r', { dir: path.join(dir, 'gate') })).toThrow();
   });
 });
+
+describe('owner-only items', () => {
+  it('a turn another person started cannot read or answer a private item, even on the attached mission', async () => {
+    const lookupItem = async (id) => ({ mission_id: 'mi_1', mission_num: 7, private: id === 'it_secret' });
+    expect((await decide(ownerTurn, `${A}item_get`, { id: 'it_secret' }, { lookupItem })).decision).toBe('deny');
+    expect((await decide(ownerTurn, `${A}item_comment`, { id: 'it_secret', body: 'x' }, { lookupItem })).decision).toBe('deny');
+    expect((await decide(ownerTurn, `${A}item_get`, { id: 'it_plain' }, { lookupItem })).decision).toBe('allow');
+  });
+});

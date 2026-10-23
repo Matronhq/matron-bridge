@@ -248,3 +248,38 @@ describe('Allow once', () => {
     expect(r.fs.pendingCount()).toBe(0);
   });
 });
+
+describe('Codex sessions never take a continuation', () => {
+  it('an Allow once tap after a switch to Codex runs nothing and says so', async () => {
+    const r = rig();
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: 'git log -3' }, why: 'w' });
+    r.fs.end(s);
+    const switched = { ...session(), codex: {} };
+    expect(r.fs.onItemReply(switched, { item_id: 'it_1', action: 'commented', comment: { action: ALLOW_LABEL } })).toBe(true);
+    expect(r.sent).toEqual([]);
+    expect(switched.foreignTurn).toBe(null);
+    expect(r.closed[0][1].comment).toMatch(/Codex/);
+    expect(r.notices.at(-1)[1]).toMatch(/Codex/);
+    expect(r.fs.pendingCount()).toBe(0);
+  });
+
+  it('parked continuations are dropped, not drained, into a Codex session', async () => {
+    const r = rig({ busy: true });
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: 'git log -3' }, why: 'w' });
+    r.fs.end(s);
+    // Tapped while the Claude session was busy: parked.
+    r.fs.onItemReply(s, { item_id: 'it_1', action: 'commented', comment: { action: ALLOW_LABEL } });
+    expect(r.sent).toEqual([]);
+    r.occupied.v = false;
+    const switched = { ...session(), codex: {} };
+    expect(r.fs.drainParked(switched)).toBe(false);
+    expect(r.sent).toEqual([]);
+    expect(switched.foreignTurn).toBe(null);
+    // And nothing is left to start later.
+    expect(r.fs.drainParked(session())).toBe(false);
+  });
+});
