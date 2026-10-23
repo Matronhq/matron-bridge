@@ -2111,7 +2111,7 @@ describe('#165 index.js prompt-reply handler — value-shape classification reti
     // `cancel:2` — flows through to journalRoutePromptReply and the "answered:"
     // echo. No value-shape early-return sits between classify and route.
     expect(body).toMatch(/queuedRelease\.state === 'live'/);
-    expect(body).toMatch(/journalRoutePromptReply\(session, answer\)/);
+    expect(body).toMatch(/journalRoutePromptReply\(session, answer, \{ causes \}\)/);
     expect(body).toMatch(/answered: /);
     expect(body).not.toMatch(/isQueueReleaseTap/);
   });

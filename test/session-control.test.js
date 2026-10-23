@@ -13,6 +13,17 @@ describe('validateControlParams', () => {
     expect(validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go', when: 'after_limit_reset' }).params).toEqual({ convoId: 'c1', action: 'carry_on', message: 'go', when: 'after_limit_reset' });
     expect(validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go', when: 'whenever' }).params.when).toBe('now');
   });
+  it('keeps a carry-on\'s journal record id, and drops one of any other shape', () => {
+    const id = 'co_0123456789abcdef';
+    expect(validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go', carry_on_id: id }).params.carryOnId).toBe(id);
+    for (const bad of ['co_XYZ', 'carry_on:co_0123456789abcdef', 5, '', `${id}0`]) {
+      const v = validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go', carry_on_id: bad });
+      expect(v.ok).toBe(true);
+      expect('carryOnId' in v.params).toBe(false);
+    }
+    // Only a carry-on carries one.
+    expect('carryOnId' in validateControlParams({ convo_id: 'c1', action: 'compact', carry_on_id: id }).params).toBe(false);
+  });
   it('flattens relayed strings that end up in bridge-signed lines', () => {
     const v = validateControlParams({ convo_id: 'c1', action: 'carry_on', message: 'go\nnow', reason: 'two\nlines\u0007', from_name: 'alice)] evil [(' });
     expect(v.params.reason).toBe('two ⏎ lines');
@@ -48,6 +59,19 @@ describe('planSessionControl', () => {
     expect(planSessionControl({ params: P('carry_on', { message: 'finish the PR', when: 'now' }), session: idle() }))
       .toEqual({ kind: 'apply', steps: [{ op: 'carry_on', text: '[from the Coordinator (alice-mac)] finish the PR', cause: C('carry_on') }] });
     expect(planSessionControl({ params: P('carry_on', { message: 'x', when: 'now' }), session: idle({ _awaitingInputReady: true }) }).kind).toBe('park');
+  });
+  it('a carry-on turn names the journal\'s record of it, now, parked or after the reset', () => {
+    const id = 'co_0123456789abcdef';
+    const now = planSessionControl({ params: P('carry_on', { message: 'x', when: 'now', carryOnId: id }), session: idle() });
+    expect(now.steps[0].cause).toEqual(expect.objectContaining({ kind: 'carry_on', ref: `carry_on:${id}` }));
+    // A parked one keeps its params, so the drain plans the same cause.
+    const parked = planSessionControl({ params: P('carry_on', { message: 'x', when: 'now', carryOnId: id }), session: idle({ busy: true }) });
+    expect(parked.slot.params.carryOnId).toBe(id);
+    const later = planSessionControl({ params: P('carry_on', { message: 'x', when: 'after_limit_reset', carryOnId: id }), session: idle({ _stall: { kind: 'usage_limit', resets_at: '2026-09-29T15:00:00Z' } }) });
+    expect(later).toEqual({ kind: 'schedule', at: '2026-09-29T15:00:00Z', text: '[from the Coordinator (alice-mac)] x', carryOnId: id });
+    // From a journal that sends no id: the kind alone.
+    const bare = planSessionControl({ params: P('carry_on', { message: 'x', when: 'now' }), session: idle() });
+    expect(bare.steps[0].cause.ref).toBeUndefined();
   });
   it('carry_on after the limit reset needs a stall with a reset time', () => {
     expect(planSessionControl({ params: P('carry_on', { message: 'x', when: 'after_limit_reset' }), session: idle() })).toMatchObject({ kind: 'error', code: 'not_stalled' });

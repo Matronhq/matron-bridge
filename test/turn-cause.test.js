@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX,
-  cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, plainCause,
+  cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, roomBatchCauses, carryOnCause, plainCause,
   mergeCauses, mergeTurnCauses, mergeIntoTurn, queueCauses, tagCauses, tappedAction, beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, causesForAsk,
 } from '../lib/turn-cause.js';
 
@@ -55,8 +55,26 @@ describe('builders', () => {
     expect(spawnOutcomeCause('sp_1')).toEqual({ kind: 'spawn_outcome', ref: 'spawn:sp_1', at: NOW });
   });
 
-  it('roomMessageCause: room:<id>', () => {
+  it('roomMessageCause: room:<id>, with one seq or a span of them', () => {
     expect(roomMessageCause('room-1')).toEqual({ kind: 'room_message', ref: 'room:room-1', at: NOW });
+    expect(roomMessageCause('room-1', 42)).toEqual({ kind: 'room_message', ref: 'room:room-1@42', at: NOW });
+    expect(roomMessageCause('room-1', 42, 50)).toEqual({ kind: 'room_message', ref: 'room:room-1@42-50', at: NOW });
+    // A span that is not one collapses to its start; an unusable seq to the room.
+    expect(roomMessageCause('room-1', 42, 40).ref).toBe('room:room-1@42');
+    for (const bad of [0, -1, 1.5, '3', null]) expect(roomMessageCause('room-1', bad).ref).toBe('room:room-1');
+  });
+
+  it('roomBatchCauses: one cause per room spanning its seqs; any unknown seq makes it bare', () => {
+    const m = roomBatchCauses([{ roomId: 'r1', seq: 9 }, { roomId: 'r2', seq: 4 }, { roomId: 'r1', seq: 3 }, { roomId: 'r3', seq: 7 }, { roomId: 'r3' }, { seq: 1 }]);
+    expect([...m.keys()]).toEqual(['r1', 'r2', 'r3']);
+    expect(m.get('r1').ref).toBe('room:r1@3-9');
+    expect(m.get('r2').ref).toBe('room:r2@4');
+    expect(m.get('r3').ref).toBe('room:r3');
+  });
+
+  it('carryOnCause: names the journal\'s record when the id has its shape, else the kind alone', () => {
+    expect(carryOnCause('co_0123456789abcdef')).toEqual({ kind: 'carry_on', ref: 'carry_on:co_0123456789abcdef', at: NOW });
+    for (const bad of [null, undefined, 'co_x', 7, 'carry_on:co_0123456789abcdef']) expect(carryOnCause(bad)).toEqual({ kind: 'carry_on', at: NOW });
   });
 
   it('plainCause: kind only', () => {

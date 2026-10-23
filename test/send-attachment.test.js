@@ -449,11 +449,14 @@ describe("the conversation's own downloads", () => {
   it("send_attachment posts this conversation's download into a room", async () => {
     const { session, own, publisher } = downloadsFixture();
     const rooms = { get: (id) => (id === 'room-1' ? { sessionRoomId: 'convo-own', role: 'guest', state: 'joined' } : null) };
+    session.currentTurn = { causes: [{ kind: 'user_message', ref: 'convo-own:4', at: 1 }], startedAt: 1 };
     const handler = createSendAttachmentHandler({
-      sessions: new Map([['convo-own', session]]), publisher, rooms, journalConvoIdFor: () => null,
+      sessions: new Map([['convo-own', session]]), publisher, rooms, journalConvoIdFor: () => 'convo-own',
     });
     const res = await handler({ roomId: 'convo-own', path: path.join(own, 'scan.zip'), chat_room_id: 'room-1' });
     expect(res.status).toBe(200);
-    expect(publisher.publishFile).toHaveBeenCalledWith('room-1', expect.objectContaining({ name: 'scan.zip' }));
+    // Into a room, the post names its session and turn causes beside the payload.
+    expect(publisher.publishFile).toHaveBeenCalledWith('room-1', expect.objectContaining({ name: 'scan.zip' }),
+      { provenance: { fromConvoId: 'convo-own', causes: [{ kind: 'user_message', ref: 'convo-own:4', at: 1 }] } });
   });
 });

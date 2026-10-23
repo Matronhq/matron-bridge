@@ -122,7 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
-import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, queueCauses, tagCauses } from './lib/turn-cause.js';
+import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, carryOnCause, roomMessageCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -9037,7 +9037,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ text: trimmed });
-    if (answer) joinHeldTurn(session, causes);
+    if (answer && !asyncQuestion) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     if (!answer) journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
     return;
@@ -9258,7 +9258,10 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
   if (session.codexPrompts?.active) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ choice, text });
-    if (answer) joinHeldTurn(session, causes);
+    // A synchronous answer continues the turn that asked; an async one is
+    // sent as a message of its own (submitCodexAsyncAnswer), which names no
+    // cause yet.
+    if (answer && !asyncQuestion) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     return answer;
   }
@@ -10453,10 +10456,11 @@ async function fireAutoResume(roomId, convoId, slot) {
     if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
       await journalRouteTextToSession(session, '/compact');
     }
-    // A Coordinator's after_limit_reset carry-on is a carry-on turn; the
-    // bridge's own automatic one names no cause.
+    // A Coordinator's after_limit_reset carry-on is a carry-on turn, naming
+    // the journal's record of it; the bridge's own automatic one names no
+    // cause.
     await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),
-      { causes: slot.source === 'coordinator' ? [plainCause('carry_on')] : null });
+      { causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });
   } catch (e) {
     console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
     // A thrown delivery must not lose the carry-on: put the slot back for
@@ -10707,7 +10711,7 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
       postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }), controlNoticeKind(params.action));
       return { ok: true, result: { applied: 'deferred', box } };
     case 'schedule':
-      session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+      session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator', ...(plan.carryOnId ? { carryOnId: plan.carryOnId } : {}) };
       persistControlState(session);
       postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }), controlNoticeKind(params.action));
       return { ok: true, result: { applied: 'scheduled', at: plan.at, box } };
@@ -10866,7 +10870,7 @@ function drainDeferredControls(session) {
           settle(current, kind);
           postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }), controlNoticeKind(params.action));
         } else if (plan.kind === 'schedule') {
-          current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+          current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator', ...(plan.carryOnId ? { carryOnId: plan.carryOnId } : {}) };
           settle(current, kind);
           postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }), controlNoticeKind(params.action));
         }
@@ -11163,7 +11167,12 @@ function deliverRoomFrameTo(room, frame) {
   }
   // Another person's reply is never consumed inline by an agent_chat_send
   // wait (see the person block below).
-  if (!person && roomReplyWaiters.resolve(replyWaiterKey(frame.convo_id, room.sessionRoomId), { from, body })) return;
+  // A reply consumed inline reaches the agent inside its running turn, so
+  // the turn takes the message's cause as a delivered one would.
+  if (!person && roomReplyWaiters.resolve(replyWaiterKey(frame.convo_id, room.sessionRoomId), { from, body })) {
+    joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);
+    return;
+  }
   if (person) {
     // Never consumed inline by an agent_chat_send wait (above): that would
     // put another person's words into a turn of this user's, unrestricted.
@@ -11172,7 +11181,7 @@ function deliverRoomFrameTo(room, frame) {
     const deliverForeign = () => {
       const queuedBeforeF = roomDelivery.pendingCount(session.roomId);
       roomDelivery.deliver(session, session.roomId, {
-        roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, foreign: { person },
+        roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, seq: frame.seq, foreign: { person },
       });
       if (echoFrom && queuedBeforeF === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
         journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
@@ -11192,8 +11201,9 @@ function deliverRoomFrameTo(room, frame) {
   // busy-means-queued line published earlier would be a lie in exactly the
   // case the agent responded fastest.
   const queuedBefore = roomDelivery.pendingCount(session.roomId);
+  // The frame's seq names the message for the turn's cause (lib/turn-cause.js).
   roomDelivery.deliver(session, session.roomId, {
-    roomId: frame.convo_id, roomTitle, from, body, at: frame.ts,
+    roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, seq: frame.seq,
   });
   if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
     journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));

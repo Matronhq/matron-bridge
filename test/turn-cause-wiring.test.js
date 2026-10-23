@@ -54,6 +54,12 @@ describe('turn causes reach sendToSession from every turn source', () => {
 
   it('room turns forward their causes; reminders and timers are reminder turns', () => {
     expect(index).toContain('sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null })');
+    // Each delivered room message carries its seq, for the per-room span the
+    // turn's cause names (lib/room-delivery.js), and a reply consumed inline
+    // by a wait joins the running turn with its own.
+    const deliverTo = fnBody('function deliverRoomFrameTo(');
+    expect(deliverTo.match(/at: frame\.ts, seq: frame\.seq,/g)).toHaveLength(2);
+    expect(deliverTo).toContain('joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);');
     const fire = fnBody('async function fireTimer(');
     expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(2);
   });

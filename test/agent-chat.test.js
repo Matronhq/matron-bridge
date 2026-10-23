@@ -654,6 +654,15 @@ describe('createAgentChatHandlers', () => {
       expect(awaitRoomMessage).not.toHaveBeenCalled();
     });
 
+    it('names the writing session and its turn causes beside the message', async () => {
+      const sent = [];
+      const turn = { causes: [{ kind: 'carry_on', ref: 'carry_on:co_0123456789abcdef', at: 1 }], startedAt: 1 };
+      const f = makeFixture({ session: { currentTurn: turn }, publisher: { publishText: (convoId, payload, options) => sent.push({ convoId, payload, options }) } });
+      const id = joined(f);
+      expect((await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'ping' })).status).toBe(200);
+      expect(sent).toEqual([{ convoId: id, payload: { body: 'ping', from: 'agent' }, options: { provenance: { fromConvoId: 'convo-sess', causes: turn.causes } } }]);
+    });
+
     it('returns a quick reply from the wait window and caps wait_seconds at 60', async () => {
       const awaitRoomMessage = vi.fn(async () => ({ from: 'box-2 (agent)', body: 'yo' }));
       const f = makeFixture({ awaitRoomMessage });
@@ -1183,6 +1192,29 @@ describe('createAgentChatHandlers', () => {
       expect((await handlers.chatRead({ roomId: '!sess', room_id: 'room-ghost' })).status).toBe(404);
     });
 
+    it('the running turn takes the room\'s cause, spanning the messages others wrote', async () => {
+      const events = [
+        { seq: 40, type: 'text', sender: 'agent:box-2', payload: { body: 'please ask for a helper' }, ts: 1 },
+        { seq: 41, type: 'text', sender: 'agent:mac', payload: { body: 'on it' }, ts: 2 },
+        { seq: 47, type: 'image', sender: 'agent:box-2', payload: { name: 'x.png' }, ts: 3 },
+        { seq: 50, type: 'text', sender: 'user:alice', payload: { body: 'hi' }, ts: 4 },
+      ];
+      const turn = { causes: [{ kind: 'user_message', ref: 'convo-sess:3', at: 1 }], startedAt: 1 };
+      const { handlers, rooms, sessions } = makeFixture({ session: { currentTurn: turn }, publisher: { fetchMessages: async () => ({ events }) } });
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      expect((await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' })).status).toBe(200);
+      expect(sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@40-47']);
+      // Nothing others wrote, or no running turn: nothing is added.
+      const quiet = makeFixture({ publisher: { fetchMessages: async () => ({ events: [events[1], events[3]] }) }, session: { currentTurn: { causes: null, startedAt: 1 } } });
+      quiet.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await quiet.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(quiet.sessions.get('!sess').currentTurn.causes).toBe(null);
+      const idle = makeFixture({ publisher: { fetchMessages: async () => ({ events }) } });
+      idle.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await idle.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(idle.sessions.get('!sess').currentTurn).toBeUndefined();
+    });
+
     it('works on a LEFT room (inbox catch-up after leaving — proven past membership)', async () => {
       const { handlers, rooms } = makeFixture();
       rooms.record('room-1', { role: 'guest', state: 'left', sessionRoomId: '!sess' });
@@ -1322,7 +1354,8 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // function, but it has to clear the queued-notice rationale that now sits
     // between the two (the ⏳ is published after the short-circuit for the
     // same reason the short-circuit exists).
-    expect(indexSrc).toMatch(/if \(!person && roomReplyWaiters\.resolve\(replyWaiterKey\(frame\.convo_id, room\.sessionRoomId\), \{ from, body \}\)\) return;[\s\S]{0,3000}roomDelivery\.deliver\(/);
+    // The consumed reply still reaches the running turn's causes first.
+    expect(indexSrc).toMatch(/if \(!person && roomReplyWaiters\.resolve\(replyWaiterKey\(frame\.convo_id, room\.sessionRoomId\), \{ from, body \}\)\) \{\n {4}joinHeldTurn\(session, \[roomMessageCause\(frame\.convo_id, frame\.seq\)\]\);\n {4}return;\n {2}\}[\s\S]{0,3000}roomDelivery\.deliver\(/);
   });
 
   it('holds inbound join_requests in pendingJoinRequests, never the rooms registry (C1)', () => {
