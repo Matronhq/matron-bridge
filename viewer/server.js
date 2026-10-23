@@ -424,7 +424,17 @@ const bridgeAuth = () => {
   return key ? { [VIEWER_KEY_HEADER_NAME]: key } : {};
 };
 
-app.get('/action', async (req, res) => {
+// Queue-action links (send queued now / cancel) are signed tokens like the
+// rest, but each one drives the bridge, so they are rate-limited too.
+const actionLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.ACTION_RATE_LIMIT || '30', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+app.get('/action', actionLimiter, async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
