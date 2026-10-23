@@ -122,7 +122,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
-import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, userMessageCause, itemCause, plainCause, spawnOutcomeCause, carryOnCause, roomMessageCause, queueCauses, tagCauses } from './lib/turn-cause.js';
+import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, mergeCauses, causesForAsk, userMessageCause, itemCause, plainCause, spawnOutcomeCause, carryOnCause, roomMessageCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
@@ -10076,9 +10076,10 @@ async function fireTimer(record) {
     const repeats = record.repeat ? `, ${formatRepeat(record.repeat)}` : '';
     const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
     journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
+    // A reminder turn, naming the turn that set it (lib/reminder-tools.js).
     await journalRouteTextToSession(session,
       `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`,
-      { causes: [plainCause('reminder')] });
+      { causes: mergeCauses([plainCause('reminder'), record.causes]) });
     return;
   }
   const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
@@ -11168,9 +11169,11 @@ function deliverRoomFrameTo(room, frame) {
   // Another person's reply is never consumed inline by an agent_chat_send
   // wait (see the person block below).
   // A reply consumed inline reaches the agent inside its running turn, so
-  // the turn takes the message's cause as a delivered one would.
+  // the turn takes the message's cause as a delivered one would — for the
+  // journal to see a relay of the Coordinator's; the Coordinator's own turn
+  // is left as it was.
   if (!person && roomReplyWaiters.resolve(replyWaiterKey(frame.convo_id, room.sessionRoomId), { from, body })) {
-    joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);
+    if (session.coordinator !== true) joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);
     return;
   }
   if (person) {
@@ -12484,7 +12487,9 @@ const selfRestartHandler = createSelfRestartHandler({
   // bridge-composed text, so the flush's mirror is what shows the user what
   // the session told itself to do.
   queueContinuation: (session, text) => {
-    const entry = [{ type: 'text', text }];
+    // The continuation is the restarting turn's own work resumed: it names
+    // that turn's causes, beside `other` for the session's own words.
+    const entry = tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)]));
     // Lockstep with queueNotifications (PR #104): cancel and send_one address
     // the queue by notification index, so an entry with no slot of its own
     // would shift every later tile onto the wrong message. A bridge-composed

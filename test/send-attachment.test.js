@@ -458,5 +458,16 @@ describe("the conversation's own downloads", () => {
     // Into a room, the post names its session and turn causes beside the payload.
     expect(publisher.publishFile).toHaveBeenCalledWith('room-1', expect.objectContaining({ name: 'scan.zip' }),
       { provenance: { fromConvoId: 'convo-own', causes: [{ kind: 'user_message', ref: 'convo-own:4', at: 1 }] } });
+    // The causes are read before the upload: a turn that begins while it
+    // runs did not send this attachment.
+    const upload = publisher.uploadMedia;
+    publisher.uploadMedia = vi.fn(async (args) => {
+      session.currentTurn = { causes: [{ kind: 'reminder', at: 2 }], startedAt: 2 };
+      return upload(args);
+    });
+    session.currentTurn = { causes: [{ kind: 'user_message', ref: 'convo-own:9', at: 3 }], startedAt: 3 };
+    await handler({ roomId: 'convo-own', path: path.join(own, 'scan.zip'), chat_room_id: 'room-1' });
+    expect(publisher.publishFile).toHaveBeenLastCalledWith('room-1', expect.objectContaining({ name: 'scan.zip' }),
+      { provenance: { fromConvoId: 'convo-own', causes: [{ kind: 'user_message', ref: 'convo-own:9', at: 3 }] } });
   });
 });

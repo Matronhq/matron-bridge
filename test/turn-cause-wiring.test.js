@@ -61,7 +61,12 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(deliverTo.match(/at: frame\.ts, seq: frame\.seq,/g)).toHaveLength(2);
     expect(deliverTo).toContain('joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);');
     const fire = fnBody('async function fireTimer(');
-    expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(2);
+    // The user's /timer is a reminder turn; the agent's own reminder names
+    // the turn that set it beside it.
+    expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(1);
+    expect(fire).toContain("{ causes: mergeCauses([plainCause('reminder'), record.causes]) }");
+    // A self-restart's continuation names the restarting turn's causes beside `other`.
+    expect(index).toContain("const entry = tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)]));");
   });
 });
 

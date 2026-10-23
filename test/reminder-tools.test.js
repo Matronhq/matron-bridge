@@ -37,6 +37,17 @@ describe('reminder handlers', () => {
     expect(announce).toHaveBeenCalledWith(session, expect.objectContaining({ id: 1 }));
   });
 
+  it('create keeps the causes of the turn that set it, on disk; none when the turn had none', async () => {
+    const { h, saves, session } = fixture();
+    const causes = [{ kind: 'carry_on', ref: 'carry_on:co_0123456789abcdef', at: 1 }];
+    session.currentTurn = { causes, startedAt: 1 };
+    await h.create({ roomId: '!r:s', text: 'ask for the helper', in: '1h' });
+    expect(saves.at(-1).timers[0].causes).toEqual(causes);
+    session.currentTurn = null;
+    await h.create({ roomId: '!r:s', text: 'later', in: '2h' });
+    expect('causes' in saves.at(-1).timers[1]).toBe(false);
+  });
+
   it('create with `at` resolves a clock time on this box', async () => {
     const { h } = fixture();
     const r = await h.create({ roomId: '!r:s', text: 'standup', at: '14:30' });
