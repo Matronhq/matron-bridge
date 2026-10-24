@@ -130,6 +130,42 @@ After editing `.env`, re-run `setup/service.sh` (on macOS, launchd has no
 `EnvironmentFile` equivalent — values are inlined into the plist at install
 time).
 
+### Firewall-friendly process names on macOS
+
+Per-app firewalls on macOS identify a program by its executable file and its
+code signature. Every Node script runs through the same `node` binary, so the
+bridge would otherwise be indistinguishable from any other Node program
+(npm, a dev server, a test runner), and a wrapper script, symlink or
+`process.title` does not change that.
+
+So on macOS the bridge's starters (`setup/service.sh`, `start-bridge.sh`,
+`restart.sh`) go through `bin/run-named-node`, which keeps a copy of your
+node binary under a Matron name in `~/.matron/bin` and runs the script with
+it. The copy keeps node's own code signature (`codesign -v` passes), and the
+firewall shows:
+
+| Process | Name |
+|---|---|
+| The bridge (`index.js`) | `matron-bridge` |
+| The file viewer (`viewer/start.js`) | `matron-viewer` |
+
+The `ask-user` and `show-file` MCP servers the bridge starts for each
+session run with the bridge's copy too, so they appear as `matron-bridge`.
+
+- After a node upgrade the copy is refreshed on the next start (it is
+  replaced whenever node's size or modification time differs), and the
+  firewall may ask about it once more.
+- To opt out, set `MATRON_NAMED_NODE=0` in the environment the starter runs
+  in (for the launchd service, add it to `.env` and re-run
+  `setup/service.sh`). The script then runs with node itself.
+- `MATRON_NAMED_NODE_DIR` moves the copies elsewhere; `NODE_BIN` picks the
+  node binary (the service installer records the one it found).
+- If the copy cannot be written, the launcher prints one warning and runs
+  node itself, so the bridge still starts.
+
+Existing installs switch over when `setup/service.sh` is re-run. On Linux the
+launcher just runs node; the Windows starters do not use it.
+
 ### Windows
 
 From PowerShell (not elevated), as the user who will run the bridge:
@@ -444,6 +480,7 @@ matron-bridge/
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, optional local whisper
 ├── hooks/                # Claude Code hooks used by bridge sessions
+├── bin/run-named-node    # macOS: runs node under a Matron name (firewall-friendly)
 ├── test/                 # Vitest suite
 ├── SECURITY.md
 ├── package.json
