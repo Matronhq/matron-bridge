@@ -172,6 +172,17 @@ describe('transfer sender', () => {
     expect(readState(fx.stateFile).jobs).toEqual({});
   });
 
+  it('escapes " and ] in the name inside the room line, the same way the receiver does', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx, { name: 'a"b]c.txt' }));
+    await sender.idle();
+    sender.onFrame({ kind: 'transfer', event: 'declined', transfer_id: 'tr-1', reason: 'not needed' });
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: `[transfer of "a'b)c.txt" declined: not needed]` }));
+  });
+
   it('onFrame delivered drops the job quietly; unknown transfers are ignored', async () => {
     const fx = fixture();
     const client = fakeClient();
