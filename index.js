@@ -12252,7 +12252,7 @@ transferSender = createTransferSender({
   log: console,
   notify: ({ sessionKey, roomId, text }) => {
     const session = sessionKey ? sessions.get(sessionKey) : null;
-    if (!session || !session.alive) return;
+    if (!session || !session.alive) { console.log(`[transfer] no running session ${sessionKey || '(none)'} to tell: ${text}`); return; }
     if (roomId && agentRooms.isMuted(roomId, sessionKey)) return;
     const room = roomId ? agentRooms.get(roomId) : null;
     roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room?.title || room?.topic || null, from: 'bridge', body: text, at: Date.now() });

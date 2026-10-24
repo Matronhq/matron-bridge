@@ -1,7 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import path from 'path';
 import crypto from 'crypto';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync } from 'fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { createTransferSender, TRANSFER_CHUNK_BYTES } from '../lib/transfer-sender.js';
 
@@ -225,5 +225,158 @@ describe('transfer sender', () => {
     const sender = createTransferSender({ client: fakeClient(), scan: cleanScan, stateFile: fx.stateFile, log: silent });
     expect(sender.active()).toBe(0);
     expect(existsSync(fx.stateFile)).toBe(true);
+  });
+
+  it('sends a short last chunk at its real length', async () => {
+    const fx = fixture({ content: 'aaaabbbbcc' });
+    const client = fakeClient({ chunks: 3 });
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(client.putChunk).toHaveBeenCalledTimes(3);
+    const last = client.putChunk.mock.calls[2];
+    expect(last[1]).toBe(2);
+    expect(last[2].length).toBe(2);
+    expect(Buffer.from(last[2]).toString()).toBe('cc');
+    expect(last[3]).toBe(sha('cc'));
+  });
+
+  it('a journal on another chunk size is a failed create: cancelled and reported', async () => {
+    const fx = fixture();
+    const client = fakeClient({ chunkBytes: 8, chunks: 2 });
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(client.putChunk).not.toHaveBeenCalled();
+    expect(client.cancel).toHaveBeenCalledWith('tr-1');
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringMatching(/^\[transfer of "notes\.txt" failed: .*chunk/) }));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  describe('stalls', () => {
+    afterEach(() => { vi.useRealTimers(); });
+    const fakeTimers = () => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+
+    it('relaunches after a transient stop, backing off 1 min then 5 min', async () => {
+      fakeTimers();
+      const fx = fixture({ content: 'aaaa' });
+      const client = fakeClient({ chunks: 1 });
+      let fails = 2;
+      client.create = vi.fn(async () => (fails-- > 0 ? { ok: false, status: 503, body: { error: 'HTTP 503' } } : { ok: true, status: 201, body: { transfer_id: 'tr-1', chunk_bytes: 4, chunks: 1 } }));
+      const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
+      sender.start(startArgs(fx));
+      await sender.idle();
+      expect(client.create).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(59_000);
+      await sender.idle();
+      expect(client.create).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await sender.idle();
+      expect(client.create).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      await sender.idle();
+      expect(client.create).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await sender.idle();
+      expect(client.create).toHaveBeenCalledTimes(3);
+      expect(client.complete).toHaveBeenCalledWith('tr-1');
+      expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true, stalls: 0 });
+    });
+
+    it('gives up after 20 stops in a row: cancels on the journal and tells the session', async () => {
+      fakeTimers();
+      const fx = fixture({ content: 'aaaa' });
+      const client = fakeClient({ chunks: 1 });
+      client.putChunk = vi.fn(async () => ({ ok: false, status: 0, body: { error: 'journal unreachable' } }));
+      const notify = vi.fn();
+      const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, sleep: async () => {}, chunkBytes: 4 });
+      sender.start(startArgs(fx));
+      await sender.idle();
+      for (let i = 0; i < 19; i++) {
+        expect(notify).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(15 * 60_000);
+        await sender.idle();
+      }
+      expect(client.cancel).toHaveBeenCalledWith('tr-1');
+      expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: '[transfer of "notes.txt" stopped: the journal could not be reached]' }));
+      expect(readState(fx.stateFile).jobs).toEqual({});
+    });
+
+    it('gives up after 24 h with no progress', async () => {
+      fakeTimers();
+      const fx = fixture({ content: 'aaaa' });
+      let clock = 1_000_000;
+      const client = fakeClient({ chunks: 1 });
+      client.putChunk = vi.fn(async () => ({ ok: false, status: 502, body: { error: 'HTTP 502' } }));
+      const notify = vi.fn();
+      const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, now: () => clock, sleep: async () => {}, chunkBytes: 4 });
+      sender.start(startArgs(fx));
+      await sender.idle();
+      expect(notify).not.toHaveBeenCalled();
+      clock += 24 * 60 * 60_000;
+      await vi.advanceTimersByTimeAsync(60_000);
+      await sender.idle();
+      expect(client.cancel).toHaveBeenCalledWith('tr-1');
+      expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringMatching(/stopped: the journal could not be reached/) }));
+    });
+
+    it('a throw is retried later; once the file is gone it is cancel-and-report', async () => {
+      fakeTimers();
+      const fx = fixture({ content: 'aaaa' });
+      const client = fakeClient({ chunks: 1 });
+      const ok = client.status;
+      let calls = 0;
+      client.status = vi.fn(async (id) => {
+        calls++;
+        if (calls === 1) throw new Error('boom');
+        return ok(id);
+      });
+      const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
+      sender.start(startArgs(fx));
+      await sender.idle();
+      expect(client.putChunk).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await sender.idle();
+      expect(client.complete).toHaveBeenCalledWith('tr-1');
+
+      const fx2 = fixture({ content: 'aaaa' });
+      const client2 = fakeClient({ chunks: 1 });
+      client2.status = vi.fn(async () => { unlinkSync(fx2.absPath); throw new Error('ENOENT'); });
+      const notify = vi.fn();
+      const sender2 = createTransferSender({ client: client2, scan: cleanScan, stateFile: fx2.stateFile, log: silent, notify, chunkBytes: 4 });
+      sender2.start(startArgs(fx2));
+      await sender2.idle();
+      expect(client2.cancel).toHaveBeenCalledWith('tr-1');
+      expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringMatching(/^\[transfer of "notes\.txt" cancelled/) }));
+      expect(readState(fx2.stateFile).jobs).toEqual({});
+    });
+  });
+
+  it('uploads at most 2 jobs at once; the third starts when a slot frees', async () => {
+    const fxs = [fixture(), fixture(), fixture()];
+    const dir = mkdtempSync(path.join(tmpdir(), 'transfer-sender-'));
+    const stateFile = path.join(dir, 'transfers.json');
+    const gates = [];
+    let n = 0;
+    const client = fakeClient();
+    client.create = vi.fn(() => new Promise((resolve) => {
+      const id = `tr-${++n}`;
+      gates.push(() => resolve({ ok: true, status: 201, body: { transfer_id: id, chunk_bytes: 4, chunks: 4 } }));
+    }));
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile, log: silent, chunkBytes: 4 });
+    for (const fx of fxs) sender.start(startArgs(fx));
+    const until = async (cond) => { for (let i = 0; i < 200 && !cond(); i++) await new Promise((r) => setTimeout(r, 5)); };
+    await until(() => client.create.mock.calls.length >= 2);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(client.create).toHaveBeenCalledTimes(2);
+    expect(Object.keys(readState(stateFile).jobs)).toHaveLength(3);
+    gates[0]();
+    await until(() => client.create.mock.calls.length >= 3);
+    expect(client.create).toHaveBeenCalledTimes(3);
+    gates[1]();
+    gates[2]();
+    await sender.idle();
+    expect(client.complete).toHaveBeenCalledTimes(3);
   });
 });
