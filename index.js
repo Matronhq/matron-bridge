@@ -181,7 +181,7 @@ import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncement, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
-import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
@@ -10188,6 +10188,49 @@ async function fireTimer(record) {
 // forget the work lease, a reaper tick cannot forget the reminders.
 let workHoldUntil = 0;
 let workHoldSessions = 0;
+// Room file transfers in flight (the sender's uploads, the receiver's
+// downloads) lease the same marker: refreshTransferHold() re-reads both
+// sides every TRANSFER_HOLD_TICK_MS and on every reaper tick, and rewrites
+// the marker the moment activity starts or drops to 0. Bounded by
+// WORK_HOLD_MAX_MS of continuous activity (createTransferHold).
+let transferHoldUntil = 0;
+let transferHoldCount = 0;
+const transferHold = createTransferHold();
+const TRANSFER_HOLD_TICK_MS = 60_000;
+
+function workLeaseUntil() {
+  return Math.max(workHoldUntil, transferHoldUntil);
+}
+
+function refreshTransferHold() {
+  try {
+    const count = (transferSender?.active() ?? 0) + (transferReceiver?.active() ?? 0);
+    const prev = transferHoldUntil;
+    const until = transferHold.update(count);
+    transferHoldUntil = until;
+    transferHoldCount = until > 0 ? count : 0;
+    if ((until > 0) !== (prev > 0)) refreshKeepAwakeMarker();
+  } catch (e) {
+    try { console.warn(`[transfer] keep-awake update failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
+// Received room files older than 7 days, and partial downloads nothing will
+// resume (lib/inbox-sweep.js), on the reaper tick.
+function sweepTransferInbox() {
+  try {
+    transferReceiver?.sweep();
+  } catch (e) {
+    try { console.warn(`[transfer] inbox sweep failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
+function startTransferUpkeep() {
+  setInterval(refreshTransferHold, TRANSFER_HOLD_TICK_MS).unref();
+  // With the idle reaper off, the sweep still needs a tick of its own.
+  if (!(SESSION_IDLE_TIMEOUT_MS > 0)) setInterval(sweepTransferInbox, SESSION_IDLE_CHECK_MS).unref();
+  sweepTransferInbox();
+}
 
 function writeKeepAwakeMarker(timers) {
   writeKeepAwake(keepAwakeMarker(timers));
@@ -10199,12 +10242,12 @@ function refreshKeepAwakeMarker() {
 
 function writeKeepAwake(marker) {
   try {
-    const until = keepAwakeUntil({ timerUntil: marker?.until ?? null, workUntil: workHoldUntil });
+    const until = keepAwakeUntil({ timerUntil: marker?.until ?? null, workUntil: workLeaseUntil() });
     if (!until) {
       fs.rmSync(KEEPAWAKE_FILE, { force: true });
       return;
     }
-    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ until, reminders: marker?.reminders ?? 0, work: workHoldSessions, updatedAt: Date.now() }, null, 2));
+    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ until, reminders: marker?.reminders ?? 0, work: workHoldSessions, transfers: transferHoldCount, updatedAt: Date.now() }, null, 2));
   } catch (e) {
     try { console.warn(`[timer] keep-awake marker update failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -10223,7 +10266,7 @@ function refreshPowerHold() {
   for (const [, session] of sessions) {
     if (session.alive && !session._autoStopped) liveSessions += 1;
   }
-  const holdUntil = keepAwakeUntil({ timerUntil: timerStore.holdAwakeMarker()?.until ?? null, workUntil: workHoldUntil });
+  const holdUntil = keepAwakeUntil({ timerUntil: timerStore.holdAwakeMarker()?.until ?? null, workUntil: workLeaseUntil() });
   const flags = powerHoldFlags({ mode: KEEP_AWAKE_MODE, liveSessions, holdUntil });
   if (powerHold.set(flags)) {
     console.log(flags.length ? `[power] holding the Mac awake (caffeinate ${flags.join(' ')}; ${liveSessions} live session${liveSessions === 1 ? '' : 's'})` : '[power] released the keep-awake hold');
@@ -14745,7 +14788,10 @@ function startIdleReaper() {
     // crashed bridge cannot pin the box.
     workHoldUntil = held > 0 ? now + WORK_HOLD_LEASE_MS : 0;
     workHoldSessions = held;
+    // File transfers in flight renew their own lease on the same write.
+    refreshTransferHold();
     refreshKeepAwakeMarker();
+    sweepTransferInbox();
   }, SESSION_IDLE_CHECK_MS).unref();
 }
 
@@ -14866,6 +14912,8 @@ async function main() {
     : `Pre-reap handoff: OFF (${PRE_REAP_HANDOFF.reason})`);
   // So is the macOS sleep assertion: a disabled reaper still has live sessions.
   startPowerHold();
+  // File transfers keep the box awake and the inbox swept, reaper or not.
+  startTransferUpkeep();
   // Re-arm persisted /timer schedules (overdue ones fire after a short
   // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
   const rearmed = timerStore.init();
