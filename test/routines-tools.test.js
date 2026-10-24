@@ -350,3 +350,16 @@ describe('createRoutinesClient', () => {
     expect(await err.list()).toEqual({ status: 500, data: { error: 'HTTP 500' } });
   });
 });
+
+describe('allowance_expiring trigger', () => {
+  it('validates pct and an optional hour window, and says it in words', () => {
+    const base = { name: 'spare-allowance', title: 'Spare', prompt: 'p' };
+    expect(validateCreateFields({ ...base, trigger: { kind: 'allowance_expiring', pct: 70 } }).value.trigger).toEqual({ kind: 'allowance_expiring', pct: 70 });
+    expect(validateCreateFields({ ...base, trigger: { kind: 'allowance_expiring', pct: 70, from_hours: 2, to_hours: 24 } }).value.trigger).toEqual({ kind: 'allowance_expiring', pct: 70, from_hours: 2, to_hours: 24 });
+    for (const trigger of [{ kind: 'allowance_expiring' }, { kind: 'allowance_expiring', pct: 70, from_hours: 12 }, { kind: 'allowance_expiring', pct: 70, to_hours: 200 }, { kind: 'disk_under', pct: 20, from_hours: 1 }]) {
+      expect(validateCreateFields({ ...base, trigger }).ok).toBe(false);
+    }
+    expect(describeTrigger({ kind: 'allowance_expiring', pct: 70 })).toBe('when a weekly limit resets within 6–12 h and is under 70%');
+    expect(describeTrigger({ kind: 'allowance_expiring', pct: 50, from_hours: 2, to_hours: 24 })).toBe('when a weekly limit resets within 2–24 h and is under 50%');
+  });
+});
