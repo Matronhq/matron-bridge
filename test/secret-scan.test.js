@@ -3,8 +3,8 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { scanFile, SECRET_PATTERNS, secretKindsIn } from '../lib/secret-scan.js';
-import { readZipEntries, ZIP_MEMBER_MAX_BYTES } from '../lib/archive-entries.js';
+import { scanFile, SECRET_PATTERNS, secretKindsIn, inflateCapFor } from '../lib/secret-scan.js';
+import { readZipEntries, overlappingEntries, ZIP_MEMBER_MAX_BYTES, ZIP_MAX_ENTRIES } from '../lib/archive-entries.js';
 
 // Fake secrets are assembled from pieces so no key-shaped literal sits in
 // this file for the repository's own secret scanners to trip on.
@@ -77,9 +77,11 @@ function crc32(buf) {
   for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
-function makeZip(entries) {
+// `centrals` lists the central entries to write, default one per member:
+// [{of: memberIndex, name?, offset?}] lets a test alias or misplace them.
+function makeZip(entries, centrals = null) {
   const locals = [];
-  const centrals = [];
+  const members = [];
   let offset = 0;
   for (const { name, data = '', method = 8 } of entries) {
     const raw = Buffer.from(data);
@@ -96,25 +98,32 @@ function makeZip(entries) {
     local.writeUInt32LE(raw.length, 22);
     local.writeUInt16LE(nameBuf.length, 26);
     locals.push(local, nameBuf, comp);
+    members.push({ name, method, crc, compLen: comp.length, rawLen: raw.length, offset });
+    offset += 30 + nameBuf.length + comp.length;
+  }
+  const specs = centrals ?? members.map((_, i) => ({ of: i }));
+  const cdParts = [];
+  for (const spec of specs) {
+    const m = members[spec.of];
+    const nameBuf = Buffer.from(spec.name ?? m.name, 'utf8');
     const central = Buffer.alloc(46);
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(20, 4);
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(0x0800, 8);
-    central.writeUInt16LE(method, 10);
-    central.writeUInt32LE(crc, 16);
-    central.writeUInt32LE(comp.length, 20);
-    central.writeUInt32LE(raw.length, 24);
+    central.writeUInt16LE(m.method, 10);
+    central.writeUInt32LE(m.crc, 16);
+    central.writeUInt32LE(m.compLen, 20);
+    central.writeUInt32LE(m.rawLen, 24);
     central.writeUInt16LE(nameBuf.length, 28);
-    central.writeUInt32LE(offset, 42);
-    centrals.push(central, nameBuf);
-    offset += 30 + nameBuf.length + comp.length;
+    central.writeUInt32LE(spec.offset ?? m.offset, 42);
+    cdParts.push(central, nameBuf);
   }
-  const cd = Buffer.concat(centrals);
+  const cd = Buffer.concat(cdParts);
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(entries.length, 8);
-  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt16LE(specs.length, 8);
+  eocd.writeUInt16LE(specs.length, 10);
   eocd.writeUInt32LE(cd.length, 12);
   eocd.writeUInt32LE(offset, 16);
   return Buffer.concat([...locals, cd, eocd]);
@@ -142,7 +151,7 @@ describe('secretKindsIn', () => {
   // must agree with the published regexes.
   const samples = [
     ...Object.values(FAKE),
-    'plain words only', 'http' + '://example.com/path', 'HTTP' + '://u:p@example.com',
+    'plain words only', '://u:p@h', 'http' + '://example.com/path', 'HTTP' + '://u:p@example.com',
     'x' + '://u:p@h', '1' + '://u:p@h', 'a' + '://u:p/@h', 'a' + '://:p@h', 'a' + '://u:@h',
     'see ' + 'ftp' + '://u:p@h and ' + 'https' + '://bob:pw@example.com',
     'a' + '://b:c a' + '://d:e@f', J, J + 'a.b', J + 'a.b.c', J + '.b.c', 'x' + J + 'a.b.c',
@@ -391,6 +400,101 @@ describe('scanFile: zip', () => {
 
   it('not a zip at all is not_scanned', async () => {
     expect((await scanFile(fixture('fake.zip', 'hello'))).verdict).toBe('not_scanned');
+  });
+
+  it('a bomb of central entries sharing one member is not_scanned without inflating it', async () => {
+    const big = 'just some ordinary text here\n'.repeat(1 << 20); // 29 MiB, deflates to ~100 KiB
+    const zip = makeZip([{ name: 'a.txt', data: big }], Array.from({ length: 10 }, (_, i) => ({ of: 0, name: `m${i}.txt` })));
+    const t = Date.now();
+    expect(await scanFile(fixture('bomb.zip', zip))).toEqual({ verdict: 'not_scanned', findings: [] });
+    expect(Date.now() - t).toBeLessThan(500);
+  });
+
+  it('a repeated local header offset stops the scan there, keeping earlier findings', async () => {
+    const zip = makeZip(
+      [{ name: 'k.txt', data: `${FAKE.aws}\n` }, { name: 'b.txt', data: 'hello\n' }, { name: 'c.txt', data: `${FAKE.slack}\n` }],
+      [{ of: 0 }, { of: 1 }, { of: 1, name: 'b2.txt' }, { of: 2 }],
+    );
+    expect(await scanFile(fixture('rep.zip', zip))).toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: 'k.txt:1' }] });
+    const clean = makeZip([{ name: 'a.txt', data: 'hi\n' }], [{ of: 0 }, { of: 0, name: 'b.txt' }]);
+    expect((await scanFile(fixture('rep2.zip', clean))).verdict).toBe('not_scanned');
+  });
+
+  it('a member whose header sits inside another member\'s data is not_scanned', async () => {
+    // The stored entry d/ carries a valid local header for b.txt in its
+    // data, and the central entry for b.txt points there. (d/ is skipped as
+    // a directory, so only the overlap check stops b.txt reading clean.)
+    const inner = makeZip([{ name: 'b.txt', data: 'hello\n', method: 0 }]).subarray(0, 30 + 5 + 6);
+    const zip = makeZip(
+      [{ name: 'd/', data: inner, method: 0 }, { name: 'b.txt', data: 'hello\n', method: 0 }],
+      [{ of: 0 }, { of: 1, offset: 30 + 2 }],
+    );
+    expect((await scanFile(fixture('ovl.zip', zip))).verdict).toBe('not_scanned');
+    const entries = await readZipEntries(fixture('ovl2.zip', zip));
+    expect([...overlappingEntries(entries)].map((e) => e.name).sort()).toEqual(['b.txt', 'd/']);
+    const fine = await readZipEntries(fixture('fine.zip', makeZip([{ name: 'a.txt', data: 'a' }, { name: 'b.txt', data: 'b' }])));
+    expect(overlappingEntries(fine).size).toBe(0);
+  });
+
+  it('caps the total inflated bytes: not_scanned past it, earlier findings kept', async () => {
+    const filler = 'ok\n'.repeat(100000); // 300 KB
+    const limits = { maxInflatedBytes: 64 * 1024 };
+    const clean = makeZip([{ name: 'a.txt', data: filler }, { name: 'b.txt', data: filler }]);
+    expect(await scanFile(fixture('cap.zip', clean), { limits })).toEqual({ verdict: 'not_scanned', findings: [] });
+    const dirty = makeZip([{ name: 'a.txt', data: `${FAKE.aws}\n` + filler }]);
+    expect(await scanFile(fixture('cap2.zip', dirty), { limits }))
+      .toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: 'a.txt:1' }] });
+    expect(await scanFile(fixture('cap3.zip', clean), { limits: { maxInflatedBytes: 1 << 20 } }))
+      .toEqual({ verdict: 'clean', findings: [] });
+  });
+
+  it('stops inflating a member once it is seen to be binary', async () => {
+    // 4 MiB binary then a text member with a secret, under a 1 MiB inflate
+    // cap: only reading a little of the binary leaves room for the secret.
+    const bin = Buffer.alloc(4 * 1024 * 1024);
+    for (let i = 0; i < bin.length; i += 4) bin.writeUInt32LE((i * 2654435761) >>> 0, i);
+    const zip = makeZip([{ name: 'blob.bin', data: bin }, { name: 'z.txt', data: `${FAKE.aws}\n` }]);
+    expect(await scanFile(fixture('binfirst.zip', zip), { limits: { maxInflatedBytes: 1 << 20 } }))
+      .toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: 'z.txt:1' }] });
+  });
+
+  it('cuts long member names in findings to 256 characters', async () => {
+    const name = 'd/'.repeat(300) + 'server.pem';
+    const r = await scanFile(fixture('ln.zip', makeZip([{ name, data: `${FAKE.aws}\n` }])));
+    expect(r.verdict).toBe('flagged');
+    expect(r.findings).toEqual([
+      { kind: 'sensitive_file', line: name.slice(0, 256) },
+      { kind: 'aws_access_key', line: `${name.slice(0, 256)}:1` },
+    ]);
+  });
+
+  it('refuses more entries than the cap', async () => {
+    expect(ZIP_MAX_ENTRIES).toBe(100000);
+    const zip = makeZip([{ name: 'a.txt', data: 'a' }, { name: 'b.txt', data: 'b' }, { name: 'c.txt', data: 'c' }]);
+    const p = fixture('many.zip', zip);
+    await expect(readZipEntries(p, { maxEntries: 2 })).rejects.toThrow(/too many members/);
+    expect((await scanFile(p, { limits: { maxZipEntries: 2 } })).verdict).toBe('not_scanned');
+    expect((await scanFile(p, { limits: { maxZipEntries: 3 } })).verdict).toBe('clean');
+  });
+});
+
+describe('inflate cap', () => {
+  it('is 20x the file size, at least 256 MiB and at most 10 GiB', () => {
+    const MiB = 1024 * 1024;
+    expect(inflateCapFor(0)).toBe(256 * MiB);
+    expect(inflateCapFor(10 * MiB)).toBe(256 * MiB);
+    expect(inflateCapFor(100 * MiB)).toBe(2000 * MiB);
+    expect(inflateCapFor(1024 * MiB)).toBe(10 * 1024 * MiB);
+  });
+
+  it('applies to gzip and tgz', async () => {
+    const limits = { maxInflatedBytes: 64 * 1024 };
+    const filler = 'ok\n'.repeat(100000);
+    expect(await scanFile(fixture('cap.txt.gz', zlib.gzipSync(filler)), { limits })).toEqual({ verdict: 'not_scanned', findings: [] });
+    expect(await scanFile(fixture('cap.tgz', zlib.gzipSync(makeTar([{ name: 'a.txt', data: filler }]))), { limits }))
+      .toEqual({ verdict: 'not_scanned', findings: [] });
+    expect(await scanFile(fixture('cap2.tgz', zlib.gzipSync(makeTar([{ name: 'a.txt', data: `${FAKE.aws}\n` + filler }]))), { limits }))
+      .toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: 'a.txt:1' }] });
   });
 });
 
