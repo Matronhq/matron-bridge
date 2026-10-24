@@ -15,7 +15,7 @@ The backlog is open tracker tasks labelled `spare-allowance`, in the Tasks list'
    - stop and report if the box's weekly meter passes 90%;
    - close the item when done.
    Put it on the task's mission if it has one. At most one task per allowance per fire, and never the same task twice in one fire; the envelope caps the spawns.
-4. On the item, straight after the start: add the label `dispatched` (keep `spare-allowance`), and comment with the session link and the allowance's reset time.
+4. On the item, straight after the start: `item_comment` with `add_labels: ["dispatched"]` (it keeps `spare-allowance`), saying the session link and the allowance's reset time.
 5. Reply with one line per allowance: the task started and where (linked), or why none was started.
 
 Pausing this routine pauses the whole backlog. Removing the `spare-allowance` label takes one task out.

@@ -1158,6 +1158,7 @@ server.tool(
     attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
+    add_labels: z.array(z.string()).max(10).optional().describe('Labels to add to the item, keeping the ones it has (e.g. ["dispatched"] on a spare-allowance backlog task you started)'),
     shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
