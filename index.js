@@ -7,6 +7,8 @@ import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
+import { createTransferClient } from './lib/transfer-client.js';
+import { createTransferSender } from './lib/transfer-sender.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
@@ -399,6 +401,13 @@ const KEEPAWAKE_FILE = path.join(os.homedir(), '.matron-bridge-keepawake.json');
 // In-flight turn markers for restart carry-on — written at turn start, removed
 // at turn end, reconciled at the next boot (see lib/inflight-marker.js).
 const INFLIGHT_FILE = path.join(os.homedir(), '.matron-bridge-inflight.json');
+// Outgoing room-file transfers (lib/transfer-sender.js): one job per file
+// still going up or awaiting its outcome, so a restart resumes the upload.
+const TRANSFERS_FILE = path.join(os.homedir(), '.matron-bridge-transfers.json');
+// Built next to the send_attachment handler; a `let` so the journal frame
+// and reconnect callbacks, which can fire before that point, see null
+// rather than a temporal-dead-zone throw.
+let transferSender = null;
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -644,6 +653,11 @@ const _journalToken = resolveJournalToken();
 // says so beats one that throws.
 const journalHttpBase = JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '';
 const itemsClient = createItemsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+// Agent-to-agent file transfers (/transfers routes): same base URL and token.
+const transferClient = createTransferClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -1030,6 +1044,25 @@ function handleJournalReconnect() {
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
   journalIdentity.refresh({ force: true });
+  // Outgoing room files: carry on any upload a restart or a dropped socket
+  // interrupted, and settle jobs whose outcome frame was missed.
+  transferSender?.resumeAll().catch((e) => console.warn(`[transfer] resume failed: ${e.message}`));
+}
+
+// kind:'transfer' frames from the journal. The sender's outcomes go to the
+// transfer sender; `ready` (a file released to this device as a recipient)
+// is the receiver's, wired separately.
+function journalHandleTransferFrame(frame) {
+  switch (frame.event) {
+    case 'declined':
+    case 'failed':
+    case 'expired':
+    case 'delivered':
+      transferSender?.onFrame(frame);
+      return;
+    default:
+      debug(`transfer frame ${frame.event} for ${frame.transfer_id} not handled`);
+  }
 }
 
 // Box status lives in the journal (matron-journal #82): this box's activity,
@@ -1111,6 +1144,8 @@ const journalPublisher = createJournalPublisher({
   onConsentFrame: (frame) => journalHandleConsentFrame(frame),
   // Unseen nudges (kind:'unseen'): important things the user hasn't seen.
   onUnseenFrame: (frame) => journalHandleUnseenFrame(frame),
+  // File-transfer frames (kind:'transfer'), see journalHandleTransferFrame.
+  onTransferFrame: (frame) => journalHandleTransferFrame(frame),
   onDefaultsFrame: (frame) => { userDefaults.apply(frame); },
   // This box's own defaults. A live change is re-reported in box_status at
   // once; hello_ok's copy lands before onReconnect, whose box_status
@@ -11656,15 +11691,6 @@ function routeLocalRoomMessage(roomId, fromSessionKey, body) {
   routeLocalRoomFrame(roomId, fromSessionKey, { type: 'text', payload: { body } });
 }
 
-// Attachment twin (send_attachment with chat_room_id): same hop, with the
-// file/image payload deliverRoomFrameTo already knows how to render.
-function routeLocalRoomAttachment(roomId, fromSessionKey, { kind, name, caption, blobRef }) {
-  routeLocalRoomFrame(roomId, fromSessionKey, {
-    type: kind === 'image' ? 'image' : 'file',
-    payload: { name, ...(caption ? { caption } : {}), ...(blobRef ? { blob_ref: blobRef } : {}) },
-  });
-}
-
 function routeLocalRoomFrame(roomId, fromSessionKey, { type, payload }) {
   const room = agentRooms.get(roomId);
   if (!room || room.guestSessionRoomId == null) return;
@@ -12215,12 +12241,38 @@ const handleWake = createWakeHandler({
   isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
 });
 
+// send_attachment into a room: a journal transfer, uploaded in the
+// background. The outcome (declined / failed / expired, or a cancel because
+// the file changed) reaches the sending session as a room line, through the
+// same per-recipient delivery as any room message, so busy coalescing and
+// the mute apply.
+transferSender = createTransferSender({
+  client: transferClient,
+  stateFile: TRANSFERS_FILE,
+  log: console,
+  notify: ({ sessionKey, roomId, text }) => {
+    const session = sessionKey ? sessions.get(sessionKey) : null;
+    if (!session || !session.alive) return;
+    if (roomId && agentRooms.isMuted(roomId, sessionKey)) return;
+    const room = roomId ? agentRooms.get(roomId) : null;
+    roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room?.title || room?.topic || null, from: 'bridge', body: text, at: Date.now() });
+  },
+});
+const TRANSFER_MAX_BYTES = (() => {
+  const n = Number(process.env.MATRON_TRANSFER_MAX_BYTES);
+  return Number.isSafeInteger(n) && n > 0 ? n : 10737418240;
+})();
 const handleSendAttachment = createSendAttachmentHandler({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
   rooms: agentRooms,
-  onLocalRoomAttachment: routeLocalRoomAttachment,
+  sender: transferSender,
+  transferMaxBytes: TRANSFER_MAX_BYTES,
+  // A room with another person's agent: the owner side records `person`;
+  // the guest side is known from the journal's person-room row.
+  isPersonRoom: async (roomId, room) => (typeof room?.person === 'string' && room.person !== '')
+    || !!(await foreignSessions.contextFor(roomId)),
 });
 
 // share_html_page: a days-long signed viewer link that renders one HTML file

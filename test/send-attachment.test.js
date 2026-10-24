@@ -234,31 +234,90 @@ describe('createSendAttachmentHandler', () => {
   });
 
   describe('chat_room_id room target', () => {
-    function makeRoomFixture(roomRecord) {
+    function makeRoomFixture(roomRecord, extra = {}) {
       const fx = makeFixture();
       const rooms = { get: (id) => (id === 'room-1' ? roomRecord : null) };
+      const sender = { start: vi.fn(() => ({ jobId: 'job-1' })) };
+      const uploadMedia = vi.spyOn(fx.publisher, 'uploadMedia');
       const handler = createSendAttachmentHandler({
-        sessions: fx.sessions, publisher: fx.publisher, rooms,
-        // The room target must not require the session's own convo.
-        journalConvoIdFor: () => null,
+        sessions: fx.sessions, publisher: fx.publisher, rooms, sender,
+        // The transfer is "from" the session's own journal conversation.
+        journalConvoIdFor: () => 'convo-abc',
+        ...extra,
       });
-      return { ...fx, handler };
+      return { ...fx, handler, sender, uploadMedia };
     }
 
-    it('publishes into the room convo instead of the session convo', async () => {
-      const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
-      const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1', caption: 'evidence' });
+    it('starts a journal transfer instead of uploading media', async () => {
+      const { handler, published, sender, uploadMedia, workdir } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1', caption: 'evidence' });
       expect(res.status).toBe(200);
-      expect(published).toHaveLength(1);
-      expect(published[0].convoId).toBe('room-1');
-      expect(published[0].payload.caption).toBe('evidence');
+      expect(res.body).toMatchObject({ ok: true, status: 'pending_approval', name: 'report.pdf', size: 9 });
+      expect(res.body.note).toMatch(/approval card/);
+      expect(uploadMedia).not.toHaveBeenCalled();
+      expect(published).toHaveLength(0);
+      const realWorkdir = await realpath(workdir);
+      expect(sender.start).toHaveBeenCalledWith(expect.objectContaining({
+        sessionKey: '!room1', roomId: 'room-1', fromConvoId: 'convo-abc',
+        absPath: path.join(realWorkdir, 'report.pdf'), name: 'report.pdf', size: 9,
+        mtimeMs: expect.any(Number), contentType: 'application/pdf', caption: 'evidence',
+      }));
     });
 
-    it('lets the owner post while the room is still pending', async () => {
-      const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'pending' });
+    it('lets the owner send while the room is still pending', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'pending' });
       const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
       expect(res.status).toBe(200);
-      expect(published[0].convoId).toBe('room-1');
+      expect(sender.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses a file over 10 GB with 413 before starting anything', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { transferMaxBytes: 5 });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(413);
+      expect(res.body.error).toMatch(/too large/);
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
+    it('caps room files at 10 GB by default, not 50 MB', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { maxBytes: 1 });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(sender.start).toHaveBeenCalled();
+    });
+
+    it("refuses a room with another person's agent with 403", async () => {
+      const { handler, sender, uploadMedia } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'joined', person: 'bob' });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("files do not cross into rooms with another person's agent");
+      expect(sender.start).not.toHaveBeenCalled();
+      expect(uploadMedia).not.toHaveBeenCalled();
+    });
+
+    it('asks the injected predicate about a guest-side person room', async () => {
+      const isPersonRoom = vi.fn(async (id) => id === 'room-1');
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { isPersonRoom });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(403);
+      expect(isPersonRoom).toHaveBeenCalledWith('room-1', expect.objectContaining({ role: 'guest' }));
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
+    it('409s when the session has no journal conversation yet', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { journalConvoIdFor: () => null });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
+    it('still guards the path for room files', async () => {
+      const { handler, sender, workdir } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      writeFileSync(path.join(workdir, '.env'), 'SECRET=1');
+      expect((await handler({ roomId: '!room1', path: '.env', chat_room_id: 'room-1' })).status).toBe(403);
+      expect((await handler({ roomId: '!room1', path: '/etc/hosts', chat_room_id: 'room-1' })).status).toBe(403);
+      expect((await handler({ roomId: '!room1', path: 'nope.pdf', chat_room_id: 'room-1' })).status).toBe(404);
+      expect(sender.start).not.toHaveBeenCalled();
     });
 
     it('404s a room this session does not participate in', async () => {
@@ -276,10 +335,10 @@ describe('createSendAttachmentHandler', () => {
 
     it('409s an owner who left/was refused/expired — same shared gate as agent_chat_send', async () => {
       for (const state of ['left', 'refused', 'expired']) {
-        const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state });
+        const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state });
         const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
         expect(res.status).toBe(409);
-        expect(published).toHaveLength(0);
+        expect(sender.start).not.toHaveBeenCalled();
       }
     });
 
@@ -293,6 +352,17 @@ describe('createSendAttachmentHandler', () => {
       const handler = createSendAttachmentHandler({ sessions, publisher, journalConvoIdFor: () => 'convo-abc' });
       const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
       expect(res.status).toBe(404);
+    });
+
+    it('the own-conversation path still uploads media under the 50 MB cap', async () => {
+      const { handler, sender, uploadMedia, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf' });
+      expect(res.status).toBe(200);
+      expect(uploadMedia).toHaveBeenCalledTimes(1);
+      expect(published[0].convoId).toBe('convo-abc');
+      expect(sender.start).not.toHaveBeenCalled();
+      const capped = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { maxBytes: 5 });
+      expect((await capped.handler({ roomId: '!room1', path: 'report.pdf' })).status).toBe(413);
     });
   });
 
@@ -449,25 +519,13 @@ describe("the conversation's own downloads", () => {
   it("send_attachment posts this conversation's download into a room", async () => {
     const { session, own, publisher } = downloadsFixture();
     const rooms = { get: (id) => (id === 'room-1' ? { sessionRoomId: 'convo-own', role: 'guest', state: 'joined' } : null) };
-    session.currentTurn = { causes: [{ kind: 'user_message', ref: 'convo-own:4', at: 1 }], startedAt: 1 };
+    const sender = { start: vi.fn(() => ({ jobId: 'job-1' })) };
     const handler = createSendAttachmentHandler({
-      sessions: new Map([['convo-own', session]]), publisher, rooms, journalConvoIdFor: () => 'convo-own',
+      sessions: new Map([['convo-own', session]]), publisher, rooms, sender, journalConvoIdFor: () => 'convo-own',
     });
     const res = await handler({ roomId: 'convo-own', path: path.join(own, 'scan.zip'), chat_room_id: 'room-1' });
     expect(res.status).toBe(200);
-    // Into a room, the post names its session and turn causes beside the payload.
-    expect(publisher.publishFile).toHaveBeenCalledWith('room-1', expect.objectContaining({ name: 'scan.zip' }),
-      { provenance: { fromConvoId: 'convo-own', causes: [{ kind: 'user_message', ref: 'convo-own:4', at: 1 }] } });
-    // The causes are read before the upload: a turn that begins while it
-    // runs did not send this attachment.
-    const upload = publisher.uploadMedia;
-    publisher.uploadMedia = vi.fn(async (args) => {
-      session.currentTurn = { causes: [{ kind: 'reminder', at: 2 }], startedAt: 2 };
-      return upload(args);
-    });
-    session.currentTurn = { causes: [{ kind: 'user_message', ref: 'convo-own:9', at: 3 }], startedAt: 3 };
-    await handler({ roomId: 'convo-own', path: path.join(own, 'scan.zip'), chat_room_id: 'room-1' });
-    expect(publisher.publishFile).toHaveBeenLastCalledWith('room-1', expect.objectContaining({ name: 'scan.zip' }),
-      { provenance: { fromConvoId: 'convo-own', causes: [{ kind: 'user_message', ref: 'convo-own:9', at: 3 }] } });
+    expect(sender.start).toHaveBeenCalledWith(expect.objectContaining({ roomId: 'room-1', name: 'scan.zip' }));
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
   });
 });
