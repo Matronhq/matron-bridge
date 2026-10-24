@@ -4,7 +4,7 @@ Fires when an account's weekly usage limit resets in 6–12 hours and stands und
 
 The backlog is open tracker tasks labelled `spare-allowance`, in the Tasks list's order. Each task's body starts with `Repo:` (what the session needs), optionally `Boxes:`, and `Cost:` (a rough share of a week, such as "~15% week"), then the instructions. A task labelled `dispatched` is already running.
 
-1. Run `agent_boxes` for live numbers. For each listed allowance, take the first backlog task (in order) that fits:
+1. Run `agent_boxes` for live numbers, and `item_list` with `label: "spare-allowance"` and `kind: "task"`. Skip every task labelled `dispatched`: it is already running, so never start it again for another allowance or a later fire. For each listed allowance, take the first remaining task (in order) that fits:
    - its `Cost:` added to the allowance's current percent stays under about 90%;
    - one of the allowance's boxes has the task's repo (or matches `Boxes:`).
    Skip the allowance if nothing fits.
@@ -14,8 +14,8 @@ The backlog is open tracker tasks labelled `spare-allowance`, in the Tasks list'
    - follow its instructions;
    - stop and report if the box's weekly meter passes 90%;
    - close the item when done.
-   Put it on the task's mission if it has one. At most one task per allowance per fire; the envelope caps the spawns.
-4. On the item: add the label `dispatched` (keep `spare-allowance`), and comment with the session link and the allowance's reset time.
+   Put it on the task's mission if it has one. At most one task per allowance per fire, and never the same task twice in one fire; the envelope caps the spawns.
+4. On the item, straight after the start: add the label `dispatched` (keep `spare-allowance`), and comment with the session link and the allowance's reset time.
 5. Reply with one line per allowance: the task started and where (linked), or why none was started.
 
 Pausing this routine pauses the whole backlog. Removing the `spare-allowance` label takes one task out.
