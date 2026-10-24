@@ -87,6 +87,8 @@ describe('consent wiring (source inspection)', () => {
   });
 
   it('the Coordinator prompt teaches how to judge a file transfer card', () => {
+    const preamble = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    expect(preamble).toMatch(/file transfer[^\n]*"triage a consent request"/i);
     expect(coord).toMatch(/approve a file transfer only when the file, the sender and the receiving sessions match work you can see/i);
     expect(coord).toMatch(/never approve one whose note does not explain it/i);
     expect(coord).toMatch(/flagged[^\n]*always the user's/i);

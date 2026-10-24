@@ -22,7 +22,7 @@ describe('consent handlers', () => {
     const { h, client } = fixture({ coordinator: false });
     const r = await h.list({ roomId: '!r:s' });
     expect(r.status).toBe(403);
-    expect(r.body.error).toBe("only the Coordinator may approve chats and spawns on the user's behalf — this conversation is not the Coordinator");
+    expect(r.body.error).toBe("only the Coordinator may answer consent asks on the user's behalf — this conversation is not the Coordinator");
     expect((await h.decide({ roomId: '!r:s', kind: 'spawn', id: 'x', decision: 'approve', reason: 'r' })).status).toBe(403);
     expect(client.pending).not.toHaveBeenCalled();
     expect(client.answer).not.toHaveBeenCalled();
@@ -83,6 +83,11 @@ describe('consent handlers', () => {
     const userOnly = fixture({ answer: { status: 403, data: { error: 'forbidden', detail: 'user_only' } } });
     expect((await userOnly.h.decide({ roomId: '!r:s', kind: 'transfer', id: TR_ID, decision: 'approve', reason: 'ok' })).body.error).toMatch(/only the user may approve/);
     expect(formatJournalConsentError({ error: 'bad_request' })).toMatch(/kind is chat, spawn or transfer/);
+    const own = fixture({ answer: { status: 403, data: { error: 'forbidden', detail: 'own_ask_unverified', why: "a file the Coordinator sends is the user's to approve" } } });
+    expect((await own.h.decide({ roomId: '!r:s', kind: 'transfer', id: TR_ID, decision: 'approve', reason: 'ok' })).body.error)
+      .toBe("a file your own session sends needs the user's own approval (why: a file the Coordinator sends is the user's to approve) — leave it for the user");
+    // The spawn and chat wording is unchanged.
+    expect(formatJournalConsentError({ error: 'forbidden', detail: 'own_ask_unverified' }, { kind: 'spawn' })).toMatch(/^the journal cannot tie your own request/);
   });
 
   it('renders every journal refusal as a sentence that names the next move', async () => {
@@ -190,6 +195,10 @@ describe('consent formatting', () => {
     expect(clean).toContain('to no other box yet');
     expect(clean).toContain('  secret scan: clean');
     expect(clean).toContain('  note: (none) — never approve a transfer whose note does not explain it');
+    expect(clean).not.toMatch(/only the user/);
+    const userOnly = formatPendingAsk({ ...transferAsk, user_only: true }, { now: NOW });
+    expect(userOnly).toContain('  only the user can approve this one: a box it involves is one only the user approves for — leave it for them, or decline with a reason');
+    expect(userOnly).toContain(`consent_decide(kind: "transfer", id: "${TR_ID}", decision: decline, reason: …)`);
   });
   it('formatPendingAsk: a flagged transfer lists its findings and says the Coordinator cannot approve it', () => {
     const text = formatPendingAsk({ ...transferAsk, scan_verdict: 'flagged', scan_findings: [{ kind: 'aws_access_key', line: 3 }, { kind: 'private_key', line: 'db/keys.pem:1' }, { kind: 'x\ny', line: null }] }, { now: NOW });

@@ -3,7 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, utimesSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { sweepInbox, INBOX_MAX_AGE_MS } from '../lib/inbox-sweep.js';
+import { sweepInbox, INBOX_MAX_AGE_MS, INBOX_HARD_MAX_AGE_MS } from '../lib/inbox-sweep.js';
 import { createTransferReceiver } from '../lib/transfer-receiver.js';
 
 const DAY = 24 * 3600 * 1000;
@@ -15,9 +15,10 @@ const silent = { log() {}, warn() {}, error() {} };
 
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), 'inbox-sweep-'));
-  const inbox = path.join(root, 'files', 'session-1', 'inbox');
+  const files = path.join(root, 'files');
+  const inbox = path.join(files, 'session-1', 'inbox');
   mkdirSync(inbox, { recursive: true });
-  return { root, inbox, stateFile: path.join(root, 'inbox-state.json') };
+  return { root, files, roots: [files], inbox, stateFile: path.join(root, 'inbox-state.json') };
 }
 
 // A file whose mtime is `at` (what the receiver leaves: the .part's last
@@ -40,7 +41,7 @@ describe('inbox sweep', () => {
       { path: young, arrivedAt: NOW - INBOX_MAX_AGE_MS + 1, transferId: ID_B },
     ] });
     expect(INBOX_MAX_AGE_MS).toBe(7 * DAY);
-    const r = sweepInbox(fx.stateFile, { now: NOW });
+    const r = sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots });
     expect(r.deleted).toEqual([old]);
     expect(existsSync(old)).toBe(false);
     expect(existsSync(young)).toBe(true);
@@ -53,7 +54,7 @@ describe('inbox sweep', () => {
     const mine = fileAt(path.join(fx.inbox, 'notes.txt'), NOW - 30 * DAY);
     const stray = fileAt(path.join(fx.inbox, 'other.part'), NOW - 30 * DAY);
     writeState(fx.stateFile, { pending: {}, arrived: [{ path: recorded, arrivedAt: NOW - 30 * DAY, transferId: ID_A }] });
-    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([recorded]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([recorded]);
     expect(existsSync(mine)).toBe(true);
     expect(existsSync(stray)).toBe(true);
   });
@@ -62,16 +63,16 @@ describe('inbox sweep', () => {
     const fx = fixture();
     const gone = path.join(fx.inbox, 'gone.log');
     writeState(fx.stateFile, { pending: {}, arrived: [{ path: gone, arrivedAt: NOW - 8 * DAY, transferId: ID_A }] });
-    const r = sweepInbox(fx.stateFile, { now: NOW });
+    const r = sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots });
     expect(r.deleted).toEqual([]);
     expect(readState(fx.stateFile).arrived).toEqual([]);
   });
 
   it('a missing or corrupt state file deletes nothing and never throws', () => {
     const fx = fixture();
-    expect(sweepInbox(path.join(fx.root, 'nope.json'), { now: NOW }).deleted).toEqual([]);
+    expect(sweepInbox(path.join(fx.root, 'nope.json'), { now: NOW, roots: fx.roots }).deleted).toEqual([]);
     writeFileSync(fx.stateFile, '{not json');
-    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([]);
   });
 
   it('never follows a symlink at a recorded path: the link and its target stay', () => {
@@ -80,7 +81,7 @@ describe('inbox sweep', () => {
     const link = path.join(fx.inbox, 'sent.log');
     symlinkSync(target, link);
     writeState(fx.stateFile, { pending: {}, arrived: [{ path: link, arrivedAt: NOW - 30 * DAY, transferId: ID_A }] });
-    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([]);
     expect(existsSync(target)).toBe(true);
     expect(existsSync(link)).toBe(true);
   });
@@ -89,9 +90,56 @@ describe('inbox sweep', () => {
     const fx = fixture();
     const edited = fileAt(path.join(fx.inbox, 'edited.log'), NOW - DAY);
     writeState(fx.stateFile, { pending: {}, arrived: [{ path: edited, arrivedAt: NOW - 10 * DAY, transferId: ID_A }] });
-    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([]);
     expect(existsSync(edited)).toBe(true);
     expect(readState(fx.stateFile).arrived).toHaveLength(1);
+  });
+
+  it('deletes a file still being edited once it is 30 days past its arrival', () => {
+    const fx = fixture();
+    expect(INBOX_HARD_MAX_AGE_MS).toBe(30 * DAY);
+    const edited = fileAt(path.join(fx.inbox, 'edited.log'), NOW - DAY);
+    const younger = fileAt(path.join(fx.inbox, 'younger.log'), NOW - DAY);
+    writeState(fx.stateFile, { pending: {}, arrived: [
+      { path: edited, arrivedAt: NOW - INBOX_HARD_MAX_AGE_MS - 1, transferId: ID_A },
+      { path: younger, arrivedAt: NOW - INBOX_HARD_MAX_AGE_MS + 1, transferId: ID_B },
+    ] });
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([edited]);
+    expect(existsSync(younger)).toBe(true);
+  });
+
+  it('never deletes a recorded file outside an inbox under the downloads root', () => {
+    const fx = fixture();
+    // Under the root but not in an inbox directory.
+    const notInbox = path.join(fx.files, 'session-1', 'notes.log');
+    fileAt(notInbox, NOW - 30 * DAY);
+    // Outside the root altogether, even in a directory called inbox.
+    const otherInbox = path.join(fx.root, 'other', 'inbox');
+    mkdirSync(otherInbox, { recursive: true });
+    const outside = fileAt(path.join(otherInbox, 'precious.log'), NOW - 30 * DAY);
+    // A path that climbs out with '..' from an inbox.
+    const precious = fileAt(path.join(fx.root, 'precious.txt'), NOW - 30 * DAY);
+    const climbing = `${fx.inbox}/../../../precious.txt`;
+    writeState(fx.stateFile, { pending: {}, arrived: [notInbox, outside, climbing].map((p, i) => ({ path: p, arrivedAt: NOW - 30 * DAY, transferId: [ID_A, ID_B, ID_C][i] })) });
+    // No roots given: nothing is ever deleted.
+    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([]);
+    for (const p of [notInbox, outside, precious]) expect(existsSync(p), p).toBe(true);
+  });
+
+  it('never follows a symlinked inbox directory out of the root, for recorded files or .part files', () => {
+    const fx = fixture();
+    const away = path.join(fx.root, 'away');
+    mkdirSync(away);
+    const target = fileAt(path.join(away, 'precious.log'), NOW - 30 * DAY);
+    const part = fileAt(path.join(away, `x.${ID_B}.part`), NOW - 30 * DAY);
+    mkdirSync(path.join(fx.files, 'session-2'));
+    const linkedInbox = path.join(fx.files, 'session-2', 'inbox');
+    symlinkSync(away, linkedInbox);
+    writeState(fx.stateFile, { pending: {}, arrived: [{ path: path.join(linkedInbox, 'precious.log'), arrivedAt: NOW - 30 * DAY, transferId: ID_A }] });
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([]);
+    expect(existsSync(target)).toBe(true);
+    expect(existsSync(part)).toBe(true);
   });
 
   it('a path reused by a later arrival is kept while that arrival is young', () => {
@@ -101,7 +149,7 @@ describe('inbox sweep', () => {
       { path: p, arrivedAt: NOW - 9 * DAY, transferId: ID_A },
       { path: p, arrivedAt: NOW - DAY, transferId: ID_B },
     ] });
-    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([]);
     expect(existsSync(p)).toBe(true);
   });
 
@@ -120,7 +168,7 @@ describe('inbox sweep', () => {
       pending: { [ID_B]: { transfer: { id: ID_B, room_id: 'room-1', name: 'big.tar', size: 9, sha256: 'f'.repeat(64) }, dir: fx.inbox } },
       arrived: [{ path: recorded, arrivedAt: NOW - DAY, transferId: ID_C }],
     });
-    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([orphan]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([orphan]);
     for (const p of [recorded, fresh, owned, notOurs, outside]) expect(existsSync(p), p).toBe(true);
   });
 
@@ -131,22 +179,23 @@ describe('inbox sweep', () => {
       pending: { [ID_A]: { transfer: { id: ID_A }, saved: [{ key: '!s', path: p }] } },
       arrived: [{ path: p, arrivedAt: NOW - 9 * DAY, transferId: ID_A }],
     });
-    expect(sweepInbox(fx.stateFile, { now: NOW }).deleted).toEqual([]);
+    expect(sweepInbox(fx.stateFile, { now: NOW, roots: fx.roots }).deleted).toEqual([]);
     expect(existsSync(p)).toBe(true);
   });
 
   it('uses the injected fs: lstat, unlink and readdir only', () => {
     const calls = [];
     const fsImpl = {
-      readFileSync: () => JSON.stringify({ pending: {}, arrived: [{ path: '/inbox/a.log', arrivedAt: NOW - 8 * DAY, transferId: ID_A }] }),
+      readFileSync: () => JSON.stringify({ pending: {}, arrived: [{ path: '/dl/s/inbox/a.log', arrivedAt: NOW - 8 * DAY, transferId: ID_A }] }),
+      realpathSync: (p) => p,
       lstatSync: (p) => { calls.push(['lstat', p]); return { isFile: () => true, isSymbolicLink: () => false, mtimeMs: NOW - 8 * DAY }; },
       unlinkSync: (p) => calls.push(['unlink', p]),
       readdirSync: (d) => { calls.push(['readdir', d]); return []; },
     };
     const save = vi.fn();
-    expect(sweepInbox('/state.json', { now: NOW, fsImpl, save }).deleted).toEqual(['/inbox/a.log']);
-    expect(calls).toContainEqual(['unlink', '/inbox/a.log']);
-    expect(calls).toContainEqual(['readdir', '/inbox']);
+    expect(sweepInbox('/state.json', { now: NOW, fsImpl, save, roots: ['/dl'] }).deleted).toEqual(['/dl/s/inbox/a.log']);
+    expect(calls).toContainEqual(['unlink', '/dl/s/inbox/a.log']);
+    expect(calls).toContainEqual(['readdir', '/dl/s/inbox']);
     expect(save).toHaveBeenCalledWith('/state.json', { pending: {}, arrived: [] });
   });
 });
@@ -165,7 +214,7 @@ describe('receiver sweep', () => {
     };
     const session = { roomId: '!guest' };
     const receiver = createTransferReceiver({
-      client, dirFor: () => fx.inbox, sessionsForRoom: () => [session], stateFile: fx.stateFile,
+      client, dirFor: () => fx.inbox, sessionsForRoom: () => [session], stateFile: fx.stateFile, inboxRoots: fx.roots,
       log: silent, now: () => clock, sleep: async () => {},
     });
     receiver.onReady({ id: ID_A, room_id: 'room-1', name: 'build.log', size: CONTENT.length, sha256: sha(CONTENT) });
@@ -194,7 +243,7 @@ describe('receiver sweep', () => {
       listPending: vi.fn(),
     };
     const receiver = createTransferReceiver({
-      client, dirFor: () => fx.inbox, sessionsForRoom: () => [{ roomId: '!guest' }], stateFile: fx.stateFile,
+      client, dirFor: () => fx.inbox, sessionsForRoom: () => [{ roomId: '!guest' }], stateFile: fx.stateFile, inboxRoots: fx.roots,
       log: silent, now: () => NOW + 30 * DAY, sleep: async () => {},
     });
     const t = { id: ID_A, room_id: 'room-1', name: 'big.tar', size: CONTENT.length, sha256: sha(CONTENT) };

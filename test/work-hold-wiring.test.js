@@ -92,8 +92,12 @@ describe('work in flight holds the session and the box', () => {
     const refresh = fnBody('refreshTransferHold');
     expect(refresh).toContain('(transferSender?.active() ?? 0) + (transferReceiver?.active() ?? 0)');
     expect(refresh).toContain('transferHold.update(count)');
-    // A change (start or stop) rewrites the marker at once, not at the next reaper tick.
-    expect(refresh).toMatch(/if \(\(until > 0\) !== \(prev > 0\)\) refreshKeepAwakeMarker\(\);/);
+    // Every upkeep tick while held (and the one that releases it) rewrites the
+    // marker, so the lease is renewed even with the idle reaper off.
+    expect(refresh).toMatch(/if \(until > 0 \|\| prev > 0\) refreshKeepAwakeMarker\(\);/);
+    expect(fnBody('startTransferUpkeep')).toMatch(/setInterval\(refreshTransferHold, TRANSFER_HOLD_TICK_MS\)\.unref\(\);/);
+    // The sweep is confined to the bridge's own download roots.
+    expect(index).toMatch(/inboxRoots: \(\) => \[matronFilesRoot\(\), ivUploadsRoot\(\)\]/);
     expect(index).toMatch(/setInterval\(refreshTransferHold, TRANSFER_HOLD_TICK_MS\)\.unref\(\)/);
     const reaper = fnBody('startIdleReaper');
     const tick = reaper.indexOf('refreshTransferHold()');

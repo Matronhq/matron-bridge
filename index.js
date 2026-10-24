@@ -130,8 +130,8 @@ import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
-import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
-import { matronFilesDir, sessionDownloadDir } from './lib/matron-files.js';
+import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
+import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -10191,7 +10191,7 @@ let workHoldSessions = 0;
 // Room file transfers in flight (the sender's uploads, the receiver's
 // downloads) lease the same marker: refreshTransferHold() re-reads both
 // sides every TRANSFER_HOLD_TICK_MS and on every reaper tick, and rewrites
-// the marker the moment activity starts or drops to 0. Bounded by
+// the marker on each tick while held and on the one that releases it. Bounded by
 // WORK_HOLD_MAX_MS of continuous activity (createTransferHold).
 let transferHoldUntil = 0;
 let transferHoldCount = 0;
@@ -10209,7 +10209,9 @@ function refreshTransferHold() {
     const until = transferHold.update(count);
     transferHoldUntil = until;
     transferHoldCount = until > 0 ? count : 0;
-    if ((until > 0) !== (prev > 0)) refreshKeepAwakeMarker();
+    // Rewritten on every tick while held, and on the tick that releases it:
+    // with the idle reaper off this is the only thing renewing the lease.
+    if (until > 0 || prev > 0) refreshKeepAwakeMarker();
   } catch (e) {
     try { console.warn(`[transfer] keep-awake update failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -12356,6 +12358,8 @@ transferReceiver = createTransferReceiver({
   stateFile: TRANSFER_INBOX_FILE,
   log: console,
   dirFor: (target) => path.join(sessionDownloadDir(target) || matronFilesDir(target?.workdir), 'inbox'),
+  // The same two roots dirFor lands under; the inbox sweep stays inside them.
+  inboxRoots: () => [matronFilesRoot(), ivUploadsRoot()],
   sessionsForRoom: transferTargetsFor,
   isMuted: (roomId, target) => agentRooms.isMuted(roomId, target?.roomId),
   deliver: (target, line, { roomId, fromName }) => {
