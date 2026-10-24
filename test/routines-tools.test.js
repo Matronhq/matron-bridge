@@ -362,4 +362,18 @@ describe('allowance_expiring trigger', () => {
     expect(describeTrigger({ kind: 'allowance_expiring', pct: 70 })).toBe('when a weekly limit resets within 6–12 h and is under 70%');
     expect(describeTrigger({ kind: 'allowance_expiring', pct: 50, from_hours: 2, to_hours: 24 })).toBe('when a weekly limit resets within 2–24 h and is under 50%');
   });
+
+  it('validates 1–4 tiers of unused percent and hours left, on create and update', () => {
+    const base = { name: 'spare-allowance', title: 'Spare', prompt: 'p' };
+    const tiers = [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }];
+    expect(validateCreateFields({ ...base, trigger: { kind: 'allowance_expiring', tiers } }).value.trigger).toEqual({ kind: 'allowance_expiring', tiers });
+    expect(validateUpdateFields({ trigger: { kind: 'allowance_expiring', tiers } }).value.trigger).toEqual({ kind: 'allowance_expiring', tiers });
+    const t = (x) => ({ kind: 'allowance_expiring', tiers: [x] });
+    for (const trigger of [{ kind: 'allowance_expiring', tiers: [] }, { kind: 'allowance_expiring', tiers, pct: 70 }, { kind: 'allowance_expiring', tiers: Array(5).fill(tiers[0]) },
+      t({ unused_pct: 0, hours_left: 2 }), t({ unused_pct: 50, hours_left: 0 }), t({ unused_pct: 50, hours_left: 169 }), t({ unused_pct: 50 }), t({ unused_pct: 50, hours_left: 2, pct: 1 }), t(null),
+      { kind: 'disk_under', pct: 20, tiers }]) {
+      expect(validateCreateFields({ ...base, trigger }).ok).toBe(false);
+    }
+    expect(describeTrigger({ kind: 'allowance_expiring', tiers })).toBe('when a weekly limit has 50% unused with 12 h left or 25% unused with 2 h left');
+  });
 });

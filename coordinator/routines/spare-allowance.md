@@ -1,6 +1,6 @@
 ## Routine: spare-allowance — Spare weekly allowance before its reset
 
-Fires when an account's weekly usage limit resets in 6–12 hours and stands under the routine's threshold (70% by default). It fires once per account per weekly window, and only while the spare-allowance backlog has a task. The turn lists the allowances under "Tripped by:" with their percent, reset time and the boxes that use them. It then lists the head of the backlog under "Next in the spare-allowance backlog:".
+Fires when an account's weekly usage limit is about to reset with room left: by default when at least 50% of it is unused with 12 hours left, or at least 25% with 2 hours left (the routine's tiers; an older single-band form fires 6–12 hours out under a percent). It fires once per account per weekly window, and only while the spare-allowance backlog has a task. The turn lists the allowances under "Tripped by:" with their percent, reset time and the boxes that use them. It then lists the head of the backlog under "Next in the spare-allowance backlog:".
 
 The backlog is open tracker tasks labelled `spare-allowance`, in the Tasks list's order. Each task's body starts with `Repo:` (what the session needs), optionally `Boxes:`, and `Cost:` (a rough share of a week, such as "~15% week"), then the instructions. A task labelled `dispatched` is already running.
 
