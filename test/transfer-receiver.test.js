@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import path from 'path';
 import crypto from 'crypto';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, symlinkSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, symlinkSync, statSync } from 'fs';
+import fsp from 'fs/promises';
 import { tmpdir } from 'os';
 import { createTransferReceiver } from '../lib/transfer-receiver.js';
 
@@ -34,6 +35,7 @@ function fakeClient({ bytes = CONTENT, pending = [], download } = {}) {
   return {
     download: vi.fn(download || serve),
     received: vi.fn(async () => ({ ok: true, status: 200, body: { phase: 'delivered' } })),
+    failed: vi.fn(async () => ({ ok: true, status: 200, body: { phase: 'failed' } })),
     listPending: vi.fn(async () => ({ ok: true, status: 200, body: { transfers: pending } })),
   };
 }
@@ -404,6 +406,93 @@ describe('transfer receiver', () => {
       expect(client.download).not.toHaveBeenCalled();
       expect(deliver.mock.calls.map((c) => c[1])).toEqual(['[file "build.log" could not be saved: the inbox is not a directory]']);
       expect(readState(fx.stateFile).pending).toEqual({});
+    });
+
+    it('a local failure tells the journal, so the sender hears it failed', async () => {
+      const fx = fixture();
+      writeFileSync(path.join(fx.root, 'blocker'), 'not a dir');
+      const deliver = vi.fn();
+      const client = fakeClient();
+      const receiver = createTransferReceiver({
+        client, dirFor: () => path.join(fx.root, 'blocker', 'inbox'), deliver, sessionsForRoom: () => [fx.guest],
+        stateFile: fx.stateFile, log: silent, now: () => 1_000, sleep: noSleep,
+      });
+      receiver.onReady(transferOf());
+      await receiver.idle();
+      expect(client.failed).toHaveBeenCalledWith('tr-1', 'the inbox is not a directory');
+      expect(deliver).toHaveBeenCalledTimes(1);
+    });
+
+    it('telling the journal is best effort: a refusal or a throw is logged, the line still goes out first', async () => {
+      for (const failed of [
+        vi.fn(async () => ({ ok: false, status: 0, body: { error: 'journal unreachable' } })),
+        vi.fn(async () => { throw new Error('boom'); }),
+      ]) {
+        const fx = fixture();
+        writeFileSync(path.join(fx.root, 'blocker'), 'not a dir');
+        const order = [];
+        const deliver = vi.fn(() => order.push('line'));
+        const client = fakeClient();
+        client.failed = vi.fn(async (...a) => { order.push('failed'); return failed(...a); });
+        const log = { log() {}, warn: vi.fn(), error() {} };
+        const receiver = createTransferReceiver({
+          client, dirFor: () => path.join(fx.root, 'blocker', 'inbox'), deliver, sessionsForRoom: () => [fx.guest],
+          stateFile: fx.stateFile, log, now: () => 1_000, sleep: noSleep,
+        });
+        receiver.onReady(transferOf());
+        await receiver.idle();
+        expect(order).toEqual(['line', 'failed']);
+        expect(readState(fx.stateFile).pending).toEqual({});
+        expect(log.warn.mock.calls.map((c) => c[0]).join('\n')).toMatch(/telling the journal .*tr-1/);
+      }
+    });
+
+    it('records the saved path before removing the .part, so a crash cannot download it again', async () => {
+      const fx = fixture();
+      const { receiver } = makeReceiver(fx);
+      const seen = [];
+      const real = fsp.unlink;
+      const spy = vi.spyOn(fsp, 'unlink').mockImplementation(async (p) => {
+        if (String(p).endsWith('.part')) seen.push(readState(fx.stateFile).pending['tr-1']?.saved);
+        return real(p);
+      });
+      try {
+        receiver.onReady(transferOf());
+        await receiver.idle();
+      } finally {
+        spy.mockRestore();
+      }
+      const saved = path.join(fx.dirFor(fx.guest), 'build.log');
+      expect(seen).toEqual([[{ key: '!guest', path: saved }]]);
+      expect(readdirSync(fx.dirFor(fx.guest))).toEqual(['build.log']);
+    });
+
+    it('after a crash between the save and removing the .part, a restart neither downloads again nor makes a -1 copy', async () => {
+      const fx = fixture();
+      const dir = fx.dirFor(fx.guest);
+      mkdirSync(dir, { recursive: true });
+      const saved = path.join(dir, 'build.log');
+      writeFileSync(saved, CONTENT);
+      const first = makeReceiver(fx);
+      writeFileSync(first.receiver.partPathFor(dir, transferOf()), CONTENT);
+      writeFileSync(fx.stateFile, JSON.stringify({
+        pending: { 'tr-1': { transfer: transferOf(), dir, saved: [{ key: '!guest', path: saved }] } },
+        arrived: [{ path: saved, arrivedAt: 1_000, transferId: 'tr-1' }],
+      }));
+      const { receiver, client, deliver } = makeReceiver(fx);
+      await receiver.catchUp();
+      await receiver.idle();
+      expect(client.download).not.toHaveBeenCalled();
+      expect(readdirSync(dir)).toEqual(['build.log']);
+      expect(deliver).toHaveBeenCalledTimes(1);
+    });
+
+    it('writes its state file with mode 0600', async () => {
+      const fx = fixture();
+      const { receiver } = makeReceiver(fx);
+      receiver.onReady(transferOf());
+      await receiver.idle();
+      expect(statSync(fx.stateFile).mode & 0o777).toBe(0o600);
     });
 
     it('a .part that cannot be written fails cleanly and cancels the response body', async () => {

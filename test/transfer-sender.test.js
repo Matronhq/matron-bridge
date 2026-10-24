@@ -71,7 +71,8 @@ describe('transfer sender', () => {
     expect(n).toBe(2);
     expect(Buffer.from(body).toString()).toBe('cccc');
     expect(chunkSha).toBe(sha('cccc'));
-    expect(client.complete).toHaveBeenCalledWith('tr-1');
+    // The size lets the client wait long enough for the journal's hash.
+    expect(client.complete).toHaveBeenCalledWith('tr-1', { size: 16 });
     // Still in state until the journal says how it ended.
     const st = readState(fx.stateFile);
     expect(Object.values(st.jobs)[0]).toMatchObject({ transferId: 'tr-1', sha256: sha(fx.bytes), roomId: 'room-1', fromConvoId: 'convo-own', uploaded: true });
@@ -91,7 +92,7 @@ describe('transfer sender', () => {
     expect(scan).not.toHaveBeenCalled();
     expect(client.status).toHaveBeenCalledWith('tr-1');
     expect(client.putChunk.mock.calls.map((c) => [c[1], Buffer.from(c[2]).toString()])).toEqual([[2, 'cccc'], [3, 'dddd']]);
-    expect(client.complete).toHaveBeenCalledWith('tr-1');
+    expect(client.complete).toHaveBeenCalledWith('tr-1', expect.anything());
   });
 
   it('a file whose mtime changed since start is cancelled and the session told', async () => {
@@ -158,6 +159,141 @@ describe('transfer sender', () => {
     await sender.idle();
     expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: '[transfer of "notes.txt" failed: quota_exceeded]' }));
     expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('too many transfers awaiting the user: a clear "not started" line', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.create = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'too_many_awaiting' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx, { name: 'a"b]c.txt' }));
+    await sender.idle();
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
+      text: `[transfer of "a'b)c.txt" not started: too many files are already waiting for the user's approval; wait for those to be answered]`,
+    }));
+    expect(client.putChunk).not.toHaveBeenCalled();
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('no other session in the room: a clear "not started" line', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.create = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'no_recipients' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: '[transfer of "notes.txt" not started: no other session is in this room]' }));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('409 hashing on complete waits about 30 s, checks status and completes again; not a failure', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    let completes = 0;
+    client.complete = vi.fn(async () => (++completes === 1
+      ? { ok: false, status: 409, body: { error: 'conflict', detail: 'hashing' } }
+      : { ok: true, status: 200, body: { id: 'tr-1', phase: 'open', upload: 'uploaded' } }));
+    const sleep = vi.fn(async () => {});
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, sleep, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(sleep).toHaveBeenCalledWith(30_000);
+    // Once before the upload, once after the wait.
+    expect(client.status).toHaveBeenCalledTimes(2);
+    expect(client.complete).toHaveBeenCalledTimes(2);
+    expect(client.cancel).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true, stalls: 0 });
+  });
+
+  it('409 hashing, then the status shows it uploaded: done without another complete', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.complete = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'hashing' } }));
+    const open = client.status;
+    let statuses = 0;
+    client.status = vi.fn(async (id) => (++statuses === 1 ? open(id)
+      : { ok: true, status: 200, body: { id: 'tr-1', phase: 'open', upload: 'uploaded', received: [0, 1, 2, 3] } }));
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, sleep: async () => {}, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(client.complete).toHaveBeenCalledTimes(1);
+    expect(client.cancel).not.toHaveBeenCalled();
+    expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true, stalls: 0 });
+  });
+
+  it('a complete still hashing after every wait is tried again later, never cancelled', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.complete = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'hashing' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, sleep: async () => {}, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(client.complete.mock.calls.length).toBeGreaterThan(2);
+    expect(client.cancel).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    // Kept, with a relaunch scheduled.
+    expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ transferId: 'tr-1', stalls: 1 });
+    expect(Object.values(readState(fx.stateFile).jobs)[0].uploaded).toBeUndefined();
+  });
+
+  it('a file rewritten between the hash and the re-hash (same size and mtime) is cancelled as changed', async () => {
+    const fx = fixture();
+    // A whole-second mtime, so putting it back is exact.
+    const T = 1_700_000_000;
+    utimesSync(fx.absPath, T, T);
+    fx.mtimeMs = T * 1000;
+    const client = fakeClient();
+    const notify = vi.fn();
+    let hashes = 0;
+    const hashFile = vi.fn(async (p) => {
+      const digest = crypto.createHash('sha256').update(readFileSync(p)).digest('hex');
+      if (++hashes === 1) {
+        // Same length, mtime put back: only the bytes give it away.
+        writeFileSync(p, 'zzzzbbbbccccdddd');
+        utimesSync(p, T, T);
+      }
+      return digest;
+    });
+    const sender = createTransferSender({ client, scan: cleanScan, hashFile, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(hashFile).toHaveBeenCalledTimes(2);
+    expect(cleanScan).toHaveBeenCalledWith(fx.absPath);
+    expect(client.create).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringMatching(/^\[transfer of "notes\.txt" cancelled: .*changed/) }));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('hashes again after the scan; an unchanged file goes on with that digest', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    const order = [];
+    const hashFile = vi.fn(async (p) => { order.push('hash'); return crypto.createHash('sha256').update(readFileSync(p)).digest('hex'); });
+    const scan = vi.fn(async () => { await new Promise((r) => setTimeout(r, 5)); order.push('scan'); return { verdict: 'clean', findings: [] }; });
+    const sender = createTransferSender({ client, scan, hashFile, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(order).toEqual(['hash', 'scan', 'hash']);
+    expect(client.create).toHaveBeenCalledWith(expect.objectContaining({ sha256: sha(fx.bytes) }));
+  });
+
+  it('a scan that throws is not_scanned, and the error code is logged', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    const log = { log() {}, warn: vi.fn(), error() {} };
+    const scan = vi.fn(async () => { throw Object.assign(new Error('secret-looking text AKIA'), { code: 'EIO' }); });
+    const sender = createTransferSender({ client, scan, stateFile: fx.stateFile, log, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(client.create).toHaveBeenCalledWith(expect.objectContaining({ scan: { verdict: 'not_scanned', findings: [] } }));
+    const warned = log.warn.mock.calls.map((c) => c[0]).join('\n');
+    expect(warned).toMatch(/EIO/);
+    expect(warned).not.toMatch(/AKIA/);
   });
 
   it('onFrame declined drops the job and tells the sending session', async () => {
@@ -230,6 +366,14 @@ describe('transfer sender', () => {
     expect(readState(fx.stateFile).jobs).toEqual({});
   });
 
+  it('writes its state file with mode 0600', async () => {
+    const fx = fixture();
+    const sender = createTransferSender({ client: fakeClient(), scan: cleanScan, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(statSync(fx.stateFile).mode & 0o777).toBe(0o600);
+  });
+
   it('starts empty from a missing or corrupt state file', () => {
     const fx = fixture();
     writeFileSync(fx.stateFile, '{not json');
@@ -291,7 +435,7 @@ describe('transfer sender', () => {
       await vi.advanceTimersByTimeAsync(60_000);
       await sender.idle();
       expect(client.create).toHaveBeenCalledTimes(3);
-      expect(client.complete).toHaveBeenCalledWith('tr-1');
+      expect(client.complete).toHaveBeenCalledWith('tr-1', expect.anything());
       expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true, stalls: 0 });
     });
 
@@ -349,7 +493,7 @@ describe('transfer sender', () => {
       expect(client.putChunk).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(60_000);
       await sender.idle();
-      expect(client.complete).toHaveBeenCalledWith('tr-1');
+      expect(client.complete).toHaveBeenCalledWith('tr-1', expect.anything());
 
       const fx2 = fixture({ content: 'aaaa' });
       const client2 = fakeClient({ chunks: 1 });

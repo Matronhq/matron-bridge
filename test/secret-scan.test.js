@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -79,11 +79,14 @@ function crc32(buf) {
 }
 // `centrals` lists the central entries to write, default one per member:
 // [{of: memberIndex, name?, offset?}] lets a test alias or misplace them.
-function makeZip(entries, centrals = null) {
+// A member with `descriptor` has its sizes in a data descriptor after its
+// data ('sig': with the optional signature), the way streaming zip writers
+// do. `comment` is the archive comment after the end record.
+function makeZip(entries, centrals = null, { comment = '' } = {}) {
   const locals = [];
   const members = [];
   let offset = 0;
-  for (const { name, data = '', method = 8 } of entries) {
+  for (const { name, data = '', method = 8, descriptor = false } of entries) {
     const raw = Buffer.from(data);
     const comp = method === 8 ? zlib.deflateRawSync(raw) : raw;
     const nameBuf = Buffer.from(name, 'utf8');
@@ -91,15 +94,26 @@ function makeZip(entries, centrals = null) {
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(0x0800 | (descriptor ? 0x0008 : 0), 6);
     local.writeUInt16LE(method, 8);
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(comp.length, 18);
-    local.writeUInt32LE(raw.length, 22);
+    if (!descriptor) {
+      local.writeUInt32LE(crc, 14);
+      local.writeUInt32LE(comp.length, 18);
+      local.writeUInt32LE(raw.length, 22);
+    }
     local.writeUInt16LE(nameBuf.length, 26);
-    locals.push(local, nameBuf, comp);
-    members.push({ name, method, crc, compLen: comp.length, rawLen: raw.length, offset });
-    offset += 30 + nameBuf.length + comp.length;
+    let desc = Buffer.alloc(0);
+    if (descriptor) {
+      desc = Buffer.alloc(descriptor === 'sig' ? 16 : 12);
+      let q = 0;
+      if (descriptor === 'sig') { desc.writeUInt32LE(0x08074b50, 0); q = 4; }
+      desc.writeUInt32LE(crc, q);
+      desc.writeUInt32LE(comp.length, q + 4);
+      desc.writeUInt32LE(raw.length, q + 8);
+    }
+    locals.push(local, nameBuf, comp, desc);
+    members.push({ name, method, crc, compLen: comp.length, rawLen: raw.length, offset, flags: 0x0800 | (descriptor ? 0x0008 : 0) });
+    offset += 30 + nameBuf.length + comp.length + desc.length;
   }
   const specs = centrals ?? members.map((_, i) => ({ of: i }));
   const cdParts = [];
@@ -110,7 +124,7 @@ function makeZip(entries, centrals = null) {
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(20, 4);
     central.writeUInt16LE(20, 6);
-    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(m.flags, 8);
     central.writeUInt16LE(m.method, 10);
     central.writeUInt32LE(m.crc, 16);
     central.writeUInt32LE(m.compLen, 20);
@@ -120,13 +134,15 @@ function makeZip(entries, centrals = null) {
     cdParts.push(central, nameBuf);
   }
   const cd = Buffer.concat(cdParts);
+  const commentBuf = Buffer.from(comment);
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(0x06054b50, 0);
   eocd.writeUInt16LE(specs.length, 8);
   eocd.writeUInt16LE(specs.length, 10);
   eocd.writeUInt32LE(cd.length, 12);
   eocd.writeUInt32LE(offset, 16);
-  return Buffer.concat([...locals, cd, eocd]);
+  eocd.writeUInt16LE(commentBuf.length, 20);
+  return Buffer.concat([...locals, cd, eocd, commentBuf]);
 }
 
 const PNG = Buffer.concat([
@@ -353,6 +369,22 @@ describe('scanFile: tar', () => {
     expect(r.findings).toEqual([{ kind: 'sensitive_file', line: longName }]);
   });
 
+  it('data after the end-of-archive blocks makes it not_scanned (cat secret >> archive)', async () => {
+    const tar = makeTar([{ name: 'a.txt', data: 'hello\n' }]);
+    expect((await scanFile(fixture('tail.tar', Buffer.concat([tar, Buffer.from(`${FAKE.aws}\n`)])))).verdict).toBe('not_scanned');
+    // Record padding (zeros) after the end blocks is still clean.
+    expect((await scanFile(fixture('padded.tar', Buffer.concat([tar, Buffer.alloc(8192)])))).verdict).toBe('clean');
+    // One non-zero byte far into the padding is enough.
+    const late = Buffer.concat([tar, Buffer.alloc(8192)]);
+    late[late.length - 1] = 0x41;
+    expect((await scanFile(fixture('late.tar', late))).verdict).toBe('not_scanned');
+    for (const ext of ['tar.gz', 'tgz']) {
+      const gz = Buffer.concat([zlib.gzipSync(tar), Buffer.from(`${FAKE.aws}\n`)]);
+      expect((await scanFile(fixture(`tail.${ext}`, gz))).verdict).toBe('not_scanned');
+      expect((await scanFile(fixture(`intail.${ext}`, zlib.gzipSync(Buffer.concat([tar, Buffer.from(`${FAKE.aws}\n`)]))))).verdict).toBe('not_scanned');
+    }
+  });
+
   it('a corrupt or truncated tar is not_scanned', async () => {
     const good = makeTar([{ name: 'a.txt', data: 'hello world\n'.repeat(100) }]);
     expect((await scanFile(fixture('trunc.tar', good.subarray(0, 700)))).verdict).toBe('not_scanned');
@@ -396,6 +428,45 @@ describe('scanFile: zip', () => {
     const cdStart = bz.readUInt32LE(bz.length - 22 + 16);
     bz.writeUInt16LE(12, cdStart + 46 + 'a.txt'.length + 10);
     expect((await scanFile(fixture('bz2.zip', bz))).verdict).toBe('flagged');
+  });
+
+  it('data appended after the end record makes it not_scanned (cat secret >> archive)', async () => {
+    const zip = makeZip([{ name: 'a.txt', data: 'hello\n' }]);
+    expect((await scanFile(fixture('tail0.zip', zip))).verdict).toBe('clean');
+    expect((await scanFile(fixture('tail.zip', Buffer.concat([zip, Buffer.from(`${FAKE.aws}\n`)])))).verdict).toBe('not_scanned');
+    // Findings in the members still stand.
+    const dirty = makeZip([{ name: 'k.txt', data: `${FAKE.aws}\n` }]);
+    expect(await scanFile(fixture('tail2.zip', Buffer.concat([dirty, Buffer.from('junk')]))))
+      .toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: 'k.txt:1' }] });
+  });
+
+  it('bytes hidden between members, or before the first, make it not_scanned', async () => {
+    const zip = makeZip([{ name: 'a.txt', data: 'hello\n', method: 0 }, { name: 'b.txt', data: 'world\n', method: 0 }]);
+    // Shrink a.txt's declared size in its central entry: its last bytes are
+    // then outside every member's span.
+    const cdStart = zip.readUInt32LE(zip.length - 22 + 16);
+    zip.writeUInt32LE(3, cdStart + 20);
+    zip.writeUInt32LE(3, cdStart + 24);
+    expect((await scanFile(fixture('gap.zip', zip))).verdict).toBe('not_scanned');
+    // A prefix (self-extractor stub, or a secret) before the first member.
+    const plain = makeZip([{ name: 'a.txt', data: 'hello\n' }]);
+    expect((await scanFile(fixture('pre.zip', Buffer.concat([Buffer.from(`${FAKE.aws}\n`), plain])))).verdict).toBe('not_scanned');
+  });
+
+  it('a zip comment is allowed, and scanned', async () => {
+    expect(await scanFile(fixture('c.zip', makeZip([{ name: 'a.txt', data: 'hi\n' }], null, { comment: 'built by ci' }))))
+      .toEqual({ verdict: 'clean', findings: [] });
+    const r = await scanFile(fixture('c2.zip', makeZip([{ name: 'a.txt', data: 'hi\n' }], null, { comment: `key ${FAKE.aws}` })));
+    expect(r.verdict).toBe('flagged');
+    expect(r.findings.map((f) => f.kind)).toEqual(['aws_access_key']);
+  });
+
+  it('members with data descriptors (streaming writers) are covered exactly', async () => {
+    for (const descriptor of [true, 'sig']) {
+      const zip = makeZip([{ name: 'a.txt', data: 'hello\n', descriptor }, { name: 'b.txt', data: 'world\n', method: 0, descriptor }]);
+      expect(await scanFile(fixture(`dd-${descriptor}.zip`, zip))).toEqual({ verdict: 'clean', findings: [] });
+      expect((await scanFile(fixture(`dd-${descriptor}-tail.zip`, Buffer.concat([zip, Buffer.from('x')])))).verdict).toBe('not_scanned');
+    }
   });
 
   it('not a zip at all is not_scanned', async () => {
@@ -475,6 +546,27 @@ describe('scanFile: zip', () => {
     await expect(readZipEntries(p, { maxEntries: 2 })).rejects.toThrow(/too many members/);
     expect((await scanFile(p, { limits: { maxZipEntries: 2 } })).verdict).toBe('not_scanned');
     expect((await scanFile(p, { limits: { maxZipEntries: 3 } })).verdict).toBe('clean');
+  });
+});
+
+describe('scan errors', () => {
+  it('an unexpected error is not_scanned and logged by its code, never the content', async () => {
+    const log = { warn: vi.fn() };
+    const p = fixture('bad2.gz', Buffer.concat([zlib.gzipSync('ok\n'), Buffer.from(`${FAKE.aws}\n`)]));
+    expect((await scanFile(p, { log })).verdict).toBe('not_scanned');
+    const warned = log.warn.mock.calls.map((c) => c[0]).join('\n');
+    expect(warned).toMatch(/Z_DATA_ERROR/);
+    expect(warned).not.toContain(FAKE.aws);
+  });
+
+  it('logs a zip member that fails to inflate', async () => {
+    const zip = makeZip([{ name: 'a.txt', data: 'hello hello hello\n' }]);
+    // Corrupt the deflate stream of the only member.
+    zip[30 + 'a.txt'.length] = 0xff;
+    zip[30 + 'a.txt'.length + 1] = 0xff;
+    const log = { warn: vi.fn() };
+    expect((await scanFile(fixture('inflate.zip', zip), { log })).verdict).toBe('not_scanned');
+    expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/Z_DATA_ERROR/));
   });
 });
 

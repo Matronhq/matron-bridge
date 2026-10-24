@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTransferClient } from '../lib/transfer-client.js';
+import { createTransferClient, completeTimeoutMs } from '../lib/transfer-client.js';
 
 function stub(status = 200, json = { ok: 1 }) {
   const fetchImpl = vi.fn(async () => new Response(JSON.stringify(json), { status, headers: { 'content-type': 'application/json' } }));
@@ -67,6 +67,47 @@ describe('transfer client', () => {
       ['GET', '/transfers?for=me'],
     ]);
     expect(JSON.parse(f.mock.calls[3][1].body)).toEqual({ sha256: 'dead' });
+  });
+
+  it('complete waits for the journal to hash the file: at least 60 s, scaled by size, at most 15 min', () => {
+    const MB = 1024 * 1024;
+    expect(completeTimeoutMs()).toBe(60_000);
+    expect(completeTimeoutMs(100 * MB)).toBe(60_000);
+    // 10 GB at 50 MB/s, doubled.
+    expect(completeTimeoutMs(10 * 1024 * MB)).toBe(Math.ceil((10 * 1024 / 50) * 2 * 1000));
+    expect(completeTimeoutMs(1024 * 1024 * MB)).toBe(15 * 60_000);
+  });
+
+  it('complete uses the size-scaled timeout, not the JSON one', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn((url, init) => new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(new Error('aborted')))));
+      const c = mk(fetchImpl, { timeoutMs: 1000 });
+      const size = 10 * 1024 * 1024 * 1024;
+      const p = c.complete('t1', { size });
+      let settled = false; p.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(completeTimeoutMs(size) - 61_000 + 10);
+      expect((await p).status).toBe(0);
+      // Without a size it still waits the 60 s floor.
+      const q = c.complete('t1');
+      let qSettled = false; q.then(() => { qSettled = true; });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(qSettled).toBe(false);
+      await vi.advanceTimersByTimeAsync(30_010);
+      expect((await q).status).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('failed posts the reason to /transfers/:id/failed', async () => {
+    const f = stub(200, { phase: 'failed' });
+    const r = await mk(f).failed('t 1', 'the disk is full');
+    const [url, init] = f.mock.calls[0];
+    expect(url).toBe('https://journal.example.com/transfers/t%201/failed');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body)).toEqual({ reason: 'the disk is full' });
+    expect(r.ok).toBe(true);
   });
 
   it('returns HTTP errors without throwing', async () => {

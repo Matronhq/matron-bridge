@@ -264,6 +264,16 @@ describe('createSendAttachmentHandler', () => {
       }));
     });
 
+    it('refuses a file name with a backslash with a readable 400, before starting anything', async () => {
+      const { handler, sender, workdir } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      writeFileSync(path.join(workdir, 'build\\log.txt'), 'x');
+      const res = await handler({ roomId: '!room1', path: 'build\\log.txt', chat_room_id: 'room-1' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/backslash/);
+      expect(res.body.error).toMatch(/rename/);
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
     it('lets the owner send while the room is still pending', async () => {
       const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'pending' });
       const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
