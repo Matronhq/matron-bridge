@@ -78,7 +78,8 @@ function crc32(buf) {
   return (c ^ 0xffffffff) >>> 0;
 }
 // `centrals` lists the central entries to write, default one per member:
-// [{of: memberIndex, name?, offset?}] lets a test alias or misplace them.
+// [{of: memberIndex, name?, offset?, comment?}] lets a test alias or
+// misplace them, or give one an entry comment.
 // A member with `descriptor` has its sizes in a data descriptor after its
 // data ('sig': with the optional signature), the way streaming zip writers
 // do. `comment` is the archive comment after the end record.
@@ -129,9 +130,11 @@ function makeZip(entries, centrals = null, { comment = '' } = {}) {
     central.writeUInt32LE(m.crc, 16);
     central.writeUInt32LE(m.compLen, 20);
     central.writeUInt32LE(m.rawLen, 24);
+    const entryComment = Buffer.from(spec.comment ?? '');
     central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(entryComment.length, 32);
     central.writeUInt32LE(spec.offset ?? m.offset, 42);
-    cdParts.push(central, nameBuf);
+    cdParts.push(central, nameBuf, entryComment);
   }
   const cd = Buffer.concat(cdParts);
   const commentBuf = Buffer.from(comment);
@@ -453,12 +456,32 @@ describe('scanFile: zip', () => {
     expect((await scanFile(fixture('pre.zip', Buffer.concat([Buffer.from(`${FAKE.aws}\n`), plain])))).verdict).toBe('not_scanned');
   });
 
-  it('a zip comment is allowed, and scanned', async () => {
+  it('a zip comment is allowed, and scanned under a label no member name gives', async () => {
     expect(await scanFile(fixture('c.zip', makeZip([{ name: 'a.txt', data: 'hi\n' }], null, { comment: 'built by ci' }))))
       .toEqual({ verdict: 'clean', findings: [] });
-    const r = await scanFile(fixture('c2.zip', makeZip([{ name: 'a.txt', data: 'hi\n' }], null, { comment: `key ${FAKE.aws}` })));
-    expect(r.verdict).toBe('flagged');
-    expect(r.findings.map((f) => f.kind)).toEqual(['aws_access_key']);
+    const r = await scanFile(fixture('c2.zip', makeZip([{ name: 'a.txt', data: 'hi\n' }], null, { comment: `ok\nkey ${FAKE.aws}` })));
+    expect(r).toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: '<zip comment>:2' }] });
+    // A member really called that is shown so it cannot pass for the comment.
+    const m = await scanFile(fixture('c3.zip', makeZip([{ name: '<zip comment>', data: `${FAKE.aws}\n` }])));
+    expect(m.findings).toEqual([{ kind: 'aws_access_key', line: './<zip comment>:1' }]);
+  });
+
+  it('scans each entry comment as text', async () => {
+    const clean = makeZip([{ name: 'a.txt', data: 'hi\n' }], [{ of: 0, comment: 'just a note' }]);
+    expect(await scanFile(fixture('ec.zip', clean))).toEqual({ verdict: 'clean', findings: [] });
+    const dirty = makeZip([{ name: 'a.txt', data: 'hi\n' }, { name: 'b.txt', data: 'yo\n' }], [{ of: 0 }, { of: 1, comment: `key ${FAKE.aws}` }]);
+    const r = await scanFile(fixture('ec2.zip', dirty));
+    expect(r).toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: '<entry comment: b.txt>:1' }] });
+    expect(JSON.stringify(r)).not.toContain(FAKE.aws);
+  });
+
+  it('bytes in the central directory past its last entry make it not_scanned', async () => {
+    const zip = makeZip([{ name: 'a.txt', data: 'hi\n' }]);
+    const eocdAt = zip.length - 22;
+    const junk = Buffer.from(`${FAKE.aws}\n`);
+    const out = Buffer.concat([zip.subarray(0, eocdAt), junk, zip.subarray(eocdAt)]);
+    out.writeUInt32LE(out.readUInt32LE(out.length - 22 + 12) + junk.length, out.length - 22 + 12);
+    expect((await scanFile(fixture('cdtail.zip', out))).verdict).toBe('not_scanned');
   });
 
   it('members with data descriptors (streaming writers) are covered exactly', async () => {

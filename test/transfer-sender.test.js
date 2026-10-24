@@ -225,6 +225,21 @@ describe('transfer sender', () => {
     expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true, stalls: 0 });
   });
 
+  it('a refused status while waiting out hashing tells the session it failed', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.complete = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'hashing' } }));
+    const open = client.status;
+    let statuses = 0;
+    client.status = vi.fn(async (id) => (++statuses === 1 ? open(id) : { ok: false, status: 404, body: { error: 'not_found' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, sleep: async () => {}, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: '[transfer of "notes.txt" failed: not_found]' }));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
   it('a complete still hashing after every wait is tried again later, never cancelled', async () => {
     const fx = fixture();
     const client = fakeClient();
