@@ -169,6 +169,46 @@ describe('transfer receiver', () => {
     expect(readState(fx.stateFile).pending).toEqual({});
   });
 
+  it('a second mismatch tells the journal, after the room line, so the sender hears at once', async () => {
+    const fx = fixture();
+    const client = fakeClient({ bytes: Buffer.alloc(CONTENT.length, 'z') });
+    const order = [];
+    const deliver = vi.fn(() => order.push('line'));
+    client.failed = vi.fn(async () => { order.push('failed'); return { ok: true, status: 200, body: {} }; });
+    const { receiver } = makeReceiver(fx, { client, deliver });
+    receiver.onReady(transferOf());
+    await receiver.idle();
+    expect(client.failed).toHaveBeenCalledWith('tr-1', 'sha256 mismatch after retry');
+    expect(order).toEqual(['line', 'failed']);
+  });
+
+  it('telling the journal of a failed verification is best effort', async () => {
+    const fx = fixture();
+    const client = fakeClient({ bytes: Buffer.alloc(CONTENT.length, 'z') });
+    client.failed = vi.fn(async () => { throw new Error('boom'); });
+    const log = { log() {}, warn: vi.fn(), error() {} };
+    const deliver = vi.fn();
+    const receiver = createTransferReceiver({
+      client, dirFor: fx.dirFor, deliver, sessionsForRoom: () => [fx.guest],
+      stateFile: fx.stateFile, log, now: () => 1_000, sleep: noSleep,
+    });
+    receiver.onReady(transferOf());
+    await receiver.idle();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(readState(fx.stateFile).pending).toEqual({});
+    expect(log.warn.mock.calls.map((c) => c[0]).join('\n')).toMatch(/telling the journal .*tr-1/);
+  });
+
+  it('a mismatch that clears on the retry does not tell the journal anything failed', async () => {
+    const fx = fixture();
+    let n = 0;
+    const client = fakeClient({ download: async () => new Response(n++ === 0 ? Buffer.alloc(CONTENT.length, 'z') : CONTENT, { status: 200 }) });
+    const { receiver } = makeReceiver(fx, { client });
+    receiver.onReady(transferOf());
+    await receiver.idle();
+    expect(client.failed).not.toHaveBeenCalled();
+  });
+
   it('a mismatch that clears on the retry saves the file', async () => {
     const fx = fixture();
     let n = 0;
