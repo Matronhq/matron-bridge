@@ -9,6 +9,7 @@ import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createTransferClient } from './lib/transfer-client.js';
 import { createTransferSender } from './lib/transfer-sender.js';
+import { createTransferReceiver } from './lib/transfer-receiver.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
@@ -408,6 +409,10 @@ const TRANSFERS_FILE = path.join(os.homedir(), '.matron-bridge-transfers.json');
 // and reconnect callbacks, which can fire before that point, see null
 // rather than a temporal-dead-zone throw.
 let transferSender = null;
+// Incoming room files (lib/transfer-receiver.js): downloads still in flight
+// or awaiting their receipt, and every file saved, for the inbox sweep.
+const TRANSFER_INBOX_FILE = path.join(os.homedir(), '.matron-bridge-inbox.json');
+let transferReceiver = null;
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -1047,13 +1052,19 @@ function handleJournalReconnect() {
   // Outgoing room files: carry on any upload a restart or a dropped socket
   // interrupted, and settle jobs whose outcome frame was missed.
   transferSender?.resumeAll().catch((e) => console.warn(`[transfer] resume failed: ${e.message}`));
+  // Incoming room files released while this box was away or asleep, and any
+  // download a restart interrupted.
+  transferReceiver?.catchUp().catch((e) => console.warn(`[transfer] catch-up failed: ${e.message}`));
 }
 
-// kind:'transfer' frames from the journal. The sender's outcomes go to the
-// transfer sender; `ready` (a file released to this device as a recipient)
-// is the receiver's, wired separately.
+// kind:'transfer' frames from the journal. `ready` (a file released to this
+// device as a recipient) goes to the receiver; the sender's outcomes go to
+// the transfer sender.
 function journalHandleTransferFrame(frame) {
   switch (frame.event) {
+    case 'ready':
+      transferReceiver?.onReady(frame.transfer);
+      return;
     case 'declined':
     case 'failed':
     case 'expired':
@@ -11143,6 +11154,10 @@ function reconcilePendingGuestOnFrame(room, frame) {
 function deliverRoomFrameTo(room, frame) {
   const sender = frame.sender || '';
   const payload = frame.payload || {};
+  // A room file sent as a journal transfer: the event names it, but the
+  // bytes come by download. The receiver (lib/transfer-receiver.js) saves it
+  // and delivers its own line, with the saved path, through this function.
+  if (frame.type === 'file' && payload.transfer_id) return;
   // Another PERSON's words (sharing phase 2): the journal's `person:` copy.
   // Named by person, and delivered as a FOREIGN turn (lib/foreign-turn.js).
   const person = personOfSender(sender);
@@ -12256,6 +12271,56 @@ transferSender = createTransferSender({
     if (roomId && agentRooms.isMuted(roomId, sessionKey)) return;
     const room = roomId ? agentRooms.get(roomId) : null;
     roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room?.title || room?.topic || null, from: 'bridge', body: text, at: Date.now() });
+  },
+});
+// Room files released to this device: downloaded into the receiving
+// session's inbox (outside any working tree) and announced to every bound
+// session of the room except the one that sent it. In a same-bridge room
+// the sending session is on this box too, so the sender is picked out by
+// its journal conversation id, not by device. The line goes through
+// deliverRoomFrameTo as a message from the sending agent: the mute gate,
+// the wake of a sleeping conversation, busy coalescing and the user's echo
+// all apply as for any room message.
+function transferTargetsFor(roomId, fromConvoId) {
+  const room = agentRooms.get(roomId);
+  if (!room || room.person) return [];
+  const out = [];
+  const consider = (key, state) => {
+    if (key == null || state !== 'joined') return;
+    const live = sessions.get(key);
+    let target;
+    let convoId;
+    if (live) {
+      target = live;
+      convoId = journalConvoIdFor(live);
+    } else {
+      const prev = loadPersistedSessions()[key];
+      if (!prev) return;
+      target = { roomId: key, workdir: prev.workdir };
+      convoId = prev.journalConvoId || prev.sessionId || null;
+    }
+    if (fromConvoId && convoId === fromConvoId) return;
+    out.push(target);
+  };
+  consider(room.sessionRoomId, room.state);
+  if (room.guestSessionRoomId != null && room.guestSessionRoomId !== room.sessionRoomId) {
+    consider(room.guestSessionRoomId, room.guestState);
+  }
+  return out;
+}
+transferReceiver = createTransferReceiver({
+  client: transferClient,
+  stateFile: TRANSFER_INBOX_FILE,
+  log: console,
+  dirFor: (target) => path.join(sessionDownloadDir(target) || matronFilesDir(target?.workdir), 'inbox'),
+  sessionsForRoom: transferTargetsFor,
+  isMuted: (roomId, target) => agentRooms.isMuted(roomId, target?.roomId),
+  deliver: (target, line, { roomId, fromName }) => {
+    const room = agentRooms.get(roomId);
+    if (!room || !target?.roomId) return;
+    deliverRoomFrameTo({ ...room, sessionRoomId: target.roomId }, {
+      convo_id: roomId, type: 'text', sender: `agent:${fromName || 'peer'}`, payload: { body: line }, ts: Date.now(),
+    });
   },
 });
 const TRANSFER_MAX_BYTES = (() => {

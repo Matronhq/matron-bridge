@@ -1319,6 +1319,18 @@ describe('createAgentChatHandlers', () => {
       ]);
     });
 
+    it('renders a journal transfer file event by name and size (the bytes come by transfer, not blob)', async () => {
+      const events = [
+        { type: 'file', sender: 'journal', ts: 1, payload: { name: 'build.log', size: 2048, sha256: 'a'.repeat(64), transfer_id: 'tr-1', from_name: 'box-a' } },
+      ];
+      const { handlers, rooms } = makeFixture({ publisher: { fetchMessages: async () => ({ events }) } });
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      const res = await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.body.messages).toEqual([
+        { sender: 'journal', type: 'file', ts: 1, body: '[file "build.log" (transfer, 2.0 KB)]' },
+      ]);
+    });
+
     it('clamps the limit to 1..200 and defaults to 50', async () => {
       const fetchMessages = vi.fn(async () => ({ events: [] }));
       const { handlers, rooms } = makeFixture({ publisher: { fetchMessages } });

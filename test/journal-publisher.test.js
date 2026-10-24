@@ -1923,6 +1923,25 @@ describe('createJournalPublisher — agent-chat room ops', () => {
     await fake.close();
   });
 
+  it('dispatches a kind:transfer ready frame, which carries its id inside `transfer`, to onTransferFrame', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onTransferFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50); // hello_ok round-trip
+    const push = (f) => fake.connections[0].ws.send(JSON.stringify(f));
+    push({ kind: 'transfer', event: 'ready', transfer: { name: 'x' } }); // no id anywhere
+    const frame = { kind: 'transfer', event: 'ready', transfer: { id: 'tr-2', room_id: 'room-1', name: 'notes.txt', size: 3, sha256: 'a'.repeat(64) } };
+    push(frame);
+    await waitFor(() => seen.length === 1);
+    expect(seen[0]).toEqual(frame);
+    pub.close();
+    await fake.close();
+  });
+
   it('dispatches inbound kind:unseen frames to onUnseenFrame, and ignores one without a string event', async () => {
     const fake = await startFakeServer();
     const seen = [];
