@@ -601,6 +601,12 @@ describe('per-member peer mutes', () => {
     expect(rooms.get('r').peerMuted).toBeUndefined();
   });
 
+  it('a named unmute clears a legacy unnamed mute too', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    rooms.setPeerMuted('r', false, { who: 'box-2 [c4]' });
+    expect(rooms.isPeerMuted('r', '!a')).toBe(false);
+  });
+
   it('drops a member\'s mute when it leaves, matched on the box', () => {
     const rooms = createAgentRooms();
     rooms.record('r', { role: 'owner', state: 'joined', sessionRoomId: '!a' });

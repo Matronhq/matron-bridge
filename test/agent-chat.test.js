@@ -2273,7 +2273,13 @@ describe('mutes and leaving in rooms of three or more', () => {
       room(silent, { role: 'guest' });
       expect((await silent.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: '  ' })).status).toBe(400);
 
-      for (const f of [owner, local, blind, silent]) expect(f.invites.leave).not.toHaveBeenCalled();
+      // No own device id yet: this box cannot be told from the others, so a
+      // pair would look like three. Fails closed.
+      const anon = makeFixture({ publisher: { identity: () => null, fetchSnapshot: async () => ({ ...SNAP, conversations: [{ id: 'room-1', participants: [1, 7] }] }) } });
+      room(anon, { role: 'guest' });
+      expect((await anon.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' })).status).toBe(503);
+
+      for (const f of [owner, local, blind, silent, anon]) expect(f.invites.leave).not.toHaveBeenCalled();
     });
 
     it('keeps the room when the journal refuses the leave', async () => {
