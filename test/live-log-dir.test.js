@@ -60,6 +60,17 @@ describe('reading a live log back', () => {
     expect(openOwnLiveLogSync(p)).toBeNull();
   });
 
+  it('opens the log where there are no uids (Windows), without the device match', async () => {
+    const p = path.join(dir, 'matron-cmd-w.log');
+    fs.writeFileSync(p, 'out');
+    const fd = openOwnLiveLogSync(p, { getuid: null });
+    expect(fd).not.toBeNull();
+    fs.closeSync(fd);
+    const handle = await openOwnLiveLog(p, { getuid: null });
+    expect(handle).not.toBeNull();
+    await handle.close();
+  });
+
   it('refuses a file owned by another account', () => {
     const st = { isFile: () => true, nlink: 1, uid: 4242 };
     expect(isOwnLiveLog(st, { getuid: () => 1000 })).toBe(false);
