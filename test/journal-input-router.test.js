@@ -2600,10 +2600,45 @@ describe('createJournalInputConsumer — user: frames must be the owner', () => 
     expect(deps.handleControlCommand).not.toHaveBeenCalled();
   });
 
-  it('keeps the old behaviour while the owner is unknown', () => {
-    const deps = makeDeps({ ownerName: () => null });
+  it('keeps the old behaviour when the owner name is not tracked', () => {
+    const deps = makeDeps();
     createJournalInputConsumer(deps)(baseFrame({ sender: 'user:bob' }));
     expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds user messages while the owner name is unknown and replays the owner\'s once it is known', async () => {
+    let owner = null;
+    let resolveRefresh;
+    const onOwnerUnknown = vi.fn(() => new Promise((r) => { resolveRefresh = r; }));
+    const deps = makeDeps({ ownerName: () => owner, onOwnerUnknown });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:bob', seq: 1 }));
+    consumer(baseFrame({ sender: 'user:alice', seq: 2 }));
+    consumer(baseFrame({ sender: 'user:bob', convo_id: 'control-1', payload: { body: '/start' }, seq: 3 }));
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+    expect(onOwnerUnknown).toHaveBeenCalled();
+    owner = 'alice';
+    resolveRefresh('alice');
+    await Promise.resolve(); await Promise.resolve();
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeTextToSession.mock.calls[0][2]).toMatchObject({ seq: 2 });
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('keeps holding when the refresh settles without a name', async () => {
+    const deps = makeDeps({ ownerName: () => null, onOwnerUnknown: () => Promise.resolve(null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:alice' }));
+    await Promise.resolve(); await Promise.resolve();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('holds a room message from a user while the owner name is unknown', () => {
+    const routeRoomFrame = vi.fn();
+    const deps = makeDeps({ ownerName: () => null, roomFor: (id) => (id === 'room-1' ? { roomId: 'room-1' } : null), routeRoomFrame });
+    createJournalInputConsumer(deps)(baseFrame({ convo_id: 'room-1', sender: 'user:bob' }));
+    expect(routeRoomFrame).not.toHaveBeenCalled();
   });
 
   it('drops another user in a room', () => {

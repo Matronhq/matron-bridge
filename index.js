@@ -109,7 +109,7 @@ import {
 } from './lib/codex-watcher-setup.js';
 import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
 import { hookEntry } from './lib/hook-command.js';
-import { liveLogDir, liveLogPath as liveLogPathFor } from './lib/live-log-dir.js';
+import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
@@ -173,7 +173,7 @@ import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
@@ -185,7 +185,7 @@ import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice,
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
-import { quotedField } from './lib/peer-text.js';
+import { quotedField, peerField, PEER_NAME_MAX } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.js';
@@ -4885,14 +4885,24 @@ function handleClaudeEvent(session, event) {
         // The error record's own model is a placeholder; the session's
         // current model is the one that hit the limit. `since` is the first
         // stall, not the latest retry while still limited.
+        const wasForeign = session._stall?.foreign === true;
         session._stall = {
           ...stall,
           model: stall.model || session.currentModel || undefined,
           since: session._stall?.since ?? Date.now(),
           resets_at: stallResetsAt(usageLimitsCache.lines),
+          // Whose turn hit the limit: one another person started is never
+          // carried on by itself (below, and the re-arm after the refresh).
+          foreign: Boolean(session.foreignTurn),
         };
         journalStatus(session);
-        if (stall.kind === 'bad_model') {
+        if (session.foreignTurn) {
+          // The carry-on would run as an ordinary turn of the user's own,
+          // with that person's request still pending in it. The user decides.
+          if (!wasForeign) {
+            postControlNotice(session, `⏸ A turn ${peerField(session.foreignTurn.person, PEER_NAME_MAX)} started stopped at the usage limit. It will not be carried on automatically; send a message here when you want this session to continue.`);
+          }
+        } else if (stall.kind === 'bad_model') {
           // §4: one automatic recovery — default model, then carry on.
           recoverBadModel(session);
         } else {
@@ -4911,7 +4921,7 @@ function handleClaudeEvent(session, event) {
           refresh.then((updated) => {
             if (!updated || !session.alive || !session._stall) return;
             session._stall.resets_at = stallResetsAt(usageLimitsCache.lines);
-            if (session._stall.kind === 'usage_limit') {
+            if (session._stall.kind === 'usage_limit' && !session._stall.foreign) {
               session._autoResume = armFromStall(session._stall, session._autoResume, Date.now(), session._autoResumeRetries || 0);
               if (session._autoResume?.retry) session._autoResumeRetries = session._autoResume.retry;
               persistControlState(session);
@@ -5879,8 +5889,11 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   if (!session.alive || session._autoStopped) return false;
   // Backstop for the foreign-turn gate: a turn of the session's own that
   // starts while no turn is running ends any foreign turn a seam missed.
-  // Mid-turn input (busy) leaves it armed — stricter, never looser.
-  if (!foreign && !session.busy && session.foreignTurn) foreignSessions.end(session);
+  // Mid-turn input leaves it armed — stricter, never looser. "No turn is
+  // running" is the same test sessionOccupiedForForeignTurn uses: busy is
+  // false after an unacknowledged interrupt while the turn may still be
+  // running, so the open turn record (cleared at its result) counts too.
+  if (!foreign && !session.busy && !session.currentTurn && session.foreignTurn) foreignSessions.end(session);
   if (session.codex?.transport === 'app-server' && (session._codexAccountCommandPending || session._codexLoginId)) {
     return reportSessionSendFailure(session, 'Complete Codex sign-in in your browser first. Enter the device code there, then send your message again after Matron confirms. Use /login cancel to cancel.');
   }
@@ -5957,7 +5970,8 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // as `other`. Mid-turn input (busy) adds its causes when it has some.
   const beganTurn = beginOrJoinTurn(session, causes);
   session.busy = true;
-  inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
+  inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId,
+    { foreignPerson: foreign ? session.foreignTurn?.person ?? null : null });
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
   // Mirror Claude input here. Codex input is mirrored below only after its
@@ -6817,23 +6831,25 @@ function finalizeToolStreamEntry(key, entry, { exitCode = null, denied = false, 
       // whether this tail read was actually capped).
       let logBuf = null;
       let logSize = 0;
-      try {
-        const st = await fs.promises.stat(entry.logPath);
-        logSize = st.size;
-        const readLen = Math.min(st.size, TOOL_LOG_UPLOAD_MAX_BYTES);
-        if (readLen > 0) {
-          const handle = await fs.promises.open(entry.logPath, 'r');
-          try {
+      // Only the user's own file at that name counts as the log
+      // (lib/live-log-dir.js openOwnLiveLog); anything else reads as no log.
+      const handle = await openOwnLiveLog(entry.logPath);
+      if (handle) {
+        try {
+          const st = await handle.stat();
+          logSize = st.size;
+          const readLen = Math.min(st.size, TOOL_LOG_UPLOAD_MAX_BYTES);
+          if (readLen > 0) {
             const buf = Buffer.alloc(readLen);
             const { bytesRead } = await handle.read(buf, 0, readLen, st.size - readLen);
             logBuf = bytesRead === buf.length ? buf : buf.subarray(0, bytesRead);
-          } finally {
-            await handle.close();
+          } else {
+            logBuf = Buffer.alloc(0);
           }
-        } else {
-          logBuf = Buffer.alloc(0);
+        } catch { /* unreadable: finalize without it */ } finally {
+          await handle.close().catch(() => {});
         }
-      } catch { /* denied / tee disabled at spawn: no log file — finalize anyway */ }
+      } /* else denied / tee disabled at spawn: no log file — finalize anyway */
       let blobRef = null;
       if (logBuf && logBuf.length > 0) {
         // logBuf is already the tail-capped read above: the end of a long
@@ -10745,6 +10761,9 @@ function recoverBadModel(session) {
 const FABLE_SWITCH_MAX_RETRIES = 3;
 function switchFableStall(session, { retry = 0, prior = undefined } = {}) {
   if (session.agent === AGENT_CODEX || !session.alive || !session._stall) return false;
+  // The switch carries the session on; a turn another person started is
+  // left for the user (see the stall handling in handleClaudeEvent).
+  if (session._stall.foreign) return false;
   // Once per stall, like the bad-model recovery: an interactive switch
   // reports success once /model is typed, so a TUI that stayed on Fable
   // would stall again and switch again on every carry-on. Cleared by the
@@ -11220,9 +11239,17 @@ function deliverRoomFrameTo(room, frame) {
   if (frame.type === 'file' && payload.transfer_id) return;
   // Another PERSON's words (sharing phase 2): the journal's `person:` copy.
   // Named by person, and delivered as a FOREIGN turn (lib/foreign-turn.js).
-  const person = personOfSender(sender);
-  const from = person ? personLabel(person, payload.via)
+  const senderPerson = personOfSender(sender);
+  const from = senderPerson ? personLabel(senderPerson, payload.via)
     : sender.startsWith('agent:') ? `${sender.slice(6)} (agent)` : sender.startsWith('user:') ? sender.slice(5) : sender;
+  // In a room with another person, the other side's words come as the
+  // journal's `person:` copy. Any other device's agent frame in that room is
+  // treated the same way: a restricted turn in the room's person's name,
+  // never an unrestricted one. This bridge's own frames are not.
+  const selfAgent = journalPublisher.identity()?.name || null;
+  const person = senderPerson
+    || (typeof room.person === 'string' && room.person && sender.startsWith('agent:') && sender !== `agent:${selfAgent}`
+      ? room.person : null);
   let body;
   if (frame.type === 'text') {
     body = typeof payload.body === 'string' ? payload.body.trim() : '';
@@ -11591,6 +11618,10 @@ function journalInjectInviteRequest(frame) {
       role: 'guest',
       state: 'pending',
       sessionRoomId: session.roomId,
+      // A room another person invited this session to: recorded on the
+      // guest side too, so everything that treats person rooms differently
+      // (restricted turns, room files) sees it from either end.
+      ...(typeof frame.person?.name === 'string' && frame.person.name ? { person: frame.person.name } : {}),
       peerDeviceId: frame.from_device_id, peerName: frame.from_name || null,
       topic: frame.topic || null,
       title: room?.title || null,
@@ -11913,6 +11944,9 @@ const journalInputConsumer = createJournalInputConsumer({
   routeRoomFrame: journalOnRoomFrame,
   selfAgentName: () => journalPublisher.identity()?.name || null,
   ownerName: () => journalIdentity.name(),
+  // A user message arrived before the owner's name was known: ask /me now;
+  // the router replays what it held once the name is in.
+  onOwnerUnknown: () => journalIdentity.refresh({ force: true }),
   // Another user's name on a `user:` frame: re-ask /me in case the owner
   // was renamed, at most once a minute.
   onForeignUser: (() => {
@@ -13220,6 +13254,15 @@ const apiServer = createServer(async (req, res) => {
           Promise.resolve(sendToRoom(roomId, outcome.notice)).catch(() => {});
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(outcome.body));
+          return;
+        }
+        // The card shows the whole input or none is sent (the same rule the
+        // MCP tool applies before it calls here): an approval always covers
+        // exactly what the user read.
+        const inputRefusal = permissionInputRefusal(toolName, input);
+        if (inputRefusal) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ behavior: 'deny', message: inputRefusal }));
           return;
         }
         const { id: permRequestId } = permissionRegistry.create({ roomId, toolName });
@@ -14882,7 +14925,10 @@ function publishRestartCarryOnCards() {
   // cards below have gone out. Everything else — a crash, a deploy's own
   // restart, the option off — keeps the tap.
   const { auto, card } = selectAutoCarryOn(stale, stamp, { enabled: CODE_UPDATE_AUTO_CARRY_ON });
-  const autoResumable = auto.filter(rec => resumable.has(rec.convoId) && isResumeConvoId(rec.convoId));
+  // A turn another person started never carries on by itself: it would run
+  // as the user's own turn with that person's request still in it. It gets
+  // the card below, which says whose turn it was.
+  const autoResumable = auto.filter(rec => !rec.foreignPerson && resumable.has(rec.convoId) && isResumeConvoId(rec.convoId));
   if (autoResumable.length) {
     try { console.log(`[code-update] ${autoResumable.length} chat(s) cut off by the self-restart onto ${String(stamp.sha || '').slice(0, 7)} carry on by themselves in ${CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS}ms`); } catch { /* logging must never throw */ }
     setTimeout(() => {
@@ -14916,7 +14962,9 @@ function publishRestartCarryOnCards() {
       try { console.warn(`[inflight] skipping carry-on card for convo=${rec.convoId} — id does not match the resume: picker value shape, so a tap would silently no-op`); } catch { /* logging must never throw */ }
       continue;
     }
-    const question = `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
+    const question = rec.foreignPerson
+      ? `⚠️ The bridge restarted during a turn ${peerField(rec.foreignPerson, PEER_NAME_MAX)} started in this chat — interrupted ${formatInterruptedAgo(rec.ageMs)}. Carry on runs as your own turn, with their request still in it.`
+      : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
     const published = journalPublishCardForConvo(rec.convoId, {
       question,
       options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],

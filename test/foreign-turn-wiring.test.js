@@ -35,12 +35,37 @@ describe('index.js wiring', () => {
 
   it('input of the session\'s own, sent while idle, ends a foreign turn a seam missed; mid-turn input does not', () => {
     const body = fnBody(index, 'function sendToSession(');
-    expect(body).toMatch(/if \(!foreign && !session\.busy && session\.foreignTurn\) foreignSessions\.end\(session\);/);
+    // "No turn running" also needs the open turn record: busy is false after an unacknowledged interrupt.
+    expect(body).toMatch(/if \(!foreign && !session\.busy && !session\.currentTurn && session\.foreignTurn\) foreignSessions\.end\(session\);/);
+    // The in-flight marker remembers whose turn it was, for the restart carry-on.
+    expect(body).toMatch(/inflightMarker\.noteTurnStart\(journalConvoIdFor\(session\), session\.roomId,\s*\{ foreignPerson: foreign \? session\.foreignTurn\?\.person \?\? null : null \}\)/);
+  });
+
+  it('a usage-limit stall in a turn another person started is never carried on by itself', () => {
+    const body = fnBody(index, 'function handleClaudeEvent(');
+    expect(body).toMatch(/foreign: Boolean\(session\.foreignTurn\),/);
+    expect(body).toMatch(/if \(session\.foreignTurn\) \{[\s\S]*?\} else if \(stall\.kind === 'bad_model'\)/);
+    expect(body).toMatch(/if \(session\._stall\.kind === 'usage_limit' && !session\._stall\.foreign\) \{/);
+    expect(fnBody(index, 'function switchFableStall(')).toMatch(/if \(session\._stall\.foreign\) return false;/);
+  });
+
+  it('user messages wait for the owner\'s name, and the permission route refuses inputs a card cannot show', () => {
+    expect(index).toMatch(/onOwnerUnknown: \(\) => journalIdentity\.refresh\(\{ force: true \}\),/);
+    const route = index.slice(index.indexOf("url.pathname === '/permission-request'"));
+    expect(route.indexOf('permissionInputRefusal(toolName, input)')).toBeGreaterThan(-1);
+    expect(route.indexOf('permissionInputRefusal(toolName, input)')).toBeLessThan(route.indexOf('permissionRegistry.create('));
+  });
+
+  it('a room another person invited this session to is recorded as a person room on the guest side', () => {
+    const body = fnBody(index, 'function journalInjectInviteRequest(');
+    expect(body).toMatch(/role: 'guest',[\s\S]{0,400}\.\.\.\(typeof frame\.person\?\.name === 'string' && frame\.person\.name \? \{ person: frame\.person\.name \} : \{\}\)/);
   });
 
   it('another person\'s room frame becomes a foreign delivery, never an inline reply-wait result', () => {
     const body = fnBody(index, 'function deliverRoomFrameTo(');
-    expect(body).toMatch(/const person = personOfSender\(sender\);/);
+    expect(body).toMatch(/const senderPerson = personOfSender\(sender\);/);
+    // Any other device's agent frame in a person room is restricted too, in the room's person's name.
+    expect(body).toMatch(/const person = senderPerson\s*\|\| \(typeof room\.person === 'string' && room\.person && sender\.startsWith\('agent:'\) && sender !== `agent:\$\{selfAgent\}`/);
     expect(body).toMatch(/if \(!person && roomReplyWaiters\.resolve\(/);
     expect(body).toMatch(/foreign: \{ person \}/);
     // Codex has no gate: never a foreign turn there.
