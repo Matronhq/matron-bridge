@@ -12,8 +12,9 @@ function makeInvites(overrides = {}) {
   const injectRequestTurn = overrides.injectRequestTurn ?? vi.fn();
   const notifyRoom = overrides.notifyRoom ?? vi.fn();
   const log = overrides.log ?? { warn: vi.fn() };
-  const inv = createAgentInvites({ sendRoomOp, rooms, injectRequestTurn, notifyRoom, log });
-  return { inv, sendRoomOp, rooms, injectRequestTurn, notifyRoom, log };
+  const onMemberLeft = overrides.onMemberLeft ?? vi.fn();
+  const inv = createAgentInvites({ sendRoomOp, rooms, injectRequestTurn, notifyRoom, onMemberLeft, log });
+  return { inv, sendRoomOp, rooms, injectRequestTurn, notifyRoom, onMemberLeft, log };
 }
 
 afterEach(() => {
@@ -656,6 +657,18 @@ describe('createAgentInvites', () => {
       notifyRoom.mockClear();
       inv.onInviteFrame({ kind: 'invite', event: 'left', room_id: 'ghost', from_device_id: 7 });
       expect(notifyRoom).not.toHaveBeenCalled();
+    });
+
+    it('member_left keeps the room live, owes no turn, and hands the leaver on', () => {
+      const { inv, rooms, notifyRoom, onMemberLeft } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'joined', sessionRoomId: '!sess' });
+      inv.onInviteFrame({ kind: 'invite', event: 'member_left', room_id: 'r1', from_device_id: 9, participants: [1, 7] });
+      expect(rooms.get('r1').state).toBe('joined');
+      expect(rooms.isActive('r1')).toBe(true);
+      expect(notifyRoom).not.toHaveBeenCalled();
+      expect(onMemberLeft).toHaveBeenCalledWith('r1', 9);
+      inv.onInviteFrame({ kind: 'invite', event: 'member_left', room_id: 'ghost', from_device_id: 9 });
+      expect(onMemberLeft).toHaveBeenCalledTimes(1);
     });
 
     it('unknown events are ignored', () => {

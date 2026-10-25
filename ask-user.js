@@ -999,19 +999,48 @@ server.tool(
   }
 );
 
-// There is deliberately NO agent_chat_leave tool (2026-08-19). A room lives
-// for the life of the two conversations: agents kept closing rooms and opening
-// new ones for every exchange, which filled the user's chat list with dead
-// single-exchange rooms and lost the thread between two sessions that talk
-// repeatedly. agent_chat_mute below is the escape hatch instead. The
-// /agent-chat-leave route and chatLeave internals still exist, but since
-// 2026-09-21 no teardown calls them: a room outlives the claude process (idle
-// reap, restart, box asleep) and is only left, lazily, once its conversation
-// can no longer be resumed (index.js orphanRoomBinding).
+// agent_chat_leave is deliberately NARROW. A room lives for the life of the
+// two conversations: agents kept closing rooms and opening new ones for every
+// exchange, which filled the user's chat list with dead single-exchange rooms
+// and lost the thread between two sessions that talk repeatedly, so a pair
+// cannot be left — agent_chat_mute is the escape hatch there. What CAN be left
+// is a room of three or more that the caller joined as a guest: the others
+// carry on, and a finished third member otherwise had only a mute to stop
+// being woken by their traffic, which then told every sender for days that
+// their messages no longer reached it. The bridge refuses every other case
+// (lib/agent-chat.js leaveRoom). The /agent-chat-leave route and chatLeave
+// internals are the bridge's own teardown, not this tool: since 2026-09-21 no
+// teardown calls them except the lazy cleanup of a conversation that can no
+// longer be resumed (index.js orphanRoomBinding).
+
+server.tool(
+  'agent_chat_leave',
+  'Leave an agent chat room you joined, when your part is done and the other members carry on without you. Only for a room of three or more members that someone else started: the room goes on for everyone else, and its messages stop waking you. A room between just you and one other session cannot be left (it stays open for the life of both conversations) — there, simply stop replying, or use agent_chat_mute if the peer is misbehaving. Your reason is posted in the room for every member.',
+  {
+    room_id: z.string().describe('The agent chat room id to leave'),
+    reason: z.string().describe('Why you are leaving, in one line — every member of the room reads it'),
+  },
+  async ({ room_id, reason }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-leave-done`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, reason }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_leave failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Left room ${room_id}. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
 
 server.tool(
   'agent_chat_mute',
-  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both conversations, across restarts and sleeps). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
+  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (a room between two sessions stays open for the life of both conversations, across restarts and sleeps). Do not mute a room just because your part is done: in a room of three or more you joined, use agent_chat_leave; in a room of two, simply stop replying. The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap. Every other member is told you muted it.',
   {
     room_id: z.string().describe('The agent chat room id to mute'),
     reason: z.string().describe('Why you are muting it, in one line — shown to your user, who decides whether to unmute'),

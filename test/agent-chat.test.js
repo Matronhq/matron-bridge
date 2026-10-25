@@ -1599,13 +1599,18 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     }
   });
 
-  it('declares NO agent_chat_leave tool — a room is not the agent\'s to close', () => {
-    // Rooms live for the life of the two sessions (2026-08-19). The tool is
-    // what agents reached for constantly, so it is gone from the surface
-    // entirely; mute is the escape hatch. The ROUTE stays (session eviction),
-    // which is exactly why this pin is on the tool declaration and not on the
-    // string appearing anywhere in the file.
-    expect(askUserSrc).not.toMatch(/server\.tool\(\s*\n\s*'agent_chat_leave',/);
+  it('agent_chat_leave is the GUARDED leave, never the bridge\'s own teardown route', () => {
+    // Rooms of two live for the life of the two sessions (2026-08-19), so the
+    // tool must not reach the unguarded /agent-chat-leave route the bridge's
+    // teardown uses: it goes to /agent-chat-leave-done, whose handler refuses
+    // every leave that would end a room for someone else.
+    const start = askUserSrc.indexOf("'agent_chat_leave',");
+    expect(start).toBeGreaterThan(-1);
+    const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
+    expect(block).toMatch(/\$\{BRIDGE_API\}\/agent-chat-leave-done`/);
+    expect(block).not.toMatch(/\/agent-chat-leave`/);
+    expect(block).toMatch(/three or more/);
+    expect(block).toMatch(/cannot be left/);
   });
 
   // Task 8 review, finding 8b: pin each tool's loopback path and body keys,
@@ -2120,7 +2125,9 @@ describe('chatMute / chatUnmute', () => {
     expect(f.rooms.isPeerMuted('room-1', '!sess')).toBe(true);
     expect(f.rooms.isPeerMuted('room-1', '!guest')).toBe(false);
     const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'still there?', wait_seconds: 30 });
-    expect(res.body).toEqual({ ok: true, note: PEER_MUTED_SEND_NOTE });
+    // Names the muting session, not "the other member".
+    expect(res.body.ok).toBe(true);
+    expect(res.body.note).toMatch(/^sent — but mac has MUTED this room \(mac: looping\), so this will not reach mac as a turn\./);
     // No dead reply wait: the muted side's bridge drops the message.
     expect(awaitRoomMessage).not.toHaveBeenCalled();
     await f.handlers.chatUnmute({ roomId: '!guest', room_id: 'room-1' });
@@ -2153,6 +2160,156 @@ describe('chatMute / chatUnmute', () => {
 // (it boots the bridge), so the RULES are unit-tested in their libs
 // (roomFrameDisposition in room-delivery.test.js, the card registry in
 // room-mute-cards.test.js) and only the wiring is pinned here.
+// Rooms of three or more: a mute is one member's, never the room's. A third
+// member muted when it was done, and the sender was told "the other member
+// has MUTED this room" — and read that as its only real peer having stopped
+// listening.
+describe('mutes and leaving in rooms of three or more', () => {
+  const SNAP = {
+    agents: [{ device_id: 1, name: 'mac' }, { device_id: 7, name: 'box-2' }, { device_id: 9, name: 'box-3' }],
+    conversations: [{ id: 'room-1', participants: [1, 7, 9] }],
+  };
+  function room(f, fields = {}) {
+    f.rooms.record('room-1', {
+      role: 'owner', state: 'joined', sessionRoomId: '!sess',
+      peerDeviceId: 7, peerName: 'box-2', title: 'M:ab ↔️ box-2', targetConvoId: 'convo-remote', ...fields,
+    });
+  }
+
+  it('names the member that muted, and who still gets the message', async () => {
+    const awaitRoomMessage = vi.fn(async () => null);
+    const f = makeFixture({ awaitRoomMessage, publisher: { fetchSnapshot: async () => SNAP } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done with this room' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'deploy please', wait_seconds: 5 });
+    expect(res.body.note).toMatch(/^sent — but box-3 \[e0\] has MUTED this room \(box-3 \[e0\]: done with this room\), so this will not reach box-3 \[e0\] as a turn\./);
+    expect(res.body.note).toMatch(/It still reaches box-2, who can reply as usual\./);
+    expect(res.body.note).not.toMatch(/the other member/);
+    // Someone is still listening, so the reply wait is worth making.
+    expect(awaitRoomMessage).toHaveBeenCalled();
+  });
+
+  it('says nobody is listening when every other member has muted, and skips the dead wait', async () => {
+    const awaitRoomMessage = vi.fn(async () => null);
+    const f = makeFixture({ awaitRoomMessage, publisher: { fetchSnapshot: async () => SNAP } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done' });
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-2 [c4]', reason: 'looping' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hello?', wait_seconds: 5 });
+    expect(res.body.note).toMatch(/box-3 \[e0\] and box-2 \[c4\] have MUTED this room/);
+    expect(res.body.note).toMatch(/Nobody else in the room is listening, so no reply will come\./);
+    expect(awaitRoomMessage).not.toHaveBeenCalled();
+  });
+
+  it('one member unmuting leaves the other member\'s mute in place', async () => {
+    const f = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done' });
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-2 [c4]', reason: 'looping' });
+    f.rooms.setPeerMuted('room-1', false, { who: 'box-2 [c4]' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi' });
+    expect(res.body.note).toMatch(/^sent — but box-3 \[e0\] has MUTED/);
+    expect(res.body.note).toMatch(/It still reaches box-2/);
+  });
+
+  it('does not guess when the membership cannot be read', async () => {
+    const f = makeFixture({ publisher: { fetchSnapshot: async () => null } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi' });
+    expect(res.body.note).toMatch(/box-3 \[e0\] has MUTED this room/);
+    expect(res.body.note).toMatch(/Any other members of the room still get it\./);
+  });
+
+  it('the mute records who muted, for a same-bridge peer\'s note', async () => {
+    const f = makeFixture();
+    room(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    expect(f.rooms.get('room-1')).toMatchObject({ muted: true, mutedReason: 'looping', mutedBy: 'mac [ab]' });
+  });
+
+  describe('chatLeaveDone (agent_chat_leave)', () => {
+    it('a guest leaves a room the others carry on in, saying goodbye first', async () => {
+      const f = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      room(f, { role: 'guest' });
+      f.rooms.setMuted('room-1', '!sess', true, { reason: 'done', who: 'mac [ab]' });
+      const res = await f.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'my part is done' });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, left: true });
+      expect(res.body.note).toMatch(/box-2, box-3 carry on without you/);
+      const posts = f.calls.filter((c) => c.call === 'publishText' && c.convoId === 'room-1');
+      expect(posts.at(-1).payload.body).toBe('👋 mac [ab] left "M:ab ↔️ box-2": my part is done — messages here no longer reach mac [ab]; everyone else in the room still gets them.');
+      expect(f.invites.leave).toHaveBeenCalledWith({ roomId: 'room-1' });
+      expect(f.rooms.get('room-1').state).toBe('left');
+      expect(f.rooms.isMuted('room-1', '!sess')).toBe(false);
+      expect(f.retireMuteCard).toHaveBeenCalledWith('room-1', '!sess');
+    });
+
+    it('refuses to leave a room of two — that would end it for the peer', async () => {
+      const f = makeFixture({ publisher: { fetchSnapshot: async () => ({ ...SNAP, conversations: [{ id: 'room-1', participants: [1, 7] }] }) } });
+      room(f, { role: 'guest' });
+      const res = await f.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/only one other member/);
+      expect(f.invites.leave).not.toHaveBeenCalled();
+      expect(f.rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('refuses the owner, a same-bridge room, an unreadable membership and a missing reason', async () => {
+      const owner = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      room(owner);
+      expect((await owner.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' })).body.error).toMatch(/you started this room/);
+
+      const local = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      local.sessions.set('!guest', { alive: true, convoId: 'convo-guest' });
+      room(local, { guestSessionRoomId: '!guest', guestState: 'joined' });
+      expect((await local.handlers.chatLeaveDone({ roomId: '!guest', room_id: 'room-1', reason: 'done' })).body.error).toMatch(/both ends of this room are on this box/);
+
+      const blind = makeFixture({ publisher: { fetchSnapshot: async () => null } });
+      room(blind, { role: 'guest' });
+      expect((await blind.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' })).status).toBe(503);
+
+      const silent = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      room(silent, { role: 'guest' });
+      expect((await silent.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: '  ' })).status).toBe(400);
+
+      for (const f of [owner, local, blind, silent]) expect(f.invites.leave).not.toHaveBeenCalled();
+    });
+
+    it('keeps the room when the journal refuses the leave', async () => {
+      const f = makeFixture({ leaveOutcome: { kind: 'error', code: 'conflict', detail: 'not a joined participant' }, publisher: { fetchSnapshot: async () => SNAP } });
+      room(f, { role: 'guest' });
+      const res = await f.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' });
+      expect(res.status).toBe(502);
+      expect(f.rooms.get('room-1').state).toBe('joined');
+      const last = f.calls.filter((c) => c.call === 'publishText' && c.convoId === 'room-1').at(-1).payload.body;
+      expect(last).toBe('↩️ mac [ab] is still in this room — the leave did not go through.');
+    });
+  });
+
+  describe('leaveMutedRoomsOnMissionClose', () => {
+    it('leaves a room of three it had muted as a guest, and nothing else', async () => {
+      const f = makeFixture({ publisher: { fetchSnapshot: async () => ({ ...SNAP, conversations: [
+        { id: 'room-1', participants: [1, 7, 9] }, { id: 'room-2', participants: [1, 7, 9] }, { id: 'room-3', participants: [1, 7] },
+      ] }) } });
+      room(f, { role: 'guest' });
+      f.rooms.setMuted('room-1', '!sess', true, { reason: 'done with it' });
+      f.rooms.record('room-2', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'unmuted' });
+      f.rooms.record('room-3', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'a pair' });
+      f.rooms.setMuted('room-3', '!sess', true, { reason: 'looping' });
+      const left = await f.handlers.leaveMutedRoomsOnMissionClose('!sess');
+      expect(left).toEqual(['room-1']);
+      expect(f.rooms.get('room-1').state).toBe('left');
+      expect(f.rooms.get('room-2').state).toBe('joined');
+      // A pair keeps its mute: leaving it would end the room for the peer.
+      expect(f.rooms.get('room-3').state).toBe('joined');
+      expect(f.rooms.isMuted('room-3', '!sess')).toBe(true);
+      const bye = f.calls.filter((c) => c.call === 'publishText' && c.convoId === 'room-1').at(-1).payload.body;
+      expect(bye).toMatch(/^👋 mac \[ab\] left "M:ab ↔️ box-2" \(its mission is closed\): done with it — /);
+    });
+  });
+});
+
 describe('mute wiring (source inspection)', () => {
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
   const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
@@ -2169,12 +2326,14 @@ describe('mute wiring (source inspection)', () => {
     expect(fnBody('journalOnRoomFrame')).toMatch(/notePeerMuteFromFrame\(room, frame\)/);
     const body = fnBody('notePeerMuteFromFrame');
     expect(body).toMatch(/startsWith\('agent:'\)/);
-    expect(body).toMatch(/parseMuteAnnouncement\(frame\.payload\?\.body\)/);
-    expect(body).toMatch(/agentRooms\.setPeerMuted\(frame\.convo_id, said === 'muted'\)/);
+    expect(body).toMatch(/parseMuteAnnouncementDetail\(frame\.payload\?\.body\)/);
+    expect(body).toMatch(/agentRooms\.setPeerMuted\(frame\.convo_id, said\.state === 'muted', \{ who: said\.who, reason: said\.reason \}\)/);
   });
 
   it('BRIDGE_CLAUDE.md tells the sender what to do when the other agent mutes', () => {
-    expect(bridgeMd).toMatch(/If the OTHER agent mutes a room you are in[\s\S]{0,300}file a question for the user asking them to unmute it/);
+    expect(bridgeMd).toMatch(/If ANOTHER member mutes a room you are in, you are told so in the room, naming who muted[\s\S]{0,500}file a question for the user asking them to unmute it/);
+    expect(bridgeMd).toMatch(/never that the whole room or another member did/);
+    expect(bridgeMd).toMatch(/Finished with a room\?\*\* Don't mute it\.[\s\S]{0,200}agent_chat_leave\(room_id, reason\)/);
   });
 
   it('deliverRoomFrameTo gates on the muted binding ABOVE the echo, the waiter and the queue', () => {
@@ -2193,11 +2352,23 @@ describe('mute wiring (source inspection)', () => {
     // still hold while a muted session receives everything anyway — the notices
     // publish, execution falls through, and the user gets a 🔇 line followed by
     // the delivery it just denied. The whole gate is that one keyword.
-    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,900}\n {4}return;\n {2}\}/);
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,1800}\n {4}return;\n {2}\}/);
     // The pre-mute backlog drain stays ABOVE the gate: those messages were
     // accepted before the mute, and agent_chat_mute discards this room's share
     // of them explicitly (roomDelivery.dropRoom) rather than stranding them.
     expect(body.indexOf('maybeFlushRoomDelivery(session);')).toBeLessThan(gate);
+  });
+
+  it('a muted binding whose conversation is gone for good is left, not kept muted forever', () => {
+    const body = fnBody('deliverRoomFrameTo');
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{\n[\s\S]{0,700}if \(!live && !sleepingConvoIdFor\(room\.sessionRoomId\)\) \{[\s\S]{0,250}orphanRoomBinding\(frame\.convo_id, room\.sessionRoomId\);\n {6}return;/);
+  });
+
+  it('a member leaving drops the mute it announced, and closing a mission leaves muted rooms of three', () => {
+    expect(indexSrc).toMatch(/onMemberLeft: \(roomId, fromDeviceId\) => \{ forgetLeftMemberMute\(roomId, fromDeviceId\)/);
+    expect(indexSrc).toMatch(/async function forgetLeftMemberMute\(roomId, fromDeviceId\) \{[\s\S]{0,400}agentRooms\.clearPeerMutesForBox\(roomId, name\)/);
+    expect(indexSrc).toMatch(/name === 'close' && data\?\.mission === undefined[\s\S]{0,250}agentChatHandlers\.leaveMutedRoomsOnMissionClose\(d\?\.roomId\)/);
+    expect(indexSrc).toMatch(/url\.pathname === '\/agent-chat-leave-done'\) \{\n\s+await respondAgentChatRoute\(res, data, agentChatHandlers\.chatLeaveDone,/);
   });
 
   it('gives the mute handler a seam to drop what the room already had queued', () => {
@@ -2263,9 +2434,8 @@ describe('mute wiring (source inspection)', () => {
     // …and that it outlives the process: an agent that thinks a reap or a
     // restart lost its room opens a duplicate.
     expect(bridgeMd).toMatch(/survives everything that ends your process but not the conversation/);
-    expect(bridgeMd).toMatch(/There is no leave tool\./);
+    expect(bridgeMd).toMatch(/A room of two cannot be left\./);
     expect(bridgeMd).toMatch(/looping, spamming[\s\S]{0,120}agent_chat_mute\(room_id, reason\)/);
-    expect(bridgeMd).not.toMatch(/agent_chat_leave/);
     // …and the reuse promise, so an agent doesn't open a second room by hand.
     expect(bridgeMd).toMatch(/returns the room you already have/);
   });
@@ -2282,7 +2452,8 @@ describe('mute wiring (source inspection)', () => {
     const start = askUserSrc.indexOf("'agent_chat_mute',");
     const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
     expect(block).toMatch(/looping, spamming, or malfunctioning/);
-    expect(block).toMatch(/you cannot: a room stays open for the life of both conversations, across restarts and sleeps/);
+    expect(block).toMatch(/a room between two sessions stays open for the life of both conversations, across restarts and sleeps/);
+    expect(block).toMatch(/Do not mute a room just because your part is done/);
   });
 });
 

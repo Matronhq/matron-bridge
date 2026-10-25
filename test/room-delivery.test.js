@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { formatMuteAnnouncement, formatUnmuteAnnouncement, formatUserUnmuteAnnouncement, parseMuteAnnouncement, PEER_MUTED_GUIDANCE, createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
+import { formatMuteAnnouncement, formatUnmuteAnnouncement, formatUserUnmuteAnnouncement, parseMuteAnnouncement, parseMuteAnnouncementDetail, formatPeerMutedSendNote, formatLeaveAnnouncement, PEER_MUTED_SEND_NOTE, PEER_MUTED_GUIDANCE, createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
 
 function makeDelivery({ injectResult = true } = {}) {
   const injectTurn = vi.fn(() => injectResult);
@@ -569,7 +569,7 @@ describe('dropRoom', () => {
 describe('mute announcements', () => {
   it('the mute line carries the reason and tells the sender to go through the user', () => {
     const line = formatMuteAnnouncement({ who: 'box-a', title: 'a ↔️ b', reason: 'looping' });
-    expect(line).toBe(`🔇 box-a muted "a ↔️ b": looping — ${PEER_MUTED_GUIDANCE}`);
+    expect(line).toBe(`🔇 box-a muted "a ↔️ b": looping — your messages in this room no longer reach box-a; any other members still get them. ${PEER_MUTED_GUIDANCE}`);
     expect(line.split('\n')).toHaveLength(1);
     expect(PEER_MUTED_GUIDANCE).toMatch(/file a question for your user asking them to unmute/);
     expect(PEER_MUTED_GUIDANCE).toMatch(/do not open a new chat/);
@@ -619,5 +619,33 @@ describe('a turn another person starts waits for any running turn', () => {
     const s = { alive: true, busy: false, currentTurn: { causes: null } };
     delivery.deliver(s, 'k1', msg());
     expect(injectTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('who muted, and who still listens', () => {
+  it('reads the muting member and its reason back from the line', () => {
+    const line = formatMuteAnnouncement({ who: 'box-3 [e0]', title: 'a ↔️ b', reason: 'done with this room' });
+    expect(parseMuteAnnouncementDetail(line)).toEqual({ state: 'muted', who: 'box-3 [e0]', reason: 'done with this room' });
+    expect(parseMuteAnnouncementDetail('🔇 box-a muted "t": you are looping')).toEqual({ state: 'muted', who: 'box-a', reason: 'you are looping' });
+    expect(parseMuteAnnouncementDetail(formatUnmuteAnnouncement({ who: 'box-3 [e0]', title: 't' }))).toEqual({ state: 'unmuted', who: 'box-3 [e0]', reason: null });
+    expect(parseMuteAnnouncementDetail(formatUserUnmuteAnnouncement({ who: 'box-3 [e0]' }))).toMatchObject({ state: 'unmuted', who: 'box-3 [e0]' });
+    expect(parseMuteAnnouncementDetail('hello')).toBeNull();
+  });
+
+  it('a leave line is not read as a mute or an unmute', () => {
+    const line = formatLeaveAnnouncement({ who: 'box-3 [e0]', title: 't', reason: 'done' });
+    expect(line).toBe('👋 box-3 [e0] left "t": done — messages here no longer reach box-3 [e0]; everyone else in the room still gets them.');
+    expect(parseMuteAnnouncement(line)).toBeNull();
+    expect(formatLeaveAnnouncement({ who: 'a', title: 't', reason: 'r', why: 'its mission is closed' })).toMatch(/^👋 a left "t" \(its mission is closed\): r — /);
+  });
+
+  it('the send note names muters and listeners, and never guesses', () => {
+    expect(formatPeerMutedSendNote({ mutes: [{ who: 'box-3 [e0]', reason: 'done' }], listening: ['box-4'] }))
+      .toBe('sent — but box-3 [e0] has MUTED this room (box-3 [e0]: done), so this will not reach box-3 [e0] as a turn. It still reaches box-4, who can reply as usual. If a muted member still needs it, file a question for your user asking them to unmute; do not open a new chat to get round the mute.');
+    expect(formatPeerMutedSendNote({ mutes: [{ who: 'a [1]' }, { who: 'b [2]' }], listening: [] }))
+      .toMatch(/^sent — but a \[1\] and b \[2\] have MUTED this room, so this will not reach them as a turn\. Nobody else in the room is listening/);
+    expect(formatPeerMutedSendNote({ mutes: [{ who: 'a [1]' }], listening: ['x', 'y', 'z'] })).toMatch(/It still reaches x, y and z,/);
+    expect(PEER_MUTED_SEND_NOTE).toMatch(/^sent — but a member of this room has MUTED this room, so this will not reach it as a turn\. Any other members of the room still get it\./);
+    expect(PEER_MUTED_SEND_NOTE).not.toMatch(/the other member/);
   });
 });
