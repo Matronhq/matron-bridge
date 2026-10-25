@@ -7,6 +7,10 @@ import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
+import { createTransferClient } from './lib/transfer-client.js';
+import { createTransferSender } from './lib/transfer-sender.js';
+import { createTransferOutcomeNotify } from './lib/transfer-outcome.js';
+import { createTransferReceiver } from './lib/transfer-receiver.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
@@ -127,8 +131,8 @@ import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
-import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
-import { matronFilesDir, sessionDownloadDir } from './lib/matron-files.js';
+import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
+import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -178,7 +182,7 @@ import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncement, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
-import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField } from './lib/peer-text.js';
@@ -399,6 +403,17 @@ const KEEPAWAKE_FILE = path.join(os.homedir(), '.matron-bridge-keepawake.json');
 // In-flight turn markers for restart carry-on — written at turn start, removed
 // at turn end, reconciled at the next boot (see lib/inflight-marker.js).
 const INFLIGHT_FILE = path.join(os.homedir(), '.matron-bridge-inflight.json');
+// Outgoing room-file transfers (lib/transfer-sender.js): one job per file
+// still going up or awaiting its outcome, so a restart resumes the upload.
+const TRANSFERS_FILE = path.join(os.homedir(), '.matron-bridge-transfers.json');
+// Built next to the send_attachment handler; a `let` so the journal frame
+// and reconnect callbacks, which can fire before that point, see null
+// rather than a temporal-dead-zone throw.
+let transferSender = null;
+// Incoming room files (lib/transfer-receiver.js): downloads still in flight
+// or awaiting their receipt, and every file saved, for the inbox sweep.
+const TRANSFER_INBOX_FILE = path.join(os.homedir(), '.matron-bridge-inbox.json');
+let transferReceiver = null;
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -644,6 +659,11 @@ const _journalToken = resolveJournalToken();
 // says so beats one that throws.
 const journalHttpBase = JOURNAL_WS_URL && _journalToken ? deriveMediaHttpBaseUrl(JOURNAL_WS_URL) : '';
 const itemsClient = createItemsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+// Agent-to-agent file transfers (/transfers routes): same base URL and token.
+const transferClient = createTransferClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -1030,6 +1050,31 @@ function handleJournalReconnect() {
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
   journalIdentity.refresh({ force: true });
+  // Outgoing room files: carry on any upload a restart or a dropped socket
+  // interrupted, and settle jobs whose outcome frame was missed.
+  transferSender?.resumeAll().catch((e) => console.warn(`[transfer] resume failed: ${e.message}`));
+  // Incoming room files released while this box was away or asleep, and any
+  // download a restart interrupted.
+  transferReceiver?.catchUp().catch((e) => console.warn(`[transfer] catch-up failed: ${e.message}`));
+}
+
+// kind:'transfer' frames from the journal. `ready` (a file released to this
+// device as a recipient) goes to the receiver; the sender's outcomes go to
+// the transfer sender.
+function journalHandleTransferFrame(frame) {
+  switch (frame.event) {
+    case 'ready':
+      transferReceiver?.onReady(frame.transfer);
+      return;
+    case 'declined':
+    case 'failed':
+    case 'expired':
+    case 'delivered':
+      transferSender?.onFrame(frame);
+      return;
+    default:
+      debug(`transfer frame ${frame.event} for ${frame.transfer_id} not handled`);
+  }
 }
 
 // Box status lives in the journal (matron-journal #82): this box's activity,
@@ -1111,6 +1156,8 @@ const journalPublisher = createJournalPublisher({
   onConsentFrame: (frame) => journalHandleConsentFrame(frame),
   // Unseen nudges (kind:'unseen'): important things the user hasn't seen.
   onUnseenFrame: (frame) => journalHandleUnseenFrame(frame),
+  // File-transfer frames (kind:'transfer'), see journalHandleTransferFrame.
+  onTransferFrame: (frame) => journalHandleTransferFrame(frame),
   onDefaultsFrame: (frame) => { userDefaults.apply(frame); },
   // This box's own defaults. A live change is re-reported in box_status at
   // once; hello_ok's copy lands before onReconnect, whose box_status
@@ -10142,6 +10189,51 @@ async function fireTimer(record) {
 // forget the work lease, a reaper tick cannot forget the reminders.
 let workHoldUntil = 0;
 let workHoldSessions = 0;
+// Room file transfers in flight (the sender's uploads, the receiver's
+// downloads) lease the same marker: refreshTransferHold() re-reads both
+// sides every TRANSFER_HOLD_TICK_MS and on every reaper tick, and rewrites
+// the marker on each tick while held and on the one that releases it. Bounded by
+// WORK_HOLD_MAX_MS of continuous activity (createTransferHold).
+let transferHoldUntil = 0;
+let transferHoldCount = 0;
+const transferHold = createTransferHold();
+const TRANSFER_HOLD_TICK_MS = 60_000;
+
+function workLeaseUntil() {
+  return Math.max(workHoldUntil, transferHoldUntil);
+}
+
+function refreshTransferHold() {
+  try {
+    const count = (transferSender?.active() ?? 0) + (transferReceiver?.active() ?? 0);
+    const prev = transferHoldUntil;
+    const until = transferHold.update(count);
+    transferHoldUntil = until;
+    transferHoldCount = until > 0 ? count : 0;
+    // Rewritten on every tick while held, and on the tick that releases it:
+    // with the idle reaper off this is the only thing renewing the lease.
+    if (until > 0 || prev > 0) refreshKeepAwakeMarker();
+  } catch (e) {
+    try { console.warn(`[transfer] keep-awake update failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
+// Received room files older than 7 days, and partial downloads nothing will
+// resume (lib/inbox-sweep.js), on the reaper tick.
+function sweepTransferInbox() {
+  try {
+    transferReceiver?.sweep();
+  } catch (e) {
+    try { console.warn(`[transfer] inbox sweep failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
+function startTransferUpkeep() {
+  setInterval(refreshTransferHold, TRANSFER_HOLD_TICK_MS).unref();
+  // With the idle reaper off, the sweep still needs a tick of its own.
+  if (!(SESSION_IDLE_TIMEOUT_MS > 0)) setInterval(sweepTransferInbox, SESSION_IDLE_CHECK_MS).unref();
+  sweepTransferInbox();
+}
 
 function writeKeepAwakeMarker(timers) {
   writeKeepAwake(keepAwakeMarker(timers));
@@ -10153,12 +10245,12 @@ function refreshKeepAwakeMarker() {
 
 function writeKeepAwake(marker) {
   try {
-    const until = keepAwakeUntil({ timerUntil: marker?.until ?? null, workUntil: workHoldUntil });
+    const until = keepAwakeUntil({ timerUntil: marker?.until ?? null, workUntil: workLeaseUntil() });
     if (!until) {
       fs.rmSync(KEEPAWAKE_FILE, { force: true });
       return;
     }
-    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ until, reminders: marker?.reminders ?? 0, work: workHoldSessions, updatedAt: Date.now() }, null, 2));
+    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ until, reminders: marker?.reminders ?? 0, work: workHoldSessions, transfers: transferHoldCount, updatedAt: Date.now() }, null, 2));
   } catch (e) {
     try { console.warn(`[timer] keep-awake marker update failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -10177,7 +10269,7 @@ function refreshPowerHold() {
   for (const [, session] of sessions) {
     if (session.alive && !session._autoStopped) liveSessions += 1;
   }
-  const holdUntil = keepAwakeUntil({ timerUntil: timerStore.holdAwakeMarker()?.until ?? null, workUntil: workHoldUntil });
+  const holdUntil = keepAwakeUntil({ timerUntil: timerStore.holdAwakeMarker()?.until ?? null, workUntil: workLeaseUntil() });
   const flags = powerHoldFlags({ mode: KEEP_AWAKE_MODE, liveSessions, holdUntil });
   if (powerHold.set(flags)) {
     console.log(flags.length ? `[power] holding the Mac awake (caffeinate ${flags.join(' ')}; ${liveSessions} live session${liveSessions === 1 ? '' : 's'})` : '[power] released the keep-awake hold');
@@ -11108,6 +11200,10 @@ function reconcilePendingGuestOnFrame(room, frame) {
 function deliverRoomFrameTo(room, frame) {
   const sender = frame.sender || '';
   const payload = frame.payload || {};
+  // A room file sent as a journal transfer: the event names it, but the
+  // bytes come by download. The receiver (lib/transfer-receiver.js) saves it
+  // and delivers its own line, with the saved path, through this function.
+  if (frame.type === 'file' && payload.transfer_id) return;
   // Another PERSON's words (sharing phase 2): the journal's `person:` copy.
   // Named by person, and delivered as a FOREIGN turn (lib/foreign-turn.js).
   const person = personOfSender(sender);
@@ -11654,15 +11750,6 @@ function journalNotifyRoomEvent(roomId, text, { sessionKey } = {}) {
 // recipients: a pending guest gets the backlog via the accept backfill.
 function routeLocalRoomMessage(roomId, fromSessionKey, body) {
   routeLocalRoomFrame(roomId, fromSessionKey, { type: 'text', payload: { body } });
-}
-
-// Attachment twin (send_attachment with chat_room_id): same hop, with the
-// file/image payload deliverRoomFrameTo already knows how to render.
-function routeLocalRoomAttachment(roomId, fromSessionKey, { kind, name, caption, blobRef }) {
-  routeLocalRoomFrame(roomId, fromSessionKey, {
-    type: kind === 'image' ? 'image' : 'file',
-    payload: { name, ...(caption ? { caption } : {}), ...(blobRef ? { blob_ref: blobRef } : {}) },
-  });
 }
 
 function routeLocalRoomFrame(roomId, fromSessionKey, { type, payload }) {
@@ -12215,12 +12302,91 @@ const handleWake = createWakeHandler({
   isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
 });
 
+// send_attachment into a room: a journal transfer, uploaded in the
+// background. The outcome (declined / failed / expired, or a cancel because
+// the file changed) reaches the sending session as a room line through
+// deliverRoomFrameTo with its own binding (lib/transfer-outcome.js), so
+// busy coalescing and the mute apply, and a session the idle reap took
+// down while the upload ran is woken with the line.
+transferSender = createTransferSender({
+  client: transferClient,
+  stateFile: TRANSFERS_FILE,
+  log: console,
+  notify: createTransferOutcomeNotify({
+    getRoom: (roomId) => agentRooms.get(roomId),
+    deliverRoomFrameTo,
+    log: console,
+  }),
+});
+// Room files released to this device: downloaded into the receiving
+// session's inbox (outside any working tree) and announced to every bound
+// session of the room except the one that sent it. In a same-bridge room
+// the sending session is on this box too, so the sender is picked out by
+// its journal conversation id, not by device. The line goes through
+// deliverRoomFrameTo as a message from the sending agent: the mute gate,
+// the wake of a sleeping conversation, busy coalescing and the user's echo
+// all apply as for any room message.
+function transferTargetsFor(roomId, fromConvoId) {
+  const room = agentRooms.get(roomId);
+  if (!room || room.person) return [];
+  const out = [];
+  const consider = (key, state) => {
+    if (key == null || state !== 'joined') return;
+    const live = sessions.get(key);
+    let target;
+    let convoId;
+    if (live) {
+      target = live;
+      convoId = journalConvoIdFor(live);
+    } else {
+      const prev = loadPersistedSessions()[key];
+      if (!prev) return;
+      target = { roomId: key, workdir: prev.workdir };
+      convoId = prev.journalConvoId || prev.sessionId || null;
+    }
+    if (fromConvoId && convoId === fromConvoId) return;
+    out.push(target);
+  };
+  consider(room.sessionRoomId, room.state);
+  if (room.guestSessionRoomId != null && room.guestSessionRoomId !== room.sessionRoomId) {
+    consider(room.guestSessionRoomId, room.guestState);
+  }
+  return out;
+}
+transferReceiver = createTransferReceiver({
+  client: transferClient,
+  stateFile: TRANSFER_INBOX_FILE,
+  log: console,
+  dirFor: (target) => path.join(sessionDownloadDir(target) || matronFilesDir(target?.workdir), 'inbox'),
+  // The same two roots dirFor lands under; the inbox sweep stays inside them.
+  inboxRoots: () => [matronFilesRoot(), ivUploadsRoot()],
+  sessionsForRoom: transferTargetsFor,
+  isMuted: (roomId, target) => agentRooms.isMuted(roomId, target?.roomId),
+  deliver: (target, line, { roomId, fromName }) => {
+    const room = agentRooms.get(roomId);
+    if (!room || !target?.roomId) return;
+    // No seq: the transfer does not name the room event it became, so the
+    // turn takes the room's bare room_message cause (lib/turn-cause.js).
+    deliverRoomFrameTo({ ...room, sessionRoomId: target.roomId }, {
+      convo_id: roomId, type: 'text', sender: `agent:${fromName || 'peer'}`, payload: { body: line }, ts: Date.now(),
+    });
+  },
+});
+const TRANSFER_MAX_BYTES = (() => {
+  const n = Number(process.env.MATRON_TRANSFER_MAX_BYTES);
+  return Number.isSafeInteger(n) && n > 0 ? n : 10737418240;
+})();
 const handleSendAttachment = createSendAttachmentHandler({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
   rooms: agentRooms,
-  onLocalRoomAttachment: routeLocalRoomAttachment,
+  sender: transferSender,
+  transferMaxBytes: TRANSFER_MAX_BYTES,
+  // A room with another person's agent: the owner side records `person`;
+  // the guest side is known from the journal's person-room row.
+  isPersonRoom: async (roomId, room) => (typeof room?.person === 'string' && room.person !== '')
+    || !!(await foreignSessions.contextFor(roomId)),
 });
 
 // share_html_page: a days-long signed viewer link that renders one HTML file
@@ -14628,7 +14794,10 @@ function startIdleReaper() {
     // crashed bridge cannot pin the box.
     workHoldUntil = held > 0 ? now + WORK_HOLD_LEASE_MS : 0;
     workHoldSessions = held;
+    // File transfers in flight renew their own lease on the same write.
+    refreshTransferHold();
     refreshKeepAwakeMarker();
+    sweepTransferInbox();
   }, SESSION_IDLE_CHECK_MS).unref();
 }
 
@@ -14749,6 +14918,8 @@ async function main() {
     : `Pre-reap handoff: OFF (${PRE_REAP_HANDOFF.reason})`);
   // So is the macOS sleep assertion: a disabled reaper still has live sessions.
   startPowerHold();
+  // File transfers keep the box awake and the inbox swept, reaper or not.
+  startTransferUpkeep();
   // Re-arm persisted /timer schedules (overdue ones fire after a short
   // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
   const rearmed = timerStore.init();

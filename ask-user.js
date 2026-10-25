@@ -232,10 +232,10 @@ server.tool(
 
 server.tool(
   'send_attachment',
-  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory or be one the bridge downloaded for this conversation (a file the user sent here, or an item attachment), and attachments are capped at 50 MB. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
+  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory or be one the bridge downloaded for this conversation (a file the user sent here, or an item attachment), and attachments are capped at 50 MB. With chat_room_id the file goes to the other agents in that room instead: each room file needs the user\'s approval on a card, may be up to 10 GB, and uploads in the background — the tool returns at once and the outcome arrives in the room. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
   {
     path: z.string().describe('Path to the file — absolute, or relative to the session working directory'),
-    caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body'),
+    caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body. For a room file it is shown on the approval card as your note: say what the file is and why you are sending it'),
     chat_room_id: z.string().optional().describe('Optional agent chat room id — post the attachment into that room instead of this conversation (you must be a participant of the room)'),
   },
   async ({ path, caption, chat_room_id }) => {
@@ -248,6 +248,9 @@ server.tool(
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `send_attachment failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      if (data.status === 'pending_approval') {
+        return { content: [{ type: 'text', text: `"${data.name}" (${data.size} bytes) is waiting for approval to go into room ${chat_room_id}. ${data.note || ''}`.trim() }] };
       }
       return { content: [{ type: 'text', text: `Sent ${data.kind} "${data.name}" (${data.size} bytes) into ${chat_room_id ? `room ${chat_room_id}` : 'the chat'}.` }] };
     } catch (err) {
@@ -581,7 +584,7 @@ server.tool(
 // consent_list / consent_decide go through the bridge loopback
 // (index.js mounts lib/consent-tools.js at /consent/<op>); the journal
 // allows both to the Coordinator alone.
-const CONSENT_WHAT = "Consent approval is for the user's Coordinator only (the journal refuses anyone else) and only for the user's own agents and boxes. It covers agent chat invites, room join requests and agent_session_start spawns — never tool permission prompts or secret requests, which stay with the user. The user always sees the card too and may answer first; every decision you make shows on the card and in the tracker as made by the Coordinator, with your reason, and the user can stop the session or mute the room with one tap. Follow the rules in your instructions: approve only what you understand and that follows the box rules, never into an offline box, give a reason every time, and leave the rest for the user.";
+const CONSENT_WHAT = "Consent approval is for the user's Coordinator only (the journal refuses anyone else) and only for the user's own agents and boxes. It covers agent chat invites, room join requests, agent_session_start spawns and file transfers into rooms — never tool permission prompts or secret requests, which stay with the user. The user always sees the card too and may answer first; every decision you make shows on the card and in the tracker as made by the Coordinator, with your reason, and the user can stop the session or mute the room with one tap. Follow the rules in your instructions: approve only what you understand and that follows the box rules, never into an offline box, give a reason every time, and leave the rest for the user.";
 
 async function callConsent(name, args, render) {
   try {
@@ -600,17 +603,17 @@ async function callConsent(name, args, render) {
 
 server.tool(
   'consent_list',
-  `List the chat invites, room join requests and spawn requests waiting for the user's approval, oldest first, each with who asks whom, the box and its state, the task or justification, and the consent_decide call to answer it. ${CONSENT_WHAT} Call it when the journal nudges you about a pending request, when your own agent_session_start or agent_chat_start is waiting, and when you sweep the state of the world.`,
+  `List the chat invites, room join requests, spawn requests and file transfers waiting for the user's approval, oldest first, each with who asks whom, the box and its state, the task or justification (for a file transfer: the file, its size and sha256, the secret scan's verdict and the sender's note), and the consent_decide call to answer it. ${CONSENT_WHAT} Call it when the journal nudges you about a pending request, when your own agent_session_start or agent_chat_start is waiting, and when you sweep the state of the world.`,
   {},
   async () => callConsent('list', {}, formatPendingList),
 );
 
 server.tool(
   'consent_decide',
-  `Approve or decline one waiting chat or spawn request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} The journal's operator may cap approvals per day; at that cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. Declines are never capped.`,
+  `Approve or decline one waiting chat, spawn or file transfer request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} The journal's operator may cap approvals per day, file transfers included; at that cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. A file transfer the secret scan flagged can only be approved by the user: you may decline it, never approve it. Declines are never capped.`,
   {
-    kind: z.enum(['chat', 'spawn']).describe('As consent_list shows it'),
-    id: z.string().max(128).describe('The request id from consent_list (a spawn id, or room_id/device_id for a chat)'),
+    kind: z.enum(['chat', 'spawn', 'transfer']).describe('As consent_list shows it'),
+    id: z.string().max(128).describe('The request id from consent_list (a spawn id, a transfer id, or room_id/device_id for a chat)'),
     decision: z.enum(['approve', 'decline']),
     reason: z.string().min(1).max(200).describe('One line the user reads on the card and in the tracker: why this follows the rules, or why not'),
   },
