@@ -607,6 +607,13 @@ describe('per-member peer mutes', () => {
     expect(rooms.isPeerMuted('r', '!a')).toBe(false);
   });
 
+  it('a member filed by name unmuting leaves someone else\'s unnamed mute alone', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    rooms.setPeerMuted('r', true, { who: 'box-3 [e0]', reason: 'done' });
+    rooms.setPeerMuted('r', false, { who: 'box-3 [e0]' });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: null, reason: null }]);
+  });
+
   it('drops a member\'s mute when it leaves, matched on the box', () => {
     const rooms = createAgentRooms();
     rooms.record('r', { role: 'owner', state: 'joined', sessionRoomId: '!a' });
