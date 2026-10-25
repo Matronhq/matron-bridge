@@ -305,6 +305,26 @@ describe('createSendAttachmentHandler', () => {
       expect(uploadMedia).not.toHaveBeenCalled();
     });
 
+    it("passes the asking turn's causes, read before any await, and a null when the turn has none", async () => {
+      const asked = [{ kind: 'user_message', ref: 'convo-abc:41', at: 1 }];
+      let release;
+      const gate = new Promise((r) => { release = r; });
+      const isPersonRoom = vi.fn(() => gate.then(() => false));
+      const { handler, sender, sessions } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { isPersonRoom });
+      const session = sessions.get('!room1');
+      session.currentTurn = { causes: asked };
+      const pending = handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      // A new turn begins while the person-room check is still out.
+      session.currentTurn = { causes: [{ kind: 'room_message', ref: 'room:room-1', at: 2 }] };
+      release();
+      expect((await pending).status).toBe(200);
+      expect(sender.start).toHaveBeenCalledWith(expect.objectContaining({ fromConvoId: 'convo-abc', causes: asked }));
+
+      session.currentTurn = null;
+      await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(sender.start.mock.calls[1][0].causes).toBeNull();
+    });
+
     it('asks the injected predicate about a guest-side person room', async () => {
       const isPersonRoom = vi.fn(async (id) => id === 'room-1');
       const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { isPersonRoom });

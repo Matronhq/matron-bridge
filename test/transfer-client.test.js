@@ -10,13 +10,14 @@ const mk = (fetchImpl, extra = {}) => createTransferClient({ baseUrl: 'https://j
 describe('transfer client', () => {
   it('create posts JSON with bearer auth', async () => {
     const f = stub(201, { id: 't1' });
-    const r = await mk(f).create({ room_id: 'r', name: 'a.txt' });
+    const causes = [{ kind: 'user_message', ref: 'c:1', at: 1 }];
+    const r = await mk(f).create({ room_id: 'r', name: 'a.txt', causes });
     const [url, init] = f.mock.calls[0];
     expect(url).toBe('https://journal.example.com/transfers');
     expect(init.method).toBe('POST');
     expect(init.headers.Authorization).toBe('Bearer tok-secret');
     expect(init.headers['Content-Type']).toBe('application/json');
-    expect(JSON.parse(init.body)).toEqual({ room_id: 'r', name: 'a.txt' });
+    expect(JSON.parse(init.body)).toEqual({ room_id: 'r', name: 'a.txt', causes });
     expect(r).toEqual({ ok: true, status: 201, body: { id: 't1' } });
   });
 

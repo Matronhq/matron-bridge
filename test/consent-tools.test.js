@@ -200,6 +200,16 @@ describe('consent formatting', () => {
     expect(userOnly).toContain('  only the user can approve this one: a box it involves is one only the user approves for — leave it for them, or decline with a reason');
     expect(userOnly).toContain(`consent_decide(kind: "transfer", id: "${TR_ID}", decision: decline, reason: …)`);
   });
+  it('formatPendingAsk: a transfer shows its causes as chat and spawn asks do, after the note', () => {
+    const lines = formatPendingAsk({ ...transferAsk, causes: [{ kind: 'user_message', ref: 'c-a:12' }, { kind: 'reminder' }] }, { now: NOW }).split('\n');
+    expect(lines.slice(3, 6)).toEqual([
+      "  note, in box-a's words: the staging dump ⏎ for the migration test",
+      '  started by: user_message c-a:12',
+      '  started by: reminder',
+    ]);
+    expect(formatPendingAsk(transferAsk, { now: NOW })).not.toContain('started by');
+  });
+
   it('formatPendingAsk: a flagged transfer lists its findings and says the Coordinator cannot approve it', () => {
     const text = formatPendingAsk({ ...transferAsk, scan_verdict: 'flagged', scan_findings: [{ kind: 'aws_access_key', line: 3 }, { kind: 'private_key', line: 'db/keys.pem:1' }, { kind: 'x\ny', line: null }] }, { now: NOW });
     expect(text).toContain('  secret scan: flagged — 3 possible secrets: aws_access_key (line 3), private_key (db/keys.pem:1), x ⏎ y');

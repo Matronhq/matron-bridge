@@ -78,6 +78,38 @@ describe('transfer sender', () => {
     expect(Object.values(st.jobs)[0]).toMatchObject({ transferId: 'tr-1', sha256: sha(fx.bytes), roomId: 'room-1', fromConvoId: 'convo-own', uploaded: true });
   });
 
+  it("persists the asking turn's causes and sends them on create; none, none sent", async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    const causes = [{ kind: 'item_tap', ref: 'item:7@2026-01-01T00:00:00.000Z', at: 5 }];
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
+    sender.start(startArgs(fx, { causes }));
+    await sender.idle();
+    expect(client.create).toHaveBeenCalledWith(expect.objectContaining({ causes }));
+    expect(Object.values(readState(fx.stateFile).jobs)[0].causes).toEqual(causes);
+
+    const fx2 = fixture();
+    const client2 = fakeClient();
+    const sender2 = createTransferSender({ client: client2, scan: cleanScan, stateFile: fx2.stateFile, log: silent, chunkBytes: 4 });
+    sender2.start(startArgs(fx2));
+    await sender2.idle();
+    expect(client2.create.mock.calls[0][0]).not.toHaveProperty('causes');
+  });
+
+  it('a job resumed before its create sends the causes it persisted', async () => {
+    const fx = fixture();
+    const causes = [{ kind: 'routine', ref: 'routine:daily-sweep@2026-01-01T08:00:00.000Z', at: 9 }];
+    writeFileSync(fx.stateFile, JSON.stringify({ jobs: { 'job-1': {
+      transferId: null, absPath: fx.absPath, size: fx.size, mtimeMs: fx.mtimeMs, sha256: null,
+      roomId: 'room-1', fromConvoId: 'convo-own', sessionKey: '!s1', name: 'notes.txt', contentType: 'text/plain', caption: 'why', causes,
+    } } }));
+    const client = fakeClient();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
+    await sender.resumeAll();
+    expect(client.create).toHaveBeenCalledTimes(1);
+    expect(client.create).toHaveBeenCalledWith(expect.objectContaining({ from_convo_id: 'convo-own', causes }));
+  });
+
   it('after a restart uploads only the chunks the journal does not have', async () => {
     const fx = fixture();
     writeFileSync(fx.stateFile, JSON.stringify({ jobs: { 'job-1': {
