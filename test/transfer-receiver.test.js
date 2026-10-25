@@ -295,6 +295,7 @@ describe('transfer receiver', () => {
         receiver.onReady(transferOf());
         await receiver.idle();
         expect(client.download).toHaveBeenCalledTimes(4);
+        expect(receiver.active()).toBe(1); // waiting to relaunch still holds the box awake
         await tick(receiver, 59_999);
         expect(client.download).toHaveBeenCalledTimes(4);
         await tick(receiver, 1);
@@ -313,6 +314,7 @@ describe('transfer receiver', () => {
         expect(deliver).toHaveBeenCalledTimes(1);
         expect(readState(fx.stateFile).pending).toEqual({});
         expect(vi.getTimerCount()).toBe(0);
+        expect(receiver.active()).toBe(0);
       } finally {
         vi.useRealTimers();
       }
