@@ -22,6 +22,7 @@
     "@anthropic-ai/sdk": "^0.131.0",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "chrome-devtools-mcp": "1.12.0",
     "diff": "^9.0.0",
     "dotenv": "^18.0.5",
     "express": "^5.2.1",
