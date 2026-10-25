@@ -6,7 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { SECRET_CONTEXT_MAX_LENGTH } from './lib/secret-context.js';
-import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
+import { resolvePermissionTimeoutMs, classifyPermissionPostResponse, permissionInputRefusal } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
@@ -107,6 +107,11 @@ server.tool(
     // CLOSED — any relay failure denies rather than silently allowing.
     const deny = (message) => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'deny', message }) }] });
     const allow = () => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'allow', updatedInput: input ?? {} }) }] });
+    // The card shows the whole input and "Allow once" releases exactly that
+    // input, so a call the card could only show in part is refused here,
+    // before any card is minted.
+    const refusal = permissionInputRefusal(tool_name, input ?? {});
+    if (refusal) return deny(refusal);
     try {
       const postRes = await bridgeFetch(`${BRIDGE_API}/permission-request`, {
         method: 'POST',

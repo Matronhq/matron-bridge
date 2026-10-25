@@ -65,7 +65,9 @@ describe('code-update self-restart wiring', () => {
     expect(boot).toMatch(/const stamp = takeSelfRestartStamp\(SELF_RESTART_STAMP_FILE\);\n\s*if \(!stale\.length\) return;/);
     expect(boot).toMatch(/selectAutoCarryOn\(stale, stamp, \{ enabled: CODE_UPDATE_AUTO_CARRY_ON \}\)/);
     // Same two gates as a card: a persisted session to resume, and a convo id a resume can address.
-    expect(boot).toMatch(/auto\.filter\(rec => resumable\.has\(rec\.convoId\) && isResumeConvoId\(rec\.convoId\)\)/);
+    // A turn another person started never carries on by itself; it gets a card that names them.
+    expect(boot).toMatch(/auto\.filter\(rec => !rec\.foreignPerson && resumable\.has\(rec\.convoId\) && isResumeConvoId\(rec\.convoId\)\)/);
+    expect(boot).toMatch(/rec\.foreignPerson\s*\?\s*`⚠️ The bridge restarted during a turn \$\{peerField\(rec\.foreignPerson, PEER_NAME_MAX\)\} started/);
     expect(boot).toMatch(/setTimeout\(\(\) => \{[\s\S]*?carryOnConvo\(rec\.convoId, null, null, CODE_UPDATE_AUTO_CARRY_ON_TEXT, notice\)[\s\S]*?\}, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS\)/);
     // The resume notice says why, instead of the default "session was idle" copy.
     expect(boot).toMatch(/const notice = `🔄 The bridge restarted itself onto new code[^`]*carry on automatically\.`;/);

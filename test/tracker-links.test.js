@@ -176,8 +176,10 @@ describe('index.js wiring', () => {
 
   it('refreshes the name at boot and on every hello_ok (forced) and at each spawn', () => {
     // Plus one, throttled, when a `user:` frame carries another name.
-    expect(index.match(/journalIdentity\.refresh\(\{ force: true \}\);/g)?.length).toBe(3);
-    expect(index).toMatch(/userDefaults\.refresh\(\);\n\s*journalIdentity\.refresh\(\);/);
+    // Through refreshJournalIdentity, which also releases user messages held
+    // while the name was unknown.
+    expect(index.match(/refreshJournalIdentity\(\{ force: true \}\);/g)?.length).toBe(3);
+    expect(index).toMatch(/userDefaults\.refresh\(\);\n\s*refreshJournalIdentity\(\);/);
   });
 
   it('renders every instruction block through it at spawn', () => {

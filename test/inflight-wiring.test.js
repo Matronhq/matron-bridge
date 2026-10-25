@@ -154,7 +154,7 @@ describe('restart carry-on turn-boundary wiring', () => {
       'handleCodexEvent must record the turn start once the Codex thread id arrives, and must gate '
       + 'it on session.busy so a thread.started outside a turn cannot invent a marker. '
       + 'CONSEQUENCE OF REMOVING: no carry-on card for the first turn of every new Codex chat.',
-    ).toContain('if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);');
+    ).toContain('if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));');
 
     expect(
       body.split('inflightMarker.noteTurnStart(').length - 1,
