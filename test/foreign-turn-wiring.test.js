@@ -38,13 +38,18 @@ describe('index.js wiring', () => {
     // "No turn running" also needs the open turn record: busy is false after an unacknowledged interrupt.
     expect(body).toMatch(/if \(!foreign && !session\.busy && !session\.currentTurn && session\.foreignTurn\) foreignSessions\.end\(session\);/);
     // The in-flight marker remembers whose turn it was, for the restart carry-on.
-    expect(body).toMatch(/inflightMarker\.noteTurnStart\(journalConvoIdFor\(session\), session\.roomId,\s*\{ foreignPerson: foreign \? session\.foreignTurn\?\.person \?\? null : null \}\)/);
+    expect(body).toMatch(/inflightMarker\.noteTurnStart\(journalConvoIdFor\(session\), session\.roomId, inflightTurnOrigin\(session\)\)/);
+    // Every marker write names the running restricted turn's person, not only the send that started it.
+    expect(index).not.toMatch(/inflightMarker\.noteTurnStart\(journalConvoIdFor\(session\), session\.roomId\);/);
+    expect(fnBody(index, 'function inflightTurnOrigin(')).toMatch(/foreignPerson: session\.foreignTurn\?\.person \?\? null/);
   });
 
   it('a usage-limit stall in a turn another person started is never carried on by itself', () => {
     const body = fnBody(index, 'function handleClaudeEvent(');
     expect(body).toMatch(/foreign: Boolean\(session\.foreignTurn\),/);
     expect(body).toMatch(/if \(session\.foreignTurn\) \{[\s\S]*?\} else if \(stall\.kind === 'bad_model'\)/);
+    // A carry-on armed before the stall is dropped as well.
+    expect(body).toMatch(/if \(session\.foreignTurn\) \{[\s\S]*?if \(session\._autoResume\) \{\s*session\._autoResume = null;/);
     expect(body).toMatch(/if \(session\._stall\.kind === 'usage_limit' && !session\._stall\.foreign\) \{/);
     expect(fnBody(index, 'function switchFableStall(')).toMatch(/if \(session\._stall\.foreign\) return false;/);
   });

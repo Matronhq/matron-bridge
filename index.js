@@ -3210,7 +3210,7 @@ function handleCodexEvent(session, event) {
           // keys the card on, and that journalResumeConvo matches. Claude
           // print/iv are unaffected: they mint the id at construction
           // (index.js:1337, 2024), so journalIdMissing is never true for them.
-          if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
+          if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
           journalFlushForSession(session);
         }
       }
@@ -4529,7 +4529,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true, causes = nu
     // begins the turn (ended by its result event) or joins the running one.
     const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
-    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
+    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
     const jsonMsg = JSON.stringify({
@@ -4898,7 +4898,13 @@ function handleClaudeEvent(session, event) {
         journalStatus(session);
         if (session.foreignTurn) {
           // The carry-on would run as an ordinary turn of the user's own,
-          // with that person's request still pending in it. The user decides.
+          // with that person's request still pending in it. The user decides,
+          // so any carry-on armed earlier (a Coordinator's message included)
+          // is dropped too.
+          if (session._autoResume) {
+            session._autoResume = null;
+            persistControlState(session);
+          }
           if (!wasForeign) {
             postControlNotice(session, `⏸ A turn ${peerField(session.foreignTurn.person, PEER_NAME_MAX)} started stopped at the usage limit. It will not be carried on automatically; send a message here when you want this session to continue.`);
           }
@@ -5880,6 +5886,15 @@ function flushResponse(session) {
   session.lastActivityAt = Date.now();
 }
 
+// Whose turn the in-flight marker records (lib/inflight-marker.js): while a
+// turn another person started is running, the restricted gate is armed, so
+// every send and resume that (re)writes the marker during it names them —
+// not only the send that started it. A restart then never carries that turn
+// on as the user's own.
+function inflightTurnOrigin(session) {
+  return { foreignPerson: session.foreignTurn?.person ?? null };
+}
+
 // skipJournalMirror: the journal input consumer's routed text has already
 // been recorded in the journal (the client's own `send` row) — publishing it
 // again here as an agent-sourced echo would duplicate it. Every other caller
@@ -5970,8 +5985,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // as `other`. Mid-turn input (busy) adds its causes when it has some.
   const beganTurn = beginOrJoinTurn(session, causes);
   session.busy = true;
-  inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId,
-    { foreignPerson: foreign ? session.foreignTurn?.person ?? null : null });
+  inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
   // Mirror Claude input here. Codex input is mirrored below only after its
@@ -12133,7 +12147,7 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
     // result event ends the turn).
     const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
-    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
+    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
     const jsonMsg = JSON.stringify({
       type: 'user',
       message: {
