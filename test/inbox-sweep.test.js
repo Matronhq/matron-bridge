@@ -183,7 +183,8 @@ describe('inbox sweep', () => {
     expect(existsSync(p)).toBe(true);
   });
 
-  it('uses the injected fs: lstat, unlink and readdir only', () => {
+  // POSIX fixture paths: on Windows they resolve onto a drive and fail the inbox check.
+  it.skipIf(process.platform === 'win32')('uses the injected fs: lstat, unlink and readdir only', () => {
     const calls = [];
     const fsImpl = {
       readFileSync: () => JSON.stringify({ pending: {}, arrived: [{ path: '/dl/s/inbox/a.log', arrivedAt: NOW - 8 * DAY, transferId: ID_A }] }),

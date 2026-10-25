@@ -527,7 +527,8 @@ describe('transfer receiver', () => {
       expect(deliver).toHaveBeenCalledTimes(1);
     });
 
-    it('writes its state file with mode 0600', async () => {
+    // POSIX file modes; Windows has none.
+    it.skipIf(process.platform === 'win32')('writes its state file with mode 0600', async () => {
       const fx = fixture();
       const { receiver } = makeReceiver(fx);
       receiver.onReady(transferOf());
@@ -553,7 +554,8 @@ describe('transfer receiver', () => {
       expect(readState(fx.stateFile).pending).toEqual({});
     });
 
-    it('never writes through a symlink planted at the .part path', async () => {
+    // O_NOFOLLOW and symlinks are POSIX-only.
+    it.skipIf(process.platform === 'win32')('never writes through a symlink planted at the .part path', async () => {
       const fx = fixture();
       const dir = fx.dirFor(fx.guest);
       mkdirSync(dir, { recursive: true });
@@ -596,7 +598,8 @@ describe('transfer receiver', () => {
       expect(readFileSync(path.join(fx.dirFor(fx.guest), 'build.log'))).toEqual(CONTENT);
     });
 
-    it('escapes " and ] in the name inside a room line', async () => {
+    // `"` is not a legal file-name character on Windows.
+    it.skipIf(process.platform === 'win32')('escapes " and ] in the name inside a room line', async () => {
       const fx = fixture();
       const { receiver, deliver } = makeReceiver(fx);
       receiver.onReady(transferOf({ name: 'a"b]c.txt' }));

@@ -413,7 +413,8 @@ describe('transfer sender', () => {
     expect(readState(fx.stateFile).jobs).toEqual({});
   });
 
-  it('writes its state file with mode 0600', async () => {
+  // POSIX file modes; Windows has none.
+  it.skipIf(process.platform === 'win32')('writes its state file with mode 0600', async () => {
     const fx = fixture();
     const sender = createTransferSender({ client: fakeClient(), scan: cleanScan, stateFile: fx.stateFile, log: silent, chunkBytes: 4 });
     sender.start(startArgs(fx));
