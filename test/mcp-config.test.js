@@ -147,9 +147,9 @@ describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', 
       extras: ['browser'],
       platform: 'darwin',
       askUserBaseDir: '/opt/bridge',
-      execPath: '/Users/alice/.matron/bin/matron-bridge',
+      execPath: '/opt/matron/bin/matron-bridge',
     });
-    expect(config.mcpServers['chrome-devtools'].command).toBe('/Users/alice/.matron/bin/matron-bridge');
+    expect(config.mcpServers['chrome-devtools'].command).toBe('/opt/matron/bin/matron-bridge');
     expect(config.mcpServers['chrome-devtools'].args[0])
       .toBe('/opt/bridge/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js');
   });

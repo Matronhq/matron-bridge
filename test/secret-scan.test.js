@@ -448,6 +448,14 @@ describe('scanFile: tar', () => {
       Buffer.alloc(1024),
     ]);
     expect((await scanFile(fixture('pax-garbled.tar', tar))).verdict).toBe('not_scanned');
+    // A record must end in the newline its length counts.
+    const unterminated = Buffer.from('9 path=xX');
+    const tar2 = Buffer.concat([
+      tarHeader('PaxHeader', unterminated.length, 'x'), pad512(unterminated),
+      tarHeader('a.txt', 6), pad512(Buffer.from('hello\n')),
+      Buffer.alloc(1024),
+    ]);
+    expect((await scanFile(fixture('pax-unterminated.tar', tar2))).verdict).toBe('not_scanned');
   });
 
   it('a corrupt or truncated tar is not_scanned', async () => {

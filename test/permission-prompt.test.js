@@ -142,6 +142,12 @@ describe('permissionInputRefusal', () => {
     expect(permissionInputRefusal('Write', { file_path: '/tmp/example/a.txt', content: 'A'.repeat(600) })).toBeNull();
   });
 
+  it('refuses an input carrying bidirectional controls, which the card would show altered', () => {
+    const msg = permissionInputRefusal('Bash', { command: 'cat notes\u202Etxt.sh' });
+    expect(msg).toMatch(/bidirectional/);
+    expect(permissionInputRefusal('Write', { file_path: '/tmp/example/a.txt', content: 'plain\u2067text' })).toMatch(/bidirectional/);
+  });
+
   it('lets an input exactly at the card limit through', () => {
     expect(permissionInputRefusal('Bash', { command: 'x'.repeat(PERMISSION_PREVIEW_MAX) })).toBeNull();
   });

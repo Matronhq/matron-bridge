@@ -55,7 +55,10 @@ describe('index.js wiring', () => {
   });
 
   it('user messages wait for the owner\'s name, and the permission route refuses inputs a card cannot show', () => {
-    expect(index).toMatch(/onOwnerUnknown: \(\) => journalIdentity\.refresh\(\{ force: true \}\),/);
+    expect(index).toMatch(/onOwnerUnknown: \(\) => refreshJournalIdentity\(\{ force: true \}\),/);
+    // Any refresh that learns the name releases what the router held.
+    expect(fnBody(index, 'function refreshJournalIdentity(')).toMatch(/journalInputConsumer\.replayHeldOwnerFrames\(\)/);
+    expect(index).not.toMatch(/[^.\w]journalIdentity\.refresh\(\{/);
     const route = index.slice(index.indexOf("url.pathname === '/permission-request'"));
     expect(route.indexOf('permissionInputRefusal(toolName, input)')).toBeGreaterThan(-1);
     expect(route.indexOf('permissionInputRefusal(toolName, input)')).toBeLessThan(route.indexOf('permissionRegistry.create('));

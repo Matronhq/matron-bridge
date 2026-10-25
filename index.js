@@ -927,6 +927,17 @@ const journalIdentity = createJournalIdentity({
   load: () => (fs.existsSync(JOURNAL_IDENTITY_FILE) ? JSON.parse(fs.readFileSync(JOURNAL_IDENTITY_FILE, 'utf-8')) : null),
   save: (data) => atomicWriteFileSync(JOURNAL_IDENTITY_FILE, JSON.stringify(data, null, 2), { mode: 0o600 }),
 });
+// Every refresh that brings the owner's name in also releases the user
+// messages the input router held while it was unknown
+// (lib/journal-input-router.js holdUntilOwnerKnown).
+function refreshJournalIdentity(opts) {
+  return journalIdentity.refresh(opts).then((name) => {
+    if (name) {
+      try { journalInputConsumer.replayHeldOwnerFrames(); } catch { /* not wired yet */ }
+    }
+    return name;
+  });
+}
 const trackerUrlBaseNow = () => trackerUrlBase({ httpBase: journalHttpBase, userName: journalIdentity.name() });
 function trackerLinksNow(text) {
   return renderTrackerLinks(text, trackerUrlBaseNow());
@@ -1049,7 +1060,7 @@ function handleJournalReconnect() {
   coordinatorLookup.refresh({ force: true });
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
-  journalIdentity.refresh({ force: true });
+  refreshJournalIdentity({ force: true });
   // Outgoing room files: carry on any upload a restart or a dropped socket
   // interrupted, and settle jobs whose outcome frame was missed.
   transferSender?.resumeAll().catch((e) => console.warn(`[transfer] resume failed: ${e.message}`));
@@ -1192,7 +1203,7 @@ if (JOURNAL_ENABLED) {
   coordinatorLookup.refresh({ force: true });
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
-  journalIdentity.refresh({ force: true });
+  refreshJournalIdentity({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
   // other publish here). No Matrix dependency: this convo has no Matrix
@@ -2401,7 +2412,7 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   coordinatorLookup.refresh();
   memoryLookup.refresh();
   userDefaults.refresh();
-  journalIdentity.refresh();
+  refreshJournalIdentity();
   if (JOURNAL_ENABLED && !role.known && !coordinatorUnknownWarned.has(roomId) && candidates.some((c) => typeof c === 'string' && c)) {
     coordinatorUnknownWarned.add(roomId);
     console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
@@ -11960,7 +11971,7 @@ const journalInputConsumer = createJournalInputConsumer({
   ownerName: () => journalIdentity.name(),
   // A user message arrived before the owner's name was known: ask /me now;
   // the router replays what it held once the name is in.
-  onOwnerUnknown: () => journalIdentity.refresh({ force: true }),
+  onOwnerUnknown: () => refreshJournalIdentity({ force: true }),
   // Another user's name on a `user:` frame: re-ask /me in case the owner
   // was renamed, at most once a minute.
   onForeignUser: (() => {
@@ -11968,7 +11979,7 @@ const journalInputConsumer = createJournalInputConsumer({
     return () => {
       if (Date.now() - last < 60_000) return;
       last = Date.now();
-      journalIdentity.refresh({ force: true });
+      refreshJournalIdentity({ force: true });
     };
   })(),
   selfAgentDeviceId: () => journalPublisher.identity()?.deviceId ?? null,
