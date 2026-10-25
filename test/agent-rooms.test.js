@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createAgentRooms, INVITE_TTL_MS, PERSON_INVITE_TTL_MS } from '../lib/agent-rooms.js';
+import { labelBox, createAgentRooms, INVITE_TTL_MS, PERSON_INVITE_TTL_MS } from '../lib/agent-rooms.js';
 
 // No fs fake needed: the registry takes plain load/save functions, so tests
 // record calls directly and round-trip persistence through the save payload.
@@ -564,7 +564,6 @@ describe('peer mute', () => {
     expect(rooms.isPeerMuted('r', '!a')).toBe(false);
 
     rooms.record('l', { role: 'owner', state: 'joined', sessionRoomId: '!a', guestSessionRoomId: '!b', guestState: 'joined' });
-    expect(rooms.setPeerMuted('l', true)).toBeNull();
     rooms.setMuted('l', '!b', true, { reason: 'x' });
     expect(rooms.isPeerMuted('l', '!a')).toBe(true);
     expect(rooms.isPeerMuted('l', '!b')).toBe(false);
@@ -578,6 +577,67 @@ describe('peer mute', () => {
     a.setPeerMuted('r', true);
     const b = createAgentRooms({ load: () => saved, save: () => {} });
     expect(b.isPeerMuted('r', '!a')).toBe(true);
+  });
+});
+
+describe('per-member peer mutes', () => {
+  it('files each announced mute under the member that made it', () => {
+    const rooms = createAgentRooms();
+    rooms.record('r', { role: 'owner', state: 'joined', sessionRoomId: '!a' });
+    rooms.setPeerMuted('r', true, { who: 'box-3 [e0]', reason: 'done' });
+    rooms.setPeerMuted('r', true, { who: 'box-2 [c4]', reason: 'looping' });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: 'box-3 [e0]', reason: 'done' }, { who: 'box-2 [c4]', reason: 'looping' }]);
+    rooms.setPeerMuted('r', false, { who: 'box-2 [c4]' });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: 'box-3 [e0]', reason: 'done' }]);
+    expect(rooms.isPeerMuted('r', '!a')).toBe(true);
+    expect(rooms.peerMutesFor('r', '!other')).toEqual([]);
+  });
+
+  it('reads a record from before per-member mutes as one unnamed mute', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: null, reason: null }]);
+    rooms.setPeerMuted('r', false);
+    expect(rooms.isPeerMuted('r', '!a')).toBe(false);
+    expect(rooms.get('r').peerMuted).toBeUndefined();
+  });
+
+  it('a named unmute clears a legacy unnamed mute too', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    rooms.setPeerMuted('r', false, { who: 'box-2 [c4]' });
+    expect(rooms.isPeerMuted('r', '!a')).toBe(false);
+  });
+
+  it('a member filed by name unmuting leaves someone else\'s unnamed mute alone', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    rooms.setPeerMuted('r', true, { who: 'box-3 [e0]', reason: 'done' });
+    rooms.setPeerMuted('r', false, { who: 'box-3 [e0]' });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: null, reason: null }]);
+  });
+
+  it('drops a member\'s mute when it leaves, matched on the box', () => {
+    const rooms = createAgentRooms();
+    rooms.record('r', { role: 'owner', state: 'joined', sessionRoomId: '!a' });
+    rooms.setPeerMuted('r', true, { who: 'box-3 [e0]', reason: 'done' });
+    rooms.setPeerMuted('r', true, { who: 'box-2 [c4]', reason: 'looping' });
+    expect(rooms.clearPeerMutesForBox('r', 'box-3')).toBe(1);
+    expect(rooms.peerMutesFor('r', '!a').map((m) => m.who)).toEqual(['box-2 [c4]']);
+    expect(rooms.clearPeerMutesForBox('r', 'nobody')).toBe(0);
+  });
+
+  it('a same-bridge room names the other binding and adds any remote member\'s mute', () => {
+    const rooms = createAgentRooms();
+    rooms.record('l', { role: 'owner', state: 'joined', sessionRoomId: '!a', guestSessionRoomId: '!b', guestState: 'joined' });
+    rooms.setMuted('l', '!b', true, { reason: 'x', who: 'mac [bb]' });
+    rooms.setPeerMuted('l', true, { who: 'box-3 [e0]', reason: 'done' });
+    expect(rooms.peerMutesFor('l', '!a')).toEqual([{ who: 'mac [bb]', reason: 'x' }, { who: 'box-3 [e0]', reason: 'done' }]);
+    expect(rooms.peerMutesFor('l', '!b')).toEqual([{ who: 'box-3 [e0]', reason: 'done' }]);
+    rooms.setMuted('l', '!b', false);
+    expect(rooms.get('l').guestMutedBy).toBeNull();
+  });
+
+  it('labelBox strips the session tag', () => {
+    expect(labelBox('box-a [3f]')).toBe('box-a');
+    expect(labelBox('box-a')).toBe('box-a');
   });
 });
 

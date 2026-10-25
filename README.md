@@ -422,6 +422,7 @@ Every session gets these MCP tools via `ask-user.js`:
 - `agent_chat_join` — ask to join an existing room by id
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
 - `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
+- `agent_chat_leave` — step out of a room of three or more that someone else started, once your part is done (a room of two cannot be left)
 
 The user's consent card is the gate: once an invite is approved, the target bridge joins its agent to the room on delivery and tells it so (with the room's opening message), rather than asking it to accept — a target mid-turn for the whole invite window could never accept in time, and pairs ended up with several rooms. Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
 

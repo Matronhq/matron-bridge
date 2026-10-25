@@ -181,7 +181,7 @@ import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices }
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncement, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncementDetail, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
@@ -11162,14 +11162,28 @@ function journalOnRoomFrame(room, frame) {
 
 // A remote peer's mute is held by its own bridge, which announces it in the
 // room (🔇 … muted …, 🔊 … unmuted …). Recording what it said is how
-// agent_chat_send here can tell the sender its messages are going nowhere
-// (lib/agent-rooms.js isPeerMuted). Agent frames only: a line the user types
-// that happens to look like one says nothing about the peer. Same-bridge
-// rooms read the peer's binding directly and are skipped by setPeerMuted.
+// agent_chat_send here can tell the sender its messages are going nowhere,
+// and to which member (lib/agent-rooms.js peerMutesFor): filed under the
+// label the line names, so in a room of three or more one member's mute is
+// never read as the whole room's. Agent frames only: a line the user types
+// that happens to look like one says nothing about the peer. A same-bridge
+// peer's own line never arrives here (own-device echo); its binding is read
+// directly instead.
 function notePeerMuteFromFrame(room, frame) {
   if (frame.type !== 'text' || !String(frame.sender || '').startsWith('agent:')) return;
-  const said = parseMuteAnnouncement(frame.payload?.body);
-  if (said) agentRooms.setPeerMuted(frame.convo_id, said === 'muted');
+  const said = parseMuteAnnouncementDetail(frame.payload?.body);
+  if (said) agentRooms.setPeerMuted(frame.convo_id, said.state === 'muted', { who: said.who, reason: said.reason });
+}
+
+// A member left a room the others carry on in (journal member_left): drop
+// the mute it had announced, so later sends stop naming it. The frame names
+// a device; the mute was filed under that box's session label.
+async function forgetLeftMemberMute(roomId, fromDeviceId) {
+  if (!Number.isInteger(fromDeviceId)) return;
+  let roster;
+  try { roster = await journalPublisher.fetchRoster(); } catch { roster = null; }
+  const name = (roster?.agents || []).find((a) => a?.device_id === fromDeviceId)?.name;
+  if (name) agentRooms.clearPeerMutesForBox(roomId, name);
 }
 
 // First-use membership reconciliation for a REMOTE guest binding stranded
@@ -11264,6 +11278,16 @@ function deliverRoomFrameTo(room, frame) {
     sender,
   });
   if (disposition !== 'deliver') {
+    // A muted binding whose conversation is gone for good — not running and
+    // nothing persisted to resume it from — is left now, the same lazy
+    // cleanup an unmuted one gets below. Without it the mute outlived the
+    // session indefinitely, and every other member kept being told its
+    // messages no longer reached a session that no longer existed.
+    if (!live && !sleepingConvoIdFor(room.sessionRoomId)) {
+      debug(`room frame for ${frame.convo_id}: muted session ${room.sessionRoomId} is gone and not resumable — leaving the room`);
+      orphanRoomBinding(frame.convo_id, room.sessionRoomId);
+      return;
+    }
     // A `user:` frame is something the user typed into the room themself, so
     // swallowing it silently would look like the message being lost: he gets
     // the 💬 echo and then the 🔇 line in the ⏳'s place. Peer AGENT frames
@@ -11772,6 +11796,7 @@ agentInvites = createAgentInvites({
   rooms: agentRooms,
   injectRequestTurn: journalInjectInviteRequest,
   notifyRoom: journalNotifyRoomEvent,
+  onMemberLeft: (roomId, fromDeviceId) => { forgetLeftMemberMute(roomId, fromDeviceId).catch(() => {}); },
   log: console,
 });
 
@@ -13275,6 +13300,12 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === '/agent-chat-leave-done') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatLeaveDone,
+          (status, b) => debug(`agent-chat-leave-done ${status} ${data?.room_id} ${b.error || 'ok'}`));
+        return;
+      }
+
       if (url.pathname === '/agent-chat-mute') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatMute,
           (status, b) => debug(`agent-chat-mute ${status} ${data?.room_id} ${b.error || 'ok'}`));
@@ -13361,7 +13392,18 @@ const apiServer = createServer(async (req, res) => {
       const missionsRoute = url.pathname.match(/^\/missions\/(start|create|post|update|status|join|leave|get|list|close)$/);
       if (missionsRoute) {
         const name = missionsRoute[1];
-        await respondAgentChatRoute(res, data, missionsHandlers[name],
+        // A session closing its OWN mission is done with its work: rooms it
+        // had muted as a third member are left rather than kept muted
+        // (lib/agent-chat.js leaveMutedRoomsOnMissionClose). After the close,
+        // and never in its way.
+        const handler = name === 'close' && data?.mission === undefined
+          ? async (d) => {
+            const r = await missionsHandlers.close(d);
+            if (r?.status === 200) agentChatHandlers.leaveMutedRoomsOnMissionClose(d?.roomId).catch(() => {});
+            return r;
+          }
+          : missionsHandlers[name];
+        await respondAgentChatRoute(res, data, handler,
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
         return;
       }
