@@ -11180,7 +11180,7 @@ function notePeerMuteFromFrame(room, frame) {
 // a device; the mute was filed under that box's session label.
 async function forgetLeftMemberMute(roomId, fromDeviceId) {
   if (!Number.isInteger(fromDeviceId)) return;
-  let roster = null;
+  let roster;
   try { roster = await journalPublisher.fetchRoster(); } catch { roster = null; }
   const name = (roster?.agents || []).find((a) => a?.device_id === fromDeviceId)?.name;
   if (name) agentRooms.clearPeerMutesForBox(roomId, name);
