@@ -62,6 +62,22 @@ function makeTar(entries) {
   return Buffer.concat(parts);
 }
 
+function pad512(buf) {
+  return Buffer.concat([buf, Buffer.alloc((512 - (buf.length % 512)) % 512)]);
+}
+// A pax extended header's data: one "<len> key=value\n" record per entry,
+// where <len> counts the whole record including itself.
+function paxData(records) {
+  const parts = [];
+  for (const [key, value] of Object.entries(records)) {
+    const rest = ` ${key}=${value}\n`;
+    let len = rest.length + 1;
+    while (String(len).length + rest.length !== len) len = String(len).length + rest.length;
+    parts.push(`${len}${rest}`);
+  }
+  return Buffer.from(parts.join(''));
+}
+
 // --- zip fixtures (built by hand) ---
 let crcTable;
 function crc32(buf) {
@@ -388,6 +404,52 @@ describe('scanFile: tar', () => {
     }
   });
 
+  it('scans the data of a member of any type, not only plain files', async () => {
+    const key = `${FAKE.privateKeyHeader}\nAAAA\n`;
+    // Unknown, sparse, directory, symlink and contiguous types alike.
+    for (const type of ['A', 'S', '5', '2', '7']) {
+      const tar = makeTar([{ name: 'a.txt', data: 'hello\n' }, { name: 'payload', type, data: key }]);
+      const r = await scanFile(fixture(`type-${type}.tar`, tar));
+      expect(r).toEqual({ verdict: 'flagged', findings: [{ kind: 'private_key', line: 'payload:1' }] });
+    }
+    const bin = makeTar([{ name: 'payload', type: 'A', data: PNG }]);
+    expect((await scanFile(fixture('type-bin.tar', bin))).verdict).toBe('not_scanned');
+    // A link or directory with no data is still clean.
+    const plain = makeTar([{ name: 'd/', type: '5' }, { name: 'd/l', type: '2' }, { name: 'd/a.txt', data: 'hi\n' }]);
+    expect(await scanFile(fixture('types-ok.tar', plain))).toEqual({ verdict: 'clean', findings: [] });
+  });
+
+  it('frames a member by its pax size record, not the header size field', async () => {
+    const body = Buffer.from(`one\n${FAKE.aws}\n`);
+    // The header says no data; the pax record gives the real size.
+    const tar = Buffer.concat([
+      tarHeader('PaxHeader', paxData({ size: body.length }).length, 'x'), pad512(paxData({ size: body.length })),
+      tarHeader('keys.txt', 0), pad512(body),
+      Buffer.alloc(1024),
+    ]);
+    expect(await scanFile(fixture('pax-size.tar', tar)))
+      .toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: 'keys.txt:2' }] });
+  });
+
+  it('a pax header whose size cannot be followed makes it not_scanned', async () => {
+    const withPax = (records, type = 'x') => Buffer.concat([
+      tarHeader('PaxHeader', paxData(records).length, type), pad512(paxData(records)),
+      tarHeader('a.txt', 6), pad512(Buffer.from('hello\n')),
+      Buffer.alloc(1024),
+    ]);
+    expect((await scanFile(fixture('pax-path.tar', withPax({ path: 'b.txt' })))).verdict).toBe('clean');
+    expect((await scanFile(fixture('pax-bad.tar', withPax({ size: '12abc' })))).verdict).toBe('not_scanned');
+    expect((await scanFile(fixture('pax-global.tar', withPax({ size: 6 }, 'g')))).verdict).toBe('not_scanned');
+    expect((await scanFile(fixture('pax-long.tar', withPax({ comment: 'x'.repeat(70 * 1024), size: 6 })))).verdict).toBe('not_scanned');
+    const garbled = Buffer.concat([Buffer.from('9999 size=6\n'), Buffer.from('hello')]);
+    const tar = Buffer.concat([
+      tarHeader('PaxHeader', garbled.length, 'x'), pad512(garbled),
+      tarHeader('a.txt', 6), pad512(Buffer.from('hello\n')),
+      Buffer.alloc(1024),
+    ]);
+    expect((await scanFile(fixture('pax-garbled.tar', tar))).verdict).toBe('not_scanned');
+  });
+
   it('a corrupt or truncated tar is not_scanned', async () => {
     const good = makeTar([{ name: 'a.txt', data: 'hello world\n'.repeat(100) }]);
     expect((await scanFile(fixture('trunc.tar', good.subarray(0, 700)))).verdict).toBe('not_scanned');
@@ -424,6 +486,16 @@ describe('scanFile: zip', () => {
     const secondCentral = cdStart + 46 + 'a.txt'.length;
     bz.writeUInt16LE(12, secondCentral + 10);
     expect((await scanFile(fixture('bz.zip', bz))).verdict).toBe('not_scanned');
+  });
+
+  it('scans an entry named like a directory that carries data', async () => {
+    for (const method of [0, 8]) {
+      const zip = makeZip([{ name: 'a.txt', data: 'hi\n' }, { name: 'd/', data: `k=${FAKE.aws}\n`, method }]);
+      expect(await scanFile(fixture(`dirdata-${method}.zip`, zip)))
+        .toEqual({ verdict: 'flagged', findings: [{ kind: 'aws_access_key', line: 'd/:1' }] });
+    }
+    const bin = makeZip([{ name: 'd/', data: PNG, method: 0 }]);
+    expect((await scanFile(fixture('dirbin.zip', bin))).verdict).toBe('not_scanned');
   });
 
   it('a skipped member does not hide a finding in another', async () => {
