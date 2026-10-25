@@ -12365,6 +12365,8 @@ transferReceiver = createTransferReceiver({
   deliver: (target, line, { roomId, fromName }) => {
     const room = agentRooms.get(roomId);
     if (!room || !target?.roomId) return;
+    // No seq: the transfer does not name the room event it became, so the
+    // turn takes the room's bare room_message cause (lib/turn-cause.js).
     deliverRoomFrameTo({ ...room, sessionRoomId: target.roomId }, {
       convo_id: roomId, type: 'text', sender: `agent:${fromName || 'peer'}`, payload: { body: line }, ts: Date.now(),
     });
