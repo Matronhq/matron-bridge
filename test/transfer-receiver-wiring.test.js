@@ -45,4 +45,13 @@ describe('transfer receiver wiring', () => {
     expect(body).toContain('deliverRoomFrameTo({ ...room, sessionRoomId: target.roomId }');
     expect(body).toContain('agentRooms.isMuted(roomId, target?.roomId)');
   });
+
+  it("the sender's outcome lines go through the wake-capable room path, not a live-only notify", () => {
+    const start = index.indexOf('transferSender = createTransferSender({');
+    expect(start).toBeGreaterThan(-1);
+    const body = index.slice(start, index.indexOf('\n});\n', start));
+    expect(body).toMatch(/notify: createTransferOutcomeNotify\(\{\s*getRoom: \(roomId\) => agentRooms\.get\(roomId\),\s*deliverRoomFrameTo,/);
+    expect(body).not.toContain('.alive');
+    expect(body).not.toContain('roomDelivery.deliver(');
+  });
 });

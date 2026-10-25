@@ -183,21 +183,25 @@ describe('inbox sweep', () => {
     expect(existsSync(p)).toBe(true);
   });
 
-  // POSIX fixture paths: on Windows they resolve onto a drive and fail the inbox check.
-  it.skipIf(process.platform === 'win32')('uses the injected fs: lstat, unlink and readdir only', () => {
+  it('uses the injected fs: lstat, unlink and readdir only', () => {
     const calls = [];
+    // Built with path, so they are absolute on every platform.
+    const root = path.resolve('/dl');
+    const inboxDir = path.join(root, 's', 'inbox');
+    const file = path.join(inboxDir, 'a.log');
+    const stateFile = path.resolve('/state.json');
     const fsImpl = {
-      readFileSync: () => JSON.stringify({ pending: {}, arrived: [{ path: '/dl/s/inbox/a.log', arrivedAt: NOW - 8 * DAY, transferId: ID_A }] }),
+      readFileSync: () => JSON.stringify({ pending: {}, arrived: [{ path: file, arrivedAt: NOW - 8 * DAY, transferId: ID_A }] }),
       realpathSync: (p) => p,
       lstatSync: (p) => { calls.push(['lstat', p]); return { isFile: () => true, isSymbolicLink: () => false, mtimeMs: NOW - 8 * DAY }; },
       unlinkSync: (p) => calls.push(['unlink', p]),
       readdirSync: (d) => { calls.push(['readdir', d]); return []; },
     };
     const save = vi.fn();
-    expect(sweepInbox('/state.json', { now: NOW, fsImpl, save, roots: ['/dl'] }).deleted).toEqual(['/dl/s/inbox/a.log']);
-    expect(calls).toContainEqual(['unlink', '/dl/s/inbox/a.log']);
-    expect(calls).toContainEqual(['readdir', '/dl/s/inbox']);
-    expect(save).toHaveBeenCalledWith('/state.json', { pending: {}, arrived: [] });
+    expect(sweepInbox(stateFile, { now: NOW, fsImpl, save, roots: [root] }).deleted).toEqual([file]);
+    expect(calls).toContainEqual(['unlink', file]);
+    expect(calls).toContainEqual(['readdir', inboxDir]);
+    expect(save).toHaveBeenCalledWith(stateFile, { pending: {}, arrived: [] });
   });
 });
 

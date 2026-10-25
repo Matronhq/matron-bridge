@@ -1915,6 +1915,18 @@ describe('agent-chat room carve-out', () => {
     expect(deps.routeRoomFrame).toHaveBeenCalledTimes(2);
   });
 
+  // The journal's own room lines for a transfer ("Not sent: ... declined",
+  // "Delivered ...", expired, failed) are for the people reading the room.
+  // They never reach a session, so the sending bridge tells its session
+  // itself (lib/transfer-outcome.js) with no duplicate.
+  it('drops a journal-voice line in a room (sender journal)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'journal', payload: { body: 'Not sent: `x` was declined' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
   it('drops this bridge\'s own echo (sender agent:<self>)', () => {
     const deps = makeRoomDeps();
     const consumer = createJournalInputConsumer(deps);

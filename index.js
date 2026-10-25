@@ -9,6 +9,7 @@ import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createTransferClient } from './lib/transfer-client.js';
 import { createTransferSender } from './lib/transfer-sender.js';
+import { createTransferOutcomeNotify } from './lib/transfer-outcome.js';
 import { createTransferReceiver } from './lib/transfer-receiver.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
@@ -12303,20 +12304,19 @@ const handleWake = createWakeHandler({
 
 // send_attachment into a room: a journal transfer, uploaded in the
 // background. The outcome (declined / failed / expired, or a cancel because
-// the file changed) reaches the sending session as a room line, through the
-// same per-recipient delivery as any room message, so busy coalescing and
-// the mute apply.
+// the file changed) reaches the sending session as a room line through
+// deliverRoomFrameTo with its own binding (lib/transfer-outcome.js), so
+// busy coalescing and the mute apply, and a session the idle reap took
+// down while the upload ran is woken with the line.
 transferSender = createTransferSender({
   client: transferClient,
   stateFile: TRANSFERS_FILE,
   log: console,
-  notify: ({ sessionKey, roomId, text }) => {
-    const session = sessionKey ? sessions.get(sessionKey) : null;
-    if (!session || !session.alive) { console.log(`[transfer] no running session ${sessionKey || '(none)'} to tell: ${text}`); return; }
-    if (roomId && agentRooms.isMuted(roomId, sessionKey)) return;
-    const room = roomId ? agentRooms.get(roomId) : null;
-    roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room?.title || room?.topic || null, from: 'bridge', body: text, at: Date.now() });
-  },
+  notify: createTransferOutcomeNotify({
+    getRoom: (roomId) => agentRooms.get(roomId),
+    deliverRoomFrameTo,
+    log: console,
+  }),
 });
 // Room files released to this device: downloaded into the receiving
 // session's inbox (outside any working tree) and announced to every bound

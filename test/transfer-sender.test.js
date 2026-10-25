@@ -220,6 +220,36 @@ describe('transfer sender', () => {
     expect(readState(fx.stateFile).jobs).toEqual({});
   });
 
+  it('more than one other session in the room: a clear "not started" line', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.create = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'multiple_recipients' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx, { name: 'x' }));
+    await sender.idle();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
+      text: '[transfer of "x" not started: this room has more than one other session; files go to one session at a time]',
+    }));
+    expect(client.putChunk).not.toHaveBeenCalled();
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('a declined outcome is told once, however many times the journal says so', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    client.status = vi.fn(async () => ({ ok: true, status: 200, body: { id: 'tr-1', phase: 'declined' } }));
+    sender.onFrame({ kind: 'transfer', event: 'declined', transfer_id: 'tr-1', reason: 'not needed' });
+    sender.onFrame({ kind: 'transfer', event: 'declined', transfer_id: 'tr-1', reason: 'not needed' });
+    await sender.resumeAll();
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
   it('409 hashing on complete waits about 30 s, checks status and completes again; not a failure', async () => {
     const fx = fixture();
     const client = fakeClient();

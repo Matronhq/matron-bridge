@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, symlinkSync, statSync } from 'fs';
 import fsp from 'fs/promises';
+import nodeFs from 'fs';
 import { tmpdir } from 'os';
 import { createTransferReceiver } from '../lib/transfer-receiver.js';
 
@@ -264,6 +265,128 @@ describe('transfer receiver', () => {
     expect(sleep.mock.calls.map((c) => c[0])).toEqual([2000, 8000, 30000]);
     expect(deliver).not.toHaveBeenCalled();
     expect(Object.keys(readState(fx.stateFile).pending)).toEqual(['tr-1']);
+  });
+
+  describe('relaunching a stalled download while connected', () => {
+    function stalledReceiver(fx, plan) {
+      // plan(call) -> a status for that download call (200 serves CONTENT).
+      let calls = 0;
+      const client = fakeClient({
+        download: async () => {
+          calls += 1;
+          const status = plan(calls);
+          return status === 200 ? new Response(CONTENT, { status: 200 }) : new Response(null, { status });
+        },
+      });
+      const deliver = vi.fn();
+      const receiver = createTransferReceiver({
+        client, dirFor: fx.dirFor, deliver, sessionsForRoom: () => [fx.guest],
+        stateFile: fx.stateFile, log: silent, now: () => 1_000, sleep: noSleep,
+      });
+      return { receiver, client, deliver };
+    }
+    const tick = async (receiver, ms) => { vi.advanceTimersByTime(ms); await receiver.idle(); };
+
+    it('relaunches after 1 min, 5 min, then every 15 min, and stops once it is saved', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const fx = fixture();
+        const { receiver, client, deliver } = stalledReceiver(fx, (n) => (n <= 20 ? 503 : 200));
+        receiver.onReady(transferOf());
+        await receiver.idle();
+        expect(client.download).toHaveBeenCalledTimes(4);
+        await tick(receiver, 59_999);
+        expect(client.download).toHaveBeenCalledTimes(4);
+        await tick(receiver, 1);
+        expect(client.download).toHaveBeenCalledTimes(8);
+        await tick(receiver, 5 * 60_000 - 1);
+        expect(client.download).toHaveBeenCalledTimes(8);
+        await tick(receiver, 1);
+        expect(client.download).toHaveBeenCalledTimes(12);
+        await tick(receiver, 15 * 60_000);
+        expect(client.download).toHaveBeenCalledTimes(16);
+        await tick(receiver, 15 * 60_000);
+        expect(client.download).toHaveBeenCalledTimes(20);
+        await tick(receiver, 15 * 60_000);
+        expect(client.download).toHaveBeenCalledTimes(21);
+        expect(readFileSync(path.join(fx.dirFor(fx.guest), 'build.log'))).toEqual(CONTENT);
+        expect(deliver).toHaveBeenCalledTimes(1);
+        expect(readState(fx.stateFile).pending).toEqual({});
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a 404 or 410 on a relaunch ends it: the .part and the entry go, and no timer is left', async () => {
+      for (const gone of [404, 410]) {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        try {
+          const fx = fixture();
+          const { receiver, client, deliver } = stalledReceiver(fx, (n) => (n <= 4 ? 503 : gone));
+          receiver.onReady(transferOf());
+          await receiver.idle();
+          await tick(receiver, 60_000);
+          expect(client.download).toHaveBeenCalledTimes(5);
+          expect(readState(fx.stateFile).pending).toEqual({});
+          expect(existsSync(receiver.partPathFor(fx.dirFor(fx.guest), transferOf()))).toBe(false);
+          expect(deliver).not.toHaveBeenCalled();
+          expect(vi.getTimerCount()).toBe(0);
+          await tick(receiver, 60 * 60_000);
+          expect(client.download).toHaveBeenCalledTimes(5);
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+    });
+
+    it('a ready frame before the relaunch is due runs it now and clears the timer', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const fx = fixture();
+        const { receiver, client } = stalledReceiver(fx, (n) => (n <= 4 ? 503 : 200));
+        receiver.onReady(transferOf());
+        await receiver.idle();
+        expect(vi.getTimerCount()).toBe(1);
+        receiver.onReady(transferOf());
+        await receiver.idle();
+        expect(client.download).toHaveBeenCalledTimes(5);
+        expect(readState(fx.stateFile).pending).toEqual({});
+        expect(vi.getTimerCount()).toBe(0);
+        await tick(receiver, 60 * 60_000);
+        expect(client.download).toHaveBeenCalledTimes(5);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it('where hard links fail, it copies without replacing: never a rename onto the target', async () => {
+    const fx = fixture();
+    const dir = fx.dirFor(fx.guest);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'build.log'), 'older');
+    const link = vi.fn(async () => { throw Object.assign(new Error('no hard links here'), { code: 'EPERM' }); });
+    const rename = vi.spyOn(fsp, 'rename');
+    try {
+      const deliver = vi.fn();
+      const receiver = createTransferReceiver({
+        client: fakeClient(), dirFor: fx.dirFor, deliver, sessionsForRoom: () => [fx.guest],
+        stateFile: fx.stateFile, log: silent, now: () => 1_000, sleep: noSleep, link,
+      });
+      receiver.onReady(transferOf());
+      await receiver.idle();
+      expect(link).toHaveBeenCalled();
+      expect(rename).not.toHaveBeenCalled();
+      expect(readFileSync(path.join(dir, 'build.log'), 'utf-8')).toBe('older');
+      const saved = path.join(dir, 'build-1.log');
+      expect(readFileSync(saved)).toEqual(CONTENT);
+      expect(readdirSync(dir).sort()).toEqual(['build-1.log', 'build.log']); // the .part is gone
+      expect(deliver.mock.calls[0][1]).toContain(`saved to ${saved} `);
+      expect(readState(fx.stateFile).arrived.map((a) => a.path)).toEqual([saved]);
+    } finally {
+      rename.mockRestore();
+    }
   });
 
   it('catchUp downloads a released transfer missed while asleep', async () => {
@@ -554,19 +677,83 @@ describe('transfer receiver', () => {
       expect(readState(fx.stateFile).pending).toEqual({});
     });
 
-    // O_NOFOLLOW and symlinks are POSIX-only.
-    it.skipIf(process.platform === 'win32')('never writes through a symlink planted at the .part path', async () => {
+    // Windows may refuse to make a symlink without the privilege: then there
+    // is nothing to test.
+    const plantSymlink = (ctx, target, at) => {
+      try {
+        symlinkSync(target, at);
+      } catch (e) {
+        if (e?.code === 'EPERM') ctx.skip();
+        throw e;
+      }
+    };
+
+    it('never writes through a symlink planted at the .part path', async (ctx) => {
       const fx = fixture();
       const dir = fx.dirFor(fx.guest);
       mkdirSync(dir, { recursive: true });
       const outside = path.join(fx.root, 'outside.txt');
       writeFileSync(outside, 'untouched');
       const { receiver, deliver } = makeReceiver(fx);
-      symlinkSync(outside, receiver.partPathFor(dir, transferOf()));
+      plantSymlink(ctx, outside, receiver.partPathFor(dir, transferOf()));
       receiver.onReady(transferOf());
       await receiver.idle();
       expect(readFileSync(outside, 'utf-8')).toBe('untouched');
       expect(deliver.mock.calls.map((c) => c[1])).toEqual([expect.stringMatching(/could not be saved/)]);
+    });
+
+    it('without O_NOFOLLOW (Windows) a symlink at the .part path is refused before the open', async (ctx) => {
+      const fx = fixture();
+      const dir = fx.dirFor(fx.guest);
+      mkdirSync(dir, { recursive: true });
+      const outside = path.join(fx.root, 'outside.txt');
+      writeFileSync(outside, 'untouched');
+      const { O_NOFOLLOW: _none, ...fsConstants } = nodeFs.constants;
+      const deliver = vi.fn();
+      const client = fakeClient();
+      const receiver = createTransferReceiver({
+        client, dirFor: fx.dirFor, deliver, sessionsForRoom: () => [fx.guest],
+        stateFile: fx.stateFile, log: silent, now: () => 1_000, sleep: noSleep, fsConstants,
+      });
+      plantSymlink(ctx, outside, receiver.partPathFor(dir, transferOf()));
+      receiver.onReady(transferOf());
+      await receiver.idle();
+      expect(readFileSync(outside, 'utf-8')).toBe('untouched');
+      expect(deliver.mock.calls.map((c) => c[1])).toEqual(['[file "build.log" could not be saved: a symlink is in the way]']);
+      expect(client.failed).toHaveBeenCalledWith('tr-1', 'a symlink is in the way');
+    });
+
+    it('without O_NOFOLLOW a 200 still starts a regular .part over', async () => {
+      const fx = fixture();
+      const dir = fx.dirFor(fx.guest);
+      mkdirSync(dir, { recursive: true });
+      const { O_NOFOLLOW: _none, ...fsConstants } = nodeFs.constants;
+      const client = fakeClient({ download: async () => new Response(CONTENT, { status: 200 }) });
+      const receiver = createTransferReceiver({
+        client, dirFor: fx.dirFor, deliver: vi.fn(), sessionsForRoom: () => [fx.guest],
+        stateFile: fx.stateFile, log: silent, now: () => 1_000, sleep: noSleep, fsConstants,
+      });
+      writeFileSync(receiver.partPathFor(dir, transferOf()), 'GARBAGE---');
+      receiver.onReady(transferOf());
+      await receiver.idle();
+      expect(readFileSync(path.join(dir, 'build.log'))).toEqual(CONTENT);
+    });
+
+    it('without O_NOFOLLOW a download still resumes from a regular .part', async () => {
+      const fx = fixture();
+      const dir = fx.dirFor(fx.guest);
+      mkdirSync(dir, { recursive: true });
+      const { O_NOFOLLOW: _none, ...fsConstants } = nodeFs.constants;
+      const client = fakeClient();
+      const receiver = createTransferReceiver({
+        client, dirFor: fx.dirFor, deliver: vi.fn(), sessionsForRoom: () => [fx.guest],
+        stateFile: fx.stateFile, log: silent, now: () => 1_000, sleep: noSleep, fsConstants,
+      });
+      writeFileSync(receiver.partPathFor(dir, transferOf()), CONTENT.subarray(0, 10));
+      receiver.onReady(transferOf());
+      await receiver.idle();
+      expect(client.download).toHaveBeenCalledWith('tr-1', expect.objectContaining({ start: 10 }));
+      expect(readFileSync(path.join(dir, 'build.log'))).toEqual(CONTENT);
     });
 
     it('a second inbox that cannot take a copy gets the failure line; the first still gets its file', async () => {
@@ -598,13 +785,38 @@ describe('transfer receiver', () => {
       expect(readFileSync(path.join(fx.dirFor(fx.guest), 'build.log'))).toEqual(CONTENT);
     });
 
-    // `"` is not a legal file-name character on Windows.
-    it.skipIf(process.platform === 'win32')('escapes " and ] in the name inside a room line', async () => {
+    // `"` is not a legal file-name character on Windows, so it is saved as
+    // `_` everywhere; `]` is legal, and only the room line escapes it.
+    it('escapes " and ] in the name inside a room line', async () => {
       const fx = fixture();
       const { receiver, deliver } = makeReceiver(fx);
       receiver.onReady(transferOf({ name: 'a"b]c.txt' }));
       await receiver.idle();
-      expect(deliver.mock.calls[0][1]).toMatch(/^\[sent file "a'b\)c\.txt" — saved to /);
+      const saved = path.join(fx.dirFor(fx.guest), 'a_b]c.txt');
+      expect(readFileSync(saved)).toEqual(CONTENT);
+      expect(deliver.mock.calls[0][1]).toMatch(/^\[sent file "a_b\)c\.txt" — saved to /);
+      expect(deliver.mock.calls[0][1]).toContain(`saved to ${saved} (`);
+    });
+
+    it('saves a name Windows would refuse under the same safe name on every platform', async () => {
+      const fx = fixture();
+      const { receiver, deliver } = makeReceiver(fx);
+      receiver.onReady(transferOf({ name: 'why?: a<b>|c*.log. . ' }));
+      await receiver.idle();
+      const dir = fx.dirFor(fx.guest);
+      expect(readdirSync(dir)).toEqual(['why__ a_b__c_.log']);
+      const saved = path.join(dir, 'why__ a_b__c_.log');
+      expect(deliver.mock.calls[0][1]).toMatch(/^\[sent file "why__ a_b__c_\.log" — saved to /);
+      expect(deliver.mock.calls[0][1]).toContain(`saved to ${saved} (`);
+      expect(readState(fx.stateFile).arrived.map((a) => a.path)).toEqual([saved]);
+    });
+
+    it('a name of only dots and spaces is saved as "file"', async () => {
+      const fx = fixture();
+      const { receiver } = makeReceiver(fx);
+      receiver.onReady(transferOf({ name: '. . .' }));
+      await receiver.idle();
+      expect(readdirSync(fx.dirFor(fx.guest))).toEqual(['file']);
     });
 
     it('downloads at most 2 at once; queued ones still count as active', async () => {
