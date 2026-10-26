@@ -90,6 +90,18 @@ describe('consent handlers', () => {
     expect(formatJournalConsentError({ error: 'forbidden', detail: 'own_ask_unverified' }, { kind: 'spawn' })).toMatch(/^the journal cannot tie your own request/);
   });
 
+  it('a file from work the Coordinator relayed, with the user\'s file switch off, names the switch', () => {
+    const why = "a file the Coordinator had another session send is the user's to approve while Coordinator file approvals are off";
+    expect(formatJournalConsentError({ error: 'forbidden', detail: 'own_ask_unverified', why }, { kind: 'transfer' }))
+      .toBe('this file comes from work you relayed (a carry-on, room message or spawn of yours), and the user has not switched on "Let the Coordinator approve file transfers" — leave it for the user');
+  });
+
+  it('the transfer cap is named as the cap on file approvals', () => {
+    expect(formatJournalConsentError({ error: 'conflict', detail: 'daily_cap', cap: 100 }, { kind: 'transfer' }))
+      .toBe('the daily cap on Coordinator file approvals is reached (100 in 24 h) — the file stays for the user; tell them in one line');
+    expect(formatJournalConsentError({ error: 'conflict', detail: 'daily_cap', cap: 20 }, { kind: 'spawn' })).toMatch(/^the daily cap on Coordinator approvals is reached \(20 in 24 h\)/);
+  });
+
   it('renders every journal refusal as a sentence that names the next move', async () => {
     const cases = [
       [{ status: 403, data: { error: 'forbidden', detail: 'not_coordinator' } }, /does not list this conversation as the Coordinator/],

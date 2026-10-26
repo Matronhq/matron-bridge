@@ -92,7 +92,8 @@ describe('consent wiring (source inspection)', () => {
     expect(coord).toMatch(/approve a file transfer only when the file, the sender and the receiving sessions match work you can see/i);
     expect(coord).toMatch(/never approve one whose note does not explain it/i);
     expect(coord).toMatch(/flagged[^\n]*always the user's/i);
-    expect(coord).toMatch(/transfer[^\n]*same daily cap/i);
+    expect(coord).toMatch(/work you relayed[^\n]*only while the user's "Let the Coordinator approve file transfers" switch is on/i);
+    expect(coord).toMatch(/Transfer approvals have a daily cap of their own/);
     expect(coord).toMatch(/transfer[^\n]*reason on every decision/i);
   });
 
