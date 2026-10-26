@@ -422,7 +422,7 @@ describe('start', () => {
         stopSession: (s) => stopped.push(s),
         bindSpawnRoom: (roomId, s) => { sequence.push('bind'); bound.push([roomId, s]); },
         unbindSpawnRoom: (roomId) => { sequence.push('unbind'); unbound.push(roomId); },
-        injectTurn: (s, text) => { sequence.push('inject'); injected.push([s, text]); return true; },
+        injectTurn: (s, text, meta) => { sequence.push('inject'); injected.push([s, text, meta]); return true; },
         serverLabel: 'box-6',
         ...overrides,
       });
@@ -441,6 +441,18 @@ describe('start', () => {
       expect(text).toContain('room-42');
       expect(text).toContain('acme-app');
       expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: true, result: { convo_id: 'convo-9' } });
+    });
+
+    it('the opening turn names its spawn as its cause, and only a well-formed id', () => {
+      const { handler, injected } = spawnHarness();
+      handler(REQ('start', { workdir: '~', prompt: 'do the thing', spawn_id: '6f1c2b3a-0d4e-4f5a-9b6c-7d8e9f0a1b2c' }));
+      expect(injected[0][2].causes.map((c) => [c.kind, c.ref])).toEqual([['other', 'spawned:6f1c2b3a-0d4e-4f5a-9b6c-7d8e9f0a1b2c']]);
+      // A journal that predates spawn_id, or a malformed one: `other` alone.
+      for (const spawnId of [undefined, 'spawn:x', 'a'.repeat(65), 42]) {
+        const h = spawnHarness();
+        h.handler(REQ('start', { workdir: '~', prompt: 'do the thing', ...(spawnId === undefined ? {} : { spawn_id: spawnId }) }));
+        expect(h.injected[0][2].causes.map((c) => [c.kind, c.ref])).toEqual([['other', undefined]]);
+      }
     });
 
     it('missing prompt with room_id -> bad_request, no startSession call', () => {

@@ -1617,7 +1617,9 @@ const journalRpcHandler = createRpcRequestHandler({
     agentRooms.record(roomId, { role: 'guest', state: 'joined', sessionRoomId: session.roomId });
   },
   unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
-  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  // meta.causes: the spawned child's opening turn names its spawn
+  // (spawnedCause), so the journal can follow the child's asks back to it.
+  injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null }),
   // Coordinator session control (lib/session-control.js): resolve or resume
   // the target, park while occupied, apply through the /model, /switch,
   // /compact and turn-injection paths. Late-bound like joinMission.
@@ -6099,9 +6101,12 @@ function sendTextToSession(session, text, opts) {
   return sendToSession(session, [{ type: 'text', text }], opts);
 }
 
-function submitCodexAsyncAnswer(session, text) {
+// `causes` are the user's replies that answered it (lib/codex-prompts.js
+// collects one per question): the message carries them like any queued
+// entry, so the turn it starts or joins is credited to the user's answer.
+function submitCodexAsyncAnswer(session, text, causes = null) {
   if (!session.alive || session._autoStopped) return false;
-  const entry = markJournalOrigin([{ type: 'text', text }]);
+  const entry = tagCauses(markJournalOrigin([{ type: 'text', text }]), causes);
   // Use the normal acknowledged steering / turn-start path so answers are
   // retained on a delivery race and enter history only when dispatched.
   // Never retry a previously uncertain send merely because an answer arrived.
@@ -9163,7 +9168,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
   if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
-    const answer = session.codexPrompts.answer({ text: trimmed });
+    const answer = session.codexPrompts.answer({ text: trimmed, causes });
     if (answer && !asyncQuestion) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     if (!answer) journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
@@ -9386,10 +9391,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 function journalRoutePromptReply(session, { choice, text }, { causes = null } = {}) {
   if (session.codexPrompts?.active) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
-    const answer = session.codexPrompts.answer({ choice, text });
+    const answer = session.codexPrompts.answer({ choice, text, causes });
     // A synchronous answer continues the turn that asked; an async one is
-    // sent as a message of its own (submitCodexAsyncAnswer), which names no
-    // cause yet.
+    // sent as a message of its own (submitCodexAsyncAnswer) that carries
+    // the reply's causes.
     if (answer && !asyncQuestion) joinHeldTurn(session, causes);
     if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
     return answer;
@@ -11395,11 +11400,11 @@ function deliverRoomFrameTo(room, frame) {
   // Another person's reply is never consumed inline by an agent_chat_send
   // wait (see the person block below).
   // A reply consumed inline reaches the agent inside its running turn, so
-  // the turn takes the message's cause as a delivered one would — for the
-  // journal to see a relay of the Coordinator's; the Coordinator's own turn
-  // is left as it was.
+  // the turn takes the message's cause as a delivered one would: for the
+  // journal to see a relay of the Coordinator's, and in the Coordinator's
+  // own turn so that a peer's words it took in count against its own asks.
   if (!person && roomReplyWaiters.resolve(replyWaiterKey(frame.convo_id, room.sessionRoomId), { from, body })) {
-    if (session.coordinator !== true) joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);
+    joinHeldTurn(session, [roomMessageCause(frame.convo_id, frame.seq)]);
     return;
   }
   if (person) {

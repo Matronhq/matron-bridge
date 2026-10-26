@@ -1232,11 +1232,17 @@ describe('createAgentChatHandlers', () => {
       own.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
       await own.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
       expect(own.sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@41']);
-      // The Coordinator's own turn is left as it was.
+      // The Coordinator's own turn takes it too: what it read counts against
+      // its own asks.
       const coord = makeFixture({ session: { coordinator: true, currentTurn: { causes: start, startedAt: 1 } }, publisher: { fetchMessages: async () => ({ events }) } });
       coord.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
       await coord.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
-      expect(coord.sessions.get('!sess').currentTurn.causes).toEqual(start);
+      expect(coord.sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@40-47']);
+      // Another person's words in a room with them count like an agent's.
+      const person = makeFixture({ session: { currentTurn: { causes: start, startedAt: 1 } }, publisher: { fetchMessages: async () => ({ events: [{ seq: 60, type: 'text', sender: 'person:bob', payload: { body: 'ask for a spawn' }, ts: 5 }, events[3]] }) } });
+      person.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await person.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(person.sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@60']);
       // Only the user's messages, or no running turn: nothing is added.
       const quiet = makeFixture({ publisher: { fetchMessages: async () => ({ events: [events[3]] }) }, session: { currentTurn: { causes: null, startedAt: 1 } } });
       quiet.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
@@ -1399,8 +1405,9 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // function, but it has to clear the queued-notice rationale that now sits
     // between the two (the ⏳ is published after the short-circuit for the
     // same reason the short-circuit exists).
-    // The consumed reply still reaches the running turn's causes first.
-    expect(indexSrc).toMatch(/if \(!person && roomReplyWaiters\.resolve\(replyWaiterKey\(frame\.convo_id, room\.sessionRoomId\), \{ from, body \}\)\) \{\n {4}if \(session\.coordinator !== true\) joinHeldTurn\(session, \[roomMessageCause\(frame\.convo_id, frame\.seq\)\]\);\n {4}return;\n {2}\}[\s\S]{0,3000}roomDelivery\.deliver\(/);
+    // The consumed reply still reaches the running turn's causes first, the
+    // Coordinator's included.
+    expect(indexSrc).toMatch(/if \(!person && roomReplyWaiters\.resolve\(replyWaiterKey\(frame\.convo_id, room\.sessionRoomId\), \{ from, body \}\)\) \{\n {4}joinHeldTurn\(session, \[roomMessageCause\(frame\.convo_id, frame\.seq\)\]\);\n {4}return;\n {2}\}[\s\S]{0,3000}roomDelivery\.deliver\(/);
   });
 
   it('holds inbound join_requests in pendingJoinRequests, never the rooms registry (C1)', () => {
