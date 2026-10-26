@@ -133,7 +133,7 @@ describe('consent handlers', () => {
     expect(formatJournalConsentError({ error: 'forbidden', detail: 'own_ask_unverified' })).toBe("the journal cannot tie your own request to the user's words or a routine fire — leave it for the user");
     // A request relayed through another session names where it came from.
     expect(formatJournalConsentError({ error: 'forbidden', detail: 'own_ask_unverified', why: 'relayed from the Coordinator (carry_on:co_0123456789abcdef): started by room_message' }))
-      .toBe("this request comes from your own carry-on or room message, and the journal cannot tie that to the user's words or a routine fire (why: relayed from the Coordinator (carry_on:co_0123456789abcdef): started by room_message) — leave it for the user");
+      .toBe("this request comes from your own carry-on, room message or spawn, and the journal cannot tie that to the user's words or a routine fire (why: relayed from the Coordinator (carry_on:co_0123456789abcdef): started by room_message) — leave it for the user");
     expect(formatJournalConsentError({ error: 'forbidden', detail: 'envelope' })).toBe("this request is outside the routine's envelope — leave it for the user or ask the user to widen the envelope");
     expect(formatJournalConsentError({ error: 'forbidden', detail: 'verifier' })).toBe("the verifier judged this request outside the routine's remit — leave it for the user");
     expect(formatJournalConsentError({ error: 'conflict', detail: 'routine_cap' })).toBe("routine-born approvals are at today's cap (?) — the ask stays for the user");

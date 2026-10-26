@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   CAUSE_KINDS, CAUSES_MAX, CAUSE_REF_MAX,
-  cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, roomBatchCauses, carryOnCause, plainCause,
+  cause, userMessageCause, itemCause, routineCause, spawnOutcomeCause, roomMessageCause, roomBatchCauses, carryOnCause, plainCause, spawnedCause,
   mergeCauses, mergeTurnCauses, mergeIntoTurn, queueCauses, tagCauses, tappedAction, beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, causesForAsk,
 } from '../lib/turn-cause.js';
 
@@ -82,6 +82,11 @@ describe('builders', () => {
       expect(plainCause(k)).toEqual({ kind: k, at: NOW });
     }
     expect(() => plainCause('nope')).toThrow();
+  });
+
+  it('spawnedCause: `other` naming the spawn, or bare for a missing or malformed id', () => {
+    expect(spawnedCause('6f1c2b3a-0d4e-4f5a-9b6c-7d8e9f0a1b2c')).toEqual({ kind: 'other', ref: 'spawned:6f1c2b3a-0d4e-4f5a-9b6c-7d8e9f0a1b2c', at: NOW });
+    for (const bad of [null, undefined, '', 'a:b', 'a'.repeat(65), 7]) expect(spawnedCause(bad)).toEqual({ kind: 'other', at: NOW });
   });
 });
 

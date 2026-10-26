@@ -36,6 +36,22 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(fnBody('async function journalRouteTextToSession(').match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(4);
   });
 
+  it('a Codex async question\'s answer, sent as a message of its own, carries the replies\' causes', () => {
+    expect(fnBody('function journalRoutePromptReply(')).toContain('session.codexPrompts.answer({ choice, text, causes });');
+    expect(fnBody('async function journalRouteTextToSession(')).toContain('session.codexPrompts.answer({ text: trimmed, causes });');
+    const submit = fnBody('function submitCodexAsyncAnswer(');
+    expect(submit).toContain('function submitCodexAsyncAnswer(session, text, causes = null) {');
+    expect(submit).toContain('const entry = tagCauses(markJournalOrigin([{ type: \'text\', text }]), causes);');
+    const wiring = readFileSync(new URL('../lib/codex-app-wiring.js', import.meta.url), 'utf8');
+    expect(wiring).toContain('submitAsync: (body, causes) => submitAsyncAnswer?.(session, body, causes),');
+  });
+
+  it('a spawned session\'s opening turn is sent with the causes the start handler names', () => {
+    expect(index).toContain('injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null }),');
+    const rpc = readFileSync(new URL('../lib/journal-rpc.js', import.meta.url), 'utf8');
+    expect(rpc).toContain('injectTurn(session, opening, { causes: [spawnedCause(params.spawn_id)] })');
+  });
+
   it('queued and resume-held messages keep their causes, and the flush that sends them merges them', () => {
     expect(fnBody('function sendToSession(')).toContain('(session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));');
     expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })');
