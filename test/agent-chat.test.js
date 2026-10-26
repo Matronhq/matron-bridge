@@ -76,6 +76,7 @@ function makeFixture(overrides = {}) {
     serverLabel: '2',
     deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
     publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages,
+    ...('personRoomState' in overrides ? { personRoomState: overrides.personRoomState } : {}),
     log,
   });
   return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer, publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages };
@@ -2783,6 +2784,76 @@ describe('chatStart with a person (talk request)', () => {
     // A different person is a different room.
     await handlers.chatStart({ ...talk, person: 'carol' });
     expect(invites.invite).toHaveBeenCalledTimes(2);
+  });
+
+  it('pending says where the card is: the room\'s own conversation and For you, not the session\'s chat', async () => {
+    const { handlers } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const res = await handlers.chatStart(talk);
+    expect(res.body.note).toMatch(/room's own conversation, "[^"]*👤 bob — cover editor"/);
+    expect(res.body.note).toMatch(/not in your session's chat/);
+    expect(res.body.note).toMatch(/For you/);
+  });
+
+  it('a repeat ask whose first is still waiting on the user\'s card says so, posts nothing and raises nothing', async () => {
+    const personRoomState = vi.fn(async () => ({ status: 200, data: { person_room: { state: 'awaiting_owner', person: 'bob' } } }));
+    const { handlers, invites, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
+    const first = await handlers.chatStart(talk);
+    calls.length = 0;
+    const again = await handlers.chatStart({ ...talk, message: 'also this' });
+    expect(personRoomState).toHaveBeenCalledWith(first.body.room_id);
+    expect(again.body).toMatchObject({ room_id: first.body.room_id, status: 'pending', waiting_on: 'your_user' });
+    expect(again.body.note).toMatch(/still waiting for YOUR user's card/);
+    expect(again.body.note).toMatch(/room's own conversation/);
+    expect(again.body.note).not.toMatch(/reused/);
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+    expect(calls.filter((c) => c.call === 'publishText')).toEqual([]);
+  });
+
+  it('a repeat ask the other person has yet to accept says it waits on them', async () => {
+    const personRoomState = async () => ({ status: 200, data: { person_room: { state: 'awaiting_guest' } } });
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
+    await handlers.chatStart(talk);
+    const again = await handlers.chatStart(talk);
+    expect(again.body).toMatchObject({ status: 'pending', waiting_on: 'bob' });
+    expect(again.body.note).toMatch(/waiting for bob to accept/);
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+  });
+
+  it('a repeat ask whose first the journal no longer holds starts a fresh room with a fresh card', async () => {
+    const personRoomState = async () => ({ status: 404, data: { error: 'not found' } });
+    const { handlers, invites, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
+    const first = await handlers.chatStart(talk);
+    const again = await handlers.chatStart(talk);
+    expect(again.body.room_id).not.toBe(first.body.room_id);
+    expect(again.body.status).toBe('pending');
+    expect(rooms.get(first.body.room_id).state).toBe('expired');
+    expect(invites.invite).toHaveBeenCalledTimes(2);
+    // The old room is closed in the chat list, with a line saying why.
+    expect(calls.some((c) => c.call === 'upsertConvo' && c.convoId === first.body.room_id && c.opts.sessionState === 'done')).toBe(true);
+    expect(calls.some((c) => c.call === 'publishText' && c.convoId === first.body.room_id && /no longer open/.test(c.payload.body))).toBe(true);
+  });
+
+  it('the same check covers a room at another person\'s shared session', async () => {
+    const roster = { ...ROSTER, people: [{ person: 'bob', sessions: [{ convo_id: 'bob-work', title: 'Bob work', agent_device_id: 40 }] }] };
+    const personRoomState = vi.fn(async () => ({ status: 200, data: { person_room: { state: 'awaiting_owner' } } }));
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState, publisher: { fetchRoster: async () => roster } });
+    const ask = { roomId: '!sess', target_convo_id: 'bob-work', topic: 'cover editor', justification: 'compare notes', message: 'hello bob' };
+    const first = await handlers.chatStart(ask);
+    expect(first.body.note).toMatch(/room's own conversation, "[^"]*👤 bob — cover editor"/);
+    const again = await handlers.chatStart(ask);
+    expect(again.body).toMatchObject({ room_id: first.body.room_id, status: 'pending', waiting_on: 'your_user' });
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unreadable journal or an open room reuses as before', async () => {
+    for (const r of [{ status: 0, data: { error: 'journal unreachable' } }, { status: 200, data: { person_room: { state: 'joined' } } }]) {
+      const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState: async () => r });
+      const first = await handlers.chatStart(talk);
+      const again = await handlers.chatStart(talk);
+      expect(again.body.room_id).toBe(first.body.room_id);
+      expect(again.body.note).toMatch(/existing room reused/);
+      expect(invites.invite).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('fails closed on unknown identity, like a session target', async () => {
