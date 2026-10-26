@@ -2821,13 +2821,16 @@ describe('chatStart with a person (talk request)', () => {
 
   it('a repeat ask whose first the journal no longer holds starts a fresh room with a fresh card', async () => {
     const personRoomState = async () => ({ status: 404, data: { error: 'not found' } });
-    const { handlers, invites, rooms } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
+    const { handlers, invites, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
     const first = await handlers.chatStart(talk);
     const again = await handlers.chatStart(talk);
     expect(again.body.room_id).not.toBe(first.body.room_id);
     expect(again.body.status).toBe('pending');
     expect(rooms.get(first.body.room_id).state).toBe('expired');
     expect(invites.invite).toHaveBeenCalledTimes(2);
+    // The old room is closed in the chat list, with a line saying why.
+    expect(calls.some((c) => c.call === 'upsertConvo' && c.convoId === first.body.room_id && c.opts.sessionState === 'done')).toBe(true);
+    expect(calls.some((c) => c.call === 'publishText' && c.convoId === first.body.room_id && /no longer open/.test(c.payload.body))).toBe(true);
   });
 
   it('the same check covers a room at another person\'s shared session', async () => {
