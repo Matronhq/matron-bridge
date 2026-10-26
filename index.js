@@ -12525,6 +12525,10 @@ const agentChatHandlers = createAgentChatHandlers({
   // overrule it with one tap.
   publishMuteCard: publishRoomMuteCard,
   retireMuteCard: (roomId, sessionKey) => journalInputConsumer.roomMuteCards.retire(roomId, sessionKey),
+  // Where a pending room with another person stands in the journal, so a
+  // repeat agent_chat_start can say whose card it waits on (or start afresh
+  // when the ask is over) instead of a bare "existing room reused".
+  personRoomState: (roomId) => sharingClient.personRoom(roomId),
   // A mute has to reach the backlog too: the gate in deliverRoomFrameTo only
   // stops NEW frames, and what a flooding peer already queued would otherwise
   // be injected wholesale at the next turn-end seam.
