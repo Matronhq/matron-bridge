@@ -462,7 +462,16 @@ npm run check   # node --check on every entrypoint
 npm run ci      # lint + check + test + npm audit (high)
 ```
 
-CI runs the same gates on Node 20 and 22.
+CI runs the same gates on Node 22, on Linux and on Windows.
+
+Two operator checks are kept out of `npm test`, because each needs a local install or an API key:
+
+```bash
+node scripts/check-codex-app-server.mjs        # Codex app-server contract check: ephemeral threads, no model turns, no tool runs
+node scripts/spoken-sample.mjs [conversation]  # print the spoken summary lines for a saved conversation (one real model call)
+```
+
+`check-codex-app-server.mjs` needs the Codex CLI installed and logged in; run it after a Codex upgrade. `spoken-sample.mjs` needs `OPENAI_API_KEY` or `GEMINI_API_KEY` (`SUMMARY_MODEL` overrides the model) and reads a JSON array of `{role, text}` messages, by default `test/fixtures/spoken-sample.json`. Neither prints keys or config values.
 
 ## File structure
 
