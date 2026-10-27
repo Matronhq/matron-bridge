@@ -29,7 +29,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
     const route = fnBody('function journalRoutePromptReply(');
     expect(route).toContain('{ causes = null } = {}');
     // print mode: the raw tool_result answer takes the turn seam with them.
-    expect(route).toContain('submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false, causes });');
+    expect(route).toContain('submitAnswer(session, `${header}${answerText}`, { causes });');
     // iv and Codex: the answer joins the turn that is waiting on it.
     expect(route.match(/joinHeldTurn\(session, causes\);/g)).toHaveLength(3);
     // A typed answer into an iv prompt (classified or not) or a Codex one joins it the same way.
@@ -137,13 +137,13 @@ describe('a running turn only ever gains causes', () => {
 describe('a user\'s answer or plan approval carries its causes', () => {
   it('a typed answer to a pending question forwards the message\'s causes to submitAnswer', () => {
     const route = fnBody('async function journalRouteTextToSession(');
-    expect(route.match(/submitAnswer\(session, [^\n]*\{ mirrorToJournal: false, causes \}\);/g)).toHaveLength(2);
+    expect(route.match(/submitAnswer\(session, [^\n]*\{ causes \}\);/g)).toHaveLength(2);
   });
 
   it('submitAnswer: the text-reply path sends them, the tool_result path begins or joins the turn with them', () => {
     const answer = fnBody('function submitAnswer(');
-    expect(answer).toContain('{ mirrorToJournal = true, causes = null } = {}');
-    expect(answer).toContain('sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal, causes });');
+    expect(answer).toContain('{ causes = null } = {}');
+    expect(answer).toContain('sendTextToSession(session, answerText, { skipJournalMirror: true, causes });');
     const seam = answer.indexOf('const beganTurn = beginOrJoinTurn(session, causes);\n    session.busy = true;');
     expect(seam).toBeGreaterThan(answer.indexOf("if (mode === 'text-reply')"));
     expect(seam).toBeLessThan(answer.indexOf('writePromptAnswer(session, jsonMsg'));

@@ -2306,25 +2306,12 @@ function journalStreamClear(session) {
   journalPublisher.endStream(convoId, ref, { clear: true });
 }
 
-// Mirror a user's accepted prompt answer (button tap, numbered/lettered
-// quick-reply, yes-no confirm, free-text prompt reply, AskUserQuestion
-// answer) into the journal as their side of the conversation. These paths
-// answer via PTY keystrokes (iv.respondToPrompt / iv.sendText) or the
-// tool_result stdin write and so bypass sendToSession's user-text mirror —
-// without this the journal would record the prompt but never the choice.
-// Each answering path calls this exactly once, at the point the answer is
-// accepted and dispatched.
-function journalMirrorUserAnswer(session, text) {
-  const body = typeof text === 'string' ? text.trim() : '';
-  if (!body) return;
-  journalPublishUserItem(session, 'publishText', { body, from: 'user' });
-}
-
-function recordUserAnswer(session, text, { mirrorToJournal = true } = {}) {
+// Record a user's accepted prompt answer in the session's own history. The
+// journal already holds the answer: every answer arrives as a journal event.
+function recordUserAnswer(session, text) {
   const body = typeof text === 'string' ? text.trim() : '';
   if (!body) return;
   recordConversationMessage(session, 'user', body);
-  if (mirrorToJournal) journalMirrorUserAnswer(session, body);
 }
 
 function reportPromptAnswerDeliveryFailure(session, error) {
@@ -4068,17 +4055,11 @@ async function handleInteractivePrompt(session, prompt) {
 // If the session has a pending TUI prompt and the user's message looks like
 // a valid response, send the keystroke and return true (so the message isn't
 // also forwarded to claude as a regular user message).
-//
-// mirrorToJournal defaults true (the Matrix path — the journal has no other
-// way of learning the user's answer). The journal input consumer passes
-// false: an answer that arrived AS a journal event (a plain text reply
-// routed here while a TUI prompt happened to be open) must not be
-// re-published — the journal already has the user's own `send` row for it.
-function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = true } = {}) {
+function maybeResolveInteractivePrompt(session, userText) {
   const p = session.pendingInteractivePrompt;
   if (!p) return false;
   const trimmed = (userText || '').trim().toLowerCase();
-  const mirrorAnswer = (text) => recordUserAnswer(session, text, { mirrorToJournal });
+  const mirrorAnswer = (text) => recordUserAnswer(session, text);
 
   // Confirm to the Matrix user what we sent on their behalf (without this the
   // consumption is invisible) and start a typing indicator for the next render.
@@ -4512,14 +4493,11 @@ function sendAllQuestions(session) {
   }
 }
 
-// mirrorToJournal defaults true (Matrix path). The journal input consumer
-// passes false when the answer arrived as a journal prompt_reply or plain
-// text event — the journal already has the user's own row for it (the
-// prompt_reply payload, or the text `send` row), so mirroring again here
-// would duplicate it.
+// The answer arrived as a journal prompt_reply or plain text event, so the
+// journal already has the user's own row for it and nothing is mirrored back.
 // causes: what the answer is (the user's message, lib/turn-cause.js), for
 // the turn it starts or joins — the same as for any other send.
-function submitAnswer(session, answerText, { mirrorToJournal = true, causes = null } = {}) {
+function submitAnswer(session, answerText, { causes = null } = {}) {
   const mode = session.waitingForAnswer;
   session.waitingForAnswer = null;
   session.pendingQuestions = null;
@@ -4528,7 +4506,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true, causes = nu
 
   if (mode === 'text-reply') {
     // AskUserQuestion was auto-rejected — send the answer as a regular user message
-    sendTextToSession(session, answerText, { skipJournalMirror: !mirrorToJournal, causes });
+    sendTextToSession(session, answerText, { skipJournalMirror: true, causes });
   } else {
     // Normal tool_result flow. This path only applies to print-mode stream-
     // json input. In iv-mode, user questions are surfaced and answered via the
@@ -4563,7 +4541,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true, causes = nu
       // This answer goes in via a raw tool_result stdin write (not
       // sendToSession), so record it only after stdin accepts the chunk.
       onDelivered: () => {
-        recordUserAnswer(session, answerText, { mirrorToJournal });
+        recordUserAnswer(session, answerText);
         if (session.resetTimeout) session.resetTimeout();
       },
       onError: (error) => reportSessionSendFailure(
@@ -9083,15 +9061,10 @@ function journalSessionCommandCtx(session) {
 // — cross-transport display parity). Everything a plain typed reply — or a
 // bridge command — can do, a Matron text message can do too.
 
-// Non-Matrix replacement for the deleted stripQueueNotificationLinks: its
-// Matrix tile-edit loop is gone along with outbound Matrix sends (Task 3),
-// but lib/busy-queue.js's 'send'/'interrupt' flush paths still rely on this
-// seam to clear session.queueNotifications when the queue empties — skip it
-// and a later re-queued message misaligns against stale notif entries (the
-// PR #104 Bugbot finding this array exists to prevent). The 'cancel'/
-// 'cancel:<n>' paths don't need this: their notif pop/splice already runs
-// unconditionally, independent of the (now Matrix-only, now null) editMessage
-// seam.
+// The stripQueueNotificationLinks seam: lib/busy-queue.js's 'send'/'interrupt'
+// flush paths call it to clear session.queueNotifications when the queue
+// empties — skip it and a later re-queued message misaligns against stale
+// notification entries. The 'cancel'/'cancel:<n>' paths pop their own entry.
 function clearQueueNotifications(session) {
   session.queueNotifications = [];
 }
@@ -9171,12 +9144,12 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
     const answer = session.codexPrompts.answer({ text: trimmed, causes });
     if (answer && !asyncQuestion) joinHeldTurn(session, causes);
-    if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    if (answer && !asyncQuestion) recordUserAnswer(session, answer);
     if (!answer) journalPublishNotice(journalConvoIdFor(session), 'Choose one of Codex’s offered options, or use !esc to interrupt.');
     return;
   }
 
-  if (session.iv && maybeResolveInteractivePrompt(session, trimmed, { mirrorToJournal: false })) {
+  if (session.iv && maybeResolveInteractivePrompt(session, trimmed)) {
     session.pendingUnclassifiedPrompt = false;
     joinHeldTurn(session, causes);
     return;
@@ -9208,9 +9181,9 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (q?.options?.length > 0) {
       const answer = resolveQuestionAnswer(session, trimmed);
       const header = q.header ? `${q.header}: ` : '';
-      submitAnswer(session, `${header}${answer}`, { mirrorToJournal: false, causes });
+      submitAnswer(session, `${header}${answer}`, { causes });
     } else {
-      submitAnswer(session, trimmed, { mirrorToJournal: false, causes });
+      submitAnswer(session, trimmed, { causes });
     }
     return;
   }
@@ -9297,29 +9270,17 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
       return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
     }
-    // Busy-queue magic words — the SAME classifier and implementation the
-    // old Matrix busy branch used (lib/busy-queue.js), checked at the same
-    // point (busy, not a TUI slash passthrough). Feedback goes through
-    // ctx.sendReply — a fresh sendToRoom text that also mirrors into the
-    // journal, like every other command reply. The Matrix tile-edit half of
-    // the PR #104 seams is gone (outbound Matrix sends retired, Task 3):
-    // editMessage is null (lib/busy-queue.js no-ops it), and
-    // stripQueueNotificationLinks is now clearQueueNotifications — same
-    // array-clearing effect minus the Matrix edit loop, still needed so a
-    // 'send'/'interrupt' flush doesn't leave stale notif entries to misalign
-    // a later re-queue (see clearQueueNotifications above). Kept as named
-    // keys (rather than omitted) so the wiring stays self-documenting and
-    // the source-inspection pin in test/busy-queue.test.js still finds both
-    // identifiers. Only sendHtml is omitted: journal feedback stays plain. A
-    // flush still goes through the one true flushQueue (single merged send +
-    // origin-aware mirroring, PR #100) — never a second flush path.
+    // Busy-queue magic words (lib/busy-queue.js), checked while busy and
+    // after the TUI slash passthrough. Feedback goes through ctx.sendReply,
+    // which mirrors into the journal like every other command reply; a flush
+    // goes through the one flushQueue (single merged send + origin-aware
+    // mirroring) and clears the notifications with clearQueueNotifications.
     const ctx = journalSessionCommandCtx(session);
     const handledMagicWord = await dispatchBusyQueueMagicWord(trimmed, session, {
       sendReply: ctx.sendReply,
       formatQueueSummary,
       flushQueue,
       stripQueueNotificationLinks: clearQueueNotifications,
-      editMessage: null,
       queueRelease: queueReleaseForBatch(session, pendingFlushBatch(session)),
       convoId: journalConvoIdFor(session),
       emitRelease,
@@ -9379,11 +9340,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
 
 // prompt_reply -> pending prompt. Resolves `choice`/`text` against whichever
 // pending-prompt shape the session currently has, then answers through the
-// SAME primitives a Matrix button tap or typed reply uses
-// (session.iv.respondToPrompt / submitAnswer) — never journalMirrorUserAnswer
-// or submitAnswer's own mirroring path: the prompt_reply journal row already
-// records the user's answer, so mirroring it again would duplicate it.
-// Returns the resolved answer's label (for the Matrix echo), or null if
+// SAME primitives a button tap or typed reply uses
+// (session.iv.respondToPrompt / submitAnswer), none of which mirror the
+// answer: the prompt_reply journal row already records it.
+// Returns the resolved answer's label (for the echo), or null if
 // nothing could be resolved (no pending prompt, or an unmatched choice with
 // no usable free text). `causes` names the user's reply row: a raw
 // tool_result answer takes it as its turn seam (submitAnswer), and an answer
@@ -9397,7 +9357,7 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
     // sent as a message of its own (submitCodexAsyncAnswer) that carries
     // the reply's causes.
     if (answer && !asyncQuestion) joinHeldTurn(session, causes);
-    if (answer && !asyncQuestion) recordUserAnswer(session, answer, { mirrorToJournal: false });
+    if (answer && !asyncQuestion) recordUserAnswer(session, answer);
     return answer;
   }
   if (session._codexBuildValue && choice === session._codexBuildValue && !session.busy) {
@@ -9423,7 +9383,7 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
           if (noteEffortConfirmationAnswer(session, p, resolved.option.label)) persistEffortLevel(session);
           session.pendingInteractivePrompt = null;
           session.pendingUnclassifiedPrompt = false;
-          recordUserAnswer(session, resolved.option.label, { mirrorToJournal: false });
+          recordUserAnswer(session, resolved.option.label);
           return resolved.option.label;
         }
       }
@@ -9441,7 +9401,7 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
       const dispatched = sendDelayedPromptAnswer(session, {
         response: ftResponse,
         text: freeText,
-        onDelivered: () => recordUserAnswer(session, freeText, { mirrorToJournal: false }),
+        onDelivered: () => recordUserAnswer(session, freeText),
         onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
       });
       if (!dispatched) return null;
@@ -9480,7 +9440,7 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
     }
     if (!answerText) return null;
     const header = q.header ? `${q.header}: ` : '';
-    submitAnswer(session, `${header}${answerText}`, { mirrorToJournal: false, causes });
+    submitAnswer(session, `${header}${answerText}`, { causes });
     return answerText;
   }
 
