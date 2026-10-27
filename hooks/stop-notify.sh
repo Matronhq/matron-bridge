@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop hook — notifies the matrix bridge that an assistant turn has finished.
+# Stop hook — notifies the bridge that an assistant turn has finished.
 # Mirrors the shape of hooks/compact-notify.sh.
 INPUT=$(cat)
 SID=$(echo "$INPUT" | jq -r '.session_id // empty')

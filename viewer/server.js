@@ -195,7 +195,7 @@ export function sensitiveFilename(label, filename) {
 }
 
 // Shell page for one-time sensitive data. Deliberately contains NO secret:
-// browsers, Safe Browsing, and Matrix URL previewers all GET links before or
+// browsers, Safe Browsing, and chat URL previewers all GET links before or
 // as the user clicks them, and with a one-time store the prefetch used to BE
 // the view ("already been viewed" before the user ever saw it). The secret
 // only moves on POST /sensitive/reveal, which nothing automated sends —
