@@ -45,7 +45,7 @@ describe('findTrackerLinks', () => {
   it('ignores links to other hosts, conversations, images and non-numeric paths', () => {
     const text = [
       '[#1 x](https://github.com/acme/repo/pull/1)',
-      '[a chat](matron://convo/abc-123)',
+      '[a chat](matron://convo/abc-def)',
       '![#2 pic](https://chat.example/u/alice/2)',
       '[#3 x](https://chat.example/u/alice/3/extra)',
       '[#4 x](https://evil.example/u/alice/4)',
@@ -199,7 +199,7 @@ describe('createTrackerLinkChecker', () => {
   it('skips matron://item links when the session\'s user is unknown', async () => {
     const { lookup, search } = fakeJournal(rows);
     const check = createTrackerLinkChecker({ lookup, search, base: () => null });
-    expect(await check(['[#290 Wrong title](matron://item/290)'])).toEqual({ ok: true });
+    expect(await check(['[#29 Wrong title](matron://item/29)'])).toEqual({ ok: true });
     expect(lookup).not.toHaveBeenCalled();
   });
 
