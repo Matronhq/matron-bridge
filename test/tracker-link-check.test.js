@@ -53,6 +53,20 @@ describe('findTrackerLinks', () => {
     expect(findTrackerLinks(text, { base: BASE })).toEqual([]);
   });
 
+  it('skips links written as code: an example of the link form is not a link', () => {
+    const text = [
+      'Write it as `[#12](https://chat.example/u/alice/12)` with a title.',
+      '```',
+      '[#13](https://chat.example/u/alice/13)',
+      '```',
+      '~~~md',
+      '[#14](https://chat.example/u/alice/14)',
+      '~~~',
+      `But this one counts: ${link(15)}`,
+    ].join('\n');
+    expect(findTrackerLinks(text, { base: BASE }).map((l) => l.num)).toEqual([15]);
+  });
+
   it('finds nothing in an empty or non-string text', () => {
     expect(findTrackerLinks('', { base: BASE })).toEqual([]);
     expect(findTrackerLinks(undefined, { base: BASE })).toEqual([]);
