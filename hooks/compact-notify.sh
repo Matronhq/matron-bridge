@@ -1,5 +1,5 @@
 #!/bin/bash
-# PreCompact hook — notifies the matrix bridge that compaction is starting
+# PreCompact hook — notifies the bridge that compaction is starting
 INPUT=$(cat)
 SID=$(echo "$INPUT" | jq -r '.session_id // empty')
 PORT="${MATRON_BRIDGE_API_PORT:-9802}"

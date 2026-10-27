@@ -1,12 +1,12 @@
 #!/bin/bash
 # PreToolUse hook for ExitPlanMode — gates plan-mode approval through the
-# matrix bridge instead of letting claude's TUI show a "Build? Y/n" prompt.
+# bridge instead of letting claude's TUI show a "Build? Y/n" prompt.
 #
 # Flow:
 #   1. Hook receives the tool_use_id and plan text on stdin.
 #   2. POSTs to bridge HTTP /plan-decision and BLOCKS until the bridge
 #      responds (the bridge holds the response open while it waits for the
-#      user's Matrix reply — see the timeout matching --max-time below).
+#      user's reply — see the timeout matching --max-time below).
 #   3. Returns hookSpecificOutput with permissionDecision allow|deny.
 #
 # For any tool_name other than ExitPlanMode the hook is a no-op pass-through.

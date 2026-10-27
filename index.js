@@ -329,7 +329,7 @@ if (isRootOutsideSandbox()) {
   console.warn(`[permissions] ${ROOT_BYPASS_WARNING}`);
 }
 // Idle reaping: a session is killed if no activity (incoming user message OR
-// outgoing assistant text posted to Matrix) is observed within this window.
+// outgoing assistant text posted to the chat) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
 // --resume. Set to 0 to disable.
 // Default 1h. Reaping is silent and the next user message auto-resumes the
@@ -382,9 +382,11 @@ const SELF_RESTART_STAMP_FILE = path.join(os.homedir(), '.matron-bridge-self-res
 // backstop so a message is never lost if readiness is never detected.
 const RESUME_READY_QUIET_MS = parseInt(process.env.RESUME_READY_QUIET_MS || '800', 10);
 const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || '120000', 10);
-const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
+const MAX_MSG_LENGTH = 32768;  // practical size limit for one chat message
 const DEBUG = process.env.DEBUG === '1';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
+// The ~/.claude-matrix-* state file names below are historical; renaming them
+// would need a migration.
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 // One-time "Bridge online" marker — see lib/announce-once.js.
 const ANNOUNCE_MARKER_FILE = path.join(os.homedir(), '.claude-matrix-announced.json');
@@ -631,9 +633,9 @@ if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[viewer] HMAC_SECRET or VIEWER_BASE_URL unset — file links and secure secret/sensitive-data links disabled');
 }
 
-// Journal dual-post (migration off Matrix — see matron-journal's protocol
-// design doc). JOURNAL_TOKEN_FILE takes precedence over JOURNAL_TOKEN when
-// both are set; the file is read once at boot. Disabled (safe no-op) unless
+// Journal connection (see matron-journal's protocol design doc).
+// JOURNAL_TOKEN_FILE takes precedence over JOURNAL_TOKEN when both are set;
+// the file is read once at boot. Disabled (safe no-op) unless
 // both the URL and a token resolve to non-empty strings — see
 // createJournalPublisher's own warning for the disabled case.
 const JOURNAL_WS_URL = process.env.JOURNAL_WS_URL || '';
@@ -1207,8 +1209,7 @@ if (JOURNAL_ENABLED) {
   refreshJournalIdentity({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
-  // other publish here). No Matrix dependency: this convo has no Matrix
-  // room, only a journal conversation.
+  // other publish here). This convo has no session, only a journal conversation.
   journalPublisher.upsertConvo(JOURNAL_CONTROL_CONVO_ID, { title: `${os.hostname()} bridge`, sessionState: 'running' });
   // First boot for this control convo only — idle-stopped boxes wake several
   // times a day, and a fresh message here on every boot bumps the control
@@ -1983,9 +1984,8 @@ function journalActivity(session, state, detail) {
 }
 
 // Compute and publish a structured `diff` journal event for an
-// Edit/Write/MultiEdit tool_use — the journal-only replacement for the old
-// "✏️ Editing [path](link)" Matrix indicator (see the diff-cards design in
-// matron-apple).
+// Edit/Write/MultiEdit tool_use, which the apps render as a diff card (see
+// the diff-cards design in matron-apple).
 // `label` is the subagent label, null for the parent agent. Published at
 // tool_use time, same semantics as the old message (a denied edit still
 // shows its card). Deliberately SYNCHRONOUS end to end: journalPublish
@@ -1993,7 +1993,7 @@ function journalActivity(session, state, detail) {
 // events publish first and reorder cards against their tool_use. The only
 // I/O is Write's size-capped readFileSync of the old content inside
 // computeEditDiff, which swallows every failure — journal problems never
-// touch the Matrix hot path.
+// break the session's event handling.
 function buildEditDiffPayload(session, toolName, input, label) {
   const absPath = path.isAbsolute(input.file_path)
     ? input.file_path
@@ -2326,11 +2326,11 @@ function reportPromptAnswerDeliveryFailure(session, error) {
 // downloaded and materialized locally.
 // Best-effort and fire-and-forget: the HTTP media upload is awaited inside
 // this async IIFE, but the call site never awaits journalMirrorUserMedia
-// itself, so a slow or dead journal server never delays the Matrix/Claude
+// itself, so a slow or dead journal server never delays the Claude
 // media flow. uploadMedia already fails open (null on any failure); a null
 // here just means the file/image event is skipped — a journal event without
 // a blob to point at is useless. image vs file is chosen by content-type
-// prefix (not Matrix msgtype), since a PDF or a picture sent as a generic
+// prefix (not msgtype), since a PDF or a picture sent as a generic
 // m.file still has an image/* or application/pdf mime either way.
 function journalMirrorUserMedia(session, { buffer, mime, name, dims }) {
   if (!JOURNAL_ENABLED) return;
@@ -2707,7 +2707,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Chat history for topic summarization
     chatHistory: [],         // { role, text } - full messages (code/tools stripped)
     pinnedSummaryEventId: null, // event ID of pinned summary message
-    pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
+    pinnedSummaryText: '',       // accumulated summary text (source of truth)
     lastSummaryMsgCount: 0, // chatHistory index the summary pass has consumed through (persisted)
     lastRosterText: '',     // last ROSTER paragraph — preamble for the next incremental pass (persisted)
   };
@@ -3422,7 +3422,7 @@ function finishCodexTurn(session, {
 // JSONL transcript (via TranscriptTail), turn-end comes from the Stop hook,
 // plan approval comes from the PreToolUse:ExitPlanMode hook. Returns a
 // session object with the same shape as createSession() so downstream code
-// (Matrix posting, queue management, restart) is unchanged.
+// (chat posting, queue management, restart) is unchanged.
 function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options = {}) {
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persistedForRoom = getPersistedSession(roomId);
@@ -3477,7 +3477,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       // ExitPlanMode is NOT intercepted in iv-mode. Claude's own in-TUI
       // confirmation prompt ("Yes / Yes, manually / Refine / Tell Claude
       // what to change") is caught by lib/prompt-detector.js and routed
-      // through Matrix as a numbered question — that's the single approval
+      // to the user as a numbered question — that's the single approval
       // round. The hook+/plan-decision flow remains in print-mode only.
       PreToolUse: [
         // The foreign-turn gate (lib/foreign-turn.js), first and on every tool.
@@ -3504,8 +3504,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   claudeArgs.push(
     ...(ivBypass ? ['--dangerously-skip-permissions'] : ['--permission-mode', 'auto']),
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
-    // (lib/prompt-detector.js) catches it and routes the question through
-    // Matrix. Print-mode kept it disallowed because there was no way to
+    // (lib/prompt-detector.js) catches it and routes the question to the
+    // user. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
     // The Coordinator runs without file-editing tools (spec §2c). iv mode has
     // no other disallowed tool, so an ordinary session gets no flag at all.
@@ -3846,7 +3846,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     foreignSessions.end(session);
     endTurn(session);
     debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
-    // Flush the accumulated assistant text to Matrix.
+    // Flush the accumulated assistant text to the chat.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
       flushResponse(session);
     }
@@ -3898,7 +3898,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   };
 
   // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
-  // fires. We post the plan to Matrix and stash the tool_use_id so that
+  // fires. We post the plan to the chat and stash the tool_use_id so that
   // the "build" handler in the message loop can call
   // pendingPlanDecisions.get(toolUseId).resolve(...) when the user replies.
   session.requestPlanDecision = (toolUseId, planText) => {
@@ -3937,7 +3937,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   return session;
 }
 
-// Surface a detected TUI prompt to Matrix as a multiple-choice question.
+// Surface a detected TUI prompt to the user as a multiple-choice question.
 async function handleInteractivePrompt(session, prompt) {
   if (!session.sendHtml && !session.sendCallback) return;
   // Surface claude's explanatory prose (rendered above the menu) BEFORE the
@@ -3999,7 +3999,7 @@ async function handleInteractivePrompt(session, prompt) {
       if (session.pendingInteractivePrompt !== prompt) return;
       // sendButtonMessage (index.js) returns true once it's published the
       // prompt to the journal, or null when there's no journal session for
-      // this room to publish to (outbound Matrix sends are gone — Task 3).
+      // this room to publish to.
       // Fall through to the text rendering below in the null case so the
       // prompt is never silently dropped while the TUI waits for an answer.
       const sent = await session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
@@ -4061,7 +4061,7 @@ function maybeResolveInteractivePrompt(session, userText) {
   const trimmed = (userText || '').trim().toLowerCase();
   const mirrorAnswer = (text) => recordUserAnswer(session, text);
 
-  // Confirm to the Matrix user what we sent on their behalf (without this the
+  // Confirm to the user what we sent on their behalf (without this the
   // consumption is invisible) and start a typing indicator for the next render.
   const ack = (label, { numberPrefix = '', note = '' } = {}) => {
     const tail = note ? ` ${note}` : '';
@@ -4192,7 +4192,7 @@ function unwrapUrls(text) {
 }
 
 // Surface free-text TUI output (e.g. the /login OAuth URL screen, "press
-// enter to continue" notices) to Matrix. Triggered by the prompt-detector's
+// enter to continue" notices) to the user. Triggered by the prompt-detector's
 // `screen-update` event whenever the screen settles with URLs or input
 // cues that don't classify as a structured menu — those are the only PTY
 // states the user MUST see but that don't fire transcript events and
@@ -4421,9 +4421,9 @@ function formatQuestion(q, index, total) {
 }
 
 function formatQuestionHtml(q, index, total) {
-  // Matrix custom HTML (org.matrix.custom.html) collapses raw "\n" to a single
-  // space, so options separated only by newlines render as a run-on wall in
-  // Element/matron-web. Use explicit <br> for line breaks and a blank line
+  // HTML rendering collapses raw "\n" to a single space, so options
+  // separated only by newlines render as a run-on wall. Use explicit <br>
+  // for line breaks and a blank line
   // (double <br>) between options so A/B/C are visually separated. An option
   // whose label is tagged "(Recommended)" gets a ⭐ marker.
   let msg = '';
@@ -4970,7 +4970,7 @@ function handleClaudeEvent(session, event) {
       }
       // Suppress claude's "No response requested." filler. It's emitted in
       // response to internal synthetic prompts (e.g. resume-time nudges)
-      // and is just noise on Matrix. Suppress only the text — fall
+      // and is just noise in the chat. Suppress only the text — fall
       // through to the tool_use loop below so any concurrent tool calls
       // (Task/AskUserQuestion/etc.) still get handled.
       const isFiller = textParts.length === 1 && /^\s*No response requested\.?\s*$/.test(textParts[0]);
@@ -5139,8 +5139,8 @@ function handleClaudeEvent(session, event) {
                 // Cap once here so a pathological (~1 MiB) command can't blow
                 // past the server's 1 MiB WS payload cap in the offset-0
                 // frame's meta; the server truncates meta at 2000 chars
-                // itself, so this changes nothing semantically. Matrix-event
-                // and display uses keep the untruncated displayCommand.
+                // itself, so this changes nothing semantically. Display
+                // uses keep the untruncated displayCommand.
                 const streamCommand = String(displayCommand).slice(0, 2000);
                 const pump = createToolStreamPump({
                   logPath: liveLogPath,
@@ -5195,9 +5195,9 @@ function handleClaudeEvent(session, event) {
                      && input.file_path) {
             // Journal-only: a structured `diff` event
             // replaces the old "✏️ Editing [path](link)" room message —
-            // isKeyEvent stays false, so nothing posts to Matrix and
-            // nothing mirrors into the journal as text. session.toolCalls
-            // below still gets this plain line for the turn summary.
+            // isKeyEvent stays false, so nothing posts to the chat as
+            // text. session.toolCalls below still gets this plain line for the
+            // turn summary.
             const verb = toolName === 'Write' ? 'Writing' : 'Editing';
             indicator = `✏️ ${verb} ${input.file_path}`;
             publishEditDiff(session, toolName, input, null);
@@ -5238,11 +5238,9 @@ function handleClaudeEvent(session, event) {
             isKeyEvent = true;
           }
 
-          // When sendLiveOutputEvent already posted a Matrix message for
-          // this Bash call, skip the regular `🔧 <command>` indicator —
-          // the live-output message contains the same command in its
-          // fallback body/formatted_body, so non-matron-web clients still
-          // see it, and matron-web clients see the rendered viewer tile.
+          // When sendLiveOutputEvent already published this Bash call's
+          // tool activity (which carries the command), skip the regular
+          // `🔧 <command>` indicator.
           if (!liveOutputSent) {
             session.toolCalls.push(indicator);
             if (isKeyEvent && session.sendHtml && indicatorHtml) {
@@ -5651,7 +5649,7 @@ function handleClaudeEvent(session, event) {
       // routine context trimming (every turn in long sessions), NOT just full
       // compaction. The system event with subtype='compact' already handles
       // actual compaction notifications, so we intentionally skip these here
-      // to avoid spamming the Matrix room.
+      // to avoid spamming the chat.
       break;
     }
 
@@ -5890,8 +5888,8 @@ function inflightTurnOrigin(session) {
 // skipJournalMirror: the journal input consumer's routed text has already
 // been recorded in the journal (the client's own `send` row) — publishing it
 // again here as an agent-sourced echo would duplicate it. Every other caller
-// (Matrix messages, which have no other route into the journal) leaves this
-// false, unchanged from before.
+// (text the bridge injects itself, which has no other route into the
+// journal) leaves this false.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, causes = null } = {}) {
   if (!session.alive || session._autoStopped) return false;
   // Backstop for the foreign-turn gate: a turn of the session's own that
@@ -5987,12 +5985,12 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   }
 
   // /context-full is a bridge-only command — claude itself knows only
-  // /context. Rewrite it here, the single choke point every transport
-  // funnels through (Matrix messages, journal-routed text, queue flushes),
-  // and arm the one-shot flag flushResponse consumes to let the resulting
-  // report through untrimmed. Placed after the journal mirror above so the
-  // journal records what the user actually typed. Plain /context needs no
-  // marking: flushResponse trims any context report by default.
+  // /context. Rewrite it here, the single choke point every input funnels
+  // through (journal-routed text, queue flushes), and arm the one-shot flag
+  // flushResponse consumes to let the resulting report through untrimmed.
+  // Placed after the journal mirror above so the journal records what the user
+  // actually typed. Plain /context needs no marking: flushResponse trims any
+  // context report by default.
   if (contentBlocks.length === 1 && contentBlocks[0].type === 'text') {
     const nativeContext = contextFullToNative(contentBlocks[0].text);
     if (nativeContext) {
@@ -6328,7 +6326,7 @@ function formatQueueSummary(queued) {
 // back-to-back sendToSession calls paste twice into the same input line and
 // submit as one concatenated message). The send itself always carries
 // skipJournalMirror: true; journal mirroring happens out-of-band afterward,
-// once we know the send actually went out — the Matrix-origin text subset
+// once we know the send actually went out — the non-journal-origin text subset
 // via journalPublishUserItem, and any media blocks' deferred journal mirror
 // (Bugbot finding #4 — see lib/media-mirror.js) via journalMirrorUserMedia.
 // A queue entry that never reaches here (cancelled, or the whole queue
@@ -6720,10 +6718,9 @@ function padTable(tableText) {
 // Journal bodies are raw markdown: Matron clients render GFM themselves
 // (the Mac timeline lays out pipe tables natively as of matron-apple #134,
 // iOS/Android via their markdown views), so nothing here may rewrite
-// message text for presentation. The old plainTextFormat() Element X
-// fallback — fence + pad pipe tables for monospace — lived here until
-// 2026-08-12; it survived the Matrix exit and silently downgraded every
-// table to a code block on all clients.
+// message text for presentation. Don't reintroduce a fallback that fences
+// and pads pipe tables for monospace: it downgrades every table to a code
+// block on all clients.
 
 // --- File Helpers ---
 
@@ -6743,12 +6740,12 @@ function deduplicateFilename(dir, filename) {
 
 // --- Send to Session ---
 
-// skipJournalMirror: set by the journal input consumer's Matrix echoes
-// (e.g. "📱 alice (Matron): <body>") and resolved-answer notices — those exist
-// only so the Matrix room shows what arrived via the journal; mirroring them
-// BACK into the journal as a fresh from:'assistant' text event would be
+// skipJournalMirror: set by the journal input consumer's echoes
+// (e.g. "📱 alice (Matron): <body>") and resolved-answer notices. Publishing
+// them into the journal as a fresh from:'assistant' text event would be
 // exactly the re-publish loop the return path must avoid (the journal
-// already has the user's own row for that content).
+// already has the user's own row for that content), so with the flag set
+// sendToRoom publishes nothing.
 async function sendToRoom(roomId, text, html, { skipJournalMirror = false, notice = null } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
   // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
@@ -6806,8 +6803,8 @@ async function sendLiveOutputEvent(session, { command }) {
 // (exit_code: null) — every stream ends in exactly one finalize; a second
 // call for the same ref is a no-op (the registry entry is gone).
 // Fire-and-forget async: the upload is HTTP, and journal problems must never
-// touch the Matrix hot path (uploadMedia and finalizeToolOutput both already
-// fail open).
+// block the session's event handling (uploadMedia and finalizeToolOutput
+// both already fail open).
 const TOOL_LOG_UPLOAD_MAX_BYTES = 10 * 1024 * 1024; // well under the server's 50 MB media cap
 const TOOL_SNIPPET_READ_BYTES = 64 * 1024; // decode only the tail we snippet from
 
@@ -6935,7 +6932,7 @@ function sweepToolStreams(session) {
   }
 }
 
-// fallbackBody/fallbackHtml are the retired Matrix plain/HTML fallback text.
+// fallbackBody/fallbackHtml are retired plain/HTML fallback text.
 // Still accepted because ~11 call sites pass them positionally through the
 // session.sendButtonMessage closures; the journal publishes structured
 // prompts and ignores them. Retiring the whole fallback-text plumbing is a
@@ -6954,7 +6951,8 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _
 
 // Mint a globally-unique conversation id for a new session. Journal convention
 // is a UUID (see matron-journal protocol.md: bridges MUST mint globally-unique
-// convo ids). This id doubles as the in-memory session key (formerly the Matrix room id).
+// convo ids). This id doubles as the in-memory session key (`roomId`, a
+// historical name).
 function newSessionConvoId() {
   return randomUUID();
 }
@@ -7019,7 +7017,7 @@ async function maybeUpdatePinnedSummary(session) {
   // (maybeSummarizeAtTurnEnd) gates on >=SUMMARY_MIN_NEW new messages.
 
   try {
-    // Use in-memory summary as source of truth (not Matrix, since getEvent returns original, not edits)
+    // Use in-memory summary as source of truth
     let currentSummary = session.pinnedSummaryText || '';
     const bulletCount = (currentSummary.match(/^•/gm) || []).length;
 
@@ -7117,11 +7115,9 @@ async function maybeUpdatePinnedSummary(session) {
     }
 
     if (updatedSummary) {
-      // Store accumulated summary in session (source of truth). The Matrix
-      // pinned-message mechanics (create/verify/edit the pinned event,
-      // m.room.pinned_events bookkeeping) are gone along with outbound
-      // Matrix sends — only the summary text itself has ongoing meaning, so
-      // that's all that gets persisted now.
+      // Store accumulated summary in session (source of truth). Only the
+      // summary text itself has ongoing meaning, so that's all that gets
+      // persisted.
       session.pinnedSummaryText = updatedSummary;
       if (session.claudeSessionId) {
         persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
@@ -7477,9 +7473,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           startModel ? { model: startModel, ...explicitModelFlag(startModel) } : undefined);
       }
 
-      // Confirm in the origin room/convo. No matrix.to room link: Matron is
-      // the only client now, and its new conversation appears on its own —
-      // a Matrix room URL is just a dead link there.
+      // Confirm in the origin room/convo. No link to the new conversation:
+      // it appears in Matron on its own.
       // Show what the session actually got: machine defaults plus its own flags.
       const shownStartExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
       const extrasNote = shownStartExtras.length > 0 ? ` (extras: ${shownStartExtras.join(', ')})` : '';
@@ -8532,7 +8527,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           break;
         }
         // This branch used to be silent on success — the TUI shows the
-        // command running, but a Matron/Matrix user can't see the TUI, so
+        // command running, but a Matron user can't see the TUI, so
         // /logout appeared to do nothing (live-test round 2). Acknowledge,
         // and mark the /logout so the exit-0 handler confirms it instead of
         // reporting a generic session end. Deliberately does NOT set
@@ -8621,7 +8616,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       // No-arg: offer buttons. Bare /effort in the TUI opens a "Change effort
       // level?" arrow-menu the bridge can't drive (paste+Enter just opens it
-      // and leaves it hanging), so present the levels as Matrix buttons and
+      // and leaves it hanging), so present the levels as picker buttons and
       // dispatch the pick back through switchEffortInSession (which sends
       // `/effort <level>` inline — no picker).
       if (session.iv) {
@@ -8954,7 +8949,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // bypassing the session-keyed journalPublish buffering — used when there may
 // be no live session object for the target convo (e.g. a reply for a
 // session that no longer exists) or for control-convo replies (which have no
-// Matrix room / session at all). Fails open like every other journal call.
+// session at all). Fails open like every other journal call.
 // `notice` ({kind, icon, summary}, lib/system-notice.js) marks a notice the
 // apps may show as one compact row that expands to `body`.
 function journalPublishNotice(convoId, body, notice = null) {
@@ -9008,23 +9003,21 @@ function formatInterruptedAgo(ageMs) {
   return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
 }
 
-// Echo something into a session's Matrix room WITHOUT re-mirroring it into
-// the journal (sendToRoom's default behavior publishes a from:'assistant'
+// Echo something into a session's room WITHOUT re-mirroring it into the
+// journal (sendToRoom's default behavior publishes a from:'assistant'
 // text event for everything it sends — see its own comment — which for an
 // echo of content the journal already has would be exactly the re-publish
-// loop this return path exists to avoid). Fire-and-forget: Matrix delivery
-// failures here must never affect journal-side processing.
+// loop this return path exists to avoid). With the journal as the only
+// output this publishes nothing. Fire-and-forget: failures here must never
+// affect journal-side processing.
 function journalEchoToRoom(session, plain, html) {
   if (!session || !session.roomId) return;
   sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
 }
 
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
-// replies go through the NORMAL sendToRoom for the session's Matrix room —
-// which already mirrors to the journal, so both surfaces see the command's
-// output — and the command text itself was already echoed into the room by
-// journalOnText (the "📱 alice (Matron): ..." line) before this ever runs, so
-// the room reads as a complete transcript of what was asked. `sender` is who
+// replies go through the NORMAL sendToRoom for the session's room id,
+// which publishes them into the session's journal convo. `sender` is who
 // a command like !start/!resume/!workdir invites into any NEW room it
 // creates; the bridge is single-user, so ALLOWED_USER_IDS[0] is the only
 // sane choice — the same assumption journalHandleControlCommand's
@@ -9037,29 +9030,26 @@ function journalSessionCommandCtx(session) {
   };
 }
 
-// text -> session. Mirrors the ordering a Matrix reply goes through —
-// bridge-intercepted !/ command dispatch (classifyBridgeCommand +
-// handleCommand — Deliverable 1/2, see lib/command-dispatch.js),
-// pending-TUI-prompt resolution (maybeResolveInteractivePrompt, same
-// parseOptionReply-driven logic a typed Matrix reply uses), the
+// text -> session, in this order: bridge-intercepted !/ command dispatch
+// (classifyBridgeCommand + handleCommand — Deliverable 1/2, see
+// lib/command-dispatch.js), pending-TUI-prompt resolution
+// (maybeResolveInteractivePrompt, parseOptionReply-driven), the
 // detector-missed "unclassified prompt" menu guard, print-mode
 // AskUserQuestion resolution, the plan-mode `build` keyword
-// (dispatchPlanBuild + the shared approvePlanBuild), iv-mode PTY rescue
-// keystrokes (classifyRescueKeystroke), THEN busy-queueing (with the same
-// TUI-slash-passthrough bypass Matrix uses), THEN a normal turn — using the
-// exact same session state (queuedMessages, pendingInteractivePrompt,
-// pendingUnclassifiedPrompt) a Matrix message would, rather than a second
+// (dispatchPlanBuild + approvePlanBuild), iv-mode PTY rescue
+// keystrokes (classifyRescueKeystroke), THEN busy-queueing (with the
+// TUI-slash-passthrough bypass), THEN a normal turn — using the session
+// state (queuedMessages, pendingInteractivePrompt,
+// pendingUnclassifiedPrompt) every other input uses, rather than a second
 // parallel queue. Every downstream call passes the mirror-bypass flag: the
 // journal already has this text as the client's own `send` row, so nothing
 // here may publish a duplicate agent-sourced echo of it.
 //
 // Scope note: the busy-queue magic words (bare "send"/"interrupt"/"cancel")
-// are reproduced below via the shared lib/busy-queue.js implementation the
-// Matrix busy branch also uses — feedback is a fresh text, and the Matrix
-// "📨 Queued" tiles are maintained exactly like their Matrix counterparts
-// (cancel pops-and-edits the cancelled tile; send clears + strips the rest
-// — cross-transport display parity). Everything a plain typed reply — or a
-// bridge command — can do, a Matron text message can do too.
+// are handled below via the shared lib/busy-queue.js implementation —
+// feedback is a fresh text, and the "📨 Queued" tiles are maintained
+// (cancel pops-and-edits the cancelled tile; send clears + strips the
+// rest).
 
 // The stripQueueNotificationLinks seam: lib/busy-queue.js's 'send'/'interrupt'
 // flush paths call it to clear session.queueNotifications when the queue
@@ -9074,14 +9064,12 @@ function clearQueueNotifications(session) {
 // calls onTurnEnd and `busy` would stay true until the next cue or turn,
 // wedging every later message into the queue. The compact_boundary handler
 // in handleClaudeEvent stands in as the turn-end when this marker is armed
-// for the current turn (#73). The Matrix handler armed it until the Matrix
-// client went (7af9450); since then no path did, so every journal-originated
-// iv /compact — the user's, a Coordinator compact, an auto-resume's, the
-// pre-reap handoff's — left the session busy. Same guards as the original:
-// idle only (a /compact typed mid-turn is ended by that turn's own Stop
-// hook, and arming would let a later boundary clear busy under the next
-// turn), stamped with the current turnCount so a stale boundary cannot
-// stand in for a later turn's end, and self-disarmed after a generous
+// for the current turn (#73). Without it every iv /compact — the user's, a
+// Coordinator compact, an auto-resume's, the pre-reap handoff's — left the
+// session busy. Guards: idle only (a /compact typed mid-turn is ended by
+// that turn's own Stop hook, and arming would let a later boundary clear busy
+// under the next turn), stamped with the current turnCount so a stale boundary
+// cannot stand in for a later turn's end, and self-disarmed after a generous
 // window in case compaction fails and no boundary ever arrives. Print mode
 // needs none of this: its compact run emits its own result event.
 const OPERATOR_COMPACT_ARM_MS = 300_000;
@@ -9116,9 +9104,8 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   if (session.codex?.transport === 'app-server' && await runCodexControl(session, trimmed)) return;
 
   // Bridge-intercepted !/ commands run FIRST, before any prompt/menu
-  // resolution below — exactly where Matrix's room.message handler checks
-  // them (before the message is even routed to a session at all) — so e.g.
-  // /stop always stops the session even while a TUI menu is open. Replay
+  // resolution below — so e.g. /stop always stops the session even while a
+  // TUI menu is open. Replay
   // guard: flushCursor synchronously before dispatch (inside
   // dispatchJournalBridgeCommand), so a crash inside the cursor's debounce
   // window can't replay an already-dispatched destructive command
@@ -9168,9 +9155,8 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       joinHeldTurn(session, causes);
       return;
     }
-    // Not a valid selector — do NOT type it into the still-open menu (same
-    // PTY-desync risk the Matrix path guards against). Notice instead of
-    // silently dropping it.
+    // Not a valid selector — do NOT type it into the still-open menu (it
+    // would desync the PTY). Notice instead of silently dropping it.
     journalPublishNotice(journalConvoIdFor(session),
       "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.");
     return;
@@ -9188,12 +9174,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     return;
   }
 
-  // Plan-mode `build` keyword — the SAME decision gate and approval
-  // implementation as the Matrix handler (dispatchPlanBuild +
-  // approvePlanBuild), checked at the same position in the ordering: after
-  // prompt/menu/question resolution, before rescue keystrokes and
-  // busy-queueing. With no pending plan, `build` falls through and routes to
-  // Claude as ordinary text, exactly like Matrix. The "▶️ Building..."
+  // Plan-mode `build` keyword (dispatchPlanBuild + approvePlanBuild),
+  // checked after prompt/menu/question resolution, before rescue keystrokes
+  // and busy-queueing. With no pending plan, `build` falls through and routes
+  // to Claude as ordinary text. The "▶️ Building..."
   // notice goes through the session ctx's sendHtml (sendToRoom), which
   // mirrors into the journal like every other bridge reply.
   const dispatchedBuild = await dispatchPlanBuild(
@@ -9208,11 +9192,9 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   );
   if (dispatchedBuild) return;
 
-  // iv-mode PTY rescue keystrokes (!enter/!esc/!escape/!stop) — same
-  // classifier and same session.iv.sendKeystroke calls the Matrix handler
-  // uses, checked at the same point in the order (after prompt/menu/question
-  // resolution, before busy-queueing), so e.g. the unclassified-menu
-  // guidance to "send !esc to cancel" works identically from Matron. Same
+  // iv-mode PTY rescue keystrokes (!enter/!esc/!escape/!stop), checked
+  // after prompt/menu/question resolution, before busy-queueing, so e.g. the
+  // unclassified-menu guidance to "send !esc to cancel" works. Same
   // replay guard as the bridge-command dispatch above (inside
   // dispatchJournalRescueKeystroke): !esc/!enter have real side effects
   // (keystrokes into the TUI, clearing busy state). Print-mode sessions
@@ -9260,11 +9242,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   // An /effort-from-print flow holds input like a running turn until it
   // returns to print (effortFlowHoldsInput); the return carries the queue.
   if (session.busy || effortFlowHoldsInput(session)) {
-    // TUI-native slash commands bypass queueing exactly like Matrix's
-    // isClaudeSlashCommand check: it's PTY input for claude's own command
-    // palette, not a new chat turn, so it must reach claude immediately even
-    // mid-turn. `//` escapes this (queues like ordinary text) — same rule
-    // Matrix uses (isIvSlashPassthrough, lib/command-dispatch.js).
+    // TUI-native slash commands bypass queueing: it's PTY input for claude's
+    // own command palette, not a new chat turn, so it must reach claude
+    // immediately even mid-turn. `//` escapes this (queues like ordinary
+    // text) — see isIvSlashPassthrough, lib/command-dispatch.js.
     // Not during an /effort-flow hold: typing now would cancel the flow's
     // pending Enter, so a TUI slash queues like text until the return.
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
@@ -9286,10 +9267,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       emitRelease,
     });
     if (handledMagicWord) return;
-    // Queue like a Matrix message would, but marked journal-origin so the
-    // eventual flushQueue send skips the journal mirror — the journal
-    // already has this text as the client's own send row, and re-mirroring
-    // on flush would show a duplicate in Matron (see lib/queue-flush.js).
+    // Queue it, marked journal-origin so the eventual flushQueue send skips
+    // the journal mirror — the journal already has this text as the client's
+    // own send row, and re-mirroring on flush would show a duplicate in Matron
+    // (see lib/queue-flush.js).
     if (!session.queuedMessages) session.queuedMessages = [];
     // /compact jumps the queue and travels alone (lib/compact-priority.js).
     // Unshifting is what makes the jump real, and it also gives the flush side
@@ -9309,11 +9290,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     const entry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
     if (compactJump) session.queuedMessages.unshift(entry);
     else session.queuedMessages.push(entry);
-    // Post the SAME "📨 Queued" tile a Matrix-origin queue gets (shared
-    // notifyQueuedMessage, lib/busy-queue.js). Until this call existed a
-    // Matron send queued silently — session.sendButtonMessage both posts
-    // the Matrix tile and journal-publishes the prompt, so the app renders
-    // the notification card too. No signed-link fallback here: journal
+    // Post the "📨 Queued" tile (shared notifyQueuedMessage,
+    // lib/busy-queue.js) — session.sendButtonMessage journal-publishes the
+    // prompt, so the app renders the notification card. Without it a Matron
+    // send would queue silently. No signed-link fallback here: journal
     // feedback degrades to the plain ctx.sendReply text, which also
     // mirrors into the journal.
     const preview = trimmed.length > 40 ? trimmed.slice(0, 37) + '…' : trimmed;
@@ -9413,7 +9393,7 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
   }
 
   // print-mode: AskUserQuestion pending. Same option-id convention
-  // sendAllQuestions uses when building Matrix buttons (opt_a, opt_b, …) so a
+  // sendAllQuestions uses when building reply buttons (opt_a, opt_b, …) so a
   // choice sent by id round-trips correctly.
   if (session.waitingForAnswer && session.pendingQuestions?.length) {
     const q = session.pendingQuestions[session.currentQuestionIndex] || session.pendingQuestions[0];
@@ -9448,9 +9428,8 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
 }
 
 // Adapts journalRouteTextToSession to the router's routeTextToSession(session,
-// body, {username}) interface: echoes the incoming message into the
-// session's Matrix room (so the room stays a complete transcript regardless
-// of which client sent a given message), then routes it in.
+// body, {username}) interface: echoes the incoming message (a no-op publish,
+// see journalEchoToRoom), then routes it in.
 function journalOnText(session, body, { username, seq, convoId }) {
   rearmPreReapHandoff(session);
   journalEchoToRoom(session, `📱 ${username} (Matron): ${body}`, `📱 <b>${escapeHtml(username)} (Matron):</b> ${escapeHtml(body)}`);
@@ -9469,16 +9448,15 @@ function journalOnText(session, body, { username, seq, convoId }) {
 // media (file/image/voice-note) -> session. Thin wiring around the injectable
 // lib/journal-media.js orchestrator: the router hands us a resolved
 // {type, blobRef, contentType, name, size, dims}; the orchestrator fetches the
-// blob back out of the journal blob store and feeds it to the session exactly
-// the way the Matrix media path does — audio transcribed and injected as if
-// the user typed it, images/files saved to the same per-session location and
-// attached to the next prompt. Fire-and-forget: the orchestrator's returned
-// function never throws/rejects (it swallows internally), matching the
-// router's contract for routeMediaToSession. Nothing here re-mirrors the blob
-// into the journal — the client's own file/image event is already there — so
-// file/image injection passes skipJournalMirror; a voice note's transcript IS
-// published (as the user's message, via sendTextToSession) so it's visible in
-// the journal too, mirroring what the Matrix m.audio path records.
+// blob back out of the journal blob store and feeds it to the session —
+// audio transcribed and injected as if the user typed it, images/files saved
+// to the same per-session location and attached to the next prompt.
+// Fire-and-forget: the orchestrator's returned function never throws/rejects
+// (it swallows internally), matching the router's contract for
+// routeMediaToSession. Nothing here re-mirrors the blob into the journal — the
+// client's own file/image event is already there — so file/image injection
+// passes skipJournalMirror; a voice note's transcript IS published (as the
+// user's message, via sendTextToSession) so it's visible in the journal too.
 // Whether this box has whisper installed (model file + CLI). Local
 // transcription is an opt-in fallback behind the journal; nothing here
 // installs it.
@@ -9563,10 +9541,10 @@ const journalMediaRouter = createJournalMediaRouter({
 });
 
 // Queue a prepared media injection while the session is busy — the media
-// counterpart of the journal text busy-queue branch (journalRouteTextToSession)
-// and the Matrix busy media branch (room.message handler). Pushes the
-// already-fetched/built blocks onto the SAME session.queuedMessages a Matrix or
-// journal-text message uses (never a second queue), so the shared flushQueue
+// counterpart of the journal text busy-queue branch (journalRouteTextToSession).
+// Pushes the already-fetched/built blocks onto the SAME
+// session.queuedMessages a journal-text message uses (never a second
+// queue), so the shared flushQueue
 // (one merged sendToSession at turn end) delivers them in arrival order with any
 // interleaved queued text, and posts the SAME "📨 Queued" tile via the shared
 // notifyQueuedMessage.
@@ -9575,7 +9553,7 @@ const journalMediaRouter = createJournalMediaRouter({
 // non-enumerable pending-media-mirror tag, and a spread drops it so the flush
 // can't re-mirror a file the journal already recorded as the client's own
 // event. mirrorToJournal picks the origin: a voice-note transcript stays
-// Matrix-origin so flushQueue's mirrorText journal-publishes it (matching the
+// unmarked so flushQueue's mirrorText journal-publishes it (matching the
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path. `cause` (one cause or a list: an item reply's, or a
@@ -9979,13 +9957,11 @@ function journalIsControlConvo(convoId) {
 
 // Control-convo commands (Deliverable 3). Reuses the SAME shared dispatcher
 // (handleCommand) and command surface (BRIDGE_COMMAND_NAMES,
-// lib/command-dispatch.js) the Matrix control room's !start/!sessions/!help
-// etc. use, via a synthetic "room" — JOURNAL_CONTROL_CONVO_ID, a string
-// that can never collide with a real Matrix room ID (those are always
-// `!opaque:server`). handleCommand's own `sessions.get(roomId)` naturally
-// resolves to undefined for that synthetic ID, which reproduces exactly the
-// behavior a fresh, session-less Matrix room already has: /start, /resume,
-// and /workdir create a brand new session (same
+// lib/command-dispatch.js) session convos use, via a synthetic "room" —
+// JOURNAL_CONTROL_CONVO_ID, a string that can never collide with a session
+// key. handleCommand's own `sessions.get(roomId)` naturally resolves to
+// undefined for that synthetic ID, so it behaves like a session-less room:
+// /start, /resume, and /workdir create a brand new session (same
 // newSessionConvoId/createSession primitives, same argument handling
 // including default workdir and --browser extras); every session-scoped
 // command (/status, /stop, /mcp, /model, …) correctly reports "No active
@@ -10003,7 +9979,7 @@ async function journalHandleControlCommand(body) {
 
   // Same JOURNAL_UNAVAILABLE_COMMANDS safety net the session-command path
   // has (currently empty — see the constant's comment): a future
-  // Matrix-only command must be refused from BOTH journal paths.
+  // denylisted command must be refused from BOTH journal paths.
   if (decision.kind === 'unavailable') {
     reply(`/${decision.cmd} isn't available from Matron.`);
     return;
@@ -10055,15 +10031,12 @@ function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
 
 // Journal-side auto-resume (the router's resumeSessionForConvo seam): the
 // idle reaper kills sessions on the assumption that "the next user message
-// auto-resumes" them — which the Matrix room path does, but the journal path
-// used to dead-end with "no longer active". A convo id IS the persisted
-// claude session id, so scan persisted sessions for it and respawn through
-// the SAME helper the Matrix path uses (resumePersistedSession — hoisted,
-// defined next to the Matrix handler below). Returns the new session for the
-// router to route the triggering text or media into (delivery is safe:
-// sendToSession holds input in _resumeOutbox until the resumed TUI is ready,
-// and print mode's stdin buffers), or null to fall back to the unknown-convo
-// notice.
+// auto-resumes" them. A convo id IS the persisted claude session id, so
+// scan persisted sessions for it and respawn through resumePersistedSession
+// (hoisted, defined below). Returns the new session for the router to route
+// the triggering text or media into (delivery is safe: sendToSession holds
+// input in _resumeOutbox until the resumed TUI is ready, and print mode's
+// stdin buffers), or null to fall back to the unknown-convo notice.
 function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
   // Never publish a non-string notice: a mis-wired caller once passed the
   // router ctx here and it rendered as `{"username":…}` JSON.
@@ -10123,7 +10096,7 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
       // is only ever published there — see publishRestartCarryOnCards), so
       // the failure has to land in that SAME journal convo, exactly like the
       // catch block three lines below. `_sendReply` (journalSessionCommandCtx's
-      // sendReply, which routes to the session's MATRIX room) is the wrong
+      // sendReply, which publishes only through a live session) is the wrong
       // surface here and is left unused rather than called — kept in the
       // signature only because handlePickerValue (lib/picker-dispatch.js)
       // positionally calls carryOnConvo(convoId, session, sendReply) and
@@ -12051,15 +12024,15 @@ function journalEvictConvoInput(session) {
   }
 }
 
-// Plan approval for the `build` keyword — the Matrix handler's original
-// build block, extracted verbatim so the journal session-text route runs
-// the SAME code path (PR #101 follow-up; decision gate: dispatchPlanBuild,
-// lib/command-dispatch.js). iv-mode resolves the pending /plan-decision
-// hook with allow; print-mode does the tool_result/denial dance (or falls
-// back to a plain approval message when the denial was already answered).
-// `sendHtml` is the transport's reply sink for the final "▶️ Building..."
-// notice — Matrix passes its room sink, the journal passes the session
-// ctx's sendToRoom sink, which also mirrors into the journal.
+// Plan approval for the `build` keyword, called from the journal
+// session-text route and a build reply on a plan item (decision gate:
+// dispatchPlanBuild, lib/command-dispatch.js). iv-mode resolves the pending
+// /plan-decision hook with allow; print-mode does the tool_result/denial
+// dance (or falls back to a plain approval message when the denial was
+// already answered).
+// `sendHtml` is the caller's reply sink for the final "▶️ Building..."
+// notice — the session ctx's sendToRoom sink, which publishes into the
+// journal.
 // `causes` is the approval itself (the user's message or item reply,
 // lib/turn-cause.js): every path below either starts a turn with it or adds
 // it to the one the plan is waiting in.
@@ -12164,12 +12137,11 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
 
 // Respawn a persisted session into its room: recreate the process with
 // --resume, restore room-scoped state, announce to the room, and hold input
-// until the resumed TUI is ready. Shared by the Matrix room.message
-// auto-resume branch below and the journal input path's
-// resumeSessionForConvo (journalResumeConvo), so the two transports can't
-// drift apart on what a resume restores. Synchronous — the "Auto-resuming…"
-// room notice is fire-and-forget, which is what lets the journal router's
-// sync consumer call this directly.
+// until the resumed TUI is ready. Called through resumeSleepingSession,
+// e.g. by the journal input path's resumeSessionForConvo
+// (journalResumeConvo). Synchronous — the "Auto-resuming…" room notice is
+// fire-and-forget, which is what lets the journal router's sync consumer call
+// this directly.
 //
 // skipJournalMirror applies to that notice only (the session's own
 // sendCallback/sendHtml stay mirrored as usual): the journal resume path
@@ -12330,7 +12302,7 @@ const permissionRegistry = createPermissionRegistry({
 // Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
 // requests waiting for a user decision in interactive mode. The hook script
 // (hooks/exit-plan-decision.sh) holds an HTTP request open against
-// /plan-decision; the bridge resolves it once the user replies on Matrix.
+// /plan-decision; the bridge resolves it once the user replies.
 // Phase 4 wires the session-side handler that actually surfaces the plan.
 const pendingPlanDecisions = new Map();
 
@@ -13595,7 +13567,7 @@ const apiServer = createServer(async (req, res) => {
           expiresAt,
         });
 
-        // Send notification to user in Matrix chat. Use the session
+        // Send notification to user in the chat. Use the session
         // resolveShareTarget already vetted — it guaranteed one of these two
         // channels exists, which is what makes the `notified` field below
         // true rather than merely hopeful.
@@ -13629,12 +13601,9 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/redact-message') {
-        // Message redaction was a Matrix-only capability (redacting a room
-        // event). The journal transport has no equivalent, so this endpoint
-        // now reports unsupported instead of acting. The ask-user
-        // redact_message MCP tool surfaces this text back to Claude; that MCP
-        // tool lives in ask-user.js (out of scope for this task) and should
-        // be retired in a follow-up.
+        // The journal has no message redaction, so this endpoint reports
+        // unsupported instead of acting. The ask-user redact_message MCP
+        // tool (ask-user.js) surfaces this text back to Claude.
         res.writeHead(501, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Message redaction is not supported: the bridge is journal-only and has no message-redaction capability.' }));
         return;
@@ -13835,7 +13804,7 @@ const apiServer = createServer(async (req, res) => {
 
       } else if (url.pathname === '/plan-decision') {
         // PreToolUse hook (hooks/exit-plan-decision.sh) — fires when claude
-        // calls ExitPlanMode. Blocks until the user decides via Matrix.
+        // calls ExitPlanMode. Blocks until the user decides.
         const { session_id, tool_use_id, plan } = data;
         if (!tool_use_id) {
           res.writeHead(400);
@@ -14551,12 +14520,11 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
 }
 
 // Print-mode turn interrupt — the print-mode counterpart of iv-mode's Esc
-// keystroke rescue, shared verbatim by the Matrix handler and the journal
-// session-text route (same convention as approvePlanBuild). The turn's
-// `result` event is the success signal: it clears busy and cancels the
-// fallback timer via clearPendingInterrupt. The timer only fires if the CLI
-// never delivers one (wedged process), so the bridge stops queueing
-// messages behind a busy flag nothing will ever clear.
+// keystroke rescue, used by the journal session-text route (same convention
+// as approvePlanBuild). The turn's `result` event is the success signal: it
+// clears busy and cancels the fallback timer via clearPendingInterrupt. The
+// timer only fires if the CLI never delivers one (wedged process), so the
+// bridge stops queueing messages behind a busy flag nothing will ever clear.
 async function printModeInterrupt(session, sendReply) {
   if (session.agent === AGENT_CODEX) {
     if (!session.alive || !session.busy || !session.codex?.child) {
@@ -14863,8 +14831,8 @@ function startIdleReaper() {
         continue;
       }
 
-      // Silent reap — posting a Matrix notice would bump the room to the top
-      // of the user's room list, defeating the purpose. The session is
+      // Silent reap — posting a notice would bump the conversation to the top
+      // of the user's list, defeating the purpose. The session is
       // resumable on the next user message via the existing auto-resume path.
       const idleHours = Math.round((now - last) / 3600000);
       debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
