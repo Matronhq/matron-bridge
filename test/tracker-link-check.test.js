@@ -12,10 +12,10 @@ const link = (num, text = `#${num}`, base = BASE) => `[${text}](${base}/${num})`
 
 describe('findTrackerLinks', () => {
   it('finds https tracker links and splits the number and title out of the link text', () => {
-    const text = `See ${link(285, '#285 Merge: printer XML…')} and ${link(7, 'item #7 — Late orders')}.`;
+    const text = `See ${link(41, '#41 Merge: release notes…')} and ${link(7, 'item #7 — Office move')}.`;
     expect(findTrackerLinks(text, { base: BASE })).toEqual([
-      { raw: '[#285 Merge: printer XML…](https://chat.example/u/alice/285)', user: 'alice', num: 285, textNum: 285, title: 'Merge: printer XML…' },
-      { raw: '[item #7 — Late orders](https://chat.example/u/alice/7)', user: 'alice', num: 7, textNum: 7, title: 'Late orders' },
+      { raw: '[#41 Merge: release notes…](https://chat.example/u/alice/41)', user: 'alice', num: 41, textNum: 41, title: 'Merge: release notes…' },
+      { raw: '[item #7 — Office move](https://chat.example/u/alice/7)', user: 'alice', num: 7, textNum: 7, title: 'Office move' },
     ]);
   });
 
@@ -83,13 +83,13 @@ describe('findTrackerLinks', () => {
 
 describe('titleMatches', () => {
   it('accepts the title, a prefix of it, or an abbreviation with an ellipsis', () => {
-    expect(titleMatches('Merge: printer XML export', 'Merge: printer XML export')).toBe(true);
-    expect(titleMatches('Merge: printer XML…', 'Merge: printer XML export for the print run')).toBe(true);
-    expect(titleMatches('merge printer xml exp...', 'Merge: printer XML export')).toBe(true);
+    expect(titleMatches('Merge: release notes export', 'Merge: release notes export')).toBe(true);
+    expect(titleMatches('Merge: release notes…', 'Merge: release notes export for the launch')).toBe(true);
+    expect(titleMatches('merge release notes exp...', 'Merge: release notes export')).toBe(true);
   });
 
   it('accepts a paraphrase that keeps most of the title\'s words', () => {
-    expect(titleMatches('late-orders item', 'Late orders shipped after the cut-off: options')).toBe(true);
+    expect(titleMatches('office-move item', 'Office move to the new building: options')).toBe(true);
     expect(titleMatches('catch wrong #N item links', 'Matron: catch wrong #N item links — the bridge checks titles')).toBe(true);
   });
 
@@ -98,13 +98,13 @@ describe('titleMatches', () => {
   });
 
   it('refuses a title that belongs to something else', () => {
-    expect(titleMatches('the new merge question', 'Late orders shipped after the cut-off: options')).toBe(false);
-    expect(titleMatches('Printer XML', 'Holiday rota for December')).toBe(false);
+    expect(titleMatches('the new merge question', 'Office move to the new building: options')).toBe(false);
+    expect(titleMatches('Release notes', 'Holiday rota for December')).toBe(false);
   });
 
   it('refuses link text that names no title at all', () => {
-    expect(titleMatches('here', 'Merge: printer XML export')).toBe(false);
-    expect(titleMatches('', 'Merge: printer XML export')).toBe(false);
+    expect(titleMatches('here', 'Merge: release notes export')).toBe(false);
+    expect(titleMatches('', 'Merge: release notes export')).toBe(false);
   });
 });
 
@@ -121,15 +121,15 @@ function fakeJournal(rows, { searchResults = [] } = {}) {
 
 describe('createTrackerLinkChecker', () => {
   const rows = {
-    'alice/285': { kind: 'item', title: 'Merge: printer XML export' },
-    'alice/290': { kind: 'item', title: 'Late orders shipped after the cut-off' },
-    'alice/300': { kind: 'mission', title: 'Holiday rota' },
+    'alice/41': { kind: 'item', title: 'Merge: release notes export' },
+    'alice/42': { kind: 'item', title: 'Office move to the new building' },
+    'alice/43': { kind: 'mission', title: 'Holiday rota' },
   };
 
   it('passes text whose links carry their targets\' titles', async () => {
     const { lookup, search } = fakeJournal(rows);
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    expect(await check([`Done: ${link(285, '#285 Merge: printer XML…')}`, `on ${link(300, '#300 Holiday rota')}`])).toEqual({ ok: true });
+    expect(await check([`Done: ${link(41, '#41 Merge: release notes…')}`, `on ${link(43, '#43 Holiday rota')}`])).toEqual({ ok: true });
   });
 
   it('passes text with no tracker links without asking the journal', async () => {
@@ -141,24 +141,24 @@ describe('createTrackerLinkChecker', () => {
 
   it('refuses a real number with the wrong title, naming both and the number the title belongs to', async () => {
     const { lookup, search } = fakeJournal(rows, {
-      searchResults: [{ kind: 'item', num: 285, title: 'Merge: printer XML export' }],
+      searchResults: [{ kind: 'item', num: 41, title: 'Merge: release notes export' }],
     });
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    const r = await check([`The new one is ${link(290, '#290 Merge: printer XML…')}`]);
+    const r = await check([`The new one is ${link(42, '#42 Merge: release notes…')}`]);
     expect(r.ok).toBe(false);
     expect(r.error).toContain('Nothing was posted');
-    expect(r.error).toContain('#290 is the item "Late orders shipped after the cut-off"');
-    expect(r.error).toContain('"Merge: printer XML…" is #285 (item "Merge: printer XML export")');
-    expect(search).toHaveBeenCalledWith('Merge: printer XML…');
+    expect(r.error).toContain('#42 is the item "Office move to the new building"');
+    expect(r.error).toContain('"Merge: release notes…" is #41 (item "Merge: release notes export")');
+    expect(search).toHaveBeenCalledWith('Merge: release notes…');
   });
 
   it('refuses without a suggestion when the title matches nothing', async () => {
-    const { lookup, search } = fakeJournal(rows, { searchResults: [{ kind: 'item', num: 300, title: 'Holiday rota' }] });
+    const { lookup, search } = fakeJournal(rows, { searchResults: [{ kind: 'item', num: 43, title: 'Holiday rota' }] });
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    const r = await check([link(290, '#290 Printer XML')]);
+    const r = await check([link(42, '#42 Release notes')]);
     expect(r.ok).toBe(false);
-    expect(r.error).toContain('#290 is the item "Late orders shipped after the cut-off"');
-    expect(r.error).not.toContain('#300');
+    expect(r.error).toContain('#42 is the item "Office move to the new building"');
+    expect(r.error).not.toContain('#43');
   });
 
   it('refuses a number that does not exist', async () => {
@@ -172,30 +172,30 @@ describe('createTrackerLinkChecker', () => {
   it('refuses link text whose number differs from the link\'s', async () => {
     const { lookup, search } = fakeJournal(rows);
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    const r = await check([`[#285 Merge: printer XML](${BASE}/290)`]);
+    const r = await check([`[#41 Merge: release notes](${BASE}/42)`]);
     expect(r.ok).toBe(false);
-    expect(r.error).toContain('the text says #285 but the link goes to #290');
+    expect(r.error).toContain('the text says #41 but the link goes to #42');
   });
 
   it('refuses a bare #N link without giving away its title', async () => {
     const { lookup, search } = fakeJournal(rows);
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    const r = await check([`see ${link(290)}`]);
+    const r = await check([`see ${link(42)}`]);
     expect(r.ok).toBe(false);
     expect(r.error).toContain('has no title');
-    expect(r.error).toContain('[#290 <title>]');
+    expect(r.error).toContain('[#42 <title>]');
     // Echoing the target's title would let a wrong number through by copying it.
-    expect(r.error).not.toContain('Late orders');
+    expect(r.error).not.toContain('Office move');
     expect(lookup).not.toHaveBeenCalled();
   });
 
   it('accepts unnumbered link text that matches the title, and refuses text that does not', async () => {
     const { lookup, search } = fakeJournal(rows);
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    expect(await check([`[the holiday rota](${BASE}/300)`])).toEqual({ ok: true });
-    const r = await check([`[here](${BASE}/300)`]);
+    expect(await check([`[the holiday rota](${BASE}/43)`])).toEqual({ ok: true });
+    const r = await check([`[here](${BASE}/43)`]);
     expect(r.ok).toBe(false);
-    expect(r.error).toContain('#300 is the mission "Holiday rota"');
+    expect(r.error).toContain('#43 is the mission "Holiday rota"');
   });
 
   it('lets the write through when the journal cannot be asked, or answers without a title', async () => {
@@ -214,17 +214,37 @@ describe('createTrackerLinkChecker', () => {
   it('asks the journal once per distinct link, and caches answers', async () => {
     const { lookup, search } = fakeJournal(rows);
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    await check([`${link(285, '#285 Merge')} ${link(285, '#285 Merge printer')}`]);
-    await check([link(285, '#285 Merge')]);
+    await check([`${link(41, '#41 Merge')} ${link(41, '#41 Merge release')}`]);
+    await check([link(41, '#41 Merge')]);
     expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks again about a number it could not find: the record may have just been made', async () => {
+    const rows2 = {};
+    const { lookup, search } = fakeJournal(rows2);
+    const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
+    expect((await check([link(50, '#50 Fresh item')])).ok).toBe(false);
+    rows2['alice/50'] = { kind: 'item', title: 'Fresh item' };
+    expect(await check([link(50, '#50 Fresh item')])).toEqual({ ok: true });
+  });
+
+  it('checks every link, however many the text has', async () => {
+    const many = {};
+    for (let n = 1; n <= 60; n++) many[`alice/${n}`] = { kind: 'item', title: `Task number ${n}` };
+    const { lookup, search } = fakeJournal(many);
+    const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
+    const text = Array.from({ length: 60 }, (_, i) => link(i + 1, i === 59 ? '#60 Holiday rota' : `#${i + 1} Task number ${i + 1}`)).join(' ');
+    const r = await check([text]);
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('#60 is the item "Task number 60"');
   });
 
   it('lists every bad link in one refusal', async () => {
     const { lookup, search } = fakeJournal(rows);
     const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
-    const r = await check([`${link(290, '#290 Holiday rota')} ${link(300)}`]);
-    expect(r.error).toContain('#290 is the item');
-    expect(r.error).toContain('[#300 <title>]');
+    const r = await check([`${link(42, '#42 Holiday rota')} ${link(43)}`]);
+    expect(r.error).toContain('#42 is the item');
+    expect(r.error).toContain('[#43 <title>]');
   });
 });
 
