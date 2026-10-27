@@ -18,7 +18,6 @@ const TOOL_CALLS = {
 describe('projects wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
-  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
   it('mounts exactly the seven /projects routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/projects\\\/\(([a-z|]+)\)\$\/\)/);
@@ -172,12 +171,6 @@ describe('projects wiring', () => {
     expect(slice('project_create', 'project_update')).toContain('${PROJECT_WHAT}');
     expect(askUser).not.toMatch(/(?<!\w)convo_id:\s*z\./);
     expect(askUser).not.toMatch(/idem_key:\s*z\./);
-  });
-
-  it('npm run check covers the three new files', () => {
-    for (const f of ['lib/projects-client.js', 'lib/projects-tools.js', 'lib/projects-format.js']) {
-      expect(pkg.scripts.check).toContain(`node --check ${f}`);
-    }
   });
 
   describe('instructions (spec 2026-09-30 §5 "Prompts")', () => {

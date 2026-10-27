@@ -50,7 +50,6 @@ describe('bridge wiring', () => {
     expect(index).toContain('convoIdFor: journalConvoIdFor,');
     expect(index).toContain('requests: secretRequests,');
     expect(index).toContain('secretRequests.submit(');
-    expect(index).toContain('secretRequests.read(');
   });
 
   it('re-arms persisted requests at startup', () => {

@@ -458,7 +458,7 @@ CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a reposito
 ```bash
 npm test        # vitest suite
 npm run lint    # eslint, zero warnings allowed
-npm run check   # node --check on every entrypoint
+npm run check   # node --check on every .js/.mjs file
 npm run ci      # lint + check + test + npm audit (high)
 ```
 
