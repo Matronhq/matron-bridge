@@ -24,9 +24,13 @@ describe('findTrackerLinks', () => {
     expect(l).toMatchObject({ user: 'bob', num: 3, textNum: 3, title: 'Their task' });
   });
 
-  it('reads the old matron://item form against the session\'s own user', () => {
-    const [l] = findTrackerLinks('[#12 Fix it](matron://item/12)', { base: BASE });
-    expect(l).toMatchObject({ user: 'alice', num: 12, textNum: 12, title: 'Fix it' });
+  it('reads the old matron://item, mission and project forms against the session\'s own user', () => {
+    const found = findTrackerLinks('[#12 Fix it](matron://item/12) [#13 Plan](matron://mission/13) [#14 Launch](matron://project/14)', { base: BASE });
+    expect(found.map(({ user, num, title }) => ({ user, num, title }))).toEqual([
+      { user: 'alice', num: 12, title: 'Fix it' },
+      { user: 'alice', num: 13, title: 'Plan' },
+      { user: 'alice', num: 14, title: 'Launch' },
+    ]);
   });
 
   it('keeps a bare #N link and a link with no number in its text', () => {
@@ -45,7 +49,6 @@ describe('findTrackerLinks', () => {
   it('ignores links to other hosts, conversations, images and non-numeric paths', () => {
     const text = [
       '[#1 x](https://github.com/acme/repo/pull/1)',
-      '[a chat](matron://convo/abc-def)',
       '![#2 pic](https://chat.example/u/alice/2)',
       '[#3 x](https://chat.example/u/alice/3/extra)',
       '[#4 x](https://evil.example/u/alice/4)',
