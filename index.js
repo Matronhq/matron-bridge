@@ -11189,8 +11189,8 @@ const roomReplyWaiters = createRoomReplyWaiters();
 // fanned out to one session consume the OTHER session's pending wait — the
 // consumed reply then never reaches the session that armed it. Remote rooms
 // bind exactly one session per bridge, so the composite key changes nothing
-// for them. ' ' cannot appear in either id.
-const replyWaiterKey = (chatRoomId, sessionKey) => `${chatRoomId} ${sessionKey || ''}`;
+// for them. NUL cannot appear in either id.
+const replyWaiterKey = (chatRoomId, sessionKey) => `${chatRoomId}\u0000${sessionKey || ''}`;
 function awaitRoomMessage(chatRoomId, ms, sessionKey) {
   return roomReplyWaiters.await(replyWaiterKey(chatRoomId, sessionKey), ms);
 }
@@ -12970,22 +12970,6 @@ const apiServer = createServer(async (req, res) => {
     return true;
   };
   if (req.method === 'GET' && refuseApiCall(null)) return;
-
-  // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
-  // uses it (request_secret is non-blocking now); it stays so a
-  // bridge upgraded under an already-running MCP server still answers.
-  if (req.method === 'GET' && url.pathname.startsWith('/secret/')) {
-    const secretId = url.pathname.split('/')[2];
-    const state = secretRequests.read(secretId);
-    if (!state) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: 'Secret request not found' }));
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(state));
-    return;
-  }
 
   // GET /permission-request/:id — permission_request MCP tool polls for a tap
   if (req.method === 'GET' && url.pathname.startsWith('/permission-request/')) {

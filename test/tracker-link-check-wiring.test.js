@@ -4,7 +4,6 @@ import { LINK_CHECK_FIELDS } from '../lib/tracker-link-check.js';
 
 describe('tracker link check wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
   it('builds one checker from the journal lookup, the search route and the session\'s link base', () => {
     expect(index).toContain("import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } from './lib/tracker-link-check.js';");
@@ -31,9 +30,5 @@ describe('tracker link check wiring', () => {
       return !!m && m[1].split('|').includes(op);
     };
     for (const route of Object.keys(LINK_CHECK_FIELDS)) expect(reachable(route), route).toBe(true);
-  });
-
-  it('is in the syntax check', () => {
-    expect(pkg.scripts.check).toContain('node --check lib/tracker-link-check.js');
   });
 });

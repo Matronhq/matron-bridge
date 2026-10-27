@@ -744,18 +744,6 @@ describe('orphaned secret files', () => {
   });
 });
 
-describe('createSecretRequests.read (legacy GET compatibility)', () => {
-  it('reports pending, then answered once, then forgets', async () => {
-    const h = makeHarness();
-    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
-    expect(h.store.read('sec-1')).toEqual({ answered: false, path: null });
-    await (await h.store.submit('sec-1', DUMMY)).done;
-    expect(h.store.read('sec-1')).toEqual({ answered: true, path: '/tmp/secrets/sec-1.txt' });
-    expect(h.store.read('sec-1')).toBe(null);
-    expect(h.store.read('unknown')).toBe(null);
-  });
-});
-
 describe('createSecretRequests expiry', () => {
   it('closes the item as cancelled and tells the agent when 24 h pass', async () => {
     const h = makeHarness();

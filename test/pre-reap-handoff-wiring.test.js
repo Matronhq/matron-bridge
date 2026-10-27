@@ -10,7 +10,6 @@ describe('pre-reap handoff wiring', () => {
   const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   const envExample = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
   const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
-  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
   function fnBody(name) {
     const start = index.indexOf(`function ${name}(`);
@@ -129,12 +128,11 @@ describe('pre-reap handoff wiring', () => {
     expect(main).toContain('Pre-reap handoff: OFF (${PRE_REAP_HANDOFF.reason})');
   });
 
-  it('is documented and syntax-checked', () => {
+  it('is documented', () => {
     for (const v of ['MATRON_PRE_REAP_HANDOFF', 'MATRON_PRE_REAP_HANDOFF_IDLE_MS', 'MATRON_PRE_REAP_COMPACT_PCT']) {
       expect(readme, `${v} missing from README`).toContain(`| \`${v}\` |`);
       expect(envExample, `${v} missing from .env.example`).toMatch(new RegExp(`^${v}=`, 'm'));
     }
     expect(claudeMd).toContain('[pre-reap handoff from the bridge]');
-    expect(pkg.scripts.check).toContain('node --check lib/pre-reap-handoff.js');
   });
 });

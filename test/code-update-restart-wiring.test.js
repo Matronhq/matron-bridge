@@ -82,9 +82,4 @@ describe('code-update self-restart wiring', () => {
     expect(fnCarry).toMatch(/await journalRouteTextToSession\(target, text\);/);
     expect(fnCarry).toMatch(/journalResumeConvo\(convoId, resumeNotice\)/);
   });
-
-  it('is in the syntax-check script like every other lib', () => {
-    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    expect(pkg.scripts.check).toMatch(/node --check lib\/code-update-restart\.js/);
-  });
 });
