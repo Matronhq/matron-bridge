@@ -11,6 +11,7 @@ import {
   PERMISSION_GATE_FETCH_TIMEOUT_MS,
 } from '../lib/permission-prompt.js';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
+import { readStdinText } from './hook-util.mjs';
 
 // The bridge bakes `--port <n> --room <id>` into the hook command at spawn.
 // Deliberately NOT read from the environment: a settings `env` block reaches
@@ -26,16 +27,10 @@ function parseArgs(argv) {
   return out;
 }
 
-async function readStdin() {
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  return Buffer.concat(chunks).toString('utf8');
-}
-
 async function main() {
   let toolName;
   try {
-    toolName = JSON.parse(await readStdin())?.tool_name;
+    toolName = JSON.parse(await readStdinText())?.tool_name;
   } catch {
     // Unparseable hook input: we cannot tell what is being called. Ask.
     return permissionGateHookOutput(null);
