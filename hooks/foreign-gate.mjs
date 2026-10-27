@@ -4,6 +4,7 @@
 // unreachable -> deny while the turn's flag file exists, nothing otherwise.
 import fs from 'node:fs';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
+import { readStdinText } from './hook-util.mjs';
 
 const DENY = {
   hookSpecificOutput: {
@@ -24,15 +25,9 @@ function parseArgs(argv) {
   return out;
 }
 
-async function readStdin() {
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  return Buffer.concat(chunks).toString('utf8');
-}
-
 async function main() {
   const { port, room, flag, auth } = parseArgs(process.argv.slice(2));
-  const input = await readStdin();
+  const input = await readStdinText();
   // The bridge's answer is the truth; the flag file decides only when the
   // bridge cannot be reached (present -> deny, absent -> nothing).
   const fallback = () => (!flag || fs.existsSync(flag) ? DENY : null);

@@ -4,15 +4,21 @@ import { readApiHeaderFile } from '../lib/api-header-file.js';
 // the .sh versions would need Git Bash + jq + curl). Same contract as the shell
 // scripts: read the hook JSON from stdin, never fail the tool call — anything
 // unexpected means exit 0 with no (or empty) output.
-export async function readStdinJson() {
+export async function readStdinText() {
   const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+export async function readStdinJson() {
+  let text;
   try {
-    for await (const chunk of process.stdin) chunks.push(chunk);
+    text = await readStdinText();
   } catch {
     return null;
   }
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return JSON.parse(text);
   } catch {
     return null;
   }
