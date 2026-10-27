@@ -38,6 +38,7 @@ import { createBoxDefaultsStore, createBoxDefaultsSetter, resolveDefaultAgent, b
 import { createUserSettings } from './lib/user-settings.js';
 import { createJournalIdentity } from './lib/journal-identity.js';
 import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
+import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } from './lib/tracker-link-check.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
@@ -12555,6 +12556,18 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// Tracker links in what agents write (lib/tracker-link-check.js): each one
+// carries the title the agent means, and the routes in LINK_CHECK_FIELDS
+// refuse a write whose title does not match what the number points at.
+const trackerLinkCheck = createTrackerLinkChecker({
+  lookup: (user, num) => sharingClient.lookup(user, num),
+  search: (q) => missionsClient.searchAll({ q: q.slice(0, 200), limit: 5 }),
+  base: () => trackerUrlBaseNow(),
+});
+const linkChecked = (route, handler) => (LINK_CHECK_FIELDS[route] && typeof handler === 'function'
+  ? withTrackerLinkCheck(trackerLinkCheck, handler, LINK_CHECK_FIELDS[route])
+  : handler);
+
 // The `search` tool route (spec 2026-10-12 unified search), mounted below.
 // Reuses missionsClient (createJournalRequester is shared across domains;
 // lib/missions-client.js added searchAll alongside the mission routes) — a
@@ -13342,13 +13355,13 @@ const apiServer = createServer(async (req, res) => {
       }
 
       if (url.pathname === '/agent-chat-start') {
-        await respondAgentChatRoute(res, data, agentChatHandlers.chatStart,
+        await respondAgentChatRoute(res, data, linkChecked('agent-chat-start', agentChatHandlers.chatStart),
           (status, b) => debug(`agent-chat-start ${status} ${b.room_id || ''} ${b.status || b.error || ''}`));
         return;
       }
 
       if (url.pathname === '/agent-chat-send') {
-        await respondAgentChatRoute(res, data, agentChatHandlers.chatSend,
+        await respondAgentChatRoute(res, data, linkChecked('agent-chat-send', agentChatHandlers.chatSend),
           (status, b) => debug(`agent-chat-send ${status} ${data?.room_id} ${b.error || (b.reply ? 'reply' : 'ok')}`));
         return;
       }
@@ -13450,7 +13463,7 @@ const apiServer = createServer(async (req, res) => {
       const itemsRoute = url.pathname.match(/^\/items\/(create|list|get|comment|close|reopen|reorder|move|handover|accept|decline)$/);
       if (itemsRoute) {
         const name = itemsRoute[1];
-        await respondAgentChatRoute(res, data, itemsHandlers[name],
+        await respondAgentChatRoute(res, data, linkChecked(`items/${name}`, itemsHandlers[name]),
           (status, b) => debug(`items/${name} ${status} ${b.error || (b.item ? `#${b.item.num ?? '?'}` : `${(b.items || []).length} items`)}`));
         return;
       }
@@ -13480,7 +13493,7 @@ const apiServer = createServer(async (req, res) => {
             return r;
           }
           : missionsHandlers[name];
-        await respondAgentChatRoute(res, data, handler,
+        await respondAgentChatRoute(res, data, linkChecked(`missions/${name}`, handler),
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
         return;
       }
@@ -13526,7 +13539,7 @@ const apiServer = createServer(async (req, res) => {
       const briefingRoute = url.pathname.match(/^\/briefing\/(publish)$/);
       if (briefingRoute) {
         const name = briefingRoute[1];
-        await respondAgentChatRoute(res, data, briefingHandlers[name],
+        await respondAgentChatRoute(res, data, linkChecked(`briefing/${name}`, briefingHandlers[name]),
           (status, b) => debug(`briefing/${name} ${status} ${b.error || (b.briefing ? `${b.briefing.id} seq ${b.briefing.seq}` : 'ok')}`));
         return;
       }
@@ -13536,7 +13549,7 @@ const apiServer = createServer(async (req, res) => {
       const sharingRoute = url.pathname.match(/^\/sharing\/(contact_list|contact_add|contact_remove|contact_block|share|unshare|shares|shared_list|shared_get|shared_post|shared_status|shared_item_create|shared_item_comment|shared_item_close|shared_item_reopen)$/);
       if (sharingRoute) {
         const name = sharingRoute[1];
-        await respondAgentChatRoute(res, data, sharingHandlers[name],
+        await respondAgentChatRoute(res, data, linkChecked(`sharing/${name}`, sharingHandlers[name]),
           (status, b) => debug(`sharing/${name} ${status} ${b.error || b.blocked_by || 'ok'}`));
         return;
       }

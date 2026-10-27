@@ -1384,7 +1384,9 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   it('mounts every loopback route on its handler via the throw-isolating adapter', () => {
     for (const [route, handler] of ROUTES) {
       expect(indexSrc).toMatch(new RegExp(
-        `url\\.pathname === '${route}'[\\s\\S]{0,120}respondAgentChatRoute\\(res, data, agentChatHandlers\\.${handler},`));
+        // The two sending routes go through the tracker link check first
+        // (lib/tracker-link-check.js).
+        `url\\.pathname === '${route}'[\\s\\S]{0,120}respondAgentChatRoute\\(res, data, (agentChatHandlers\\.${handler}|linkChecked\\('${route.slice(1)}', agentChatHandlers\\.${handler}\\)),`));
     }
     // The shared adapter turns a handler throw into that route's own 500 —
     // never the outer body-parse catch's "Invalid JSON" 400.
