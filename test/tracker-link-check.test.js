@@ -41,6 +41,11 @@ describe('findTrackerLinks', () => {
     ]);
   });
 
+  it('reads link text that is the URL itself as a bare link', () => {
+    const [l] = findTrackerLinks(`[${BASE}/7](${BASE}/7)`, { base: BASE });
+    expect(l).toMatchObject({ num: 7, textNum: null, title: '' });
+  });
+
   it('strips emphasis and quotes around the written title', () => {
     const [l] = findTrackerLinks(`[**#9** "Ship the thing"](${BASE}/9)`, { base: BASE });
     expect(l.title).toBe('Ship the thing');
