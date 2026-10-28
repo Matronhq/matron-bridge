@@ -102,6 +102,22 @@ describe('titleMatches', () => {
     expect(titleMatches('Release notes', 'Holiday rota for December')).toBe(false);
   });
 
+  it('does not count the pieces of a URL as matching words', () => {
+    const actual = 'Merge https://example.com/org/repo/pull/10 (live tracking fix)';
+    expect(titleMatches('Merge https://example.com/org/repo/pull/11 (search fix)', actual)).toBe(false);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/1', actual)).toBe(false);
+    expect(titleMatches('https://example.com/org/repo/pull/10', 'Merge https://example.com/org/repo/pull/11')).toBe(false);
+  });
+
+  it('still matches a title with a URL in it, written in full, cut short or without the URL', () => {
+    const actual = 'Merge https://example.com/org/repo/pull/10 (live tracking fix)';
+    expect(titleMatches(actual, actual)).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/10', actual)).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pu…', actual)).toBe(true);
+    expect(titleMatches('Merge (live tracking fix)', actual)).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/10/ (live tracking)', actual)).toBe(true);
+  });
+
   it('refuses link text that names no title at all', () => {
     expect(titleMatches('here', 'Merge: release notes export')).toBe(false);
     expect(titleMatches('', 'Merge: release notes export')).toBe(false);
