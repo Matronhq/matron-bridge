@@ -125,6 +125,9 @@ describe('titleMatches', () => {
     expect(titleMatches('https://example.com/org/repo/pu… live tracking', actual)).toBe(true);
     expect(titleMatches('https://example.com/org/repo/pull/1...', actual)).toBe(true);
     expect(titleMatches('Fix [https://example.com/a]', 'Fix https://example.com/a')).toBe(true);
+    // An address cut short inside wrapping punctuation is still cut short.
+    expect(titleMatches('Merge (https://example.com/org/repo/pull/1...)', 'Merge https://example.com/org/repo/pull/10')).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/1..., then ship', 'Merge https://example.com/org/repo/pull/10 then ship')).toBe(true);
     expect(titleMatches('Fix (see https://example.com/a)', 'Fix: see https://example.com/a')).toBe(true);
     expect(titleMatches('Fix https://example.com/item(1) docs', 'Fix https://example.com/item(1) docs')).toBe(true);
   });
