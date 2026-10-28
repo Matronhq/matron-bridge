@@ -632,6 +632,8 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     const body = indexSrc.slice(start, end);
     // The normal cases are untouched…
     expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text, noticeMeta\('spawn', text\)\)/);
+    // The outcome line opens the parent's turn only when the parent takes it now.
+    expect(body).toContain('if (session && !sessionOccupiedForRoomDelivery(session) && canAnnounceTurn(session)) announceTurnStart(session, TURN_ORIGIN.SPAWN);');
     expect(body).toMatch(/if \(session\) \{/);
     // …and the parent's turn names the spawn the journal decided (none without an id).
     expect(body).toContain("const cause = typeof requestId === 'string' && requestId ? spawnOutcomeCause(requestId) : null;");
@@ -655,7 +657,7 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     expect(args).toMatch(/getDisk: \(\) => buildDisk\(\{ path: DEFAULT_WORKDIR \}\)/);
     expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
     expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
-    expect(args).toMatch(/injectTurn: \(session, text, meta\) => sendTextToSession\(session, text, \{ skipJournalMirror: true, causes: meta\?\.causes \?\? null \}\)/);
+    expect(args).toMatch(/injectTurn: \(session, text, meta\) => sendTextToSession\(session, text, \{ skipJournalMirror: true, causes: meta\?\.causes \?\? null, turnOrigin: TURN_ORIGIN\.SPAWN \}\)/);
     expect(args).toMatch(/serverLabel: SERVER_LABEL,/);
     expect(indexSrc).toMatch(/import \{ buildActivity, buildLimits, buildDisk \} from '\.\/lib\/spawn-capacity\.js';/);
   });
