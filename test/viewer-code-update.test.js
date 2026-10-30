@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startViewerCodeUpdateWatcher, viewerPreflight } from '../viewer/code-update.js';
 import { RESTART_EXIT_CODE } from '../lib/code-update-restart.js';
 
@@ -106,7 +107,7 @@ describe('viewer restart onto new code', () => {
 
 describe('viewerPreflight', () => {
   it('loads the viewer module from the checkout', async () => {
-    const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+    const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
     expect(await viewerPreflight(repo)).toEqual({ ok: true });
   });
 
