@@ -267,6 +267,14 @@ card instead). Sessions between turns resume with their history on their next tu
 as with any restart. The exit code is 75, non-zero on purpose: launchd only
 relaunches after a non-zero exit.
 
+The file viewer follows the same rule: it watches the same checkout and,
+once new code has settled and the viewer module loads from it, exits with
+75 for its own supervisor to relaunch it. It has no turns to wait for. This
+keeps the viewer and the bridge on the same code, so a change to how the
+viewer signs its calls to the bridge cannot leave secret forms and one-time
+links failing until the machine reboots. `MATRON_CODE_UPDATE_RESTART=0` in
+the viewer's environment turns it off.
+
 ## Config (.env)
 
 | Variable | Description | Default |
