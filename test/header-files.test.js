@@ -51,6 +51,8 @@ describe('where the header files live', () => {
       expect(readApiHeaderFile(file)).toEqual({ 'X-Test': 'abc' });
       if (posix) expect(fs.statSync(file).mode & 0o077).toBe(0);
       expect(healHeaderFile(file, 'X-Test: abc')).toBe(false);
+      fs.writeFileSync(file, '');
+      expect(healHeaderFile(file, 'X-Test: abc')).toBe(true);
       fs.rmSync(path.join(base, 'd'), { recursive: true });
       expect(healHeaderFile(file, 'X-Test: abc')).toBe(true);
       expect(readApiHeaderFile(file)).toEqual({ 'X-Test': 'abc' });
@@ -89,6 +91,35 @@ describe('a session token file that something deleted', () => {
       expect(readApiHeaderFile(a)['X-Matron-Session-Token']).toBe(auth.tokenFor('room-a'));
       expect(readApiHeaderFile(b)['X-Matron-Session-Token']).toBe(auth.tokenFor('room-b'));
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('is rewritten when something emptied it', () => {
+    const dir = tmp();
+    try {
+      const auth = createApiAuth({ dir });
+      const file = auth.ensure('room-a');
+      fs.writeFileSync(file, '');
+      expect(auth.heal()).toEqual(['room-a']);
+      fs.writeFileSync(file, 'X-Matron-Session-Token: \n');
+      auth.ensure('room-a');
+      expect(readApiHeaderFile(file)['X-Matron-Session-Token']).toBe(auth.tokenFor('room-a'));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps handing out a known path when a rewrite fails, and none when the first write fails', () => {
+    const dir = tmp();
+    try {
+      let failing = false;
+      const fsImpl = { ...fs, writeFileSync: (...a) => { if (failing) throw new Error('disk full'); return fs.writeFileSync(...a); } };
+      const auth = createApiAuth({ dir, fsImpl });
+      const file = auth.ensure('room-a');
+      fs.rmSync(file);
+      failing = true;
+      expect(auth.ensure('room-a')).toBe(file);
+      expect(() => auth.ensure('room-b')).toThrow(/disk full/);
+      failing = false;
+      expect(auth.heal()).toEqual(['room-a']);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('has nothing to heal when tokens stay in memory', () => {
@@ -141,7 +172,7 @@ describe('the hooks with a missing token file', () => {
     for (const script of ['stop-notify.sh', 'compact-notify.sh']) {
       const r = run(script, { MATRON_BRIDGE_API_HEADER_FILE: '/nonexistent/s.header' });
       expect(r.status).toBe(0);
-      expect(r.stderr).toMatch(/bridge token file \/nonexistent\/s\.header is missing.*401 Missing or unknown bridge session token.*\/restart/);
+      expect(r.stderr).toMatch(/bridge token file \/nonexistent\/s\.header is missing, unreadable or empty.*401 Missing or unknown bridge session token.*\/restart/);
     }
   });
   it('the Node hooks say so on stderr too', () => {
