@@ -32,6 +32,10 @@ fallback() {
   if [ -z "$FLAG" ] || [ -e "$FLAG" ]; then printf '%s' "$DENY"; fi
   exit 0
 }
+if [ ! -r "$AUTH" ]; then
+  echo "matron-bridge: this session's bridge token file $AUTH is missing or unreadable, so the bridge refuses the foreign-turn check (401 Missing or unknown bridge session token). A /restart of this session re-mints it." >&2
+  AUTH=/dev/null
+fi
 case "$PORT" in ''|*[!0-9]*) cat >/dev/null; fallback ;; esac
 if [ -z "$ROOM" ] || ! command -v curl >/dev/null 2>&1; then cat >/dev/null; fallback; fi
 ENC_ROOM=$(printf '%s' "$ROOM" | od -An -tx1 | tr -d ' \n' | sed 's/\(..\)/%\1/g')
