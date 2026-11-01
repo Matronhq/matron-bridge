@@ -241,6 +241,7 @@ import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
 import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
+import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './lib/header-files.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -751,22 +752,30 @@ const memoryClient = createMemoryClient({
 // an env value or argv: `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"` reads
 // the header from the file, whereas a token on curl's command line would be
 // visible to other users in the process table. The file is `<Header>: <token>`
-// in a private mkdtemp dir, removed on exit.
+// in this process's private run directory (lib/header-files.js: under the
+// state directory, not the temp folder, whose cleaners delete by age),
+// removed on exit and rewritten by the heal timer below if it goes missing.
+//
+// The run directory holds the session API header files too.
+let HEADER_RUN_DIR = null;
+try {
+  HEADER_RUN_DIR = createRunDir(headerRunRoot());
+  process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+} catch (e) {
+  console.warn(`[api] could not create the header file directory under ${headerRunRoot()}: ${e.message}`);
+}
 const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
 const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
+const JOURNAL_PROXY_HEADER_LINE = `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}`;
 let JOURNAL_PROXY_HEADER_FILE = '';
-if (journalHttpBase) {
-  let dir = '';
+if (journalHttpBase && HEADER_RUN_DIR) {
   try {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
-    const file = path.join(dir, 'header');
-    fs.writeFileSync(file, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
-    JOURNAL_PROXY_HEADER_FILE = file;
-    process.once('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
+    JOURNAL_PROXY_HEADER_FILE = writeHeaderFile(path.join(HEADER_RUN_DIR, 'journal-proxy.header'), JOURNAL_PROXY_HEADER_LINE);
   } catch (e) {
-    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
     console.warn(`[journal] could not write the read-proxy header file; journal search is unavailable to sessions: ${e.message}`);
   }
+} else if (journalHttpBase) {
+  console.warn('[journal] no header file directory; journal search is unavailable to sessions');
 }
 // Windows: the per-boot token that gates POST /shutdown, written where
 // restart.ps1 reads it (%LOCALAPPDATA%\matron-bridge\shutdown.token).
@@ -782,19 +791,27 @@ const journalReadProxy = createJournalReadProxy({
 });
 
 // Per-session tokens for the loopback API (lib/api-auth.js): each session's
-// children get a 0600 header file in a private mkdtemp dir, removed on exit.
+// children get a 0600 header file in the private run directory above.
 // MATRON_BRIDGE_API_AUTH=off turns the check off (the tokens are still
 // issued), for a rollback without a code change.
 const API_AUTH_ENFORCED = process.env.MATRON_BRIDGE_API_AUTH !== 'off';
-let API_AUTH_DIR = null;
-try {
-  API_AUTH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-api-'));
-  process.once('exit', () => { try { fs.rmSync(API_AUTH_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
-} catch (e) {
-  console.warn(`[api] could not create the session token directory: ${e.message}`);
-}
+const API_AUTH_DIR = HEADER_RUN_DIR;
 const apiAuth = createApiAuth({ dir: API_AUTH_DIR, viewerKey: viewerApiKey(process.env.HMAC_SECRET || '') });
 if (!API_AUTH_ENFORCED) console.warn('[api] MATRON_BRIDGE_API_AUTH=off: loopback API session tokens are not checked');
+// Rewrite any header file that has gone missing, so a live session whose
+// file something deleted gets it back without a restart (a respawn heals it
+// at once: ensure() rewrites a missing file).
+const HEADER_HEAL_INTERVAL_MS = 10 * 60 * 1000;
+function healHeaderFiles() {
+  const rooms = apiAuth.heal();
+  if (rooms.length) console.warn(`[api] rewrote ${rooms.length} missing session token file(s): ${rooms.join(', ')}`);
+  try {
+    if (healHeaderFile(JOURNAL_PROXY_HEADER_FILE, JOURNAL_PROXY_HEADER_LINE)) console.warn('[journal] rewrote the missing read-proxy header file');
+  } catch (e) {
+    console.warn(`[journal] could not rewrite the read-proxy header file: ${e.message}`);
+  }
+}
+setInterval(healHeaderFiles, HEADER_HEAL_INTERVAL_MS).unref();
 // The operator token, for the owner's own scripts outside any session
 // (lib/api-auth.js). Written once this process holds the API port (a second
 // start that cannot bind must not replace the live bridge's file), and

@@ -25,16 +25,18 @@ import { BRIEF_WHAT } from './lib/sharing-tools.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
-import { readApiHeaderFile } from './lib/api-header-file.js';
+import { readApiHeaderFile, explainUnauthorized } from './lib/api-header-file.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 // This session's loopback API token (lib/api-auth.js), sent on every bridge
 // call. Read per call: the file is written before the session spawns, and a
-// read is cheap next to the request.
-function bridgeFetch(url, opts = {}) {
-  const auth = readApiHeaderFile(process.env.MATRON_BRIDGE_API_HEADER_FILE);
-  return fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...auth } });
+// read is cheap next to the request. A 401 caused by a missing or unreadable
+// file says so, naming the file and the fix, on top of the bridge's error.
+async function bridgeFetch(url, opts = {}) {
+  const file = process.env.MATRON_BRIDGE_API_HEADER_FILE;
+  const auth = readApiHeaderFile(file);
+  return explainUnauthorized(await fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...auth } }), file);
 }
 const POLL_INTERVAL_MS = 500;
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
