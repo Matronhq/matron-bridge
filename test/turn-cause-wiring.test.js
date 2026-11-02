@@ -17,9 +17,9 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(fnBody('function journalOnText(')).toContain('const causes = seq != null && convoId ? [userMessageCause(convoId, seq)] : null;');
     expect(fnBody('function journalOnText(')).toContain('journalRouteTextToSession(session, body, { causes })');
     const route = fnBody('async function journalRouteTextToSession(');
-    expect(route).toContain('{ keepRestartBudget = false, causes = null } = {}');
+    expect(route).toContain('{ keepRestartBudget = false, causes = null, turnOrigin = null } = {}');
     expect(route).toContain('const entry = tagCauses(markJournalOrigin([{ type: \'text\', text: trimmed }]), causes);');
-    expect(route.match(/sendTextToSession\(session, trimmed, \{ skipJournalMirror: true, causes \}\)/g)).toHaveLength(2);
+    expect(route.match(/sendTextToSession\(session, trimmed, \{ skipJournalMirror: true, causes(?:, turnOrigin)? \}\)/g)).toHaveLength(2);
   });
 
   it('a tap on a question card names the user\'s reply row, on every answer path', () => {
@@ -47,14 +47,14 @@ describe('turn causes reach sendToSession from every turn source', () => {
   });
 
   it('a spawned session\'s opening turn is sent with the causes the start handler names', () => {
-    expect(index).toContain('injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null }),');
+    expect(index).toContain('injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null, turnOrigin: TURN_ORIGIN.SPAWN }),');
     const rpc = readFileSync(new URL('../lib/journal-rpc.js', import.meta.url), 'utf8');
     expect(rpc).toContain('injectTurn(session, opening, { causes: [spawnedCause(params.spawn_id)] })');
   });
 
   it('queued and resume-held messages keep their causes, and the flush that sends them merges them', () => {
-    expect(fnBody('function sendToSession(')).toContain('(session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));');
-    expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })');
+    expect(fnBody('function sendToSession(')).toContain('(session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markTurnOrigin(markJournalOrigin(contentBlocks), turnOrigin) : contentBlocks, causes));');
+    expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued), turnOrigin: mirrorText ? null : injectedOrigin })');
     expect(fnBody('async function journalQueueMedia(')).toContain('const entry = tagCauses([...blocks], cause);');
   });
 
@@ -69,7 +69,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
   });
 
   it('room turns forward their causes; reminders and timers are reminder turns', () => {
-    expect(index).toContain('sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null })');
+    expect(index).toContain('sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null, turnOrigin: roomTurnOrigin(meta?.causes) })');
     // Each delivered room message carries its seq, for the per-room span the
     // turn's cause names (lib/room-delivery.js), and a reply consumed inline
     // by a wait joins the running turn with its own.
@@ -79,10 +79,10 @@ describe('turn causes reach sendToSession from every turn source', () => {
     const fire = fnBody('async function fireTimer(');
     // The user's /timer is a reminder turn; the agent's own reminder names
     // the turn that set it beside it.
-    expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(1);
-    expect(fire).toContain("{ causes: mergeCauses([plainCause('reminder'), record.causes]) }");
+    expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\], turnOrigin: TURN_ORIGIN\.REMINDER \}/g)).toHaveLength(1);
+    expect(fire).toContain("{ causes: mergeCauses([plainCause('reminder'), record.causes]), turnOrigin: TURN_ORIGIN.REMINDER }");
     // A self-restart's continuation names the restarting turn's causes beside `other`.
-    expect(index).toContain("const entry = tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)]));");
+    expect(index).toContain("const entry = markTurnOrigin(tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)])), TURN_ORIGIN.CARRY_ON);");
   });
 });
 
@@ -91,7 +91,7 @@ describe('a running turn only ever gains causes', () => {
     // The rule itself is lib/turn-cause.js beginOrJoinTurn (unit-tested
     // there); every send takes it before it marks the session busy.
     const send = fnBody('function sendToSession(');
-    expect(send).toContain('const beganTurn = beginOrJoinTurn(session, causes);\n  session.busy = true;');
+    expect(send).toContain('const beganTurn = beginOrJoinTurn(session, causes);');
     expect(send.match(/beginOrJoinTurn\(/g)).toHaveLength(1);
     expect(send).not.toMatch(/\bbeginTurn\(/);
   });
@@ -100,7 +100,9 @@ describe('a running turn only ever gains causes', () => {
     // sendToSession plus the two raw tool_result writes (a question's answer,
     // a plan's approval); nothing else sets busy directly.
     expect(index.match(/^\s*session\.busy = true;/gm)).toHaveLength(3);
-    expect(index.match(/beginOrJoinTurn\(session, causes\);\n\s*session\.busy = true;/g)).toHaveLength(3);
+    expect(index.match(/beginOrJoinTurn\(session, causes\);\n\s*session\.busy = true;/g)).toHaveLength(2);
+    // sendToSession notes whether a turn was already running first (turn-markers), then marks busy.
+    expect(index).toMatch(/const beganTurn = beginOrJoinTurn\(session, causes\);[^]*?const busyAtDispatch = session\.busy === true;\n\s*session\.busy = true;/);
   });
 
   it('a send failure ends the turn only when that send began it', () => {
@@ -144,7 +146,7 @@ describe('a user\'s answer or plan approval carries its causes', () => {
     const answer = fnBody('function submitAnswer(');
     expect(answer).toContain('{ causes = null } = {}');
     expect(answer).toContain('sendTextToSession(session, answerText, { skipJournalMirror: true, causes });');
-    const seam = answer.indexOf('const beganTurn = beginOrJoinTurn(session, causes);\n    session.busy = true;');
+    const seam = answer.indexOf('const beganTurn = beginOrJoinTurn(session, causes);');
     expect(seam).toBeGreaterThan(answer.indexOf("if (mode === 'text-reply')"));
     expect(seam).toBeLessThan(answer.indexOf('writePromptAnswer(session, jsonMsg'));
     // A write stdin refuses ends the turn only when this answer began it.
@@ -156,7 +158,7 @@ describe('a user\'s answer or plan approval carries its causes', () => {
     expect(build).toContain('async function approvePlanBuild(session, { sendHtml, causes = null }) {');
     expect(build.match(/just make the changes directly\.', \{ causes \}\);/g)).toHaveLength(2);
     expect(build.match(/sendTextToSession\(/g)).toHaveLength(2);
-    const seam = build.indexOf('const beganTurn = beginOrJoinTurn(session, causes);\n    session.busy = true;');
+    const seam = build.indexOf('const beganTurn = beginOrJoinTurn(session, causes);');
     expect(seam).toBeGreaterThan(-1);
     const write = build.indexOf('writePromptAnswer(session, jsonMsg, {');
     expect(write).toBeGreaterThan(seam);

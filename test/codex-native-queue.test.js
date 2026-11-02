@@ -5,6 +5,7 @@ import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
 import { hasQueuedCompact } from '../lib/compact-priority.js';
 import { CodexPromptQueue } from '../lib/codex-prompts.js';
 import { queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn } from '../lib/turn-cause.js';
+import { mergedTurnOrigin } from '../lib/turn-markers.js';
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 function sourceOf(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -14,7 +15,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 function setup() {
   let ack;
   const session = { agent: 'codex', alive: true, busy: true, roomId: 'room', queuedMessages: [], queueNotifications: [], codex: { transport: 'app-server', steer: vi.fn(() => new Promise(resolve => { ack = resolve; })), interrupt: vi.fn() } };
-  const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn, console,
+  const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn, mergedTurnOrigin, console,
     sessions: new Map([['room', session]]), pendingMediaMirror: () => [], journalMirrorUserMedia: vi.fn(),
     commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), finalizeSentQueue: vi.fn(),
     journalPublishNotice: vi.fn(), journalConvoIdFor: () => 'convo', dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
@@ -69,7 +70,7 @@ describe('asynchronous question answer delivery', () => {
   it('an answer after the turn ended starts its turn with the user\'s reply as its cause', () => {
     const h = setup(); h.session.busy = false;
     expect(question(h)(reply)).toBe('Tokens');
-    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true, causes: reply });
+    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true, causes: reply, turnOrigin: null });
   });
   it('an answer steered into the running turn adds the user\'s reply to its causes', () => {
     const h = setup(); h.session.currentTurn = { causes: [{ kind: 'other', at: 0 }], startedAt: 0 };
@@ -94,7 +95,7 @@ describe('asynchronous question answer delivery', () => {
     const h = setup(); h.session.busy = false;
     expect(question(h)()).toBe('Tokens');
     expect(h.session.codex.steer).not.toHaveBeenCalled();
-    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true, causes: null });
+    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true, causes: null, turnOrigin: null });
     expect(h.context.recordUserAnswer).not.toHaveBeenCalled();
   });
   it('retains rejected answers and keeps queue notification positions aligned', async () => {
