@@ -41,6 +41,40 @@ describe('items handlers', () => {
     expect(client.create).not.toHaveBeenCalled();
   });
 
+  it('create: uploads overlap, at most four at once, and attachments stay in the order listed', async () => {
+    let running = 0;
+    let peak = 0;
+    const paths = ['a.png', 'b.png', 'c.png', 'd.png', 'e.png', 'f.png'];
+    const uploadLocalFile = vi.fn(async (_s, p) => {
+      running++;
+      peak = Math.max(peak, running);
+      // Later files finish first.
+      await new Promise((r) => setTimeout(r, 2 * (paths.length - paths.indexOf(p))));
+      running--;
+      return { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3 } };
+    });
+    const { h, client } = fixture({}, { uploadLocalFile });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: paths });
+    expect(r.status).toBe(201);
+    expect(peak).toBe(4);
+    expect(client.create.mock.calls[0][0].attachments.map((a) => a.name)).toEqual(paths);
+  });
+
+  it('create: the earliest failure in the list is reported, and files not yet started are not uploaded', async () => {
+    const uploadLocalFile = vi.fn(async (_s, p) => {
+      if (p === 'late.txt') return { ok: false, status: 500, body: { error: 'late' } };
+      await new Promise((r) => setTimeout(r, 5));
+      if (p === 'early.txt') return { ok: false, status: 404, body: { error: 'early' } };
+      return { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3 } };
+    });
+    const { h, client } = fixture({}, { uploadLocalFile });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['early.txt', 'a.png', 'b.png', 'late.txt', 'never.png'] });
+    expect(r.status).toBe(404);
+    expect(r.body.error).toBe('early');
+    expect(uploadLocalFile.mock.calls.map((c) => c[1])).not.toContain('never.png');
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
   it('create: validates kind and title', async () => {
     const { h } = fixture();
     expect((await h.create({ roomId: '!r:s', kind: 'bug', title: 'T' })).status).toBe(400);
@@ -163,6 +197,23 @@ describe('items handlers', () => {
     const { h, client } = fixture();
     await h.list({ roomId: '!r:s', cursor: 'cur_1', limit: 10 });
     expect(client.list.mock.calls[0][0]).toMatchObject({ cursor: 'cur_1', limit: 10 });
+  });
+
+  it('get: comments download side by side and keep the thread order', async () => {
+    const comments = [1, 2, 3].map((n) => ({ id: `ic_${n}`, attachments: [{ blob_ref: `b${n}`, name: `${n}.csv`, mime: 'text/csv' }] }));
+    let running = 0;
+    let peak = 0;
+    const saveAttachments = vi.fn(async (_s, list) => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((r) => setTimeout(r, 5));
+      running--;
+      return list;
+    });
+    const { h } = fixture({ get: vi.fn(async () => ({ status: 200, data: { item: { id: 'it_1' }, comments } })) }, { saveAttachments });
+    const r = await h.get({ roomId: '!r:s', id: 'it_1' });
+    expect(peak).toBe(3);
+    expect(r.body.comments.map((c) => c.id)).toEqual(['ic_1', 'ic_2', 'ic_3']);
   });
 
   it('get: downloads each comment\'s file attachments through saveAttachments and returns their paths', async () => {

@@ -570,6 +570,32 @@ describe('missions handlers', () => {
       expect(client.update).not.toHaveBeenCalled();
     });
 
+    it('get: the links read overlaps the mission read rather than waiting for it', async () => {
+      let finishGet;
+      const { h, client, session, mission } = fixture({
+        get: vi.fn(() => new Promise((resolve) => { finishGet = resolve; })),
+        conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: [link('ms_1', 1, { current: true })] } })),
+      });
+      session.missionId = 'ms_1';
+      const run = h.get({ roomId: '!r:s' });
+      await new Promise((r) => setImmediate(r));
+      expect(client.conversationMissions).toHaveBeenCalledTimes(1);
+      finishGet({ status: 200, data: { mission } });
+      const r = await run;
+      expect(r.status).toBe(200);
+      expect(r.body.conversation_missions.map((m) => m.id)).toEqual(['ms_1']);
+    });
+
+    it('get: a failed links read is ignored when the mission read has already failed', async () => {
+      const { h, session } = fixture({
+        get: vi.fn(async () => ({ status: 500, data: { error: 'boom' } })),
+        conversationMissions: vi.fn(async () => { throw new Error('links down'); }),
+      });
+      session.missionId = 'ms_1';
+      const r = await h.get({ roomId: '!r:s' });
+      expect(r.status).toBe(500);
+    });
+
     it('a 404 on the links route (old journal) falls back to the GET /missions scan', async () => {
       const { h, client, session, mission } = fixture({ list: vi.fn(async () => ({ status: 200, data: { missions: [mission] } })) });
       const r = await h.update({ roomId: '!r:s', title: 'New' });
