@@ -75,6 +75,19 @@ describe('items handlers', () => {
     expect(client.create).not.toHaveBeenCalled();
   });
 
+  it('create: a path that fails its check refuses the write before any file uploads', async () => {
+    const checkLocalFile = vi.fn(async (_s, p) => (p === 'nope.png'
+      ? { ok: false, status: 404, body: { error: `file not found: ${p}` } }
+      : { ok: true }));
+    const { h, client, uploadLocalFile } = fixture({}, { checkLocalFile });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['a.png', 'nope.png', 'b.png'] });
+    expect(r.status).toBe(404);
+    expect(r.body.error).toBe('file not found: nope.png');
+    expect(checkLocalFile).toHaveBeenCalledTimes(3);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
   it('create: validates kind and title', async () => {
     const { h } = fixture();
     expect((await h.create({ roomId: '!r:s', kind: 'bug', title: 'T' })).status).toBe(400);
@@ -199,7 +212,8 @@ describe('items handlers', () => {
     expect(client.list.mock.calls[0][0]).toMatchObject({ cursor: 'cur_1', limit: 10 });
   });
 
-  it('get: comments download side by side and keep the thread order', async () => {
+  it('get: the item and its comments download side by side and keep the thread order', async () => {
+    const item = { id: 'it_1', attachments: [{ blob_ref: 'b0', name: '0.csv', mime: 'text/csv' }] };
     const comments = [1, 2, 3].map((n) => ({ id: `ic_${n}`, attachments: [{ blob_ref: `b${n}`, name: `${n}.csv`, mime: 'text/csv' }] }));
     let running = 0;
     let peak = 0;
@@ -208,11 +222,12 @@ describe('items handlers', () => {
       peak = Math.max(peak, running);
       await new Promise((r) => setTimeout(r, 5));
       running--;
-      return list;
+      return list.map((a) => ({ ...a, path: `/files/${a.name}` }));
     });
-    const { h } = fixture({ get: vi.fn(async () => ({ status: 200, data: { item: { id: 'it_1' }, comments } })) }, { saveAttachments });
+    const { h } = fixture({ get: vi.fn(async () => ({ status: 200, data: { item, comments } })) }, { saveAttachments });
     const r = await h.get({ roomId: '!r:s', id: 'it_1' });
-    expect(peak).toBe(3);
+    expect(peak).toBe(4);
+    expect(r.body.item.attachments[0].path).toBe('/files/0.csv');
     expect(r.body.comments.map((c) => c.id)).toEqual(['ic_1', 'ic_2', 'ic_3']);
   });
 

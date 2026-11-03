@@ -4,7 +4,7 @@ import { spawn, execFileSync } from 'child_process';
 import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt, localWhisperAvailable } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
-import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
+import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createTransferClient } from './lib/transfer-client.js';
@@ -12496,6 +12496,7 @@ const itemsHandlers = createItemsHandlers({
   journalConvoIdFor,
   client: itemsClient,
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+  checkLocalFile: (session, reqPath) => checkLocalUpload({ session, reqPath }),
   saveAttachments: saveItemAttachments,
 });
 

@@ -3,7 +3,7 @@ import path from 'path';
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from 'fs';
 import { realpath } from 'fs/promises';
 import { tmpdir } from 'os';
-import { classifyContentType, createSendAttachmentHandler, resolveAndUploadLocalFile } from '../lib/send-attachment.js';
+import { checkLocalUpload, classifyContentType, createSendAttachmentHandler, resolveAndUploadLocalFile } from '../lib/send-attachment.js';
 
 // Shared by the handler tests (via makeFixture) and the resolveAndUploadLocalFile
 // tests below: a temp workdir with a small real PNG plus a fake publisher whose
@@ -157,6 +157,18 @@ describe('createSendAttachmentHandler', () => {
     const res = await handler({ roomId: '!room1', path: 'big.bin' });
     expect(res.status).toBe(413);
     expect(res.body.error).toMatch(/50 MB|too large/i);
+  });
+
+  it('checkLocalUpload refuses a missing or oversized file and passes a good one, without uploading', async () => {
+    const { workdir, publisher } = makeFixture();
+    writeFileSync(path.join(workdir, 'big.bin'), Buffer.alloc(32));
+    const session = { workdir };
+    expect((await checkLocalUpload({ session, reqPath: 'nope.bin' })).status).toBe(404);
+    expect((await checkLocalUpload({ session, reqPath: 'big.bin', maxBytes: 16 })).status).toBe(413);
+    const ok = await checkLocalUpload({ session, reqPath: 'big.bin', maxBytes: 64 });
+    expect(ok.ok).toBe(true);
+    expect(ok.name).toBe('big.bin');
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
   });
 
   it('surfaces upload failure when uploadMedia fails open with null', async () => {

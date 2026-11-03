@@ -570,16 +570,19 @@ describe('missions handlers', () => {
       expect(client.update).not.toHaveBeenCalled();
     });
 
-    it('get: the links read overlaps the mission read rather than waiting for it', async () => {
+    it('get: the links read and the mission read overlap, neither waiting for the other', async () => {
       let finishGet;
+      let finishLinks;
       const { h, client, session, mission } = fixture({
         get: vi.fn(() => new Promise((resolve) => { finishGet = resolve; })),
-        conversationMissions: vi.fn(async () => ({ status: 200, data: { missions: [link('ms_1', 1, { current: true })] } })),
+        conversationMissions: vi.fn(() => new Promise((resolve) => { finishLinks = resolve; })),
       });
       session.missionId = 'ms_1';
       const run = h.get({ roomId: '!r:s' });
       await new Promise((r) => setImmediate(r));
       expect(client.conversationMissions).toHaveBeenCalledTimes(1);
+      expect(client.get).toHaveBeenCalledTimes(1);
+      finishLinks({ status: 200, data: { missions: [link('ms_1', 1, { current: true })] } });
       finishGet({ status: 200, data: { mission } });
       const r = await run;
       expect(r.status).toBe(200);

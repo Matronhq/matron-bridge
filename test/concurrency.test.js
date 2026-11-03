@@ -30,19 +30,22 @@ describe('createLimiter', () => {
   it('a newcomer cannot jump the queue or take the count past max when a slot is handed over', async () => {
     const limit = createLimiter(1);
     const first = deferred();
+    const started = [];
     let running = 0;
     let peak = 0;
-    const job = (gate) => async () => {
+    const job = (id, gate) => async () => {
+      started.push(id);
       running++;
       peak = Math.max(peak, running);
       await gate;
       running--;
     };
-    const runs = [limit(job(first.promise)), limit(job(Promise.resolve()))];
+    const runs = [limit(job('first', first.promise)), limit(job('waiter', Promise.resolve()))];
     first.resolve();
     await Promise.resolve();
-    runs.push(limit(job(Promise.resolve())));
+    runs.push(limit(job('newcomer', Promise.resolve())));
     await Promise.all(runs);
+    expect(started).toEqual(['first', 'waiter', 'newcomer']);
     expect(peak).toBe(1);
   });
 
