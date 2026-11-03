@@ -13,15 +13,18 @@ const A = 'mcp__ask-user__';
 const roomTurn = { roomId: 'room-1', person: 'tim', role: 'guest', mission: null };
 const itemTurn = { roomId: null, person: 'tim', role: 'owner', mission: { id: 'mi_1', num: 7, owner: null }, item: { id: 'it_x', num: 12 } };
 
-function rig() {
+function rig({ stored = {} } = {}) {
   const created = [];
   const comments = [];
+  const updates = [];
   const state = new Map();
   let failCreate = false;
+  let failGet = false;
+  let saved = stored;
   const fs = createForeignSessions({
     sharing: { personRoom: async () => ({ status: 404, data: {} }) },
     items: {
-      get: async (id) => (state.has(id) ? { status: 200, data: { item: { id, state: state.get(id) } } } : { status: 404, data: { error: 'not_found' } }),
+      get: async (id) => (failGet ? { status: 0, data: {} } : state.has(id) ? { status: 200, data: { item: { id, state: state.get(id) } } } : { status: 404, data: { error: 'not_found' } }),
       create: async (body) => {
         if (failCreate) return { status: 0, data: {} };
         created.push(body);
@@ -30,6 +33,7 @@ function rig() {
         return { status: 201, data: { item: { id, num: 200 + created.length } } };
       },
       comment: async (id, body) => { comments.push([id, body]); return { status: 201, data: {} }; },
+      update: async (id, body) => { updates.push([id, body]); return { status: 200, data: {} }; },
       close: async () => ({ status: 200, data: {} }),
     },
     journalConvoIdFor: (s) => `convo-${s.roomId}`,
@@ -37,9 +41,9 @@ function rig() {
     publishNotice: () => {},
     isOccupied: () => false,
     flag: { set: () => {}, clear: () => {} },
-    store: { load: () => ({}), save: () => {} },
+    store: { load: () => saved, save: (o) => { saved = o; } },
   });
-  return { fs, created, comments, state, failNext: () => { failCreate = true; } };
+  return { fs, created, comments, updates, state, saved: () => saved, failNext: () => { failCreate = true; }, failGets: (v) => { failGet = v; } };
 }
 const sessionIn = (r, turn) => {
   const s = { roomId: 'sess-a', alive: true, foreignTurn: null };
@@ -128,7 +132,9 @@ describe('raiseNotice', () => {
     expect(r.created.length).toBe(1);
     expect(r.comments.length).toBe(NOTICE_UPDATES_MAX);
     expect(r.comments[0][0]).toBe('it_1');
-    expect(r.comments[0][1]).toMatchObject({ awaiting: 'user' });
+    expect(r.comments[0][1]).toMatchObject({ as_convo_id: 'convo-sess-a' });
+    // The comment is posted, then the notice is handed back to the user.
+    expect(r.updates[0]).toEqual(['it_1', { awaiting: 'user' }]);
     expect(r.comments[0][1].body).toMatch(/^\*\*Update from tim's side\*\*: more/);
     expect(r.comments[0][1].body).toContain('> update 0');
     const capped = await r.fs.raiseNotice(s, { title: 'again', text: 'too many' });
@@ -144,6 +150,39 @@ describe('raiseNotice', () => {
     const out = await r.fs.raiseNotice(s, { title: 'second', text: 'two' });
     expect(out.body.updated).toBeUndefined();
     expect(r.created.length).toBe(2);
+  });
+
+  it('a failed lookup keeps the open notice: no second one is filed', async () => {
+    const r = rig();
+    const s = sessionIn(r, roomTurn);
+    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
+    r.failGets(true);
+    expect((await r.fs.raiseNotice(s, { title: 'b', text: 'b' })).status).toBe(502);
+    r.failGets(false);
+    expect((await r.fs.raiseNotice(s, { title: 'c', text: 'c' })).body.updated).toBe(true);
+    expect(r.created.length).toBe(1);
+  });
+
+  it('a deleted notice (404) makes room for a new one', async () => {
+    const r = rig();
+    const s = sessionIn(r, roomTurn);
+    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
+    r.state.delete('it_1');
+    await r.fs.raiseNotice(s, { title: 'b', text: 'b' });
+    expect(r.created.length).toBe(2);
+  });
+
+  it('the open notice survives a bridge restart, beside the pending asks', async () => {
+    const r = rig();
+    const s = sessionIn(r, roomTurn);
+    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
+    expect(Object.keys(r.saved())).toEqual(['foreign_notices']);
+    const again = rig({ stored: r.saved() });
+    again.state.set('it_1', 'open');
+    const s2 = sessionIn(again, roomTurn);
+    expect(again.fs.pendingCount()).toBe(0);
+    expect((await again.fs.raiseNotice(s2, { title: 'b', text: 'b' })).body.updated).toBe(true);
+    expect(again.created).toEqual([]);
   });
 
   it('another room gets a notice of its own', async () => {
