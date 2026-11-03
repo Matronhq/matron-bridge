@@ -12,3 +12,6 @@ mcp-config.local.json
 journal-cursor.json
 
 node_modules
+
+# Agent scratch (PR bodies, screenshots): never committed
+.superpowers/

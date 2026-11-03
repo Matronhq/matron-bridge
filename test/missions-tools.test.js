@@ -821,7 +821,7 @@ describe('missions handlers', () => {
     });
   });
 
-  // Named-mission close (#4901, spec 2026-09-29 coordinator session control
+  // Named-mission close (spec 2026-09-29 coordinator session control
   // "Coordinator mission close"; corrected by final-review I1, 2026-09-30):
   // `mission: N` closes ANOTHER mission by number, never cached, both item
   // tiers still block. The bridge sends the caller's own convo_id and never
