@@ -160,7 +160,7 @@ describe('createSendAttachmentHandler', () => {
   });
 
   it('checkLocalUpload refuses a missing or oversized file and passes a good one, without uploading', async () => {
-    const { workdir, publisher } = makeFixture();
+    const { workdir, uploads } = makeFixture();
     writeFileSync(path.join(workdir, 'big.bin'), Buffer.alloc(32));
     const session = { workdir };
     expect((await checkLocalUpload({ session, reqPath: 'nope.bin' })).status).toBe(404);
@@ -168,7 +168,7 @@ describe('createSendAttachmentHandler', () => {
     const ok = await checkLocalUpload({ session, reqPath: 'big.bin', maxBytes: 64 });
     expect(ok.ok).toBe(true);
     expect(ok.name).toBe('big.bin');
-    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+    expect(uploads).toEqual([]);
   });
 
   it('surfaces upload failure when uploadMedia fails open with null', async () => {
