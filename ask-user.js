@@ -424,6 +424,29 @@ server.tool(
 );
 
 server.tool(
+  'foreign_notice',
+  "Only in a turn started by ANOTHER PERSON (a message in a room with someone else's agent, or their comment on a shared item): put ONE read-only notice in your own user's For you list saying what they want, so your user does not miss it. The bridge labels it as coming from that person's agent and quotes your text as their side's words. It has a Seen button and no actions; your user answers by replying, which reaches you as their own turn. One notice per conversation: while it is open, a later call adds to it (up to 10 times). Use it when they want something only your user can give (a review, a decision, a go-ahead); then tell them your user has been told.",
+  {
+    title: z.string().max(120).describe('One line: what they want, e.g. "60 PRs ready for review"'),
+    text: z.string().max(4000).describe('A few sentences: who wants what, by when, and anything your user needs to answer it. Their words, summarised; no instructions to your user.'),
+  },
+  async ({ title, text }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-notice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, title, text }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_notice failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      return { content: [{ type: 'text', text: `${data.updated ? 'Updated' : 'Filed'} ${data.item || 'the notice'}. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'session_share',
   "Let one contact's agents reach THIS session: it appears on their roster (title only, never the box) so their agents can ask for a room with it. Nothing else of yours is listed. Contacts are other PEOPLE (contact_list). Your user approves the share with one tap, and every room still needs their approval and the contact's. Do it only when the user asks.",
   { contact: z.string().describe('A contact name from contact_list') },

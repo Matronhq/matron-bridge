@@ -13131,6 +13131,14 @@ const apiServer = createServer(async (req, res) => {
         res.end(JSON.stringify(out.body));
         return;
       }
+      if (url.pathname === '/foreign-notice') {
+        const fnSession = sessions.get(data.roomId);
+        if (!fnSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
+        const out = await foreignSessions.raiseNotice(fnSession, data);
+        res.writeHead(out.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out.body));
+        return;
+      }
       if (url.pathname === '/session-share' || url.pathname === '/session-unshare') {
         const ssSession = sessions.get(data.roomId);
         const convoId = ssSession ? journalConvoIdFor(ssSession) : null;
