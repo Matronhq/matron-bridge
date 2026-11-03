@@ -2,38 +2,28 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { createForeignSessions } from '../lib/foreign-session.js';
 import {
-  decideForeignCall, foreignRouteAllowed, foreignTurnBanner, noticeItem, noticeKey, quoteNoticeText,
-  NOTICE_UPDATES_MAX, NOTICE_TEXT_MAX,
+  decideForeignCall, foreignRouteAllowed, foreignTurnBanner, noticeItem, quoteNoticeText, NOTICE_TEXT_MAX,
 } from '../lib/foreign-turn.js';
 
 // foreign_notice: the one thing a turn another person started may put in its
-// user's For you list. One read-only notice per room (or item), labelled as
-// coming from that person's agent; later calls add to it.
+// user's For you list: a read-only notice, labelled as
+// coming from that person's agent. Each call is a notice of its own.
 const A = 'mcp__ask-user__';
 const roomTurn = { roomId: 'room-1', person: 'tim', role: 'guest', mission: null };
 const itemTurn = { roomId: null, person: 'tim', role: 'owner', mission: { id: 'mi_1', num: 7, owner: null }, item: { id: 'it_x', num: 12 } };
 
-function rig({ stored = {} } = {}) {
+function rig() {
   const created = [];
-  const comments = [];
-  const updates = [];
-  const state = new Map();
   let failCreate = false;
-  let failGet = false;
-  let saved = stored;
   const fs = createForeignSessions({
     sharing: { personRoom: async () => ({ status: 404, data: {} }) },
     items: {
-      get: async (id) => (failGet ? { status: 0, data: {} } : state.has(id) ? { status: 200, data: { item: { id, state: state.get(id) } } } : { status: 404, data: { error: 'not_found' } }),
+      get: async () => ({ status: 404, data: {} }),
       create: async (body) => {
         if (failCreate) return { status: 0, data: {} };
         created.push(body);
-        const id = `it_${created.length}`;
-        state.set(id, 'open');
-        return { status: 201, data: { item: { id, num: 200 + created.length } } };
+        return { status: 201, data: { item: { id: `it_${created.length}`, num: 200 + created.length } } };
       },
-      comment: async (id, body) => { comments.push([id, body]); return { status: 201, data: {} }; },
-      update: async (id, body) => { updates.push([id, body]); return { status: 200, data: {} }; },
       close: async () => ({ status: 200, data: {} }),
     },
     journalConvoIdFor: (s) => `convo-${s.roomId}`,
@@ -41,9 +31,9 @@ function rig({ stored = {} } = {}) {
     publishNotice: () => {},
     isOccupied: () => false,
     flag: { set: () => {}, clear: () => {} },
-    store: { load: () => saved, save: (o) => { saved = o; } },
+    store: { load: () => ({}), save: () => {} },
   });
-  return { fs, created, comments, updates, state, saved: () => saved, failNext: () => { failCreate = true; }, failGets: (v) => { failGet = v; } };
+  return { fs, created, failNext: () => { failCreate = true; } };
 }
 const sessionIn = (r, turn) => {
   const s = { roomId: 'sess-a', alive: true, foreignTurn: null };
@@ -68,8 +58,8 @@ describe('the gate lets foreign_notice through, and nothing new with it', () => 
     expect(d.reason).toMatch(/To tell your own user about it, use foreign_notice\./);
   });
   it('both banners name it', () => {
-    expect(foreignTurnBanner(roomTurn)).toMatch(/call foreign_notice \(one read-only notice/);
-    expect(foreignTurnBanner(itemTurn)).toMatch(/call foreign_notice \(one read-only notice/);
+    expect(foreignTurnBanner(roomTurn)).toMatch(/call foreign_notice \(a read-only notice/);
+    expect(foreignTurnBanner(itemTurn)).toMatch(/call foreign_notice \(a read-only notice/);
   });
 });
 
@@ -88,11 +78,6 @@ describe('the notice the bridge files', () => {
   });
   it('quotes every line of the text, and drops image syntax', () => {
     expect(quoteNoticeText('a\nb c ![x](https://example.com/p.png)')).toBe('> a\n> b\n> c [x](https://example.com/p.png)');
-  });
-  it('is limited per room, or per item for an item turn', () => {
-    expect(noticeKey(roomTurn)).toBe('room:room-1');
-    expect(noticeKey(itemTurn)).toBe('item:it_x');
-    expect(noticeKey({ person: 'tim' })).toBe(null);
   });
 });
 
@@ -120,101 +105,18 @@ describe('raiseNotice', () => {
     expect(r.created[0]).toMatchObject({ kind: 'notice', convo_id: 'convo-sess-a', awaiting: 'user', position: 'top', private: true });
   });
 
-  it('a later call while it is open adds a comment instead of a second notice, up to the cap', async () => {
+  it('every call is a notice of its own, in any room or item', async () => {
     const r = rig();
     const s = sessionIn(r, roomTurn);
-    await r.fs.raiseNotice(s, { title: 'first', text: 'one' });
-    for (let i = 0; i < NOTICE_UPDATES_MAX; i++) {
-      const out = await r.fs.raiseNotice(s, { title: 'more', text: `update ${i}` });
-      expect(out.status).toBe(200);
-      expect(out.body.updated).toBe(true);
-    }
-    expect(r.created.length).toBe(1);
-    expect(r.comments.length).toBe(NOTICE_UPDATES_MAX);
-    expect(r.comments[0][0]).toBe('it_1');
-    expect(r.comments[0][1]).toMatchObject({ as_convo_id: 'convo-sess-a' });
-    // The comment is posted, then the notice is handed back to the user.
-    expect(r.updates[0]).toEqual(['it_1', { awaiting: 'user' }]);
-    expect(r.comments[0][1].body).toMatch(/^\*\*Update from tim's side\*\*: more/);
-    expect(r.comments[0][1].body).toContain('> update 0');
-    const capped = await r.fs.raiseNotice(s, { title: 'again', text: 'too many' });
-    expect(capped.status).toBe(429);
-    expect(r.created.length).toBe(1);
-  });
-
-  it('once the user has seen it (closed), the next call files a fresh one', async () => {
-    const r = rig();
-    const s = sessionIn(r, roomTurn);
-    await r.fs.raiseNotice(s, { title: 'first', text: 'one' });
-    r.state.set('it_1', 'closed');
-    const out = await r.fs.raiseNotice(s, { title: 'second', text: 'two' });
-    expect(out.body.updated).toBeUndefined();
-    expect(r.created.length).toBe(2);
-  });
-
-  it('a failed lookup keeps the open notice: no second one is filed', async () => {
-    const r = rig();
-    const s = sessionIn(r, roomTurn);
-    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
-    r.failGets(true);
-    expect((await r.fs.raiseNotice(s, { title: 'b', text: 'b' })).status).toBe(502);
-    r.failGets(false);
-    expect((await r.fs.raiseNotice(s, { title: 'c', text: 'c' })).body.updated).toBe(true);
-    expect(r.created.length).toBe(1);
-  });
-
-  it('a deleted notice (404) makes room for a new one', async () => {
-    const r = rig();
-    const s = sessionIn(r, roomTurn);
-    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
-    r.state.delete('it_1');
-    await r.fs.raiseNotice(s, { title: 'b', text: 'b' });
-    expect(r.created.length).toBe(2);
-  });
-
-  it('the open notice survives a bridge restart, beside the pending asks', async () => {
-    const r = rig();
-    const s = sessionIn(r, roomTurn);
-    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
-    expect(Object.keys(r.saved())).toEqual(['foreign_notices']);
-    const again = rig({ stored: r.saved() });
-    again.state.set('it_1', 'open');
-    const s2 = sessionIn(again, roomTurn);
-    expect(again.fs.pendingCount()).toBe(0);
-    expect((await again.fs.raiseNotice(s2, { title: 'b', text: 'b' })).body.updated).toBe(true);
-    expect(again.created).toEqual([]);
-  });
-
-  it('an old unseen notice is still the one added to after a restart', async () => {
-    const r = rig();
-    const s = sessionIn(r, roomTurn);
-    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
-    const stored = r.saved();
-    stored.foreign_notices['room:room-1'].createdAt = 1;
-    const again = rig({ stored });
-    again.state.set('it_1', 'open');
-    expect((await again.fs.raiseNotice(sessionIn(again, roomTurn), { title: 'b', text: 'b' })).body.updated).toBe(true);
-  });
-
-  it('another room gets a notice of its own', async () => {
-    const r = rig();
-    const s = sessionIn(r, roomTurn);
-    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
+    for (const t of ['a', 'b', 'c']) expect((await r.fs.raiseNotice(s, { title: t, text: t })).status).toBe(200);
     r.fs.end(s);
-    r.fs.begin(s, { ...roomTurn, roomId: 'room-2', person: 'una' });
-    await r.fs.raiseNotice(s, { title: 'b', text: 'b' });
-    expect(r.created.map((c) => c.title)).toEqual(["From tim's agent: a", "From una's agent: b"]);
+    r.fs.begin(s, itemTurn);
+    await r.fs.raiseNotice(s, { title: 'd', text: 'd' });
+    expect(r.created.map((c) => c.title)).toEqual(["From tim's agent: a", "From tim's agent: b", "From tim's agent: c", "From tim's agent: d"]);
+    expect(r.created.every((c) => c.kind === 'notice' && c.private === true && c.actions === undefined)).toBe(true);
   });
 
-  it('calls made in parallel cannot file two notices', async () => {
-    const r = rig();
-    const s = sessionIn(r, roomTurn);
-    const outs = await Promise.all([r.fs.raiseNotice(s, { title: 'a', text: 'a' }), r.fs.raiseNotice(s, { title: 'b', text: 'b' })]);
-    expect(outs.map((o) => o.status).sort()).toEqual([200, 429]);
-    expect(r.created.length).toBe(1);
-  });
-
-  it('a journal failure is reported, and the next call tries again', async () => {
+  it('a journal failure is reported', async () => {
     const r = rig();
     const s = sessionIn(r, roomTurn);
     r.failNext();
