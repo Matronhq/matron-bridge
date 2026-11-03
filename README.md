@@ -360,7 +360,7 @@ bridge's own `ask-user` MCP loads per session; everything else is opt-in.
 |---|---|
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
-| `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
+| `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. Chrome runs with its sandbox on, so on Linux the bridge must run as an unprivileged user (Chrome will not start sandboxed as root) with Xvfb and the Google Chrome package installed; the package's AppArmor profile lets it use the user namespaces Ubuntu otherwise restricts. |
 | `!start --auto [workdir]` | Claude only: spawn with auto permission mode + Matron permission cards instead of the default `--dangerously-skip-permissions`. Also order-independent and accepted by `!resume`, `!workdir`, and `!restart`; pass `--bypass` instead to return to the default. See Permissions below. |
 | `!stop` | Stop the current session |
 | `!restart [--force] [--browser] [--bypass\|--auto]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser`/`--bypass`/`--auto` are Claude-only) |
