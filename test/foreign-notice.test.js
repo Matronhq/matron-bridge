@@ -185,6 +185,17 @@ describe('raiseNotice', () => {
     expect(again.created).toEqual([]);
   });
 
+  it('an old unseen notice is still the one added to after a restart', async () => {
+    const r = rig();
+    const s = sessionIn(r, roomTurn);
+    await r.fs.raiseNotice(s, { title: 'a', text: 'a' });
+    const stored = r.saved();
+    stored.foreign_notices['room:room-1'].createdAt = 1;
+    const again = rig({ stored });
+    again.state.set('it_1', 'open');
+    expect((await again.fs.raiseNotice(sessionIn(again, roomTurn), { title: 'b', text: 'b' })).body.updated).toBe(true);
+  });
+
   it('another room gets a notice of its own', async () => {
     const r = rig();
     const s = sessionIn(r, roomTurn);
