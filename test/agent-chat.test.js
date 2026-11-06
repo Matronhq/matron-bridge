@@ -2670,6 +2670,16 @@ describe('chatStart with a person (talk request)', () => {
     expect(invites.invite).not.toHaveBeenCalled();
   });
 
+  it('refuses someone on another journal before anything is made: rooms across journals are not available yet', async () => {
+    const { handlers, calls, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const res = await handlers.chatStart({ ...talk, person: 'bob@B.example' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/^bob@b\.example is on another Matron journal/);
+    expect(invites.invite).not.toHaveBeenCalled();
+    expect(calls.filter((c) => ['upsertConvo', 'record', 'publishText'].includes(c.call))).toEqual([]);
+    expect((await handlers.chatStart({ ...talk, person: 'bob@' })).status).toBe(400);
+  });
+
   it('asks the journal by person: no device, no conversation, the 👤 title, and a record that keeps the person', async () => {
     const { handlers, calls, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
     const res = await handlers.chatStart({ ...talk, mission: 3 });
