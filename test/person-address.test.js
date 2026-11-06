@@ -81,12 +81,12 @@ describe('contact_add remote: true', () => {
 });
 
 describe('an address where a person goes', () => {
-  it('mission_share passes the address and says sharing across journals is not here yet', async () => {
+  it('mission_share passes the address, and a not_contact refusal says both things it can mean', async () => {
     const { h, client } = fixture();
     const r = await h.share({ roomId: '!r:s', contact: 'bob@b.example' });
     expect(client.share).toHaveBeenCalledWith('ms_1', expect.objectContaining({ contact: 'bob@b.example' }));
     expect(r.body.blocked_by).toBe('across_journals');
-    expect(formatSharingError('share', r.body)).toMatch(/not available yet/);
+    expect(formatSharingError('share', r.body)).toMatch(/either they are not a contact .* or this journal does not share across journals yet/);
     // A contact on this journal still hears the usual answer.
     expect((await h.share({ roomId: '!r:s', contact: 'tim' })).body.blocked_by).toBe('not_contact');
     // A missing mission is still that, address or not.
@@ -94,13 +94,20 @@ describe('an address where a person goes', () => {
     expect((await gone.h.share({ roomId: '!r:s', contact: 'bob@b.example', mission: 9 })).body.error).toBe('not_found');
   });
 
-  it('shared_by takes an address, its host lower-cased, and an unknown one is not "no such mission"', async () => {
+  it('shared_by takes an address, its host lower-cased; nothing found says where a shared mission shows up', async () => {
     const { h, client } = fixture();
     const r = await h.shared_get({ roomId: '!r:s', shared_by: 'Bob@B.Example', num: 3 });
     expect(client.lookup).toHaveBeenCalledWith('Bob@b.example', 3);
-    expect(r.body.blocked_by).toBe('across_journals');
+    expect([r.status, r.body.error, r.body.across_journals]).toEqual([404, 'not_found', true]);
+    expect(formatSharingError('shared_get', r.body)).toMatch(/shows there once their journal has sent it/);
     expect((await h.shared_get({ roomId: '!r:s', shared_by: 'bob@', num: 3 })).status).toBe(400);
-    expect((await h.shared_post({ roomId: '!r:s', shared_by: 'bob@b.example', mission: 3, kind: 'progress', title: 'x' })).body.blocked_by).toBe('across_journals');
+    const post = await h.shared_post({ roomId: '!r:s', shared_by: 'bob@b.example', mission: 3, kind: 'progress', title: 'x' });
+    expect(formatSharingError('shared_post', post.body)).toMatch(/no mission or item with that number/);
+    // A journal that cannot read across journals rejects the address.
+    const old = fixture({ lookup: vi.fn(async () => ({ status: 400, data: { error: 'bad_request' } })) });
+    const o = await old.h.shared_get({ roomId: '!r:s', shared_by: 'bob@b.example', num: 3 });
+    expect(o.body.blocked_by).toBe('reading_across');
+    expect(formatSharingError('shared_get', o.body)).toMatch(/cannot read what people on other journals share yet/);
     expect((await h.shared_get({ roomId: '!r:s', shared_by: 'tim', num: 3 })).body.error).toBe('not_found');
   });
 
