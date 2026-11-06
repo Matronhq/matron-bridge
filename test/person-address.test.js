@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { personRef, isAddress, PERSON_MAX } from '../lib/person-ref.js';
 import { createSharingHandlers } from '../lib/sharing-tools.js';
 import { createSharingClient } from '../lib/sharing-client.js';
-import { formatContactAddAck, formatSharingError } from '../lib/sharing-format.js';
+import { formatContactAddAck, formatSharingError, contactLine } from '../lib/sharing-format.js';
 import { foreignTurnBanner, personLabel } from '../lib/foreign-turn.js';
 
 // People on other Matron journals (journal federation): an address
@@ -89,6 +89,9 @@ describe('an address where a person goes', () => {
     expect(formatSharingError('share', r.body)).toMatch(/not available yet/);
     // A contact on this journal still hears the usual answer.
     expect((await h.share({ roomId: '!r:s', contact: 'tim' })).body.blocked_by).toBe('not_contact');
+    // A missing mission is still that, address or not.
+    const gone = fixture({ share: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) });
+    expect((await gone.h.share({ roomId: '!r:s', contact: 'bob@b.example', mission: 9 })).body.error).toBe('not_found');
   });
 
   it('shared_by takes an address, its host lower-cased, and an unknown one is not "no such mission"', async () => {
@@ -106,5 +109,10 @@ describe('an address where a person goes', () => {
     expect(banner).toMatch(/started by bob@b\.example, another person, on another Matron journal — not by your user/);
     expect(foreignTurnBanner({ person: 'bob', roomId: '!room:s' })).toMatch(/started by bob, another person — not by your user/);
     expect(personLabel('bob@b.example', 'agent')).toBe("bob@b.example's agent (another person)");
+  });
+
+  it('contact lines keep a long address whole, so it can be passed back', () => {
+    const long = `${'b'.repeat(64)}@${'a'.repeat(60)}.example`;
+    expect(contactLine({ id: 'ct_1', address: long, state: 'active' })).toContain(long);
   });
 });
