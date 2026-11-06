@@ -114,7 +114,7 @@ import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
-import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER } from './lib/wake-route.js';
+import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
   createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
@@ -12330,16 +12330,26 @@ const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 // POST /wake (lib/wake-route.js): wake one configured conversation with one
 // configured text, the way a timer firing does — resuming a reaped session.
 // Off unless both env vars are set; the request can choose neither.
-const handleWake = createWakeHandler({
-  convoId: process.env.MATRON_WAKE_CONVO_ID,
-  text: process.env.MATRON_WAKE_TEXT,
-  findSession: (convoId) => findSessionByClaudeSessionId(convoId),
-  resumeConvo: (convoId) => journalResumeConvo(convoId),
-  routeText: (session, text) => journalRouteTextToSession(session, text),
-  publishNotice: (message, session) => journalPublishNotice(
-    session ? journalConvoIdFor(session) : process.env.MATRON_WAKE_CONVO_ID, message),
-  isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
-});
+// POST /wake/<name> does the same for each named target in
+// MATRON_WAKE_TARGETS, each with its own coalescing.
+function makeWakeHandler(convoId, text) {
+  return createWakeHandler({
+    convoId,
+    text,
+    findSession: (id) => findSessionByClaudeSessionId(id),
+    resumeConvo: (id) => journalResumeConvo(id),
+    routeText: (session, t) => journalRouteTextToSession(session, t),
+    publishNotice: (message, session) => journalPublishNotice(
+      session ? journalConvoIdFor(session) : convoId, message),
+    isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
+  });
+}
+const wakeHandlers = new Map([['', makeWakeHandler(process.env.MATRON_WAKE_CONVO_ID, process.env.MATRON_WAKE_TEXT)]]);
+{
+  const { targets, problems } = wakeTargetsFromEnv(process.env);
+  for (const problem of problems) console.warn(`[wake] ${problem}; that target is off`);
+  for (const [name, t] of targets) wakeHandlers.set(name, makeWakeHandler(t.convoId, t.text));
+}
 
 // send_attachment into a room: a journal transfer, uploaded in the
 // background. The outcome (declined / failed / expired, or a cancel because
@@ -12910,7 +12920,8 @@ const apiServer = createServer(async (req, res) => {
   // names a session needs that session's. The viewer's key opens only the
   // routes the viewer calls.
   const apiCaller = apiAuth.caller(req.headers);
-  const ownCredentialRoute = url.pathname === '/wake' || url.pathname === '/shutdown' || url.pathname === '/show-file';
+  const wakeName = wakeRouteName(url.pathname);
+  const ownCredentialRoute = wakeName !== null || url.pathname === '/shutdown' || url.pathname === '/show-file';
   const refuseApiCall = (namedRoomId) => {
     if (!API_AUTH_ENFORCED || ownCredentialRoute) return false;
     const r = apiAuthRefusal({ caller: apiCaller, method: req.method, pathname: url.pathname, namedRoomId });
@@ -12976,9 +12987,10 @@ const apiServer = createServer(async (req, res) => {
     return;
   }
 
-  // POST /wake — handled before the body is read: it takes no input, so the
-  // body is drained unread (an empty one never reaches the JSON parse below).
-  if (url.pathname === '/wake') {
+  // POST /wake and /wake/<name> — handled before the body is read: they take
+  // no input, so the body is drained unread (an empty one never reaches the
+  // JSON parse below).
+  if (wakeName !== null) {
     req.resume();
     if (req.method !== 'POST') {
       res.writeHead(405, { 'Content-Type': 'application/json' });
@@ -12990,6 +13002,12 @@ const apiServer = createServer(async (req, res) => {
     if (!wakeTokenOk(process.env.MATRON_WAKE_TOKEN, req.headers[WAKE_TOKEN_HEADER])) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'wake token required' }));
+      return;
+    }
+    const handleWake = wakeHandlers.get(wakeName);
+    if (!handleWake) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'wake is not configured' }));
       return;
     }
     let result;
