@@ -9526,7 +9526,7 @@ const journalMediaRouter = createJournalMediaRouter({
     });
     return blocks;
   },
-  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption }) => {
+  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption, onInlineSkip = null }) => {
     const safeName = safeMediaFilename(name);
     // Downscale/skip decision for the INLINE copy only (iv mode never inlines,
     // so don't burn a decode there). The original buffer still goes to disk.
@@ -9537,6 +9537,7 @@ const journalMediaRouter = createJournalMediaRouter({
         console.log(`[journal-media] inline image downscaled: ${buffer.length}B ${mime} -> ${inline.buffer.length}B ${inline.mediaType} ${inline.width}x${inline.height}`);
       } else if (inline.action === 'skip') {
         console.warn(`[journal-media] inline image skipped (${inline.reason}); full file still saved for Read`);
+        if (typeof onInlineSkip === 'function') onInlineSkip(inline.reason);
       }
     }
     return buildSavedMediaBlocks(session, {
