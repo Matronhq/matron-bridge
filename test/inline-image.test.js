@@ -213,6 +213,19 @@ describe('prepareInlineImage — HEIC', () => {
     expect(res.reason).toMatch(/timed out/);
   });
 
+  it('leaves AVIF to sharp', async () => {
+    const avif = await sharp({ create: { width: 2000, height: 1000, channels: 3, background: '#3c3' } })
+      .avif().toBuffer();
+    const res = await prepareInlineImage(avif, 'image/avif');
+    expect(res.action).toBe('replace');
+    expect([res.width, res.height]).toEqual([1568, 784]);
+  });
+
+  it('runs concurrent conversions one at a time and completes them all', async () => {
+    const results = await Promise.all([1, 2, 3].map(() => prepareInlineImage(HEIC_GRID, 'image/heic')));
+    for (const res of results) expect(res.action).toBe('replace');
+  });
+
   it('skips an image over the decode pixel limit before decoding it', async () => {
     const res = await prepareInlineImage(HEIC_GRID, 'image/heic', { heif: { maxPixels: 1000 } });
     expect(res.action).toBe('skip');
@@ -225,8 +238,15 @@ describe('isHeif / decodeHeif', () => {
     expect(isHeif(HEIC_GRID)).toBe(true);
     expect(isHeif(await flatJpeg(10, 10))).toBe(false);
     expect(isHeif(Buffer.from('ftypheic-ish garbage'))).toBe(false);
-    const avifLike = Buffer.from('\0\0\0\x14ftypavif\0\0\0\0avif', 'latin1');
-    expect(isHeif(avifLike)).toBe(false);
+    // An AVIF lists the structural brand mif1 too; it must stay with sharp.
+    const avif = await sharp({ create: { width: 64, height: 48, channels: 3, background: '#c33' } })
+      .avif().toBuffer();
+    expect(avif.toString('latin1', 4, 8)).toBe('ftyp');
+    expect(isHeif(avif)).toBe(false);
+    const avifMif1 = Buffer.from('\0\0\0\x18ftypavif\0\0\0\0mif1miaf', 'latin1');
+    expect(isHeif(avifMif1)).toBe(false);
+    const heicMajorMif1 = Buffer.from('\0\0\0\x18ftypmif1\0\0\0\0mif1heic', 'latin1');
+    expect(isHeif(heicMajorMif1)).toBe(true);
   });
 
   it('decodes the full-size primary image to RGBA', async () => {
