@@ -180,7 +180,7 @@ import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
-import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createJoinHold } from './lib/room-join-hold.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncementDetail, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
@@ -11740,6 +11740,9 @@ function deliverInviteAsk(session, frame, room) {
 // coalescing, resume-hold flush), just a round-trip or two later. The
 // user's notice is published between the two, once the outcome is known,
 // so it sits above the agent's turn as for any request.
+// How much of the room the join turn reads.
+const JOIN_BACKLOG_LIMIT = 20;
+
 async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
   // The other side may write as soon as the accept lands; hold the room's
   // live frames until the join turn below has been handed over.
@@ -11750,12 +11753,15 @@ async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
   } finally {
     for (const it of roomJoinHold.release(frame.room_id, shown)) {
       // The binding as it is now (joined), not as it was when the frame came.
-      journalOnRoomFrameNow(agentRooms.get(frame.room_id) || it.room, it.frame);
+      // One frame failing must not drop the ones after it.
+      try { journalOnRoomFrameNow(agentRooms.get(frame.room_id) || it.room, it.frame); } catch (e) {
+        try { console.warn(`[agent-invites] held frame for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+      }
     }
   }
 }
 
-// Returns the backlog the join turn carried (journal events), or null.
+// Returns the backlog events the join turn showed, or null.
 async function deliverAutoJoinedRequestHeld(session, frame, room, { addressed }) {
   const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });
   let joined = res.kind === 'answered';
@@ -11780,16 +11786,19 @@ async function deliverAutoJoinedRequestHeld(session, frame, room, { addressed })
   publishInviteRequestNotice(session, frame, room, { addressed, joined });
   if (!joined) { deliverInviteAsk(session, frame, room); return null; }
   if (!backlog) {
-    const page = await journalPublisher.fetchMessages(frame.room_id, { limit: 20 }).catch(() => null);
+    const page = await journalPublisher.fetchMessages(frame.room_id, { limit: JOIN_BACKLOG_LIMIT }).catch(() => null);
     backlog = page ? page.events : null;
   }
+  const more = Array.isArray(backlog) && backlog.length >= JOIN_BACKLOG_LIMIT;
   // A room with another person: the justification and the backlog are their
   // agent's words, so the turn that reads them is a foreign one, with the
   // room's context read first.
   const person = typeof frame.person?.name === 'string' && frame.person.name ? frame.person.name : null;
   if (person) await foreignSessions.refreshContext(frame.room_id).catch(() => null);
-  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog }), at: Date.now(), ...(person ? { foreign: { person } } : {}) });
-  return backlog;
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog, more }), at: Date.now(), ...(person ? { foreign: { person } } : {}) });
+  // Only what the turn showed: a held message the budget left out still
+  // comes live.
+  return Array.isArray(backlog) ? selectJoinBacklog(backlog).shown : null;
 }
 
 // Room-lifecycle FYI (late answers, peer left) surfaced to the bound session

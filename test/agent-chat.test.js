@@ -1489,7 +1489,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(askFn).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{ roomId: frame\.room_id/);
     // …which the user's copy must not inherit (it lives in lib, pinned there,
     // alongside the wake notice the reaped-target path publishes).
-    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
+    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
   });
 
   it('joins an approved remote invite on delivery: accept AWAITED after the ack, guest binding joined only on the journal\'s answer, agent told it is in the room', () => {
@@ -1550,7 +1550,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // Otherwise the agent's turn is the joined-room text with the room
     // backlog (the opening message was published before the guest joined,
     // so fan-out never reached it), never the accept/refuse instruction.
-    const fetch = helper.indexOf('journalPublisher.fetchMessages(frame.room_id, { limit: 20 })');
+    const fetch = helper.indexOf('journalPublisher.fetchMessages(frame.room_id, { limit: JOIN_BACKLOG_LIMIT })');
     expect(fetch).toBeGreaterThan(fallback);
     expect(helper).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{[^}]*body: formatAutoJoinedRequest\(frame, \{ events/);
     expect(helper).not.toMatch(/Accept with agent_chat_accept\(/);
