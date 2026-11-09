@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import {
   SubagentWatcher,
   parseWorkflowLaunchResult,
+  workflowLaunchFromStructured,
   workflowAgentLabel,
   isWorkflowRunId,
   routeWorkflowStreamEvent,
@@ -27,6 +28,8 @@ const RUN_ID = 'wf_2d973288-cf2';
 const A1 = 'a52c8df92c72f79d6'; // b1-type-primitives — has a journal result
 const A2 = 'ad9f6e2caf6fcfc05'; // b2-tables-pills    — still running in the fixture
 const LAUNCH_TEXT = fs.readFileSync(path.join(FIXTURE, 'launch-tool-result.txt'), 'utf8');
+// The same launch as Claude Code attaches it to the user event (`tool_use_result`).
+const LAUNCH_STRUCTURED = JSON.parse(fs.readFileSync(path.join(FIXTURE, 'launch-tool-use-result.json'), 'utf8'));
 
 const waitFor = async (pred, timeoutMs = 5000) => {
   const deadline = Date.now() + timeoutMs;
@@ -34,6 +37,24 @@ const waitFor = async (pred, timeoutMs = 5000) => {
   return pred();
 };
 const settle = (ms = 300) => new Promise(r => setTimeout(r, ms));
+
+describe('workflowLaunchFromStructured', () => {
+  it('reads the run and task id the Workflow tool sends', () => {
+    expect(workflowLaunchFromStructured(LAUNCH_STRUCTURED)).toEqual({ runId: RUN_ID, taskId: 'wjug1ouu0' });
+  });
+
+  it('refuses other task types, malformed run ids and non-objects', () => {
+    expect(workflowLaunchFromStructured({ ...LAUNCH_STRUCTURED, taskType: 'local_bash' })).toBeNull();
+    expect(workflowLaunchFromStructured({ ...LAUNCH_STRUCTURED, runId: 'wf_../../etc' })).toBeNull();
+    expect(workflowLaunchFromStructured({ ...LAUNCH_STRUCTURED, runId: undefined })).toBeNull();
+    expect(workflowLaunchFromStructured('wf_x')).toBeNull();
+    expect(workflowLaunchFromStructured(null)).toBeNull();
+  });
+
+  it('tolerates a missing task id', () => {
+    expect(workflowLaunchFromStructured({ ...LAUNCH_STRUCTURED, taskId: undefined })).toEqual({ runId: RUN_ID, taskId: null });
+  });
+});
 
 describe('parseWorkflowLaunchResult', () => {
   it('reads the run id and the mid-line task id from a real launch result', () => {
@@ -152,6 +173,14 @@ describe('SubagentWatcher workflow runs', () => {
     // Transcript records flow as subagent-events carrying the workflow fields.
     expect(await waitFor(() => events.some(e => e.agentId === A2 && e.event.type === 'assistant'))).toBe(true);
     expect(events.find(e => e.agentId === A2).workflowRunId).toBe(RUN_ID);
+  });
+
+  it('prefers the structured tool_use_result over the text when both are present', () => {
+    const { w, starts } = mk({ copyRun: true });
+    w.noteWorkflowToolUse('toolu_wfs', { script: 'x' });
+    expect(w.noteWorkflowResult('toolu_wfs', 'launched (text format changed)', LAUNCH_STRUCTURED)).toBe(RUN_ID);
+    expect(starts.map(s => s.agentId).sort()).toEqual([A1, A2].sort());
+    expect(w.workflowRunByTask.get('wjug1ouu0')).toBe(RUN_ID);
   });
 
   it('ignores a "Run ID:" tool_result that does not answer a Workflow tool_use', () => {
@@ -482,6 +511,39 @@ describe('routeWorkflowStreamEvent: parent stream -> sidebar child cards', () =>
     routeWorkflowStreamEvent(w, { type: 'system', subtype: 'task_notification', task_id: 'wjug1ouu0', tool_use_id: 'toolu_R', status: 'completed' });
     expect(w.workflowRuns.size).toBe(0);
     expect(state()[`parent-x:sub:${A2}`].sessionState).toBe('done');
+  });
+
+  it('takes the run from the event\'s tool_use_result when the text carries no run id', () => {
+    const w = new SubagentWatcher({ workdir: '/tmp/x-wf-structured', sessionId: 's', log: { warn() {} } });
+    watchers.push(w);
+    routeWorkflowStreamEvent(w, {
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_S', name: 'Workflow', input: { script: 'x' } }] },
+    });
+    routeWorkflowStreamEvent(w, {
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_S', content: 'Workflow launched.' }] },
+      tool_use_result: LAUNCH_STRUCTURED,
+    });
+    expect(w.workflowRuns.has(RUN_ID)).toBe(true);
+  });
+
+  it('ignores tool_use_result when the event carries several tool_results', () => {
+    const w = new SubagentWatcher({ workdir: '/tmp/x-wf-multi', sessionId: 's', log: { warn() {} } });
+    watchers.push(w);
+    routeWorkflowStreamEvent(w, {
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_M', name: 'Workflow', input: { script: 'x' } }] },
+    });
+    routeWorkflowStreamEvent(w, {
+      type: 'user',
+      message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'toolu_M', content: 'Workflow launched.' },
+        { type: 'tool_result', tool_use_id: 'toolu_other', content: 'ok' },
+      ] },
+      tool_use_result: LAUNCH_STRUCTURED,
+    });
+    expect(w.workflowRuns.size).toBe(0);
   });
 
   it('never throws on junk and ignores a null watcher', () => {
