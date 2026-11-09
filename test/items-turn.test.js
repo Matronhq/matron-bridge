@@ -153,6 +153,8 @@ describe('agent comments', () => {
     expect(isAgentCommentMarker({ ...marker, agent_comment: undefined }, 'c-a')).toBe(false);
     expect(isAgentCommentMarker({ ...marker, action: 'closed' }, 'c-a')).toBe(false);
     expect(isAgentCommentMarker({ ...marker, from_convo_id: '' }, 'c-a')).toBe(false);
+    // A private commenter is flagged without naming its conversation.
+    expect(isAgentCommentMarker({ ...marker, from_convo_id: undefined, from_label: undefined }, 'c-a')).toBe(true);
     expect(isAgentCommentMarker(null, 'c-a')).toBe(false);
   });
 });
