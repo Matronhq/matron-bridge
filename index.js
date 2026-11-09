@@ -180,7 +180,7 @@ import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { buildPermissionSnapshot } from './lib/permission-eval.js';
-import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
+import { createSlowToolNotices, renderSlowToolNotice, slowToolNoticeSummary, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -213,7 +213,7 @@ import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContext
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
-import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
+import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind, crashRestartNoticeMeta } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
@@ -2792,7 +2792,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     reminderMs: resolveSlowToolReminderMs(process.env.MATRON_SLOW_TOOL_REMINDER_MS),
     notify: ({ toolName, elapsedMs, reminder }) => {
       if (!session.alive || typeof session.sendCallback !== 'function') return;
-      session.sendCallback(renderSlowToolNotice({ toolName, elapsedMs, reminder }));
+      const text = renderSlowToolNotice({ toolName, elapsedMs, reminder });
+      const meta = noticeMeta('slow_tool', text, { summary: slowToolNoticeSummary({ toolName, elapsedMs, reminder }) });
+      if (!sendKindNotice(session, 'slow_tool', text, markdownToHtml(text), meta)) session.sendCallback(text);
     },
     log: debug,
   });
@@ -2919,7 +2921,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
+          if (!sendKindNotice(restarted, 'crash_restart', n.plain, n.html,
+            crashRestartNoticeMeta({ exitCode, attempt: restarted.restartCount }))) restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
           restarted.sendCallback(
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
@@ -3853,7 +3856,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
+          if (!sendKindNotice(restarted, 'crash_restart', n.plain, n.html,
+            crashRestartNoticeMeta({ exitCode, attempt: restarted.restartCount }))) restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
           restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
@@ -6571,9 +6575,10 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       // journalPublishNotice already no-ops on a falsy convo id and fails
       // open like every journal call.
       const count = Array.isArray(queued) ? queued.length : 0;
-      journalPublishNotice(journalConvoIdFor(session), count > 1
+      const droppedLine = count > 1
         ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
-        : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+        : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.";
+      journalPublishNotice(journalConvoIdFor(session), droppedLine, noticeMeta('delivery_failed', droppedLine));
       return false;
     }
     restore();
@@ -6647,6 +6652,22 @@ function notice(type, plainText, htmlContent) {
     plain: plainText,
     html: `${color('▌', hex)} ${htmlContent || escapeHtml(plainText)}`,
   };
+}
+
+// A bridge line in the session's chat, tagged payload.notice = {kind, icon,
+// summary} (lib/system-notice.js) so a client can recognise it without
+// matching the wording. Same delivery as session.sendHtml (sendToRoom), plus
+// the tag. Returns false when the session has no room to send through, so
+// the caller keeps its existing untagged path.
+function sendKindNotice(session, kind, plain, html, meta = noticeMeta(kind, plain)) {
+  if (!meta || !session?.roomId) return false;
+  try {
+    Promise.resolve(sendToRoom(session.roomId, plain, html, { notice: meta }))
+      .catch((e) => { try { debug(`sendKindNotice(${kind}) failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function markdownToHtml(text) {
@@ -7653,9 +7674,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : '';
       const restartModelLine = restartModelFlag.model ? `\nModel: ${aliasLabel(restartModelFlag.model)}` : '';
       const restartPermNote = permissionNote(restarted);
-      await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`
-      );
+      const restartedLine = `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`;
+      // Tagged for the apps (the summary is its first line); a restart with
+      // no live replacement session keeps the plain reply.
+      if (!restarted || !sendKindNotice(restarted, 'restart', restartedLine, markdownToHtml(restartedLine))) await sendReply(restartedLine);
       break;
     }
 
@@ -10255,8 +10277,8 @@ async function fireTimer(record) {
   let session = findSessionByClaudeSessionId(record.convoId);
   if (!session || !session.alive) session = journalResumeConvo(record.convoId);
   if (!session) {
-    journalPublishNotice(record.convoId,
-      `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`);
+    const lostLine = `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`;
+    journalPublishNotice(record.convoId, lostLine, noticeMeta('delivery_failed', lostLine));
     return;
   }
   if (record.source === 'agent') {
@@ -11166,8 +11188,9 @@ function flushRoomInbox(session) {
   // own 📨 at the next turn end).
   const sent = queued - roomDelivery.pendingCount(session.roomId);
   const flushLine = flushed ? formatRoomDeliveredNotice(sent) : formatRoomDeliveryFailedNotice(sent);
-  // A failed delivery stays a full-width warning.
-  journalPublishNotice(journalConvoIdFor(session), flushLine, flushed ? noticeMeta('queue', flushLine) : null);
+  // A failed delivery carries its own kind, so a client can give it more
+  // weight than the routine "delivered" line.
+  journalPublishNotice(journalConvoIdFor(session), flushLine, noticeMeta(flushed ? 'queue' : 'delivery_failed', flushLine));
 }
 
 // Hybrid idle/busy delivery of room messages into local sessions
@@ -12167,7 +12190,8 @@ function journalEvictConvoInput(session) {
   roomDelivery.dropSession(session?.roomId);
   const convoId = journalConvoIdFor(session);
   if (strandedRoomMessages && convoId) {
-    journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));
+    const strandedLine = formatRoomDeliveryFailedNotice(strandedRoomMessages);
+    journalPublishNotice(convoId, strandedLine, noticeMeta('delivery_failed', strandedLine));
   }
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
