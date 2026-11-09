@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   WORK_HOLD_MAX_MS, WORK_HOLD_LEASE_MS, liveWorkChildren, workHold, keepAwakeUntil, parseProcessTable,
-  mcpServerSignatures, isMcpServerProcess, createTransferHold,
+  mcpServerSignatures, isMcpServerProcess, createTransferHold, restartHold,
 } from '../lib/work-hold.js';
 
 // A session with work in flight is not idle (a colleague's
@@ -203,5 +203,49 @@ describe('createTransferHold: file transfers in flight keep the box up', () => {
   it('treats junk counts as nothing active', () => {
     const hold = createTransferHold({ now: () => 5 });
     for (const n of [undefined, null, NaN, -1, '2']) expect(hold.update(n)).toBe(0);
+  });
+});
+
+// The code-update watcher waits on the same work-in-flight signals the idle
+// reaper uses, plus running subagents, and never ages out.
+describe('restartHold', () => {
+  const table = parseProcessTable([
+    '  10     1 claude --resume abc',
+    '  11    10 node /home/d/matron-bridge/ask-user.js',
+    '  12    10 sleep 3600',
+    '  13    12 sleep 3600',
+  ].join('\n'));
+  const idleTable = parseProcessTable([
+    '  10     1 claude --resume abc',
+    '  11    10 node /home/d/matron-bridge/ask-user.js',
+  ].join('\n'));
+
+  it('holds on a turn in progress', () => {
+    expect(restartHold({ busy: true, pid: 10, table: idleTable, signatures: SIGNATURES })).toEqual({ reason: 'turn in progress' });
+  });
+
+  it('holds on a background process under claude, ignoring its MCP servers', () => {
+    const hold = restartHold({ pid: 10, table, signatures: SIGNATURES });
+    expect(hold.reason).toMatch(/^2 background processes still running \(sleep 3600\)/);
+    expect(restartHold({ pid: 10, table: idleTable, signatures: SIGNATURES })).toBeNull();
+  });
+
+  it('holds on a running subagent even with no child process and no turn', () => {
+    expect(restartHold({ pid: 10, table: idleTable, signatures: SIGNATURES, subagentCount: 1 }))
+      .toEqual({ reason: '1 subagent still running' });
+    expect(restartHold({ pid: 10, table: idleTable, signatures: SIGNATURES, subagentCount: 2 }).reason).toBe('2 subagents still running');
+  });
+
+  it('holds when a session has a process but the table could not be read', () => {
+    expect(restartHold({ pid: 10, table: [], signatures: SIGNATURES })).toEqual({ reason: 'process table unavailable' });
+  });
+
+  it('is quiet for an idle session, and for one with no process of its own', () => {
+    expect(restartHold({ pid: 10, table: idleTable, signatures: SIGNATURES, subagentCount: 0 })).toBeNull();
+    expect(restartHold({ pid: null, table: [], subagentCount: 0 })).toBeNull();
+  });
+
+  it('takes no clock: unlike the idle reaper, a hold never ages out', () => {
+    expect(Object.keys(restartHold({ busy: true }))).toEqual(['reason']);
   });
 });

@@ -187,7 +187,7 @@ import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest,
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createJoinHold } from './lib/room-join-hold.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncementDetail, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
-import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { parseProcessTable, liveWorkChildren, workHold, restartHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField, peerField, PEER_NAME_MAX } from './lib/peer-text.js';
@@ -10758,7 +10758,28 @@ function startCodeUpdateWatcher() {
   }
   const watcher = createCodeUpdateWatcher({
     readHead: () => readHeadReflog(gitDir),
-    busySessions: () => { let n = 0; for (const [, s] of sessions) if (s.alive && s.busy) n++; return n; },
+    // Sessions holding work a restart would kill: mid-turn, a background
+    // job (lib/work-hold.js restartHold), or a running subagent.
+    busySessions: () => {
+      const live = [...sessions.values()].filter(s => s.alive);
+      if (!live.length) return 0;
+      const table = readProcessTable();
+      let n = 0;
+      for (const s of live) {
+        const hold = restartHold({
+          busy: !!s.busy,
+          pid: sessionChildPid(s),
+          table,
+          signatures: MCP_SERVER_SIGNATURES,
+          subagentCount: s.subagentConvos?.runningCount() ?? 0,
+        });
+        if (hold) {
+          n++;
+          debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
+        }
+      }
+      return n;
+    },
     preflight: () => defaultPreflight(__dirname),
     restart: (info) => {
       if (shuttingDown) return;

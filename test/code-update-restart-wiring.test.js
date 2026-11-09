@@ -35,8 +35,13 @@ describe('code-update self-restart wiring', () => {
     expect(index).not.toMatch(/MAX_DEFER/);
   });
 
-  it('counts mid-turn sessions as alive && busy — the flag /sessions reports and restart_session parks on', () => {
-    expect(fn).toMatch(/busySessions: \(\) => \{[^}]*s\.alive && s\.busy/);
+  it('counts a live session as holding when it is busy (the flag /sessions reports and restart_session parks on), has a background work child, or has a running subagent', () => {
+    const busy = fn.slice(fn.indexOf('busySessions: () => {'), fn.indexOf('preflight:'));
+    expect(busy).toMatch(/filter\(s => s\.alive\)/);
+    expect(busy).toMatch(/restartHold\(\{\s*busy: !!s\.busy,\s*pid: sessionChildPid\(s\),\s*table,\s*signatures: MCP_SERVER_SIGNATURES,/);
+    // One process-table read per poll; subagents come from the session's in-memory tracker.
+    expect(busy.match(/readProcessTable\(\)/g)).toHaveLength(1);
+    expect(busy).toMatch(/subagentCount: s\.subagentConvos\?\.runningCount\(\) \?\? 0,/);
   });
 
   it('restarts through gracefulShutdown with the non-zero exit code, never while already shutting down', () => {

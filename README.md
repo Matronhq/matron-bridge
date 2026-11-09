@@ -258,8 +258,9 @@ new code on disk and the old process running. The bridge notices by itself:
 it polls its checkout's HEAD reflog, lets a landed update settle for five
 minutes (so `npm install` has finished), proves the tree boots with the same
 preflight the deploy scripts run, and then exits for the supervisor to
-relaunch it at the first poll where no session is mid-turn. A running turn
-is never cut off: the bridge keeps waiting and logs a warning every 30
+relaunch it at the first poll where no session has work in flight: a turn
+running, a background job (shell, monitor) still alive under the session's
+agent process, or a subagent running. That work is never cut off: the bridge keeps waiting and logs a warning every 30
 minutes. A box that would rather force the restart after a while sets
 `MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
 themselves (`MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` gives them the "Carry on"
