@@ -70,6 +70,21 @@ describe('timeline wiring', () => {
     return new Function('z', `${askUser.slice(start, end)}\nreturn TIMELINE_WEEK_WRITE_INPUT;`)(z);
   }
 
+  it('the read schema takes an optional week and a page offset', () => {
+    const start = askUser.indexOf('const TIMELINE_WEEK_READ_INPUT = ');
+    const end = askUser.indexOf("server.tool(\n  'timeline_week_read',");
+    expect(start, 'the read schema is missing from ask-user.js').toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const schema = z.strictObject(new Function('z', `${askUser.slice(start, end)}\nreturn TIMELINE_WEEK_READ_INPUT;`)(z));
+    expect(schema.safeParse({}).success).toBe(true);
+    expect(schema.safeParse({ week: '2026-11-09', offset: 0 }).success).toBe(true);
+    expect(schema.safeParse({ week: '2026-11-09', offset: 12 }).success).toBe(true);
+    for (const offset of [-1, 1.5, '12']) expect(schema.safeParse({ offset }).success, String(offset)).toBe(false);
+    const read = askUser.slice(end, askUser.indexOf("'timeline_week_write',"));
+    expect(read).toContain('TIMELINE_WEEK_READ_INPUT,');
+    expect(read).toMatch(/offset/);
+  });
+
   it('the write schema takes a week of entries, one per project', () => {
     const schema = writeInputSchema();
     const entry = { project: '#12', sentence: 'The thing went out.' };
@@ -119,7 +134,7 @@ describe('timeline wiring', () => {
     };
     const callTimeline = new Function('bridgeFetch', 'BRIDGE_API', 'ROOM_ID', `${src}\nreturn callTimeline;`)(fetch, 'http://bridge', '!r:s');
     const read = await callTimeline('read', {}, formatTimelineReadAck);
-    expect(JSON.parse(read.content[0].text)).toEqual({ week: { week: '2026-11-09', current: false, projects: [] } });
+    expect(read.content[0].text).toBe('week: {"week":"2026-11-09","current":false,"projects":[]}\nThat is every project that moved this week.');
     const wrote = await callTimeline('write', { week: '2026-11-02', entries: [{ project: '#3', sentence: 'S' }] }, formatTimelineWriteAck);
     expect(wrote.content[0].text).toBe('Week 2026-11-02 written (1 project).');
     const frozen = await callTimeline('write', { week: '2026-11-02', entries: [], final: true }, formatTimelineWriteAck);

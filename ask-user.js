@@ -861,12 +861,15 @@ const TIMELINE_WEEK_WRITE_INPUT = z.strictObject({
   })).max(50).optional().describe('A note for each project on the Went quiet list'),
 });
 
+const TIMELINE_WEEK_READ_INPUT = {
+  week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('The Monday of the week, YYYY-MM-DD. Omit for the current week.'),
+  offset: z.number().int().min(0).optional().describe('Which page of projects: the offset the last read gave. Omit for the first page.'),
+};
+
 server.tool(
   'timeline_week_read',
-  'Coordinator only. Read one week of the user\'s work for the Projects timeline: every project that moved (milestones, items, pictures), what is already written for it, and, for the current week, the Went quiet list. Use it before timeline_week_write, as the weekly-stories routine says.',
-  {
-    week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('The Monday of the week, YYYY-MM-DD. Omit for the current week.'),
-  },
+  'Coordinator only. Read one week of the user\'s work for the Projects timeline, a page of projects at a time: for the current week the Went quiet list first, then every project that moved (milestones, items, pictures) and what is already written for the week. The last line says whether more projects follow and the offset to pass to read them; read every page. Use it before timeline_week_write, as the weekly-stories routine says.',
+  TIMELINE_WEEK_READ_INPUT,
   async (args) => callTimeline('read', args, formatTimelineReadAck),
 );
 
