@@ -117,6 +117,16 @@ describe('timeline wiring', () => {
     expect(write).not.toMatch(/\blede\b|\bstories\b|project_ids|item_ids/);
   });
 
+  // The strict schema only refuses old-shape keys while the tool is
+  // registered with it: a plain-shape registration would strip them instead.
+  it('registers the write tool with the strict schema itself', () => {
+    const start = askUser.indexOf("server.registerTool(\n  'timeline_week_write',");
+    expect(start, 'timeline_week_write is not registered through registerTool').toBeGreaterThan(-1);
+    const registration = askUser.slice(start, askUser.indexOf('\n);', start));
+    expect(registration).toContain('inputSchema: TIMELINE_WEEK_WRITE_INPUT,');
+    expect(askUser).toMatch(/const TIMELINE_WEEK_WRITE_INPUT = z\.strictObject\(/);
+  });
+
   // Runs the REAL callTimeline source from ask-user.js against the REAL handlers.
   it('callTimeline renders acks and errors as one text line', async () => {
     const start = askUser.indexOf('async function callTimeline');
