@@ -1394,7 +1394,7 @@ const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_crea
 
 server.tool(
   'mission_start',
-  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project; leave it out only when none fits, and the mission gets a project of its own with the same name.",
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. A project is one goal with an end, holding the missions that serve it: run project_list with live: true, brief: true first and pass project: N for the goal the work serves; leave it out only when the work serves none of them, and the mission gets a project of its own with the same name. Never create or pick a broad category project.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     name: z.string().optional().describe("A short name of at most 40 characters that becomes the conversation's name in the apps; the title stays the full description"),
@@ -1406,7 +1406,7 @@ server.tool(
 
 server.tool(
   'mission_create',
-  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in an existing project; without one it gets a project of its own with the same name. Returns the mission number.",
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it into the goal it serves (project_list with live: true, brief: true shows the goals with open work); without one it gets a project of its own with the same name. Never create or pick a broad category project. Returns the mission number.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     name: z.string().optional().describe("A short name of at most 40 characters that becomes the conversation's name in the apps; the title stays the full description"),
@@ -1653,7 +1653,7 @@ async function callProjects(name, args, render) {
   }
 }
 
-const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. Every mission is in exactly one project: the one named when it started, or one of its own with the same name.';
+const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions: one goal with an end (e.g. "Promo launch" holds the launch-day mission, the promo branch and SEO phase 2), never a broad category — not a working directory, and nothing to do with ~/.claude/projects. Every mission is in exactly one project: the one named when it started, or one of its own with the same name.';
 
 server.tool(
   'project_list',

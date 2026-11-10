@@ -151,7 +151,7 @@ describe('timeline wiring', () => {
     expect(frozen.content[0].text).toBe('timeline_week_write failed: that week is frozen; pass final: true to rewrite it on purpose');
   });
 
-  it('the playbook has the weekly-stories routine, back-fill and the preamble paragraph', () => {
+  it('the playbook has the weekly-stories routine, the rewrite and the preamble paragraph', () => {
     const coord = loadCoordinatorBlock({
       readFile: (p) => readFileSync(p, 'utf8'),
       path: fileURLToPath(new URL('../BRIDGE_COORDINATOR.md', import.meta.url)),
@@ -166,9 +166,29 @@ describe('timeline wiring', () => {
     expect(routine).toMatch(/media_blob_id/);
     expect(routine).toMatch(/`week\.stored` is null, or `week\.stored\.final` is false/);
     expect(routine).toMatch(/at most 10 weeks/);
-    expect(routine).toMatch(/week\.projects\[\]\.needs_you/);
-    expect(routine).toMatch(/### Back-fill/);
-    expect(routine).toMatch(/eight weeks/);
+    // One entry per project, read a page at a time.
+    expect(routine).toMatch(/`entries`/);
+    expect(routine).toMatch(/One entry per project, at most 8/);
+    expect(routine).toMatch(/`sentence`/);
+    expect(routine).toMatch(/`offset`/);
+    expect(routine).toContain('keep going until the last line says that is every project that moved this week');
+    expect(routine).toContain('Read every page of a week before you choose what to write for it.');
+    expect(routine).toMatch(/quiet \(n of total\)/);
+    expect(routine).toMatch(/`notes`/);
+    // The older shape is gone from the routine.
+    expect(routine).not.toMatch(/lede/i);
+    expect(routine).not.toMatch(/project_ids/);
+    expect(routine).not.toMatch(/item_ids/);
+    expect(routine).not.toMatch(/3 to 6 stories/);
+    expect(routine).not.toMatch(/back-fill/i);
+    expect(routine).toMatch(/### Rewrite/);
+    const rewrite = routine.slice(routine.indexOf('### Rewrite'));
+    expect(rewrite).toMatch(/oldest first/);
+    expect(rewrite).toMatch(/`stored\.legacy` is true/);
+    expect(rewrite).toMatch(/`final: true`, except the current week/);
+    expect(rewrite).toMatch(/out of range/);
+    expect(rewrite).toMatch(/one line per week/);
+    expect(coord).toMatch(/one card per project per week/);
     expect(coord).toMatch(/follow `## Routine: weekly-stories`/);
   });
 });
