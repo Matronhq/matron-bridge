@@ -315,6 +315,212 @@ describe('timeline_week_read', () => {
   });
 });
 
+const indexRow = (n, over = {}) => ({ id: `p${n}`, num: n, title: `Project ${n}`, moved: 20 - n, milestones: 3, done: 1, for_you: 0, media: 0, newest: 5, ...over });
+const indexWeek = (over = {}) => rawWeek({ projects_total: 2, projects: [indexRow(1), indexRow(2)], ...over });
+const detailRow = (n) => ({ project: { id: `p${n}`, num: n, title: `Project ${n}` }, moved: 3, status: 'Going well.', milestones: [], items: [], media: [], needs_you: 0 });
+// A journal that reads chosen projects always says which it left out, if only [].
+const detailWeek = (over = {}) => pagedWeek({ projects_total: 2, projects: [detailRow(1), detailRow(2)], omitted: [], ...over });
+const PICK = (week) => `Pick the projects that mattered (at most 8 get a card), then call timeline_week_read with week: "${week}" and projects: [their ids or numbers] (up to 12 a call) for their milestones, items and pictures.`;
+const PREDATES_INDEX = 'the journal predates the week index — deploy the journal update, or read the week a page at a time';
+
+function indexFixture(client = {}) {
+  return fixture({
+    client: {
+      readWeekIndex: vi.fn(async (week) => ({ status: 200, data: indexWeek({ week }) })),
+      readWeekProjects: vi.fn(async (week) => ({ status: 200, data: detailWeek({ week }) })),
+      ...client,
+    },
+  });
+}
+
+describe('timeline_week_read: the index', () => {
+  it('index: true reads the whole week in one result: quiet line, index, then what to do next', async () => {
+    const { h, c } = indexFixture();
+    const r = await h.read({ roomId: '!r:s', index: true });
+    expect(c.listWeeks).toHaveBeenCalledWith({ limit: 1 });
+    expect(c.readWeekIndex).toHaveBeenCalledWith('2026-11-09');
+    expect(c.readWeekRaw).not.toHaveBeenCalled();
+    expect(r.status).toBe(200);
+    expect(formatTimelineReadAck(r.body).split('\n')).toEqual([
+      `quiet (1 of 2): ${JSON.stringify(quiet.rows)}`,
+      `index: ${JSON.stringify(indexWeek())}`,
+      PICK('2026-11-09'),
+    ]);
+  });
+
+  it('a past week has no quiet line, and projects left off the end are counted', async () => {
+    const data = indexWeek({ week: '2026-11-02', current: false, projects_total: 5, more_projects: 3 });
+    const { h, c } = indexFixture({ readWeekIndex: vi.fn(async () => ({ status: 200, data })) });
+    const r = await h.read({ roomId: '!r:s', week: '2026-11-02', index: true });
+    expect(c.listWeeks).not.toHaveBeenCalled();
+    expect(c.wentQuiet).not.toHaveBeenCalled();
+    expect(formatTimelineReadAck(r.body).split('\n')).toEqual([
+      `index: ${JSON.stringify(data)}`,
+      '3 more projects moved and are not listed (the least active).',
+      PICK('2026-11-02'),
+    ]);
+  });
+
+  it('a week in which nothing moved is still an index', async () => {
+    const { h } = indexFixture({ readWeekIndex: vi.fn(async (week) => ({ status: 200, data: indexWeek({ week, current: false, projects_total: 0, projects: [] }) })) });
+    const r = await h.read({ roomId: '!r:s', week: '2026-11-02', index: true });
+    expect(r.status).toBe(200);
+    expect(formatTimelineReadAck(r.body).split('\n').at(-1)).toBe(PICK('2026-11-02'));
+  });
+
+  it('index with projects or offset is refused locally; index: false is the paged read', async () => {
+    const { h, c } = indexFixture();
+    for (const extra of [{ projects: [1] }, { offset: 12 }, { offset: 0 }]) {
+      const r = await h.read({ roomId: '!r:s', week: '2026-11-09', index: true, ...extra });
+      expect(r.status, JSON.stringify(extra)).toBe(400);
+      expect(r.body.error).toBe('index cannot be combined with projects or offset — the index is the whole week in one read');
+    }
+    expect((await h.read({ roomId: '!r:s', week: '2026-11-09', index: 'yes' })).body.error).toBe('index must be true or false');
+    expect(c.readWeekIndex).not.toHaveBeenCalled();
+    expect((await h.read({ roomId: '!r:s', week: '2026-11-09', index: false })).status).toBe(200);
+    expect(c.readWeekRaw).toHaveBeenCalledWith('2026-11-09', { offset: 0 });
+    expect(c.readWeekIndex).not.toHaveBeenCalled();
+  });
+
+  it('an older journal answers an index call with a page: 502, not a week read as if it were whole', async () => {
+    const answers = [
+      pagedWeek({ projects_total: 30, projects: [detailRow(1)], next_offset: 12, more_projects: 18 }),
+      pagedWeek({ projects_total: 1, projects: [detailRow(1)] }),
+      pagedWeek(),
+      rawWeek({ projects: [{ id: 'p1', num: 1, title: 'A', milestones: [] }] }),
+    ];
+    for (const data of answers) {
+      const { h } = indexFixture({ readWeekIndex: vi.fn(async () => ({ status: 200, data })) });
+      expect(await h.read({ roomId: '!r:s', index: true }), JSON.stringify(data)).toEqual({ status: 502, body: { error: PREDATES_INDEX } });
+    }
+    const phase1 = await indexFixture({ readWeekIndex: vi.fn(async () => ({ status: 200, data: { week: '2026-11-09', projects: [] } })) }).h.read({ roomId: '!r:s', index: true });
+    expect(phase1.status).toBe(404);
+    const refused = await indexFixture({ readWeekIndex: vi.fn(async () => ({ status: 400, data: { error: 'bad_request', detail: 'week_out_of_range' } })) }).h.read({ roomId: '!r:s', index: true });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toMatch(/outside the range/);
+  });
+
+  it('a long quiet list is trimmed to fit beside the index; an index too large by itself is refused', async () => {
+    const pad = (length) => indexWeek({ projects: [indexRow(1, { title: 'x'.repeat(length) })] });
+    const rows = Array.from({ length: 12 }, (_, i) => ({ project: { id: `q${i}`, num: i + 1, title: 'A' }, last_moved_at: 5, note: 'n'.repeat(1000), weekly: false }));
+    const trimmed = await indexFixture({ readWeekIndex: async () => ({ status: 200, data: pad(35000) }), wentQuiet: async () => ({ status: 200, data: { total: 12, rows } }) }).h.read({ roomId: '!r:s', index: true });
+    expect(trimmed.status).toBe(200);
+    expect(trimmed.body.quiet.length).toBeGreaterThan(0);
+    expect(trimmed.body.quiet.length).toBeLessThan(12);
+    const text = formatTimelineReadAck(trimmed.body);
+    expect(text.length).toBeLessThanOrEqual(TIMELINE_READ_MAX_CHARS);
+    expect(text.split('\n')[0]).toMatch(new RegExp(`^quiet \\(${trimmed.body.quiet.length} of 12\\): `));
+    expect(formatTimelineReadAck({ ...trimmed.body, quiet: rows.slice(0, trimmed.body.quiet.length + 1) }).length).toBeGreaterThan(TIMELINE_READ_MAX_CHARS);
+
+    // The index alone is exactly the limit: it goes out without the quiet line.
+    const empty = formatTimelineReadAck({ index: pad(0) }).length;
+    const exact = await indexFixture({ readWeekIndex: async () => ({ status: 200, data: pad(TIMELINE_READ_MAX_CHARS - empty) }), wentQuiet: async () => ({ status: 200, data: { total: 12, rows } }) }).h.read({ roomId: '!r:s', index: true });
+    expect(exact.status).toBe(200);
+    expect(exact.body.quiet).toBeUndefined();
+    expect(formatTimelineReadAck(exact.body)).toHaveLength(TIMELINE_READ_MAX_CHARS);
+    const over = await indexFixture({ readWeekIndex: async () => ({ status: 200, data: pad(TIMELINE_READ_MAX_CHARS - empty + 1) }) }).h.read({ roomId: '!r:s', index: true });
+    expect(over).toEqual({ status: 502, body: { error: "the journal's week read is too large for this tool — deploy the journal update" } });
+  });
+});
+
+describe('timeline_week_read: chosen projects', () => {
+  it('projects: [...] reads exactly those projects, refs normalised, and no quiet line', async () => {
+    const { h, c } = indexFixture();
+    const r = await h.read({ roomId: '!r:s', week: '2026-11-09', projects: ['#12', ' 7 ', 3, 'prj_abc', '12'] });
+    expect(c.readWeekProjects).toHaveBeenCalledWith('2026-11-09', [12, 7, 3, 'prj_abc']);
+    expect(c.readWeekRaw).not.toHaveBeenCalled();
+    expect(c.wentQuiet).not.toHaveBeenCalled();
+    expect(r.status).toBe(200);
+    expect(formatTimelineReadAck(r.body)).toBe(`week: ${JSON.stringify(detailWeek())}\nThose are the projects you asked for.`);
+  });
+
+  it('with no week it reads the current one, still without the quiet line', async () => {
+    const { h, c } = indexFixture();
+    const r = await h.read({ roomId: '!r:s', projects: [1] });
+    expect(c.readWeekProjects).toHaveBeenCalledWith('2026-11-09', [1]);
+    expect(c.wentQuiet).not.toHaveBeenCalled();
+    expect(formatTimelineReadAck(r.body)).not.toMatch(/quiet \(/);
+  });
+
+  it('projects the journal left out to fit are named', async () => {
+    const data = detailWeek({ omitted: ['p3', 'p4'] });
+    const { h } = indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data })) });
+    const r = await h.read({ roomId: '!r:s', week: '2026-11-09', projects: [1, 2, 3, 4] });
+    expect(formatTimelineReadAck(r.body).split('\n')).toEqual([
+      `week: ${JSON.stringify(data)}`,
+      'Those are the projects you asked for.',
+      'Left out to fit: p3, p4 — ask for them in another call.',
+    ]);
+    const none = await indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data: detailWeek({ omitted: [] }) })) }).h.read({ roomId: '!r:s', week: '2026-11-09', projects: [1] });
+    expect(formatTimelineReadAck(none.body)).not.toMatch(/Left out/);
+  });
+
+  it('a bad list of projects is refused locally, naming the problem', async () => {
+    const { h, c } = indexFixture();
+    const read = (projects, extra = {}) => h.read({ roomId: '!r:s', week: '2026-11-09', projects, ...extra });
+    for (const projects of [[], 'p1', 7, {}]) {
+      const r = await read(projects);
+      expect(r.status, JSON.stringify(projects)).toBe(400);
+      expect(r.body.error).toBe('projects must be a list of 1 to 12 projects: ids, or numbers such as 12 or #12');
+    }
+    const many = await read(Array.from({ length: 13 }, (_, i) => i + 1));
+    expect(many.status).toBe(400);
+    expect(many.body.error).toBe('too many projects: at most 12 a call (got 13) — ask for the rest in another call');
+    for (const ref of ['#x', 0, -3, '', null, {}, 'a,b']) {
+      const r = await read([1, ref]);
+      expect(r.status, JSON.stringify(ref)).toBe(400);
+      expect(r.body.error).toBe(`project 2 is a bad reference ${JSON.stringify(ref)} — use the id, or the number such as 12 or #12`);
+    }
+    const paged = await read([1], { offset: 12 });
+    expect(paged.status).toBe(400);
+    expect(paged.body.error).toBe('projects cannot be combined with offset — the projects asked for come in one read');
+    expect(c.readWeekProjects).not.toHaveBeenCalled();
+  });
+
+  it('an older journal answers with a page that has more to come: 502', async () => {
+    const page = pagedWeek({ projects_total: 30, projects: [detailRow(1)], next_offset: 12, more_projects: 18 });
+    const { h } = indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data: page })) });
+    expect(await h.read({ roomId: '!r:s', projects: [1] })).toEqual({ status: 502, body: { error: PREDATES_INDEX } });
+    const noPaging = rawWeek({ projects: [detailRow(1)], more_projects: 4 });
+    const old = await indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data: noPaging })) }).h.read({ roomId: '!r:s', projects: [1] });
+    expect(old).toEqual({ status: 502, body: { error: PREDATES_INDEX } });
+  });
+
+  it('an older journal answers with one complete page of the whole week: 502', async () => {
+    // It ignored projects: no omitted list, so these are every project of the week.
+    for (const data of [
+      pagedWeek({ projects_total: 2, projects: [detailRow(1), detailRow(2)] }),
+      rawWeek({ projects: [detailRow(1), detailRow(2)] }),
+      pagedWeek({ projects_total: 2, projects: [detailRow(1), detailRow(2)], omitted: null }),
+    ]) {
+      const { h } = indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data })) });
+      expect(await h.read({ roomId: '!r:s', week: '2026-11-09', projects: [1] })).toEqual({ status: 502, body: { error: PREDATES_INDEX } });
+    }
+  });
+
+  it('projects too large for one read are refused with what to do', async () => {
+    const big = detailWeek({ projects: [{ ...detailRow(1), milestones: [{ text: 'x'.repeat(60000) }] }] });
+    const { h } = indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data: big })) });
+    expect(await h.read({ roomId: '!r:s', week: '2026-11-09', projects: [1, 2] })).toEqual({ status: 502, body: { error: 'those projects are too large for one read — ask for fewer in a call' } });
+  });
+});
+
+describe('timeline client: the index and chosen projects', () => {
+  it('asks the journal for index=1 and for projects=<refs>', async () => {
+    const calls = [];
+    const fetchImpl = async (url, init) => { calls.push([init.method, url]); return { ok: true, status: 200, json: async () => ({}) }; };
+    const c = createTimelineClient({ baseUrl: 'https://j', token: 't', fetchImpl });
+    await c.readWeekIndex('2026-11-09');
+    await c.readWeekProjects('2026-11-09', [12, 'prj_abc', 3]);
+    await c.readWeekProjects('2026-11-09', ['a b']);
+    expect(calls).toEqual([
+      ['GET', 'https://j/timeline/weeks/2026-11-09?raw=1&index=1'],
+      ['GET', 'https://j/timeline/weeks/2026-11-09?raw=1&projects=12,prj_abc,3'],
+      ['GET', 'https://j/timeline/weeks/2026-11-09?raw=1&projects=a%20b'],
+    ]);
+  });
+});
+
 describe('timeline_week_write', () => {
   it('posts the cleaned entries to the entries route with the Coordinator convo_id', async () => {
     const { h, c } = fixture();
