@@ -318,7 +318,8 @@ describe('timeline_week_read', () => {
 const indexRow = (n, over = {}) => ({ id: `p${n}`, num: n, title: `Project ${n}`, moved: 20 - n, milestones: 3, done: 1, for_you: 0, media: 0, newest: 5, ...over });
 const indexWeek = (over = {}) => rawWeek({ projects_total: 2, projects: [indexRow(1), indexRow(2)], ...over });
 const detailRow = (n) => ({ project: { id: `p${n}`, num: n, title: `Project ${n}` }, moved: 3, status: 'Going well.', milestones: [], items: [], media: [], needs_you: 0 });
-const detailWeek = (over = {}) => pagedWeek({ projects_total: 2, projects: [detailRow(1), detailRow(2)], ...over });
+// A journal that reads chosen projects always says which it left out, if only [].
+const detailWeek = (over = {}) => pagedWeek({ projects_total: 2, projects: [detailRow(1), detailRow(2)], omitted: [], ...over });
 const PICK = (week) => `Pick the projects that mattered (at most 8 get a card), then call timeline_week_read with week: "${week}" and projects: [their ids or numbers] (up to 12 a call) for their milestones, items and pictures.`;
 const PREDATES_INDEX = 'the journal predates the week index — deploy the journal update, or read the week a page at a time';
 
@@ -483,6 +484,18 @@ describe('timeline_week_read: chosen projects', () => {
     const noPaging = rawWeek({ projects: [detailRow(1)], more_projects: 4 });
     const old = await indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data: noPaging })) }).h.read({ roomId: '!r:s', projects: [1] });
     expect(old).toEqual({ status: 502, body: { error: PREDATES_INDEX } });
+  });
+
+  it('an older journal answers with one complete page of the whole week: 502', async () => {
+    // It ignored projects: no omitted list, so these are every project of the week.
+    for (const data of [
+      pagedWeek({ projects_total: 2, projects: [detailRow(1), detailRow(2)] }),
+      rawWeek({ projects: [detailRow(1), detailRow(2)] }),
+      pagedWeek({ projects_total: 2, projects: [detailRow(1), detailRow(2)], omitted: null }),
+    ]) {
+      const { h } = indexFixture({ readWeekProjects: vi.fn(async () => ({ status: 200, data })) });
+      expect(await h.read({ roomId: '!r:s', week: '2026-11-09', projects: [1] })).toEqual({ status: 502, body: { error: PREDATES_INDEX } });
+    }
   });
 
   it('projects too large for one read are refused with what to do', async () => {
