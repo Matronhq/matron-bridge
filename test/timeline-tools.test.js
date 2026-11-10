@@ -277,6 +277,19 @@ describe('timeline_week_read', () => {
     expect(formatTimelineReadAck(exact.body)).toHaveLength(TIMELINE_READ_MAX_CHARS);
   });
 
+  it('a page that fits by itself is never refused for the quiet line: the line is left out', async () => {
+    const rows = quietRows(3, 10);
+    const empty = formatTimelineReadAck({ week: pagedWeek({ projects: [{ id: 'p1', title: '' }] }) }).length;
+    // The page alone is exactly the limit, so not even "quiet (0 of 3): []" fits beside it.
+    const week = pagedWeek({ projects: [{ id: 'p1', title: 'x'.repeat(TIMELINE_READ_MAX_CHARS - empty) }] });
+    const r = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: week }), wentQuiet: async () => ({ status: 200, data: { total: 3, rows } }) } }).h.read({ roomId: '!r:s' });
+    expect(r.status).toBe(200);
+    expect(r.body.quiet).toBeUndefined();
+    const text = formatTimelineReadAck(r.body);
+    expect(text).toHaveLength(TIMELINE_READ_MAX_CHARS);
+    expect(text.startsWith('week: ')).toBe(true);
+  });
+
   it('a non-ASCII title is measured in characters, and rows are dropped whole', async () => {
     const title = 'Café déjà vu — 東京 '.repeat(2000);
     expect(Buffer.byteLength(title)).toBeGreaterThan(TIMELINE_READ_MAX_CHARS);

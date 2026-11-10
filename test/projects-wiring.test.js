@@ -264,6 +264,7 @@ describe('projects wiring', () => {
       expect(filing).toContain('about 40 moves a turn');
       expect(filing).toContain('Start every new pass again from `offset: 0`, never from an offset you saved');
       expect(filing).toContain('until a full read shows nothing left to file');
+      expect(filing).toContain('a pass in which you move nothing ends the work');
       expect(filing).not.toContain('the `offset` to carry on from');
       expect(filing).toContain('Never move private work');
       expect(filing).toContain('a refusal is final: skip it');
