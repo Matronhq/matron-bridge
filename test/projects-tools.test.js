@@ -50,6 +50,69 @@ describe('projects handlers', () => {
     expect((await down.h.list({ roomId: '!r:s' })).status).toBe(502);
   });
 
+  const rows = (count) => Array.from({ length: count }, (_, i) => ({
+    id: `pj_${i + 1}`, num: i + 1, title: `Project ${i + 1}`, state: 'open', status: 'x'.repeat(300),
+    // Every fourth project has nothing open.
+    missions: { running: i % 4 === 0 ? 0 : 1, waiting: 0, idle: 0, quiet: 0, closed: 2 }, needs_you: 0, open_items: 1, last_activity_at: 1700000000000,
+  }));
+  const listing = (count) => fixture({ list: vi.fn(async () => ({ status: 200, data: { projects: rows(count) } })) });
+  const nums = (r) => r.body.projects.map((p) => p.num);
+
+  it('list: a long list comes back 60 at a time, with the total and the offset', async () => {
+    const { h } = listing(400);
+    const r = await h.list({ roomId: '!r:s' });
+    expect(r.status).toBe(200);
+    expect(nums(r)).toEqual(Array.from({ length: 60 }, (_, i) => i + 1));
+    expect(r.body).toMatchObject({ total: 400, offset: 0, brief: false });
+  });
+
+  it('list: offset continues without repeating or skipping; limit sets the page', async () => {
+    const { h } = listing(400);
+    const seen = [];
+    for (let offset = 0; offset < 400; offset += 60) seen.push(...nums(await h.list({ roomId: '!r:s', offset })));
+    expect(seen).toEqual(Array.from({ length: 400 }, (_, i) => i + 1));
+    expect(nums(await h.list({ roomId: '!r:s', offset: 10, limit: 3 }))).toEqual([11, 12, 13]);
+    expect(nums(await h.list({ roomId: '!r:s', limit: 200 }))).toHaveLength(200);
+    const past = await h.list({ roomId: '!r:s', offset: 400 });
+    expect(past.body).toMatchObject({ projects: [], total: 400, offset: 400 });
+  });
+
+  it('list live: drops projects with no open mission, and pages what is left', async () => {
+    const { h } = listing(400);
+    const r = await h.list({ roomId: '!r:s', live: true });
+    expect(r.body.total).toBe(300);
+    expect(nums(r)).toHaveLength(60);
+    expect(nums(r).every((n) => (n - 1) % 4 !== 0)).toBe(true);
+    const next = await h.list({ roomId: '!r:s', live: true, offset: 60 });
+    expect(nums(next)[0]).toBeGreaterThan(nums(r).at(-1));
+    expect(new Set([...nums(r), ...nums(next)]).size).toBe(120);
+    // A row with no mission counts (an older journal) is not known to be idle.
+    const old = fixture({ list: vi.fn(async () => ({ status: 200, data: { projects: [{ num: 1, title: 'A' }, { num: 2, title: 'B', missions: { running: 0, waiting: 0, idle: 0, quiet: 0, closed: 1 } }] } })) });
+    expect(nums(await old.h.list({ roomId: '!r:s', live: true }))).toEqual([1]);
+  });
+
+  it('list brief: 150 at a time, marked for the renderer', async () => {
+    const { h } = listing(400);
+    const r = await h.list({ roomId: '!r:s', brief: true });
+    expect(nums(r)).toHaveLength(150);
+    expect(r.body).toMatchObject({ total: 400, offset: 0, brief: true });
+    expect(nums(await h.list({ roomId: '!r:s', brief: true, limit: 20 }))).toHaveLength(20);
+  });
+
+  it('list: a short list is passed through whole', async () => {
+    const { h, project } = fixture();
+    const r = await h.list({ roomId: '!r:s' });
+    expect(r.body).toEqual({ projects: [project], total: 1, offset: 0, brief: false });
+  });
+
+  it('list: bad live, brief, offset and limit are refused before any journal call', async () => {
+    const { h, client } = fixture();
+    for (const bad of [{ live: 'yes' }, { brief: 1 }, { offset: -1 }, { offset: 1.5 }, { offset: '3' }, { limit: 0 }, { limit: 201 }, { limit: 2.5 }]) {
+      expect((await h.list({ roomId: '!r:s', ...bad })).status, JSON.stringify(bad)).toBe(400);
+    }
+    expect(client.list).not.toHaveBeenCalled();
+  });
+
   it('get with num: straight through by number, no mission lookup', async () => {
     const { h, client, resolveMission } = fixture();
     expect((await h.get({ roomId: '!r:s', num: 0 })).status).toBe(400);

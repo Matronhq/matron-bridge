@@ -1657,8 +1657,14 @@ const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups relate
 
 server.tool(
   'project_list',
-  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. ${PROJECT_WHAT}`,
-  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
+  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. Long lists are paged: pass \`live: true, brief: true\` to see just the goals with open work. When more remain, the last line says how many and the offset to pass. ${PROJECT_WHAT}`,
+  {
+    state: z.enum(['open', 'closed']).optional().describe("Default 'open'"),
+    live: z.boolean().optional().describe('true = only projects with at least one open mission'),
+    brief: z.boolean().optional().describe('true = one line per project (open missions, needs-you count, last activity) and no status'),
+    offset: z.number().int().min(0).optional().describe('Where the page starts, from the last line of the previous page; keep the other arguments the same. Default 0'),
+    limit: z.number().int().min(1).max(200).optional().describe('Projects per page. Default 60 (brief: 150)'),
+  },
   async (args) => callProjects('list', args, formatProjectList),
 );
 

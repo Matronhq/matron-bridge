@@ -166,6 +166,12 @@ describe('projects wiring', () => {
     expect(slice('project_merge')).toMatch(/into: z\.number\(\)\.int\(\)\.min\(1\)/);
     expect(slice('project_status', 'project_close')).toMatch(/status: z\.string\(\)/);
     expect(slice('project_list', 'project_get')).toMatch(/state: z\.enum\(\['open', 'closed'\]\)\.optional\(\)/);
+    const list = slice('project_list', 'project_get');
+    expect(list).toMatch(/live: z\.boolean\(\)\.optional\(\)/);
+    expect(list).toMatch(/brief: z\.boolean\(\)\.optional\(\)/);
+    expect(list).toMatch(/offset: z\.number\(\)\.int\(\)\.min\(0\)\.optional\(\)/);
+    expect(list).toMatch(/limit: z\.number\(\)\.int\(\)\.min\(1\)\.max\(200\)\.optional\(\)/);
+    expect(list).toContain('Long lists are paged: pass \\`live: true, brief: true\\` to see just the goals with open work.');
     expect(askUser).toMatch(/const PROJECT_WHAT = .*nothing to do with ~\/\.claude\/projects/);
     expect(slice('project_list', 'project_get')).toContain('${PROJECT_WHAT}');
     expect(slice('project_create', 'project_update')).toContain('${PROJECT_WHAT}');

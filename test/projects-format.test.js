@@ -31,6 +31,79 @@ describe('projects-format', () => {
     expect(formatProjectList({})).toBe('No projects.');
   });
 
+  // What the list handler sends for a long list: one page of rows, with the
+  // count after filtering and where the page starts.
+  const many = (count, status = 'On track.') => Array.from({ length: count }, (_, i) => ({ ...row, id: `pj_${i + 1}`, num: i + 1, title: `Project ${i + 1}`, status }));
+  const page = (rows, offset, limit, extra = {}) => ({ projects: rows.slice(offset, offset + limit), total: rows.length, offset, ...extra });
+  const shown = (out) => out.split('\n').filter((l) => /^#\d+ /.test(l)).map((l) => Number(l.match(/^#(\d+) /)[1]));
+
+  it('list: a page that is not the end closes with how many remain and the offset to pass', () => {
+    const rows = many(400);
+    const out = formatProjectList(page(rows, 0, 60));
+    expect(shown(out)).toEqual(rows.slice(0, 60).map((p) => p.num));
+    expect(out.split('\n').at(-1)).toBe('340 more: call project_list again with offset: 60');
+    const last = formatProjectList(page(rows, 360, 60));
+    expect(shown(last)).toEqual(rows.slice(360).map((p) => p.num));
+    expect(last).not.toMatch(/more: call project_list/);
+  });
+
+  it('list: output never exceeds 40,000 characters; it is cut between projects and the offset follows the cut', () => {
+    const rows = many(400, 'x'.repeat(600));
+    const seen = [];
+    let offset = 0;
+    for (let calls = 0; offset < rows.length; calls += 1) {
+      expect(calls, 'paging did not finish').toBeLessThan(400);
+      const out = formatProjectList(page(rows, offset, 60));
+      expect(out.length).toBeLessThanOrEqual(40000);
+      const nums = shown(out);
+      expect(nums.length).toBeGreaterThan(0);
+      expect(nums.length).toBeLessThan(60);
+      // Every project shown is whole: its line and its status line.
+      expect(out.split('\n').filter((l) => l.startsWith('  Status')).length).toBe(nums.length);
+      seen.push(...nums);
+      offset += nums.length;
+      const tail = out.split('\n').at(-1);
+      if (offset < rows.length) expect(tail).toBe(`${rows.length - offset} more: call project_list again with offset: ${offset}`);
+      else expect(tail).not.toMatch(/more: call project_list/);
+    }
+    expect(seen).toEqual(rows.map((p) => p.num));
+  });
+
+  it('list: one oversized project is cut to fit rather than sent whole or dropped', () => {
+    const out = formatProjectList(page(many(3, 'x'.repeat(50000)), 0, 60));
+    expect(out.length).toBeLessThanOrEqual(40000);
+    expect(shown(out)).toEqual([1]);
+    expect(out.split('\n').at(-1)).toBe('2 more: call project_list again with offset: 1');
+  });
+
+  it('list brief: one line per project, no status line', () => {
+    const rows = [
+      row,
+      { ...row, id: 'pj_2', num: 71, title: 'Site', missions: { running: 0, waiting: 1, idle: 0, quiet: 0, closed: 4 }, needs_you: 0 },
+      { ...row, id: 'pj_3', num: 72, title: 'Shop', missions: { running: 1, waiting: 0, idle: 0, quiet: 0, closed: 0 }, needs_you: 1, mission: { num: 61, title: 'Checkout "v2"' } },
+      { ...row, id: 'pj_4', num: 73, title: 'Old', state: 'closed', missions: { running: 0, waiting: 0, idle: 0, quiet: 0, closed: 2 }, needs_you: 0, last_activity_at: undefined },
+      { ...row, id: 'pj_5', num: 74, title: 'Pair', mission: { num: 62, title: 'Not the only one' } },
+      { num: 75, title: 'Bare' },
+    ];
+    expect(formatProjectList(page(rows, 0, 150, { brief: true })).split('\n')).toEqual([
+      '#70 Promo launch — 4 open missions, 2 need you, last activity 2023-11-14',
+      '#71 Site — 1 open mission, last activity 2023-11-14',
+      '#72 Shop — 1 open mission, mission #61 "Checkout "v2"", 1 need you, last activity 2023-11-14',
+      '#73 Old — closed, 0 open missions',
+      '#74 Pair — 4 open missions, 2 need you, last activity 2023-11-14',
+      '#75 Bare',
+    ]);
+    const long = formatProjectList(page(many(400), 0, 150, { brief: true }));
+    expect(long).not.toMatch(/Status/);
+    expect(long.split('\n')).toHaveLength(151);
+    expect(long.split('\n').at(-1)).toBe('250 more: call project_list again with offset: 150');
+  });
+
+  it('list: an offset past the end says so', () => {
+    expect(formatProjectList({ projects: [], total: 12, offset: 60 })).toBe('No projects from offset 60 (12 in all).');
+    expect(formatProjectList({ projects: [], total: 0, offset: 0 })).toBe('No projects.');
+  });
+
   it('detail: project, body, status, missions with status, needs you, recent milestones, sessions by box', () => {
     const out = formatProjectDetail({
       project: { id: 'pj_1', num: 70, title: 'Promo launch', state: 'open', body: 'Everything for the 6 Oct launch', status: 'On track.', status_by: 'user', status_updated_at: 1700000000000 },
