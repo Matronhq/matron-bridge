@@ -67,7 +67,7 @@ describe('timeline wiring', () => {
     const session = { roomId: '!r:s', journalConvoId: 'c1', coordinator: true };
     const client = {
       listWeeks: async () => ({ status: 200, data: { weeks: [{ week: '2026-11-09' }] } }),
-      readWeekRaw: async (week) => ({ status: 200, data: { week, current: false } }),
+      readWeekRaw: async (week) => ({ status: 200, data: { week, current: false, projects: [] } }),
       writeWeek: vi.fn(async (week, body) => (body.final ? { status: 409, data: { error: 'conflict', detail: 'week_final' } } : { status: 201, data: { week, written: true, final: false } })),
     };
     const handlers = createTimelineHandlers({ sessions: new Map([['!r:s', session]]), journalConvoIdFor: (s) => s.journalConvoId, client });
@@ -77,7 +77,7 @@ describe('timeline wiring', () => {
     };
     const callTimeline = new Function('bridgeFetch', 'BRIDGE_API', 'ROOM_ID', `${src}\nreturn callTimeline;`)(fetch, 'http://bridge', '!r:s');
     const read = await callTimeline('read', {}, formatTimelineReadAck);
-    expect(JSON.parse(read.content[0].text)).toEqual({ week: { week: '2026-11-09', current: false } });
+    expect(JSON.parse(read.content[0].text)).toEqual({ week: { week: '2026-11-09', current: false, projects: [] } });
     const wrote = await callTimeline('write', { week: '2026-11-02', stories: [{ title: 'T', sentence: 'S', project_ids: ['#3'] }] }, formatTimelineWriteAck);
     expect(wrote.content[0].text).toBe('Week 2026-11-02 written (1 story).');
     const frozen = await callTimeline('write', { week: '2026-11-02', stories: [], final: true }, formatTimelineWriteAck);
@@ -97,6 +97,9 @@ describe('timeline wiring', () => {
     expect(routine).toMatch(/timeline_week_write/);
     expect(routine).toMatch(/final: true/);
     expect(routine).toMatch(/media_blob_id/);
+    expect(routine).toMatch(/`week\.stored` is null, or `week\.stored\.final` is false/);
+    expect(routine).toMatch(/at most 10 weeks/);
+    expect(routine).toMatch(/week\.projects\[\]\.needs_you/);
     expect(routine).toMatch(/### Back-fill/);
     expect(routine).toMatch(/eight weeks/);
     expect(coord).toMatch(/follow `## Routine: weekly-stories`/);

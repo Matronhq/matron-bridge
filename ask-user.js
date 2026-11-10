@@ -864,7 +864,7 @@ server.tool(
       next: z.string().max(300).optional().describe('What comes next, when the projects\' statuses say so'),
       project_ids: z.array(TIMELINE_REF).min(1).max(10).describe('The projects this story covers: ids, or numbers such as 12 or "#12"'),
       item_ids: z.array(TIMELINE_REF).max(10).optional().describe('Only items still waiting on the user'),
-      media_blob_id: z.string().max(200).optional().describe('A picture or video from the week\'s media list that shows the work well'),
+      media_blob_id: z.string().max(128).optional().describe('A picture or video from the week\'s media list that shows the work well'),
     })).max(8).describe('Up to 8 stories; group related projects into one'),
     final: z.boolean().optional().describe('true freezes the week; allowed only once it has ended'),
     notes: z.array(z.object({

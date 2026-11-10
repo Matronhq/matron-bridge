@@ -81,6 +81,15 @@ describe('timeline_week_read', () => {
     expect(bad.body.error).toMatch(/Monday of the week/);
     const down = await fixture({ client: { listWeeks: async () => ({ status: 0, data: { error: 'journal unreachable' } }) } }).h.read({ roomId: '!r:s' });
     expect(down).toEqual({ status: 502, body: { error: 'journal unreachable' } });
+    const phase1 = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: { week: '2026-11-09', start: 1, end: 2, final: false, projects: [] } }) } }).h.read({ roomId: '!r:s' });
+    expect(phase1.status).toBe(404);
+    expect(phase1.body.error).toMatch(/^the journal predates the timeline routes — deploy/);
+    expect(phase1.body.error).not.toMatch(/conversation/);
+    const phase1b = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: { current: true, week: '2026-11-09' } }) } }).h.read({ roomId: '!r:s' });
+    expect(phase1b.status).toBe(404);
+    const badRead = await fixture({ client: { readWeekRaw: async () => ({ status: 400, data: { error: 'bad_request' } }) } }).h.read({ roomId: '!r:s', week: '2026-11-02' });
+    expect(badRead.body.error).toMatch(/Monday of the week/);
+    expect(badRead.body.error).not.toMatch(/story limits/);
     const quietDown = await fixture({ client: { wentQuiet: async () => ({ status: 0, data: { error: 'journal unreachable' } }) } }).h.read({ roomId: '!r:s' });
     expect(quietDown.status).toBe(502);
   });
@@ -142,6 +151,7 @@ describe('timeline_week_write', () => {
       [{ stories: [story({ item_ids: refs(L.itemRefsMax + 1) })] }, /item_ids has at most 10/],
       [{ stories: [story({ item_ids: ['#0'] })] }, /bad reference/],
       [{ stories: [story({ media_blob_id: 7 })] }, /media_blob_id/],
+      [{ stories: [story({ media_blob_id: 'b'.repeat(L.blobIdMax + 1) })] }, /story 1 media_blob_id is too long: at most 128/],
       [{ notes: refs(L.notesMax + 1).map((n) => ({ project_id: n, note: 'x' })) }, /too many notes/],
       [{ notes: [{ project_id: 1, note: '' }] }, /note 1 note is required/],
       [{ notes: [{ project_id: 1, note: 'x'.repeat(L.noteMax + 1) }] }, /note is too long/],
@@ -166,6 +176,11 @@ describe('timeline_week_write', () => {
     expect(r.status).toBe(201);
   });
 
+  it('a media_blob_id of exactly 128 characters passes local validation', () => {
+    const v = validateTimelineWrite({ week: '2026-11-09', stories: [story({ media_blob_id: 'b'.repeat(128) })] });
+    expect(v.ok).toBe(true);
+  });
+
   it('maps each journal error to a sentence an agent can act on, and unreachable to 502', async () => {
     const cases = [
       [{ status: 403, data: { error: 'forbidden', detail: 'not_coordinator' } }, 403, /does not list this conversation as the Coordinator/],
@@ -178,7 +193,8 @@ describe('timeline_week_write', () => {
       [{ status: 400, data: { error: 'bad_request', detail: 'unknown_item', ref: 'it_9' } }, 400, /item it_9 is not one of the user's items, or is private/],
       [{ status: 400, data: { error: 'bad_request', detail: 'unknown_blob', ref: 'b1' } }, 400, /media_blob_id b1 is not a picture or video/],
       [{ status: 400, data: { error: 'bad_request' } }, 400, /rejected the call/],
-      [{ status: 404, data: { error: 'HTTP 404' } }, 404, /predates the timeline routes/],
+      [{ status: 404, data: { error: 'HTTP 404' } }, 404, /predates the timeline routes, or does not know this conversation on this box/],
+      [{ status: 404, data: { error: 'not_found' } }, 404, /does not know this conversation on this box/],
       [{ status: 500, data: { error: 'HTTP 500' } }, 500, /^HTTP 500$/],
     ];
     for (const [res, status, re] of cases) {
@@ -231,7 +247,7 @@ describe('createTimelineClient', () => {
       ['GET', 'https://j/timeline/weeks/2026-11-09?raw=1'],
       ['GET', 'https://j/timeline/weeks?limit=1'],
       ['GET', 'https://j/timeline/weeks'],
-      ['GET', 'https://j/timeline/quiet'],
+      ['GET', 'https://j/timeline/quiet?raw=1'],
       ['POST', 'https://j/timeline/weeks/2026-11-09'],
     ]);
     expect(calls[0].init.headers.Authorization).toBe('Bearer tok');
