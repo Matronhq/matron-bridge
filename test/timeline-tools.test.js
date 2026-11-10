@@ -109,7 +109,7 @@ describe('timeline_week_write', () => {
   it('defaults: no lede, final false, no notes, optional story fields omitted', async () => {
     const { h, c } = fixture();
     await h.write({ roomId: '!r:s', week: '2026-11-02', stories: [] });
-    expect(c.writeWeek).toHaveBeenCalledWith('2026-11-02', { convo_id: 'c-coord', lede: '', stories: [], final: false, notes: [] });
+    expect(c.writeWeek).toHaveBeenCalledWith('2026-11-02', { convo_id: 'c-coord', stories: [], final: false, notes: [] });
     await h.write(call());
     expect(c.writeWeek.mock.calls[1][1].stories[0]).toEqual({ title: 'Shipped it', sentence: 'The thing went out.', project_ids: [3] });
   });
@@ -178,7 +178,7 @@ describe('timeline_week_write', () => {
       [{ status: 400, data: { error: 'bad_request', detail: 'unknown_item', ref: 'it_9' } }, 400, /item it_9 is not one of the user's items, or is private/],
       [{ status: 400, data: { error: 'bad_request', detail: 'unknown_blob', ref: 'b1' } }, 400, /media_blob_id b1 is not a picture or video/],
       [{ status: 400, data: { error: 'bad_request' } }, 400, /rejected the call/],
-      [{ status: 404, data: { error: 'HTTP 404' } }, 404, /predates the timeline write route/],
+      [{ status: 404, data: { error: 'HTTP 404' } }, 404, /predates the timeline routes/],
       [{ status: 500, data: { error: 'HTTP 500' } }, 500, /^HTTP 500$/],
     ];
     for (const [res, status, re] of cases) {

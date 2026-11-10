@@ -16,4 +16,4 @@ Fires once a day (07:10 in the user's zone by default). The Projects timeline sh
 
 ### Back-fill
 
-When asked to back-fill, write the eight weeks before the current one, oldest first, each with `final: true`, the same way as step 3. Read each week with `timeline_week_read` and its Monday first. Then report one line per week.
+When asked to back-fill, write the eight weeks before the current one, oldest first, each with `final: true`, the same way as step 3. For each week, read it with `timeline_week_read` passing its Monday, then write it. If the journal says a week is out of range, skip it and say so. Then report one line per week.
