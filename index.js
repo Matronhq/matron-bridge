@@ -199,7 +199,7 @@ import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
-import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
+import { isCompactCommand, compactBatchSize, hasQueuedCompact, batchDeferralReason } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle, recordTitleEarned } from './lib/journal-title-seed.js';
 import { createSummaryModel } from './lib/summary-model.js';
@@ -3326,6 +3326,7 @@ function flushPendingSessionQueue(session) {
   const notice = queueFlushNotice('turnEnd', {
     queued: queued.length,
     deferred: deferred.length,
+    deferredBy: batchDeferralReason(queued),
     summary: formatQueueSummary(queued),
   });
   if (session.sendHtml) {
@@ -9874,7 +9875,9 @@ const QUEUE_EDIT_HOLD_MS = Number(process.env.MATRON_QUEUE_EDIT_HOLD_MS) || DEFA
 // while the message was held, nothing else will flush the queue, so deliver
 // it now — exactly what the turn end would have done.
 function queueEditHoldReleased(session) {
-  if (!session?.alive || session.busy || session.waitingForAnswer) return;
+  // The same "genuinely free" test room delivery uses: an open TUI menu or a
+  // resume hold clears busy but must not have queued text typed into it.
+  if (!session?.alive || sessionOccupiedForRoomDelivery(session)) return;
   if (sessions.get(session.roomId) !== session) return;
   if (!session.queuedMessages?.length) return;
   if (flushPendingSessionQueue(session) !== true) maybeFlushRoomDelivery(session);
@@ -13811,6 +13814,7 @@ const apiServer = createServer(async (req, res) => {
           const notice = queueFlushNotice('sendNow', {
             queued: queued.length,
             deferred: deferred.length,
+            deferredBy: batchDeferralReason(queued),
             summary: formatQueueSummary(queued),
           });
           if (session.sendHtml) {
@@ -13886,6 +13890,9 @@ const apiServer = createServer(async (req, res) => {
             : `✕ Cancelled queued message (${remaining} remaining)`;
           session.sendCallback(msg);
         }
+        // The cancelled message may have been held for editing, blocking
+        // the rest while the agent sat idle.
+        if (remaining > 0) queueEditHoldReleased(session);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, remaining }));
 

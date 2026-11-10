@@ -7,7 +7,8 @@ import {
   isEditHeld,
   releaseEntry,
 } from '../lib/queue-edit-hold.js';
-import { compactBatchSize } from '../lib/compact-priority.js';
+import { batchDeferralReason, compactBatchSize } from '../lib/compact-priority.js';
+import { queueFlushNotice } from '../lib/queue-flush-notice.js';
 import {
   handleBusyQueueMagicWord,
   notifyQueuedMessage,
@@ -285,6 +286,39 @@ describe('resolveQueueReleaseTap — edit', () => {
     expect(session.queueNotifications).toHaveLength(3);
     expect(session.queueNotifications[1].id).not.toBe(entry.itemIds[0]);
     expect(session.queueNotifications[1].plain).toBe('📨 Queued (edited): b, edited');
+    // The idle flush waits for the replacement card to be published.
+    await vi.waitFor(() => expect(deps.onHoldReleased).toHaveBeenCalledWith(session));
+  });
+
+  it('edit_save releases the queue only after the replacement card is published', async () => {
+    const session = cardSession();
+    const registry = fakeRegistry();
+    await queueAll(session, ['a'], registry);
+    let publish;
+    const deps = tapDeps(session, registry, {
+      postEditedCard: vi.fn(() => new Promise((resolve) => { publish = resolve; })),
+    });
+    const entry = entryFor(session, 0);
+    resolveQueueReleaseTap('edit', session, { ...deps, entry });
+    resolveQueueReleaseTap('edit_save', session, { ...deps, entry, text: 'new' });
+    await Promise.resolve();
+    expect(deps.onHoldReleased).not.toHaveBeenCalled();
+    publish('$card');
+    await vi.waitFor(() => expect(deps.onHoldReleased).toHaveBeenCalledTimes(1));
+  });
+
+  it('cancelling a held message releases the queue behind it', async () => {
+    const session = cardSession();
+    const registry = fakeRegistry();
+    await queueAll(session, ['a', 'b'], registry);
+    const deps = tapDeps(session, registry);
+    const entry = entryFor(session, 0);
+    const held = session.queuedMessages[0];
+    resolveQueueReleaseTap('edit', session, { ...deps, entry });
+    resolveQueueReleaseTap('cancel', session, { ...deps, entry });
+    expect(session.queuedMessages.map(e => e[0].text)).toEqual(['b']);
+    expect(isEditHeld(held)).toBe(false);
+    expect(compactBatchSize(session.queuedMessages)).toBe(1);
     expect(deps.onHoldReleased).toHaveBeenCalledWith(session);
   });
 
@@ -385,6 +419,34 @@ describe('resolveQueueReleaseTap — edit', () => {
   });
 });
 
+describe('flush notices for a hold split', () => {
+  it('echoes what went and says the rest wait for an edit, not a compaction', () => {
+    const n = queueFlushNotice('turnEnd', {
+      queued: 1, deferred: 2, deferredBy: batchDeferralReason([text('a')]),
+      summary: { plain: '  1. a', html: '<ol><li>a</li></ol>' },
+    });
+    expect(n.plain).toBe('📬 Sending 1 queued message:\n  1. a\n— the other 2 queued messages wait while a queued message is being edited.');
+    expect(n.plain).not.toMatch(/compact/);
+  });
+
+  it('a lone leading /compact is still a compaction split', () => {
+    expect(batchDeferralReason([text('/compact')])).toBe('compact');
+    expect(batchDeferralReason([text('a')])).toBe('edit');
+    expect(batchDeferralReason([text('/compact'), text('a')])).toBe('edit');
+  });
+
+  it('a card tap that sends the batch ahead of a held message says why the rest stayed', async () => {
+    const session = cardSession();
+    const registry = fakeRegistry();
+    await queueAll(session, ['a', 'b'], registry);
+    const deps = tapDeps(session, registry, { formatQueueSummary: (q) => ({ plain: `[${q.length}]`, html: '' }) });
+    resolveQueueReleaseTap('edit', session, { ...deps, entry: entryFor(session, 1) });
+    resolveQueueReleaseTap('send', session, { ...deps, entry: entryFor(session, 0) });
+    expect(deps.notify).toHaveBeenCalledWith(expect.stringMatching(/being edited/));
+    releaseEntry(session.queuedMessages[0]);
+  });
+});
+
 describe('handleBusyQueueMagicWord — send with a held message', () => {
   it('says the next message is being edited instead of "no queued messages"', async () => {
     const session = {
@@ -427,6 +489,18 @@ describe('wiring (source inspection)', () => {
     const start = src.indexOf('function flushPendingSessionQueue(');
     const body = src.slice(start, src.indexOf('\n}\n', start));
     expect(body).toMatch(/if \(batchSize === 0\) return false;/);
+  });
+
+  it('a released hold flushes only when the session is genuinely free', () => {
+    const start = src.indexOf('function queueEditHoldReleased(');
+    const body = src.slice(start, src.indexOf('\n}\n', start));
+    expect(body).toMatch(/sessionOccupiedForRoomDelivery\(session\)/);
+  });
+
+  it('the /cancel-queued endpoint releases the queue behind a cancelled held message', () => {
+    const start = src.indexOf("url.pathname === '/cancel-queued'");
+    const body = src.slice(start, src.indexOf("url.pathname === '/message'", start));
+    expect(body).toMatch(/queueEditHoldReleased\(session\)/);
   });
 
   it('typed text offers in-place edit (not a jumping /compact); tracker replies offer resend', () => {
