@@ -175,6 +175,7 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
@@ -3305,6 +3306,9 @@ function flushPendingSessionQueue(session) {
   // (lib/compact-priority.js). batchSize is the whole queue in every other
   // case, so the non-compact path is byte-for-byte what it always was.
   const batchSize = compactBatchSize(queue);
+  // The front message is held for editing (lib/queue-edit-hold.js): nothing
+  // goes until the edit is saved or cancelled, or the hold expires.
+  if (batchSize === 0) return false;
   const queued = queue.slice(0, batchSize);
   const deferred = queue.slice(batchSize);
   // Snapshot before detaching: snapshotQueuedReleaseBatch reads the batch's
@@ -9330,6 +9334,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       convoId: journalConvoIdFor(session),
       fullText: trimmed,
       compactJump,
+      // A typed message can be edited in place while it waits. Not a jumping
+      // /compact: it is a command, and holding it would hold the whole queue.
+      editMode: compactJump ? null : 'replace',
+      editHoldMs: QUEUE_EDIT_HOLD_MS,
       // Codex can't be handed a single queued message while a turn is live:
       // flushQueue interrupts and returns 'deferred', then the turn-end flush
       // sends the whole queue — so "send just this one" would silently mean
@@ -9605,6 +9613,12 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       // Same capability gate as the text path above.
       allowSendOne: session.agent !== AGENT_CODEX,
       source,
+      // A tracker reply is edited by holding it, cancelling it (which
+      // withdraws the comment) and posting the edited reply as a new
+      // comment: the journal comment is the record, so the bridge can't
+      // rewrite it in place. Other media can't be edited.
+      editMode: source?.item_id && source?.comment_id ? 'resend' : null,
+      editHoldMs: QUEUE_EDIT_HOLD_MS,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
@@ -9852,6 +9866,50 @@ function journalOnMedia(session, media, ctx) {
   journalMediaRouter(session, media, ctx);
 }
 
+// How long a queued message stays held while the user edits it before it is
+// released with its original text (lib/queue-edit-hold.js).
+const QUEUE_EDIT_HOLD_MS = Number(process.env.MATRON_QUEUE_EDIT_HOLD_MS) || DEFAULT_EDIT_HOLD_MS;
+
+// An edit hold ended (saved, cancelled or expired). If the agent went idle
+// while the message was held, nothing else will flush the queue, so deliver
+// it now — exactly what the turn end would have done.
+function queueEditHoldReleased(session) {
+  if (!session?.alive || session.busy || session.waitingForAnswer) return;
+  if (sessions.get(session.roomId) !== session) return;
+  if (!session.queuedMessages?.length) return;
+  if (flushPendingSessionQueue(session) !== true) maybeFlushRoomDelivery(session);
+}
+
+// A hold nobody released (the app closed mid-edit). The entry may have moved
+// to a replacement session since the hold began, so find whoever queues it now.
+function queueEditHoldExpired(blocks) {
+  for (const session of sessions.values()) {
+    if (!session.queuedMessages?.includes(blocks)) continue;
+    const minutes = Math.max(1, Math.round(QUEUE_EDIT_HOLD_MS / 60000));
+    journalPublishNotice(journalConvoIdFor(session),
+      `✎ A queued message was held for editing for ${minutes} minute${minutes === 1 ? '' : 's'} without being saved, so it goes with its original text.`);
+    queueEditHoldReleased(session);
+    return;
+  }
+}
+
+// The card for a queued message whose edit was just saved: same slot, new text.
+function postEditedQueueCard(session, { index, text }) {
+  const ctx = journalSessionCommandCtx(session);
+  const preview = text.length > 40 ? text.slice(0, 37) + '…' : text;
+  return notifyQueuedMessage(session, preview, {
+    sendReply: ctx.sendReply,
+    htmlEscape: escapeHtml,
+    queueRelease: journalInputConsumer.queueRelease,
+    convoId: journalConvoIdFor(session),
+    fullText: text,
+    allowSendOne: session.agent !== AGENT_CODEX,
+    editMode: 'replace',
+    editHoldMs: QUEUE_EDIT_HOLD_MS,
+    insertAt: index,
+  });
+}
+
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
 // {target_seq, choice, text}, {username}) interface.
 function journalOnPromptReply(session, answer, { username, seq, convoId: replyConvoId }) {
@@ -9888,6 +9946,13 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
       // un-actioned.
       notify: (message) => journalPublishNotice(convoId, message),
       formatQueueSummary,
+      // Edit on a queued card (lib/queue-edit-hold.js): the saved text
+      // arrives as the reply's own text.
+      text: answer?.text ?? null,
+      editHoldMs: QUEUE_EDIT_HOLD_MS,
+      onHoldExpired: queueEditHoldExpired,
+      onHoldReleased: queueEditHoldReleased,
+      postEditedCard: postEditedQueueCard,
     });
     return;
   }
