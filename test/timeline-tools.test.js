@@ -14,15 +14,15 @@ function fixture({ coordinator = true, client = {} } = {}) {
     readWeekRaw: vi.fn(async (week) => ({ status: 200, data: rawWeek({ week }) })),
     listWeeks: vi.fn(async () => ({ status: 200, data: { weeks: [{ week: '2026-11-09' }, { week: '2026-11-02' }], next_before: null } })),
     wentQuiet: vi.fn(async () => ({ status: 200, data: quiet })),
-    writeWeek: vi.fn(async (week, body) => ({ status: 201, data: { week, written: true, final: body.final } })),
+    writeWeekEntries: vi.fn(async (week, body) => ({ status: 201, data: { week, written: true, final: body.final, entries: body.entries.length } })),
     ...client,
   };
   const h = createTimelineHandlers({ sessions: new Map([['!r:s', session]]), journalConvoIdFor: (s) => s?.journalConvoId ?? null, client: c });
   return { h, c, session };
 }
 
-const story = (over = {}) => ({ title: 'Shipped it', sentence: 'The thing went out.', project_ids: [3], ...over });
-const call = (over = {}) => ({ roomId: '!r:s', week: '2026-11-02', lede: 'A good week.', stories: [story()], ...over });
+const entry = (over = {}) => ({ project: 3, sentence: 'The thing went out.', ...over });
+const call = (over = {}) => ({ roomId: '!r:s', week: '2026-11-02', entries: [entry()], ...over });
 
 describe('timeline handlers: gate', () => {
   it('refuses a non-Coordinator before any journal call, and the usual session guards', async () => {
@@ -34,7 +34,7 @@ describe('timeline handlers: gate', () => {
     }
     expect(c.readWeekRaw).not.toHaveBeenCalled();
     expect(c.listWeeks).not.toHaveBeenCalled();
-    expect(c.writeWeek).not.toHaveBeenCalled();
+    expect(c.writeWeekEntries).not.toHaveBeenCalled();
     const ok = fixture();
     for (const op of ['read', 'write']) {
       expect((await ok.h[op]({ ...call(), roomId: undefined })).status).toBe(400);
@@ -96,31 +96,92 @@ describe('timeline_week_read', () => {
 });
 
 describe('timeline_week_write', () => {
-  it('posts the cleaned body with the Coordinator convo_id', async () => {
+  it('posts the cleaned entries to the entries route with the Coordinator convo_id', async () => {
     const { h, c } = fixture();
     const r = await h.write(call({
-      week: ' 2026-11-02 ',
-      lede: '  A good week. ',
-      stories: [story({ title: ' Shipped it ', project_ids: ['#12', 'prj_abc', 7], item_ids: ['#4'], next: ' Then the rest. ', media_blob_id: ' blob1 ' })],
+      week: ' 2026-11-09 ',
+      entries: [
+        entry({ project: '#12', sentence: ' The thing went out. ', next: ' Then the rest. ', media_blob_id: ' blob1 ' }),
+        entry({ project: ' prj_abc ' }),
+        entry({ project: 7 }),
+      ],
       final: true,
       notes: [{ project_id: '#9', note: ' Left at review. ' }],
     }));
-    expect(c.writeWeek).toHaveBeenCalledWith('2026-11-02', {
+    expect(c.writeWeekEntries).toHaveBeenCalledTimes(1);
+    expect(c.writeWeekEntries).toHaveBeenCalledWith('2026-11-09', {
       convo_id: 'c-coord',
-      lede: 'A good week.',
-      stories: [{ title: 'Shipped it', sentence: 'The thing went out.', project_ids: [12, 'prj_abc', 7], item_ids: [4], next: 'Then the rest.', media_blob_id: 'blob1' }],
+      entries: [
+        { project: 12, sentence: 'The thing went out.', next: 'Then the rest.', media_blob_id: 'blob1' },
+        { project: 'prj_abc', sentence: 'The thing went out.' },
+        { project: 7, sentence: 'The thing went out.' },
+      ],
       final: true,
       notes: [{ project_id: 9, note: 'Left at review.' }],
     });
-    expect(r).toEqual({ status: 201, body: { week: '2026-11-02', written: true, final: true, stories_count: 1 } });
+    expect(r).toEqual({ status: 201, body: { week: '2026-11-09', written: true, final: true, entries: 3 } });
   });
 
-  it('defaults: no lede, final false, no notes, optional story fields omitted', async () => {
+  it('reaches the journal at /timeline/weeks/<week>/entries', async () => {
+    const calls = [];
+    const fetchImpl = async (url, init) => { calls.push([init.method, url, init.body]); return { ok: true, status: 201, json: async () => ({ week: '2026-11-09', written: true, final: false, entries: 1 }) }; };
+    const { h } = fixture({ client: createTimelineClient({ baseUrl: 'https://journal.example.com', token: 'tok', fetchImpl }) });
+    const r = await h.write(call({ week: '2026-11-09', entries: [entry({ project: '#12' })] }));
+    expect(r.status).toBe(201);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].slice(0, 2)).toEqual(['POST', 'https://journal.example.com/timeline/weeks/2026-11-09/entries']);
+    expect(JSON.parse(calls[0][2])).toEqual({ convo_id: 'c-coord', entries: [{ project: 12, sentence: 'The thing went out.' }], final: false, notes: [] });
+  });
+
+  it('defaults: final false, no notes, optional entry fields omitted, an empty list for a quiet week', async () => {
     const { h, c } = fixture();
-    await h.write({ roomId: '!r:s', week: '2026-11-02', stories: [] });
-    expect(c.writeWeek).toHaveBeenCalledWith('2026-11-02', { convo_id: 'c-coord', stories: [], final: false, notes: [] });
-    await h.write(call());
-    expect(c.writeWeek.mock.calls[1][1].stories[0]).toEqual({ title: 'Shipped it', sentence: 'The thing went out.', project_ids: [3] });
+    await h.write({ roomId: '!r:s', week: '2026-11-02', entries: [] });
+    expect(c.writeWeekEntries).toHaveBeenCalledWith('2026-11-02', { convo_id: 'c-coord', entries: [], final: false, notes: [] });
+    await h.write(call({ entries: [entry({ next: '  ', media_blob_id: '' })] }));
+    expect(c.writeWeekEntries.mock.calls[1][1].entries[0]).toEqual({ project: 3, sentence: 'The thing went out.' });
+  });
+
+  it('lede, stories and the old story fields passed anyway are not forwarded', async () => {
+    const { h, c } = fixture();
+    const r = await h.write(call({
+      lede: 'A good week.',
+      stories: [{ title: 'Shipped it', sentence: 'The thing went out.', project_ids: [3] }],
+      entries: [entry({ title: 'Shipped it', project_ids: [3, 4], item_ids: [5] })],
+    }));
+    expect(r.status).toBe(201);
+    expect(c.writeWeekEntries).toHaveBeenCalledWith('2026-11-02', { convo_id: 'c-coord', entries: [{ project: 3, sentence: 'The thing went out.' }], final: false, notes: [] });
+  });
+
+  it('stories without entries is refused locally: the old shape is never sent', async () => {
+    const { h, c } = fixture();
+    const r = await h.write({ roomId: '!r:s', week: '2026-11-02', lede: 'A good week.', stories: [] });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/entries is required/);
+    expect(c.writeWeekEntries).not.toHaveBeenCalled();
+  });
+
+  it('nine entries, a missing sentence and a bad project ref each fail locally, naming the entry', async () => {
+    const nine = Array.from({ length: 9 }, (_, i) => entry({ project: i + 1 }));
+    const cases = [
+      [{ entries: nine }, 'too many entries: at most 8 (got 9) — one entry per project, for the projects that mattered most'],
+      [{ entries: [entry(), { project: 4 }] }, 'entry 2 sentence is required'],
+      [{ entries: [entry(), entry({ project: 4 }), entry({ project: '#abc' })] }, 'entry 3 has a bad project "#abc" — use the id, or the number such as 12 or #12'],
+    ];
+    for (const [over, sentence] of cases) {
+      const { h, c } = fixture();
+      const r = await h.write(call(over));
+      expect(r).toEqual({ status: 400, body: { error: sentence } });
+      expect(c.writeWeekEntries).not.toHaveBeenCalled();
+    }
+  });
+
+  it('two entries for the same project fail locally with the one-entry-per-project sentence', async () => {
+    for (const [a, b, shown] of [[12, '#12', '#12'], ['12', 12, '#12'], ['prj_abc', ' prj_abc ', 'prj_abc']]) {
+      const { h, c } = fixture();
+      const r = await h.write(call({ entries: [entry({ project: a }), entry({ project: 5 }), entry({ project: b })] }));
+      expect(r).toEqual({ status: 400, body: { error: `project ${shown} has two entries — one entry per project` } });
+      expect(c.writeWeekEntries).not.toHaveBeenCalled();
+    }
   });
 
   it('enforces every limit before the journal', async () => {
@@ -129,33 +190,30 @@ describe('timeline_week_write', () => {
     const cases = [
       [{ week: undefined }, /week must be/],
       [{ week: '2026-11-03' }, /not a Monday/],
-      [{ lede: 'x'.repeat(L.ledeMax + 1) }, /lede is too long/],
-      [{ lede: 5 }, /lede must be text/],
-      [{ stories: undefined }, /stories is required/],
-      [{ stories: Array.from({ length: L.storiesMax + 1 }, () => story()) }, /too many stories/],
-      [{ stories: ['x'] }, /story 1 must be an object/],
-      [{ stories: [story({ title: '  ' })] }, /story 1 title is required/],
-      [{ stories: [story({ title: 'x'.repeat(L.titleMax + 1) })] }, /title is too long/],
-      [{ stories: [story({ sentence: '' })] }, /sentence is required/],
-      [{ stories: [story({ sentence: 'x'.repeat(L.sentenceMax + 1) })] }, /sentence is too long/],
-      [{ stories: [story({ next: 'x'.repeat(L.nextMax + 1) })] }, /next is too long/],
-      [{ stories: [story({ project_ids: [] })] }, /project_ids needs 1 to 10/],
-      [{ stories: [story({ project_ids: undefined })] }, /project_ids is required/],
-      [{ stories: [story({ project_ids: refs(L.projectRefsMax + 1) })] }, /project_ids needs 1 to 10/],
-      [{ stories: [story({ project_ids: [0] })] }, /bad reference/],
-      [{ stories: [story({ project_ids: [-3] })] }, /bad reference/],
-      [{ stories: [story({ project_ids: [1.5] })] }, /bad reference/],
-      [{ stories: [story({ project_ids: ['  '] })] }, /bad reference/],
-      [{ stories: [story({ project_ids: ['#abc'] })] }, /bad reference/],
-      [{ stories: [story({ project_ids: [{}] })] }, /bad reference/],
-      [{ stories: [story({ item_ids: refs(L.itemRefsMax + 1) })] }, /item_ids has at most 10/],
-      [{ stories: [story({ item_ids: ['#0'] })] }, /bad reference/],
-      [{ stories: [story({ media_blob_id: 7 })] }, /media_blob_id/],
-      [{ stories: [story({ media_blob_id: 'b'.repeat(L.blobIdMax + 1) })] }, /story 1 media_blob_id is too long: at most 128/],
+      [{ entries: undefined }, /entries is required/],
+      [{ entries: 'x' }, /entries is required/],
+      [{ entries: refs(L.entriesMax + 1).map((n) => entry({ project: n })) }, /too many entries/],
+      [{ entries: ['x'] }, /entry 1 must be an object/],
+      [{ entries: [[entry()]] }, /entry 1 must be an object/],
+      [{ entries: [entry({ sentence: '  ' })] }, /entry 1 sentence is required/],
+      [{ entries: [entry({ sentence: 5 })] }, /entry 1 sentence must be text/],
+      [{ entries: [entry({ sentence: 'x'.repeat(L.sentenceMax + 1) })] }, /entry 1 sentence is too long: at most 300/],
+      [{ entries: [entry({ next: 'x'.repeat(L.nextMax + 1) })] }, /entry 1 next is too long/],
+      [{ entries: [entry({ project: undefined })] }, /entry 1 project is required/],
+      [{ entries: [entry({ project: null })] }, /entry 1 project is required/],
+      [{ entries: [entry({ project: 0 })] }, /entry 1 has a bad project/],
+      [{ entries: [entry({ project: -3 })] }, /bad project/],
+      [{ entries: [entry({ project: 1.5 })] }, /bad project/],
+      [{ entries: [entry({ project: '  ' })] }, /bad project/],
+      [{ entries: [entry({ project: '#0' })] }, /bad project/],
+      [{ entries: [entry({ project: {} })] }, /bad project/],
+      [{ entries: [entry({ project: [3] })] }, /bad project/],
+      [{ entries: [entry({ media_blob_id: 7 })] }, /entry 1 media_blob_id/],
+      [{ entries: [entry({ media_blob_id: 'b'.repeat(L.blobIdMax + 1) })] }, /entry 1 media_blob_id is too long: at most 128/],
       [{ notes: refs(L.notesMax + 1).map((n) => ({ project_id: n, note: 'x' })) }, /too many notes/],
       [{ notes: [{ project_id: 1, note: '' }] }, /note 1 note is required/],
       [{ notes: [{ project_id: 1, note: 'x'.repeat(L.noteMax + 1) }] }, /note is too long/],
-      [{ notes: [{ project_id: 'x y'.slice(0, 0), note: 'x' }] }, /bad project_id/],
+      [{ notes: [{ project_id: '', note: 'x' }] }, /bad project_id/],
       [{ notes: 'nope' }, /notes must be a list/],
       [{ final: 'yes' }, /final must be true or false/],
     ];
@@ -164,46 +222,54 @@ describe('timeline_week_write', () => {
       const r = await h.write(call(over));
       expect(r.status, JSON.stringify(over).slice(0, 80)).toBe(400);
       expect(r.body.error, JSON.stringify(over).slice(0, 80)).toMatch(re);
-      expect(c.writeWeek).not.toHaveBeenCalled();
+      expect(c.writeWeekEntries).not.toHaveBeenCalled();
     }
     // The limits themselves are accepted.
     const edge = fixture();
     const r = await edge.h.write(call({
-      lede: 'x'.repeat(L.ledeMax),
-      stories: Array.from({ length: L.storiesMax }, () => story({ title: 'x'.repeat(L.titleMax), sentence: 'x'.repeat(L.sentenceMax), next: 'x'.repeat(L.nextMax), project_ids: refs(L.projectRefsMax), item_ids: refs(L.itemRefsMax) })),
+      entries: refs(L.entriesMax).map((n) => entry({ project: n, sentence: 'x'.repeat(L.sentenceMax), next: 'x'.repeat(L.nextMax), media_blob_id: 'b'.repeat(L.blobIdMax) })),
       notes: refs(L.notesMax).map((n) => ({ project_id: n, note: 'x'.repeat(L.noteMax) })),
     }));
     expect(r.status).toBe(201);
+    expect(L).toEqual({ entriesMax: 8, sentenceMax: 300, nextMax: 300, notesMax: 50, noteMax: 300, blobIdMax: 128 });
   });
 
-  it('a media_blob_id of exactly 128 characters passes local validation', () => {
-    const v = validateTimelineWrite({ week: '2026-11-09', stories: [story({ media_blob_id: 'b'.repeat(128) })] });
-    expect(v.ok).toBe(true);
+  it('an old journal: 404, nothing written', async () => {
+    const calls = [];
+    const fetchImpl = async (url, init) => { calls.push([init.method, url]); return { ok: false, status: 404, json: async () => { throw new Error('not json'); } }; };
+    const { h } = fixture({ client: createTimelineClient({ baseUrl: 'https://journal.example.com', token: 'tok', fetchImpl }) });
+    const r = await h.write(call({ week: '2026-11-09' }));
+    expect(r.status).toBe(404);
+    expect(r.body.error).toMatch(/^the journal predates per-project weeks — deploy the journal update before writing/);
+    // One POST to the new path; the older whole-week path is never tried.
+    expect(calls).toEqual([['POST', 'https://journal.example.com/timeline/weeks/2026-11-09/entries']]);
+    expect(createTimelineClient({ baseUrl: 'https://journal.example.com', token: 'tok', fetchImpl }).writeWeek).toBeUndefined();
   });
 
   it('maps each journal error to a sentence an agent can act on, and unreachable to 502', async () => {
     const cases = [
       [{ status: 403, data: { error: 'forbidden', detail: 'not_coordinator' } }, 403, /does not list this conversation as the Coordinator/],
       [{ status: 403, data: { error: 'forbidden' } }, 403, /only the Coordinator agent/],
-      [{ status: 409, data: { error: 'conflict', detail: 'week_final' } }, 409, /frozen; pass final: true to rewrite it on purpose/],
+      [{ status: 409, data: { error: 'conflict', detail: 'week_final' } }, 409, /^that week is frozen; pass final: true to rewrite it on purpose$/],
       [{ status: 400, data: { error: 'bad_request', detail: 'week_not_ended' } }, 400, /only after it ends \(Monday 00:00/],
       [{ status: 400, data: { error: 'bad_request', detail: 'week_out_of_range' } }, 400, /outside the range/],
       [{ status: 400, data: { error: 'bad_request', detail: 'bad_week' } }, 400, /Monday of the week/],
-      [{ status: 400, data: { error: 'bad_request', detail: 'unknown_project', ref: 42 } }, 400, /project 42 is not one of the user's projects, or is private — stories never name private work/],
-      [{ status: 400, data: { error: 'bad_request', detail: 'unknown_item', ref: 'it_9' } }, 400, /item it_9 is not one of the user's items, or is private/],
+      [{ status: 400, data: { error: 'bad_request', detail: 'unknown_project', ref: 42 } }, 400, /project 42 is not one of the user's projects, or is private — a week never names private work/],
       [{ status: 400, data: { error: 'bad_request', detail: 'unknown_blob', ref: 'b1' } }, 400, /media_blob_id b1 is not a picture or video/],
-      [{ status: 400, data: { error: 'bad_request' } }, 400, /rejected the call/],
-      [{ status: 404, data: { error: 'HTTP 404' } }, 404, /predates the timeline routes, or does not know this conversation on this box/],
-      [{ status: 404, data: { error: 'not_found' } }, 404, /does not know this conversation on this box/],
+      [{ status: 400, data: { error: 'bad_request', detail: 'duplicate_project', ref: 12 } }, 400, /^project 12 has two entries — one entry per project$/],
+      [{ status: 400, data: { error: 'bad_request', detail: 'duplicate_project' } }, 400, /^project \(unnamed\) has two entries — one entry per project$/],
+      [{ status: 400, data: { error: 'bad_request' } }, 400, /rejected the call — check the week and the entry limits \(8 entries, one per project, sentences to 300 characters\)/],
+      [{ status: 404, data: { error: 'HTTP 404' } }, 404, /^the journal predates per-project weeks — deploy the journal update before writing/],
+      [{ status: 404, data: { error: 'not_found' } }, 404, /if the journal is up to date, it does not know this conversation on this box/],
       [{ status: 500, data: { error: 'HTTP 500' } }, 500, /^HTTP 500$/],
     ];
     for (const [res, status, re] of cases) {
-      const r = await fixture({ client: { writeWeek: async () => res } }).h.write(call());
+      const r = await fixture({ client: { writeWeekEntries: async () => res } }).h.write(call());
       expect(r.status, JSON.stringify(res)).toBe(status);
       expect(r.body.error, JSON.stringify(res)).toMatch(re);
-      expect(r.body.error).not.toMatch(/\bbad_request\b|\bforbidden\b|\bweek_final\b|\bunknown_project\b/);
+      expect(r.body.error).not.toMatch(/\bbad_request\b|\bforbidden\b|\bweek_final\b|\bunknown_project\b|\bduplicate_project\b|\bstor(y|ies)\b/);
     }
-    const down = await fixture({ client: { writeWeek: async () => ({ status: 0, data: { error: 'journal unreachable' } }) } }).h.write(call());
+    const down = await fixture({ client: { writeWeekEntries: async () => ({ status: 0, data: { error: 'journal unreachable' } }) } }).h.write(call());
     expect(down).toEqual({ status: 502, body: { error: 'journal unreachable' } });
     expect(formatJournalTimelineError(null)).toBe('unknown error');
   });
@@ -220,11 +286,12 @@ describe('helpers', () => {
   it('validateWeekKey accepts a Monday only', () => {
     expect(validateWeekKey('2026-11-09')).toEqual({ ok: true, value: '2026-11-09' });
     expect(validateWeekKey('2026-11-08').ok).toBe(false);
-    expect(validateTimelineWrite({ week: '2026-11-09', stories: [] }).ok).toBe(true);
+    expect(validateTimelineWrite({ week: '2026-11-09', entries: [] }).ok).toBe(true);
   });
   it('acks', () => {
-    expect(formatTimelineWriteAck({ week: '2026-11-09', final: false, stories_count: 4 })).toBe('Week 2026-11-09 written (4 stories).');
-    expect(formatTimelineWriteAck({ week: '2026-11-02', final: true, stories_count: 1 })).toBe('Week 2026-11-02 written (1 story, frozen).');
+    expect(formatTimelineWriteAck({ week: '2026-11-09', final: false, entries: 4 })).toBe('Week 2026-11-09 written (4 projects).');
+    expect(formatTimelineWriteAck({ week: '2026-11-02', final: true, entries: 1 })).toBe('Week 2026-11-02 written (1 project, frozen).');
+    expect(formatTimelineWriteAck({ week: '2026-11-02', final: false, entries: 0 })).toBe('Week 2026-11-02 written (0 projects).');
     expect(formatTimelineReadAck({ week: { week: 'w' } })).toBe('{"week":{"week":"w"}}');
   });
 });
@@ -242,21 +309,21 @@ describe('createTimelineClient', () => {
     await c.listWeeks({ limit: 1 });
     await c.listWeeks();
     await c.wentQuiet();
-    await c.writeWeek('2026-11-09', { convo_id: 'c1', stories: [] });
+    await c.writeWeekEntries('2026-11-09', { convo_id: 'c1', entries: [] });
     expect(calls.map((x) => [x.init.method, x.url])).toEqual([
       ['GET', 'https://j/timeline/weeks/2026-11-09?raw=1'],
       ['GET', 'https://j/timeline/weeks?limit=1'],
       ['GET', 'https://j/timeline/weeks'],
       ['GET', 'https://j/timeline/quiet?raw=1'],
-      ['POST', 'https://j/timeline/weeks/2026-11-09'],
+      ['POST', 'https://j/timeline/weeks/2026-11-09/entries'],
     ]);
     expect(calls[0].init.headers.Authorization).toBe('Bearer tok');
-    expect(JSON.parse(calls[4].init.body)).toEqual({ convo_id: 'c1', stories: [] });
+    expect(JSON.parse(calls[4].init.body)).toEqual({ convo_id: 'c1', entries: [] });
     expect(calls[4].init.headers['Content-Type']).toBe('application/json');
   });
   it('returns error statuses and never throws; no base means unreachable', async () => {
     const { fetchImpl } = fakeFetch(409, { error: 'conflict', detail: 'week_final' });
-    expect(await createTimelineClient({ baseUrl: 'https://j', token: 't', fetchImpl }).writeWeek('w', {})).toEqual({ status: 409, data: { error: 'conflict', detail: 'week_final' } });
+    expect(await createTimelineClient({ baseUrl: 'https://j', token: 't', fetchImpl }).writeWeekEntries('2026-11-09', {})).toEqual({ status: 409, data: { error: 'conflict', detail: 'week_final' } });
     expect(await createTimelineClient({ baseUrl: 'https://j', token: 't', fetchImpl: async () => { throw new Error('boom'); } }).wentQuiet()).toEqual({ status: 0, data: { error: 'journal unreachable' } });
     expect((await createTimelineClient({}).wentQuiet()).status).toBe(0);
   });

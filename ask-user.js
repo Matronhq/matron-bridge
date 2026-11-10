@@ -820,11 +820,12 @@ server.tool(
   async (args) => callBriefing('publish', args, formatBriefingPublishAck),
 );
 
-// --- Projects timeline weekly stories ---
+// --- Projects: the written week ---
 // timeline_week_read / timeline_week_write go through the bridge loopback
 // (index.js mounts lib/timeline-tools.js at /timeline/read and
 // /timeline/write); the journal allows both to the Coordinator alone. A write
-// replaces the week's stories, so a retried call is harmless without a key.
+// replaces what was stored for the week, so a retried call is harmless without
+// a key.
 async function callTimeline(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   try {
@@ -843,6 +844,23 @@ async function callTimeline(name, args, render) {
 
 const TIMELINE_REF = z.union([z.string().min(1).max(64), z.number().int().positive()]);
 
+// Strict, so a call in the older shape (stories, a lede, a title on an entry)
+// is refused with the offending key named rather than quietly losing it.
+const TIMELINE_WEEK_WRITE_INPUT = z.strictObject({
+  week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('The Monday of the week, YYYY-MM-DD'),
+  entries: z.array(z.strictObject({
+    project: TIMELINE_REF.describe('The project: its id, or its number such as 12 or "#12"'),
+    sentence: z.string().min(1).max(300).describe('One sentence on what got done in this project that week, in plain words'),
+    next: z.string().max(300).optional().describe('What comes next, when the project\'s status says so'),
+    media_blob_id: z.string().max(128).optional().describe('A picture or video from the week\'s media list that shows the work well'),
+  })).max(8).describe('Up to 8 entries, one per project that mattered; an empty list for a quiet week'),
+  final: z.boolean().optional().describe('true freezes the week; allowed only once it has ended'),
+  notes: z.array(z.strictObject({
+    project_id: TIMELINE_REF,
+    note: z.string().min(1).max(300).describe('One sentence on where this project was left'),
+  })).max(50).optional().describe('A note for each project on the Went quiet list'),
+});
+
 server.tool(
   'timeline_week_read',
   'Coordinator only. Read one week of the user\'s work for the Projects timeline: every project that moved (milestones, items, pictures), what is already written for it, and, for the current week, the Went quiet list. Use it before timeline_week_write, as the weekly-stories routine says.',
@@ -852,25 +870,11 @@ server.tool(
   async (args) => callTimeline('read', args, formatTimelineReadAck),
 );
 
-server.tool(
+server.registerTool(
   'timeline_week_write',
-  'Coordinator only. Write one week of the Projects timeline: a short lede and up to 8 stories, plus a note for each project that went quiet. Plain sentences, as you would say them to a colleague: no links, no numbers (no PR or tracker numbers), no tool names. A story names the projects it covers by id or number; the journal refuses private work. Writing a week replaces what was stored for it. `final: true` freezes a week that has ended; a frozen week is rewritten only by passing `final: true` again.',
   {
-    week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('The Monday of the week, YYYY-MM-DD'),
-    lede: z.string().max(600).optional().describe('Two or three sentences for the whole week (≤600 characters), ending with how many things wait on the user, if any'),
-    stories: z.array(z.object({
-      title: z.string().min(1).max(80).describe('A short human title'),
-      sentence: z.string().min(1).max(300).describe('One sentence on what got done, in plain words'),
-      next: z.string().max(300).optional().describe('What comes next, when the projects\' statuses say so'),
-      project_ids: z.array(TIMELINE_REF).min(1).max(10).describe('The projects this story covers: ids, or numbers such as 12 or "#12"'),
-      item_ids: z.array(TIMELINE_REF).max(10).optional().describe('Only items still waiting on the user'),
-      media_blob_id: z.string().max(128).optional().describe('A picture or video from the week\'s media list that shows the work well'),
-    })).max(8).describe('Up to 8 stories; group related projects into one'),
-    final: z.boolean().optional().describe('true freezes the week; allowed only once it has ended'),
-    notes: z.array(z.object({
-      project_id: TIMELINE_REF,
-      note: z.string().min(1).max(300).describe('One sentence on where this project was left'),
-    })).max(50).optional().describe('A note for each project on the Went quiet list'),
+    description: 'Coordinator only. Write one week of Projects: up to 8 entries, one per project that mattered, each one sentence on what got done that week, an optional next step and an optional picture; plus a note for each project that went quiet. Plain sentences: no links, no numbers, no tool names. The project\'s name is the card\'s title, so do not repeat it. An entry names its project by id or number; the journal refuses private work. Writing a week replaces what was stored for it. `final: true` freezes a week that has ended; a frozen week is rewritten only by passing `final: true` again.',
+    inputSchema: TIMELINE_WEEK_WRITE_INPUT,
   },
   async (args) => callTimeline('write', args, formatTimelineWriteAck),
 );
