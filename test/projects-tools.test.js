@@ -102,7 +102,32 @@ describe('projects handlers', () => {
   it('list: a short list is passed through whole', async () => {
     const { h, project } = fixture();
     const r = await h.list({ roomId: '!r:s' });
-    expect(r.body).toEqual({ projects: [project], total: 1, offset: 0, brief: false });
+    expect(r.body).toEqual({ projects: [project], total: 1, offset: 0, brief: false, live: false, state: 'open' });
+  });
+
+  it('list: the reply carries the filters of the call, for the closing line', async () => {
+    const { h } = listing(400);
+    expect((await h.list({ roomId: '!r:s', live: true, brief: true })).body).toMatchObject({ live: true, brief: true, state: 'open', offset: 0 });
+    expect((await h.list({ roomId: '!r:s', live: true, brief: true })).body.limit).toBeUndefined();
+    expect((await h.list({ roomId: '!r:s', state: 'closed', limit: 20 })).body).toMatchObject({ live: false, brief: false, state: 'closed', limit: 20 });
+    // A limit that is the default anyway is not repeated.
+    expect((await h.list({ roomId: '!r:s', limit: 60 })).body.limit).toBeUndefined();
+    expect((await h.list({ roomId: '!r:s', brief: true, limit: 150 })).body.limit).toBeUndefined();
+    expect((await h.list({ roomId: '!r:s', brief: true, limit: 60 })).body.limit).toBe(60);
+    // A journal body cannot set them.
+    const odd = fixture({ list: vi.fn(async () => ({ status: 200, data: { projects: rows(3), live: true, state: 'closed', limit: 9 } })) });
+    const r = await odd.h.list({ roomId: '!r:s' });
+    expect(r.body).toMatchObject({ live: false, state: 'open' });
+    expect(r.body.limit).toBeUndefined();
+  });
+
+  it('list: closed projects have no open missions, so state closed with live is refused', async () => {
+    const { h, client } = fixture();
+    const r = await h.list({ roomId: '!r:s', state: 'closed', live: true });
+    expect(r).toEqual({ status: 400, body: { error: 'live lists open projects with open missions — leave out state, or leave out live' } });
+    expect(client.list).not.toHaveBeenCalled();
+    expect((await h.list({ roomId: '!r:s', state: 'closed', live: false })).status).toBe(200);
+    expect((await h.list({ roomId: '!r:s', state: 'open', live: true })).status).toBe(200);
   });
 
   it('list: bad live, brief, offset and limit are refused before any journal call', async () => {

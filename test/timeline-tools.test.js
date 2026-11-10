@@ -63,7 +63,7 @@ describe('timeline_week_read', () => {
     const r = await h.read({ roomId: '!r:s', week: '2026-11-02' });
     expect(c.listWeeks).not.toHaveBeenCalled();
     expect(c.wentQuiet).not.toHaveBeenCalled();
-    expect(r.body).toEqual({ week: rawWeek({ week: '2026-11-02', current: false }) });
+    expect(r.body).toEqual({ week: rawWeek({ week: '2026-11-02', current: false }), offset: 0 });
   });
 
   it('rejects a malformed or non-Monday week locally', async () => {
@@ -148,6 +148,7 @@ describe('timeline_week_read', () => {
     expect(formatTimelineReadAck({ week: pagedWeek({ next_offset: null }) }).split('\n').at(-1)).toBe('That is every project that moved this week.');
   });
 
+  const EVERY = 'That is every project that moved this week.';
   const CANNOT_PAGE = 'More projects moved this week than this read shows; the journal cannot page them — deploy the journal update.';
 
   it('an older journal that says more projects moved but gives no next_offset is not called complete', async () => {
@@ -155,18 +156,26 @@ describe('timeline_week_read', () => {
     expect(lines).toHaveLength(2);
     expect(lines[1]).toBe(CANNOT_PAGE);
     expect(formatTimelineReadAck({ week: rawWeek({ current: false, more_projects: true }) }).split('\n').at(-1)).toBe(CANNOT_PAGE);
-    expect(formatTimelineReadAck({ week: rawWeek({ current: false, more_projects: 0 }) }).split('\n').at(-1)).toBe('That is every project that moved this week.');
+    expect(formatTimelineReadAck({ week: rawWeek({ current: false, more_projects: 0 }) }).split('\n').at(-1)).toBe(EVERY);
 
     // Through the handler: the count the journal sends, and no offset to go on from.
     const { h } = fixture({ client: { readWeekRaw: vi.fn(async (week) => ({ status: 200, data: rawWeek({ week, more_projects: 5 }) })) } });
     const r = await h.read({ roomId: '!r:s' });
     expect(r.status).toBe(200);
     expect(formatTimelineReadAck(r.body).split('\n').at(-1)).toBe(CANNOT_PAGE);
-    const nulled = fixture({ client: { readWeekRaw: vi.fn(async (week) => ({ status: 200, data: pagedWeek({ week, more_projects: 5, next_offset: null }) })) } });
-    expect(formatTimelineReadAck((await nulled.h.read({ roomId: '!r:s' })).body).split('\n').at(-1)).toBe(CANNOT_PAGE);
   });
 
-  it('a next_offset that does not move on is never offered: no loop', async () => {
+  it('a journal that pages says the week is complete with a null next_offset, whatever else it sends', async () => {
+    expect(formatTimelineReadAck({ week: pagedWeek({ next_offset: null, more_projects: 0 }) }).split('\n').at(-1)).toBe(EVERY);
+    // The key is what counts: null is the last page even beside a stray count.
+    expect(formatTimelineReadAck({ offset: 12, week: pagedWeek({ offset: 12, next_offset: null, more_projects: 5 }) }).split('\n').at(-1)).toBe(EVERY);
+    const last = fixture({ client: { readWeekRaw: vi.fn(async (week) => ({ status: 200, data: pagedWeek({ week, offset: 12, projects_total: 14, next_offset: null, more_projects: 0 }) })) } });
+    const r = await last.h.read({ roomId: '!r:s', offset: 12 });
+    expect(r.body.offset).toBe(12);
+    expect(formatTimelineReadAck(r.body).split('\n').at(-1)).toBe(EVERY);
+  });
+
+  it('a next_offset that does not pass the offset asked for is never offered: no loop', async () => {
     const stuck = fixture({ client: { readWeekRaw: vi.fn(async (week) => ({ status: 200, data: pagedWeek({ week, offset: 12, next_offset: 12, projects_total: 30, more_projects: 6 }) })) } });
     const r = await stuck.h.read({ roomId: '!r:s', offset: 12 });
     expect(r.status).toBe(200);
@@ -175,10 +184,22 @@ describe('timeline_week_read', () => {
     expect(last).not.toMatch(/offset/);
     // The first page naming itself, and an offset that goes backwards.
     expect(formatTimelineReadAck({ week: pagedWeek({ next_offset: 0, more_projects: 6 }) }).split('\n').at(-1)).toBe(CANNOT_PAGE);
-    expect(formatTimelineReadAck({ week: pagedWeek({ offset: 12, next_offset: 6, more_projects: 6 }) }).split('\n').at(-1)).toBe(CANNOT_PAGE);
-    // Nothing more to read: the week is complete.
-    expect(formatTimelineReadAck({ week: pagedWeek({ offset: 12, next_offset: 12, more_projects: 0 }) }).split('\n').at(-1)).toBe('That is every project that moved this week.');
-    expect(formatTimelineReadAck({ week: pagedWeek({ offset: 12, next_offset: 18, more_projects: 6 }) }).split('\n').at(-1)).toBe('More projects: call timeline_week_read again with week: "2026-11-09", offset: 18.');
+    expect(formatTimelineReadAck({ offset: 12, week: pagedWeek({ offset: 12, next_offset: 6, more_projects: 6 }) }).split('\n').at(-1)).toBe(CANNOT_PAGE);
+    // An offset that stays put is not a last page, even with nothing counted after it.
+    expect(formatTimelineReadAck({ offset: 12, week: pagedWeek({ offset: 12, next_offset: 12, more_projects: 0 }) }).split('\n').at(-1)).toBe(CANNOT_PAGE);
+    // Something that is neither a whole number nor null is no offset at all.
+    expect(formatTimelineReadAck({ week: pagedWeek({ next_offset: '6', more_projects: 6 }) }).split('\n').at(-1)).toBe(CANNOT_PAGE);
+    expect(formatTimelineReadAck({ offset: 12, week: pagedWeek({ offset: 12, next_offset: 18, more_projects: 6 }) }).split('\n').at(-1)).toBe('More projects: call timeline_week_read again with week: "2026-11-09", offset: 18.');
+  });
+
+  it('it is the offset asked for that counts, not the one the journal echoes', async () => {
+    // The journal echoes an earlier offset: 6 would look like progress from 0, and is none from 12.
+    expect(formatTimelineReadAck({ offset: 12, week: pagedWeek({ offset: 0, next_offset: 6, more_projects: 6 }) }).split('\n').at(-1)).toBe(CANNOT_PAGE);
+    // The journal echoes a later one: 18 is past the 12 asked for.
+    expect(formatTimelineReadAck({ offset: 12, week: pagedWeek({ offset: 30, next_offset: 18, more_projects: 6 }) }).split('\n').at(-1)).toBe('More projects: call timeline_week_read again with week: "2026-11-09", offset: 18.');
+    const echo = fixture({ client: { readWeekRaw: vi.fn(async (week) => ({ status: 200, data: pagedWeek({ week, offset: 0, next_offset: 6, projects_total: 30, more_projects: 6 }) })) } });
+    const r = await echo.h.read({ roomId: '!r:s', offset: 12 });
+    expect(formatTimelineReadAck(r.body).split('\n').at(-1)).toBe(CANNOT_PAGE);
   });
 
   it('an oversized body is refused: the journal has no paging', async () => {
@@ -198,6 +219,10 @@ describe('timeline_week_read', () => {
     const stuck = pagedWeek({ ...big, offset: 6, next_offset: 6 });
     const r2 = await fixture({ client: { readWeekRaw: vi.fn(async () => ({ status: 200, data: stuck })) } }).h.read({ roomId: '!r:s', offset: 6 });
     expect(r2).toEqual({ status: 502, body: { error: "the journal's week read is too large for this tool — deploy the journal update" } });
+    // Nor is the offset the journal echoes: 6 asked for, 6 offered, 0 echoed.
+    const r3 = await fixture({ client: { readWeekRaw: vi.fn(async () => ({ status: 200, data: { ...stuck, offset: 0 } })) } }).h.read({ roomId: '!r:s', offset: 6 });
+    expect(r3.status).toBe(502);
+    expect(r3.body.error).not.toMatch(/offset/);
   });
 
   const quietRows = (n, noteLength) => Array.from({ length: n }, (_, i) => ({ project: { id: `q${i}`, num: i + 1, title: 'A' }, last_moved_at: 5, note: 'n'.repeat(noteLength), weekly: false }));
@@ -214,10 +239,10 @@ describe('timeline_week_read', () => {
     expect(r.body.quiet).toEqual(rows.slice(0, r.body.quiet.length));
     expect(r.body.quiet_total).toBe(12);
     const text = formatTimelineReadAck(r.body);
-    expect(text.length).toBeLessThan(45000);
+    expect(text.length).toBeLessThan(TIMELINE_READ_MAX_CHARS);
     expect(text.split('\n')[0]).toMatch(new RegExp(`^quiet \\(${r.body.quiet.length} of 12\\): `));
     // One more row would not have fitted.
-    expect(formatTimelineReadAck({ ...r.body, quiet: rows.slice(0, r.body.quiet.length + 1) }).length).toBeGreaterThan(45000);
+    expect(formatTimelineReadAck({ ...r.body, quiet: rows.slice(0, r.body.quiet.length + 1) }).length).toBeGreaterThan(TIMELINE_READ_MAX_CHARS);
 
     // A journal that gives no total: the line still says how many there were.
     const untold = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: week }), wentQuiet: async () => ({ status: 200, data: { rows } }) } }).h.read({ roomId: '!r:s' });
@@ -225,18 +250,19 @@ describe('timeline_week_read', () => {
     expect(formatTimelineReadAck(untold.body).split('\n')[0]).toMatch(new RegExp(`^quiet \\(${untold.body.quiet.length} of 12\\): `));
 
     // A quiet list that fits is left alone.
-    const small = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: pagedWeek({ projects: [{ id: 'p1', title: 'x'.repeat(30000) }] }) }), wentQuiet: async () => ({ status: 200, data: { total: 12, rows } }) } }).h.read({ roomId: '!r:s' });
+    const small = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: pagedWeek({ projects: [{ id: 'p1', title: 'x'.repeat(20000) }] }) }), wentQuiet: async () => ({ status: 200, data: { total: 12, rows } }) } }).h.read({ roomId: '!r:s' });
     expect(small.body.quiet).toHaveLength(12);
   });
 
   it('a text of exactly the limit is read; one character more is not', async () => {
+    expect(TIMELINE_READ_MAX_CHARS).toBe(40000);
     const sized = (length, over = {}) => {
       const empty = formatTimelineReadAck({ week: pagedWeek({ current: false, projects: [{ id: 'p1', title: '' }], ...over }) }).length;
       return pagedWeek({ current: false, projects: [{ id: 'p1', title: 'x'.repeat(length - empty) }], ...over });
     };
     const at = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: sized(TIMELINE_READ_MAX_CHARS) }) } }).h.read({ roomId: '!r:s', week: '2026-11-09' });
     expect(at.status).toBe(200);
-    expect(formatTimelineReadAck(at.body)).toHaveLength(45000);
+    expect(formatTimelineReadAck(at.body)).toHaveLength(TIMELINE_READ_MAX_CHARS);
     const over = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: sized(TIMELINE_READ_MAX_CHARS + 1) }) } }).h.read({ roomId: '!r:s', week: '2026-11-09' });
     expect(over.status).toBe(502);
 
@@ -248,12 +274,12 @@ describe('timeline_week_read', () => {
     const exact = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: week }), wentQuiet: async () => ({ status: 200, data: { total: 3, rows } }) } }).h.read({ roomId: '!r:s' });
     expect(exact.status).toBe(200);
     expect(exact.body.quiet).toHaveLength(1);
-    expect(formatTimelineReadAck(exact.body)).toHaveLength(45000);
+    expect(formatTimelineReadAck(exact.body)).toHaveLength(TIMELINE_READ_MAX_CHARS);
   });
 
   it('a non-ASCII title is measured in characters, and rows are dropped whole', async () => {
     const title = 'Café déjà vu — 東京 '.repeat(2000);
-    expect(Buffer.byteLength(title)).toBeGreaterThan(45000);
+    expect(Buffer.byteLength(title)).toBeGreaterThan(TIMELINE_READ_MAX_CHARS);
     const week = pagedWeek({ projects: [{ id: 'p1', title }] });
     const rows = quietRows(12, 0).map((row, i) => ({ ...row, note: `Où en est-on ? ${'é'.repeat(900)} ${i}` }));
     const r = await fixture({ client: { readWeekRaw: async () => ({ status: 200, data: week }), wentQuiet: async () => ({ status: 200, data: { total: 12, rows } }) } }).h.read({ roomId: '!r:s' });
@@ -263,7 +289,7 @@ describe('timeline_week_read', () => {
     expect(r.body.quiet.length).toBeLessThan(12);
     expect(r.body.quiet).toEqual(rows.slice(0, r.body.quiet.length));
     const text = formatTimelineReadAck(r.body);
-    expect(text.length).toBeLessThanOrEqual(45000);
+    expect(text.length).toBeLessThanOrEqual(TIMELINE_READ_MAX_CHARS);
     expect(JSON.parse(text.split('\n')[0].replace(/^quiet \(\d+ of 12\): /, ''))).toEqual(r.body.quiet);
     expect(JSON.parse(text.split('\n')[1].replace(/^week: /, '')).projects[0].title).toBe(title);
   });

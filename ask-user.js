@@ -1433,7 +1433,7 @@ server.tool(
 
 server.tool(
   'mission_update',
-  "Rename a mission (its title or its short name), rewrite its standing description, or move it to another project (project: N — every mission is in exactly one project, so it can move but never be taken out). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
+  "Rename a mission (its title or its short name), rewrite its standing description, or move it to another project (project: N — every mission is in exactly one project, so it can move but never be taken out). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator filing a mission into the goal it serves.",
   {
     title: z.string().optional().describe('≤200 chars'),
     name: z.string().optional().describe("A short name of at most 40 characters that becomes the conversation's name in the apps; the title stays the full description"),
@@ -1657,10 +1657,10 @@ const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups relate
 
 server.tool(
   'project_list',
-  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. Long lists are paged: pass \`live: true, brief: true\` to see just the goals with open work. When more remain, the last line says how many and the offset to pass. ${PROJECT_WHAT}`,
+  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. Long lists are paged: pass \`live: true, brief: true\` to see just the goals with open work. When more remain, the last line says how many and names the next call in full, with the same filters and the offset to pass. live is for open projects only: it is refused with state: 'closed'. ${PROJECT_WHAT}`,
   {
     state: z.enum(['open', 'closed']).optional().describe("Default 'open'"),
-    live: z.boolean().optional().describe('true = only projects with at least one open mission'),
+    live: z.boolean().optional().describe('true = only projects with at least one open mission; not with state: \'closed\''),
     brief: z.boolean().optional().describe('true = one line per project (open missions, needs-you count, last activity) and no status'),
     offset: z.number().int().min(0).optional().describe('Where the page starts, from the last line of the previous page; keep the other arguments the same. Default 0'),
     limit: z.number().int().min(1).max(200).optional().describe('Projects per page. Default 60 (brief: 150)'),
@@ -1718,7 +1718,7 @@ server.tool(
 
 server.tool(
   'project_merge',
-  'Merge project #num into project #into: every mission in #num moves to #into, and #num closes as "Merged into #into" (its number keeps pointing there). The Coordinator only — for near-duplicate projects; report each merge to the user.',
+  'Merge project #num into project #into: every mission in #num moves to #into, and #num closes as "Merged into #into" (its number keeps pointing there). The Coordinator only — for near-duplicate projects, and for folding a project that holds a single mission into the goal it serves; report what was merged to the user briefly, in a few lines, not merge by merge.',
   {
     num: z.number().int().min(1).describe('The project to fold away'),
     into: z.number().int().min(1).describe('The project to keep'),

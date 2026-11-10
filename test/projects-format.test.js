@@ -86,17 +86,38 @@ describe('projects-format', () => {
       { num: 75, title: 'Bare' },
     ];
     expect(formatProjectList(page(rows, 0, 150, { brief: true })).split('\n')).toEqual([
-      '#70 Promo launch — 4 open missions, 2 need you, last activity 2023-11-14',
-      '#71 Site — 1 open mission, last activity 2023-11-14',
+      '#70 Promo launch — 4 open missions, 3 closed, 2 need you, last activity 2023-11-14',
+      '#71 Site — 1 open mission, 4 closed, last activity 2023-11-14',
       '#72 Shop — 1 open mission, mission #61 "Checkout "v2"", 1 need you, last activity 2023-11-14',
-      '#73 Old — closed, 0 open missions',
-      '#74 Pair — 4 open missions, 2 need you, last activity 2023-11-14',
+      '#73 Old — closed, 0 open missions, 2 closed',
+      '#74 Pair — 4 open missions, 3 closed, 2 need you, last activity 2023-11-14',
       '#75 Bare',
     ]);
     const long = formatProjectList(page(many(400), 0, 150, { brief: true }));
     expect(long).not.toMatch(/Status/);
     expect(long.split('\n')).toHaveLength(151);
-    expect(long.split('\n').at(-1)).toBe('250 more: call project_list again with offset: 150');
+    expect(long.split('\n').at(-1)).toBe('250 more: call project_list again with brief: true, offset: 150');
+  });
+
+  it('list brief: a project whose one open mission is not its only mission says how many are closed', () => {
+    const one = { ...row, id: 'pj_6', num: 76, title: 'Goal', missions: { running: 1, waiting: 0, idle: 0, quiet: 0, closed: 5 }, needs_you: 0, mission: { num: 63, title: 'Last step' } };
+    expect(formatProjectList(page([one], 0, 150, { brief: true }))).toBe('#76 Goal — 1 open mission, 5 closed, mission #63 "Last step", last activity 2023-11-14');
+    expect(formatProjectList(page([{ ...one, missions: { ...one.missions, closed: 0 } }], 0, 150, { brief: true }))).toBe('#76 Goal — 1 open mission, mission #63 "Last step", last activity 2023-11-14');
+  });
+
+  it('list: the closing line repeats the filters of the call, so it can be followed as written', () => {
+    const rows = many(400);
+    const tail = (limit, extra) => formatProjectList(page(rows, 0, limit, extra)).split('\n').at(-1);
+    expect(tail(150, { live: true, brief: true })).toBe('250 more: call project_list again with live: true, brief: true, offset: 150');
+    expect(tail(60, { live: true })).toBe('340 more: call project_list again with live: true, offset: 60');
+    expect(tail(20, { state: 'closed', limit: 20 })).toBe('380 more: call project_list again with state: "closed", limit: 20, offset: 20');
+    expect(tail(40, { live: true, brief: true, limit: 40 })).toBe('360 more: call project_list again with live: true, brief: true, limit: 40, offset: 40');
+    // Nothing passed, nothing repeated: an open state and false flags are the defaults.
+    expect(tail(60, { state: 'open', live: false, brief: false })).toBe('340 more: call project_list again with offset: 60');
+    // The longest closing line still fits the reply.
+    const long = formatProjectList(page(many(400, 'x'.repeat(600)), 0, 200, { state: 'closed', limit: 200 }));
+    expect(long.length).toBeLessThanOrEqual(40000);
+    expect(long.split('\n').at(-1)).toMatch(/^\d+ more: call project_list again with state: "closed", limit: 200, offset: \d+$/);
   });
 
   it('list: an offset past the end says so', () => {
@@ -157,8 +178,9 @@ describe('projects-format', () => {
   });
 
   it('blocked: open_missions lists them when sent; closed; into_closed; anything else passes through', () => {
-    expect(formatProjectBlocked({ error: 'conflict', blocked_by: 'open_missions', missions: [{ num: 47, title: 'Launch day' }] })).toBe('the project still has open missions: #47 Launch day — only the user can close a project with open missions; ask them (a question item) before closing or moving any mission');
-    expect(formatProjectBlocked({ error: 'open_missions' })).toBe('the project still has open missions — only the user can close a project with open missions; ask them (a question item) before closing or moving any mission');
+    expect(formatProjectBlocked({ error: 'conflict', blocked_by: 'open_missions', missions: [{ num: 47, title: 'Launch day' }] })).toBe('the project still has open missions: #47 Launch day — only the user can close a project with open missions; ask them (a question item) before closing it');
+    expect(formatProjectBlocked({ error: 'open_missions' })).toBe('the project still has open missions — only the user can close a project with open missions; ask them (a question item) before closing it');
+    expect(formatProjectBlocked({ error: 'open_missions' })).not.toMatch(/moving/);
     expect(formatProjectBlocked({ error: 'conflict', blocked_by: 'closed' })).toBe('project is closed — it takes no changes (project_get shows where a merged project went)');
     // R9: the journal's merge route has a distinct 409 for a closed `into`.
     expect(formatProjectBlocked({ error: 'conflict', blocked_by: 'into_closed' })).toMatch(/^the project to merge into is closed/);

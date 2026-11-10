@@ -173,6 +173,10 @@ describe('timeline wiring', () => {
     expect(routine).toMatch(/`offset`/);
     expect(routine).toContain('keep going until the last line says that is every project that moved this week');
     expect(routine).toContain('Read every page of a week before you choose what to write for it.');
+    // A week that could not be read whole is never frozen.
+    expect(routine).toContain("the week's read was cut short: write from the pages you did read, never with `final: true`");
+    expect(routine).toContain('A week whose read was cut short is the exception: write it without `final`, so that it stays unfrozen');
+    expect(routine).toContain("When a week's read was cut short, add one more line saying which week and that it was left unfrozen.");
     expect(routine).toMatch(/quiet \(n of total\)/);
     expect(routine).toMatch(/`notes`/);
     // The older shape is gone from the routine.
@@ -186,6 +190,7 @@ describe('timeline wiring', () => {
     expect(rewrite).toMatch(/oldest first/);
     expect(rewrite).toMatch(/`stored\.legacy` is true/);
     expect(rewrite).toMatch(/`final: true`, except the current week/);
+    expect(rewrite).toContain('and a week whose read was cut short, which is also written not final');
     expect(rewrite).toMatch(/out of range/);
     expect(rewrite).toMatch(/one line per week/);
     expect(coord).toMatch(/one card per project per week/);
