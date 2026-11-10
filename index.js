@@ -136,7 +136,7 @@ import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
-import { parseUsageLimits, formatLimits, createUsageMissLogger } from './lib/usage-limits.js';
+import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
@@ -7345,7 +7345,9 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
 
 // Run `claude -p "/usage"` as a one-shot and return its stdout. stdin is
 // ignored (not a pipe) so Claude Code doesn't wait ~3s for stdin data. Rejects
-// on spawn error, non-zero exit, or a 30s timeout. Used by the /limits command.
+// on spawn error, non-zero exit, or a timeout (usageFetchTimeoutMs: 180 s by
+// default, USAGE_FETCH_TIMEOUT_MS to change it). Used by the /limits command
+// and the status-frame refresh.
 function fetchUsageLimitsText(cwd) {
   return new Promise((resolve, reject) => {
     const proc = spawn('claude', ['-p', '/usage', '--output-format', 'text'], {
@@ -7371,7 +7373,7 @@ function fetchUsageLimitsText(cwd) {
     const timer = setTimeout(() => {
       void killProcessTree(proc.pid, 'SIGKILL', { kill: (sig) => { try { proc.kill(sig); } catch { /* already gone */ } }, log: debug });
       finish(reject, new Error('timed out'));
-    }, 30000);
+    }, usageFetchTimeoutMs());
     proc.stdout.on('data', (d) => { stdout += d; });
     proc.stderr.on('data', (d) => { stderr += d; });
     proc.on('error', (e) => finish(reject, e));
