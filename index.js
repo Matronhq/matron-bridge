@@ -30,6 +30,8 @@ import { createRoutinesClient } from './lib/routines-client.js';
 import { createRoutineHandlers } from './lib/routines-tools.js';
 import { createBriefingsClient } from './lib/briefings-client.js';
 import { createBriefingHandlers } from './lib/briefings-tools.js';
+import { createTimelineClient } from './lib/timeline-client.js';
+import { createTimelineHandlers } from './lib/timeline-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
@@ -733,6 +735,12 @@ const routinesClient = createRoutinesClient({
 // Coordinator briefings (spec: matron-journal 2026-10-04 latest briefing):
 // the briefing_publish tool's journal client.
 const briefingsClient = createBriefingsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+// The Projects timeline's weekly stories: the timeline_week_read /
+// timeline_week_write tools' journal client.
+const timelineClient = createTimelineClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -12672,6 +12680,16 @@ const briefingHandlers = createBriefingHandlers({
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
+// The timeline_week_read / timeline_week_write tool routes
+// (lib/timeline-tools.js), mounted below; same Coordinator test as the
+// briefing tool.
+const timelineHandlers = createTimelineHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: timelineClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
 // A journal `{kind:'unseen', event:'pending'}` frame (spec: matron-journal
 // 2026-09-30 read state): important things the user hasn't seen for 2 h or
 // more. Delivered to the Coordinator exactly like a consent nudge — resumed
@@ -13537,6 +13555,16 @@ const apiServer = createServer(async (req, res) => {
         const name = briefingRoute[1];
         await respondAgentChatRoute(res, data, linkChecked(`briefing/${name}`, briefingHandlers[name]),
           (status, b) => debug(`briefing/${name} ${status} ${b.error || (b.briefing ? `${b.briefing.id} seq ${b.briefing.seq}` : 'ok')}`));
+        return;
+      }
+
+      // The timeline_week_read / timeline_week_write tool routes; same
+      // one-matcher allowlist shape. Story text is plain: no link check.
+      const timelineRoute = url.pathname.match(/^\/timeline\/(read|write)$/);
+      if (timelineRoute) {
+        const name = timelineRoute[1];
+        await respondAgentChatRoute(res, data, timelineHandlers[name],
+          (status, b) => debug(`timeline/${name} ${status} ${b.error || (b.week && typeof b.week === 'object' ? b.week.week : b.week || 'ok')}`));
         return;
       }
 
