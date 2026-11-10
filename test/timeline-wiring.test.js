@@ -71,18 +71,31 @@ describe('timeline wiring', () => {
   }
 
   it('the read schema takes an optional week and a page offset', () => {
-    const start = askUser.indexOf('const TIMELINE_WEEK_READ_INPUT = ');
+    const start = askUser.indexOf('const TIMELINE_REF = ');
     const end = askUser.indexOf("server.tool(\n  'timeline_week_read',");
-    expect(start, 'the read schema is missing from ask-user.js').toBeGreaterThan(-1);
+    expect(askUser.indexOf('const TIMELINE_WEEK_READ_INPUT = '), 'the read schema is missing from ask-user.js').toBeGreaterThan(start);
     expect(end).toBeGreaterThan(start);
     const schema = z.strictObject(new Function('z', `${askUser.slice(start, end)}\nreturn TIMELINE_WEEK_READ_INPUT;`)(z));
     expect(schema.safeParse({}).success).toBe(true);
     expect(schema.safeParse({ week: '2026-11-09', offset: 0 }).success).toBe(true);
     expect(schema.safeParse({ week: '2026-11-09', offset: 12 }).success).toBe(true);
     for (const offset of [-1, 1.5, '12']) expect(schema.safeParse({ offset }).success, String(offset)).toBe(false);
+    // The index of a week, and the detail of up to 12 projects picked from it.
+    expect(schema.safeParse({ index: true }).success).toBe(true);
+    expect(schema.safeParse({ week: '2026-11-09', index: false }).success).toBe(true);
+    expect(schema.safeParse({ week: '2026-11-09', projects: ['#12', 7, 'prj_abc'] }).success).toBe(true);
+    expect(schema.safeParse({ projects: Array.from({ length: 12 }, (_, i) => i + 1) }).success).toBe(true);
+    expect(schema.safeParse({ projects: Array.from({ length: 13 }, (_, i) => i + 1) }).success).toBe(false);
+    expect(schema.safeParse({ projects: [] }).success).toBe(false);
+    expect(schema.safeParse({ projects: [0] }).success).toBe(false);
+    expect(schema.safeParse({ index: 'yes' }).success).toBe(false);
     const read = askUser.slice(end, askUser.indexOf("'timeline_week_write',"));
     expect(read).toContain('TIMELINE_WEEK_READ_INPUT,');
     expect(read).toMatch(/offset/);
+    // Start with the index, then the detail of the projects worth a card.
+    expect(read).toMatch(/Start with `index: true`/);
+    expect(read).toMatch(/`projects: \[\.\.\.\]` \(up to 12 a call\)/);
+    expect(read).toMatch(/a page of projects at a time/);
   });
 
   it('the write schema takes a week of entries, one per project', () => {
@@ -164,19 +177,25 @@ describe('timeline wiring', () => {
     expect(routine).toMatch(/timeline_week_write/);
     expect(routine).toMatch(/final: true/);
     expect(routine).toMatch(/media_blob_id/);
-    expect(routine).toMatch(/`week\.stored` is null, or `week\.stored\.final` is false/);
+    expect(routine).toMatch(/`stored` is null, or `stored\.final` is false/);
     expect(routine).toMatch(/at most 10 weeks/);
-    // One entry per project, read a page at a time.
     expect(routine).toMatch(/`entries`/);
     expect(routine).toMatch(/One entry per project, at most 8/);
     expect(routine).toMatch(/`sentence`/);
-    expect(routine).toMatch(/`offset`/);
-    expect(routine).toContain('keep going until the last line says that is every project that moved this week');
-    expect(routine).toContain('Read every page of a week before you choose what to write for it.');
-    // A week that could not be read whole is never frozen.
-    expect(routine).toContain("the week's read was cut short: write from the pages you did read, never with `final: true`");
-    expect(routine).toContain('A week whose read was cut short is the exception: write it without `final`, so that it stays unfrozen');
-    expect(routine).toContain("When a week's read was cut short, add one more line saying which week and that it was left unfrozen.");
+    // A week is read as its index, then the detail of the projects picked.
+    expect(routine).toContain('`index: true`');
+    expect(routine).toContain('`projects: [...]`');
+    expect(routine).toContain('up to 12 candidates');
+    expect(routine).toContain('lists every project that moved, most moves first, each with how much');
+    // Never page by page: the only mention of `offset` is the rule against it.
+    expect(routine).toContain('Never read a week a page at a time (with `offset`) for this routine');
+    const file = readFileSync(new URL('../coordinator/routines/weekly-stories.md', import.meta.url), 'utf8');
+    expect(routine).toContain(file.trim());
+    expect(file.match(/offset/g)).toHaveLength(1);
+    expect(file).not.toMatch(/every page|next page|keep going until/i);
+    // A week whose index cannot be read is neither written nor frozen.
+    expect(routine).toContain("If a week's index cannot be read (the read is refused, or the journal predates the index), write nothing for that week, never freeze it");
+    expect(routine).toContain("When a week's index could not be read, add one more line saying which week and that it was left unwritten.");
     expect(routine).toMatch(/quiet \(n of total\)/);
     expect(routine).toMatch(/`notes`/);
     // The older shape is gone from the routine.
@@ -190,10 +209,13 @@ describe('timeline wiring', () => {
     expect(rewrite).toMatch(/oldest first/);
     expect(rewrite).toMatch(/`stored\.legacy` is true/);
     expect(rewrite).toMatch(/`final: true`, except the current week/);
-    expect(rewrite).toContain('and a week whose read was cut short, which is also written not final');
+    expect(rewrite).toContain('`index: true`');
+    expect(rewrite).toContain('`projects: [...]`');
+    expect(rewrite).toContain('the re-filing of projects into goals should be finished: weeks are told per project');
     expect(rewrite).toMatch(/out of range/);
     expect(rewrite).toMatch(/one line per week/);
     expect(coord).toMatch(/one card per project per week/);
+    expect(coord).toContain('returns the index of one week (every project that moved, with how much) and then the detail of the projects you pick from it');
     expect(coord).toMatch(/follow `## Routine: weekly-stories`/);
   });
 });
