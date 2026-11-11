@@ -4769,12 +4769,12 @@ function reconcileStrandedSubagents(reason = 'startup') {
 // Watcher discovery: publish the child convo (running, linked to the parent,
 // titled from the sidecar meta) the instant the subagent's transcript appears,
 // even before it emits any event.
-function handleSubagentStart(session, { agentId, label, agentType }) {
+function handleSubagentStart(session, { agentId, label, agentType, workflowRunId, workflowPhase }) {
   if (!session || !session.subagentConvos) return;
-  session.subagentConvos.discover(agentId, { label, agentType });
+  session.subagentConvos.discover(agentId, { label, agentType, workflowRunId, workflowPhase });
 }
 
-function handleSubagentEvent(session, { agentId, label, agentType, event }) {
+function handleSubagentEvent(session, { agentId, label, agentType, workflowRunId, workflowPhase, event }) {
   if (!session || !session.alive) return;
   if (!event || !event.message) return;
   const content = event.message.content;
@@ -4784,7 +4784,7 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
   // Ensure the child convo exists, refresh its title, and publish the
   // per-subagent status (model/context from THIS subagent's own event). The
   // returned child carries the convo id every publish below routes to.
-  const child = session.subagentConvos.onEvent(agentId, { label, agentType, event });
+  const child = session.subagentConvos.onEvent(agentId, { label, agentType, workflowRunId, workflowPhase, event });
   if (!child) return;
   const convoId = child.convoId;
 

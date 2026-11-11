@@ -84,11 +84,18 @@ describe('workflowAgentLabel', () => {
   it('joins description and phase', () => {
     expect(workflowAgentLabel('b1-type-primitives', 'Fix batches')).toBe('b1-type-primitives · Fix batches');
   });
-  it('omits a missing phase and truncates long labels to 40 chars', () => {
+  it('omits a missing phase and truncates long descriptions to 40 chars', () => {
     expect(workflowAgentLabel('solo', null)).toBe('solo');
+    expect(workflowAgentLabel('x'.repeat(50), null)).toBe('x'.repeat(39) + '…');
+  });
+  it('shortens the description first so the phase survives the 40-character cap', () => {
     const long = workflowAgentLabel('x'.repeat(50), 'Phase');
-    expect(long.length).toBe(40);
-    expect(long.endsWith('…')).toBe(true);
+    expect(long).toBe('x'.repeat(31) + '… · Phase');
+    expect(workflowAgentLabel('x'.repeat(35), 'Phase')).toBe(long);
+  });
+  it('keeps the phase when it leaves no room for a description', () => {
+    expect(workflowAgentLabel('Description', 'p'.repeat(40))).toBe('p'.repeat(40));
+    expect(workflowAgentLabel('Description', 'p'.repeat(50))).toBe('p'.repeat(39) + '…');
   });
   it('returns null without a description', () => {
     expect(workflowAgentLabel('', 'Phase')).toBeNull();
@@ -443,6 +450,49 @@ describe('SubagentWatcher workflow runs', () => {
   });
 });
 
+describe('subagent convo tracker workflow status', () => {
+  const setup = () => {
+    const statuses = [];
+    const publisher = {
+      upsertConvo: () => true,
+      publishStatus: (convoId, status) => statuses.push({ convoId, status }),
+    };
+    const tracker = createSubagentConvoTracker({ publisher, getParentConvoId: () => 'parent-1', log: { warn() {} } });
+    return { tracker, statuses };
+  };
+
+  it('carries run id and phase from discovery on the child status and retains them on later events', () => {
+    const { tracker, statuses } = setup();
+    tracker.discover(A1, { label: 'Work · Phase', workflowRunId: RUN_ID, workflowPhase: 'Phase' });
+    expect(statuses.at(-1)).toEqual({
+      convoId: `parent-1:sub:${A1}`,
+      status: { workflowRunId: RUN_ID, workflowPhase: 'Phase' },
+    });
+    tracker.onEvent(A1, { event: { type: 'assistant', message: { model: 'claude-opus-5-5' } } });
+    expect(statuses.at(-1).status).toMatchObject({ workflowRunId: RUN_ID, workflowPhase: 'Phase', model: 'claude-opus-5-5' });
+  });
+
+  it('reads workflow metadata from events, including a phase arriving after discovery', () => {
+    const { tracker, statuses } = setup();
+    tracker.onEvent(A1, { workflowRunId: RUN_ID });
+    expect(statuses.at(-1).status).toEqual({ workflowRunId: RUN_ID });
+    tracker.onEvent(A1, { workflowRunId: RUN_ID, workflowPhase: 'Phase' });
+    expect(statuses.at(-1).status).toEqual({ workflowRunId: RUN_ID, workflowPhase: 'Phase' });
+  });
+
+  it('omits workflow fields for a plain subagent on discovery and events', () => {
+    const { tracker, statuses } = setup();
+    tracker.noteTaskStarted('toolu_plain');
+    tracker.discover('plain', { label: 'Explore', agentType: 'code-explorer' });
+    tracker.onEvent('plain', { event: { type: 'assistant', message: { model: 'claude-opus-5-5' } } });
+    expect(statuses.length).toBeGreaterThanOrEqual(2);
+    for (const { status } of statuses) {
+      expect(status).not.toHaveProperty('workflowRunId');
+      expect(status).not.toHaveProperty('workflowPhase');
+    }
+  });
+});
+
 describe('subagent convo tracker finishAgent', () => {
   it('finishes a discovered workflow child and is a no-op for unknown ids', () => {
     const upserts = [];
@@ -557,6 +607,12 @@ describe('routeWorkflowStreamEvent: parent stream -> sidebar child cards', () =>
 
 describe('index.js workflow seam (source inspection)', () => {
   const src = fs.readFileSync(path.join(HERE, '..', 'index.js'), 'utf8');
+  it('forwards workflow metadata from both watcher handlers to the child tracker', () => {
+    expect(src).toContain('function handleSubagentStart(session, { agentId, label, agentType, workflowRunId, workflowPhase })');
+    expect(src).toContain('session.subagentConvos.discover(agentId, { label, agentType, workflowRunId, workflowPhase });');
+    expect(src).toContain('function handleSubagentEvent(session, { agentId, label, agentType, workflowRunId, workflowPhase, event })');
+    expect(src).toContain('session.subagentConvos.onEvent(agentId, { label, agentType, workflowRunId, workflowPhase, event });');
+  });
   it('handleClaudeEvent routes every non-sidechain parent event through routeWorkflowStreamEvent, and subagent-done finishes the child', () => {
     const body = src.slice(src.indexOf('function handleClaudeEvent('));
     const guard = body.indexOf('if (isSidechainEvent(event)) return;');
