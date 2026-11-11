@@ -54,7 +54,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
 
   it('queued and resume-held messages keep their causes, and the flush that sends them merges them', () => {
     expect(fnBody('function sendToSession(')).toContain('(session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));');
-    expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })');
+    expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued), queuedEntries: queued })');
     expect(fnBody('async function journalQueueMedia(')).toContain('const entry = tagCauses([...blocks], cause);');
   });
 

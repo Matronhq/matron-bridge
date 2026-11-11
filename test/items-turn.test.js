@@ -1,3 +1,4 @@
+import { STEER_NOTICE } from '../lib/claude-steer.js';
 import { describe, it, expect, vi } from 'vitest';
 import { formatItemTurn, createItemTurnRouter, isTurnWorthy, isAgentCommentMarker } from '../lib/items-turn.js';
 
@@ -242,10 +243,11 @@ describe('createItemTurnRouter', () => {
     expect(steerText).toHaveBeenCalledWith(session, {
       text: formatItemTurn(payload, { username: 'alice', body: 'fetched body', convoId: 'c1' }),
       cause: expect.objectContaining({ kind: action === 'tap' ? 'item_tap' : 'item_reply' }),
+      source: { item_id: base.item_id, comment_id: 'ic' },
     });
     expect(deps.queueText).not.toHaveBeenCalled();
     expect(deps.injectBlocks).not.toHaveBeenCalled();
-    expect(deps.publishNotice).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledExactlyOnceWith('c1', STEER_NOTICE);
   });
 
   it.each(['false', 'throw'])('queues when steering returns %s', async (outcome) => {
