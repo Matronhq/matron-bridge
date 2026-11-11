@@ -12,6 +12,37 @@ import { carryOnCause } from '../lib/turn-cause.js';
 const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 
 describe('createCrashWatch', () => {
+  it('does not flag repeated crashes of one conversation as a burst', () => {
+    const w = createCrashWatch({ now: () => 1000 });
+    for (let i = 0; i < 3; i += 1) {
+      const result = w.note({ convoId: 'a', exitCode: 143 });
+      expect(result.burst).toBe(false);
+      expect(result.count).toBe(1);
+      expect(result.events).toHaveLength(i + 1);
+    }
+  });
+
+  it('counts distinct conversations while retaining every crash and exit', () => {
+    const w = createCrashWatch({ now: () => 1000 });
+    const crashes = [
+      { convoId: 'a', exitCode: 143 },
+      { convoId: 'a', exitCode: 137 },
+      { convoId: 'b', exitCode: 1 },
+      { convoId: 'b', exitCode: null, signal: 'SIGKILL' },
+      { convoId: 'c', exitCode: 143 },
+    ];
+    for (const crash of crashes.slice(0, -1)) {
+      expect(w.note(crash).burst).toBe(false);
+    }
+    const result = w.note(crashes[4]);
+    expect(result.burst).toBe(true);
+    expect(result.count).toBe(3);
+    expect(result.events).toEqual(crashes.map(crash => ({ at: 1000, signal: null, wasBusy: false, ...crash })));
+    const text = burstNoticeText({ count: result.count, exits: result.events.map(describeExit) });
+    expect(text).toContain('3 sessions crashed within 60s');
+    expect(text).toContain('(exit 143 (SIGTERM), exit 137 (SIGKILL), exit 1, signal SIGKILL)');
+  });
+
   it('flags a burst once, on the crash that crosses the threshold', () => {
     let t = 1000;
     const w = createCrashWatch({ now: () => t, windowMs: 60_000, threshold: 3 });
@@ -46,6 +77,23 @@ describe('createCrashWatch', () => {
     expect(w.note({ convoId: 'd', exitCode: 143 }).burst).toBe(true);
   });
 
+  it('reopens a burst when distinct conversations age out despite repeated crashes remaining', () => {
+    let t = 0;
+    const w = createCrashWatch({ now: () => t });
+    w.note({ convoId: 'a', exitCode: 143 });
+    w.note({ convoId: 'b', exitCode: 143 });
+    expect(w.note({ convoId: 'c', exitCode: 143 }).burst).toBe(true);
+    t = 30_000;
+    for (let i = 0; i < 3; i += 1) w.note({ convoId: 'c', exitCode: 143 });
+    t = 61_000;
+    const second = w.note({ convoId: 'd', exitCode: 143 });
+    expect(second.count).toBe(2);
+    expect(second.burst).toBe(false);
+    const third = w.note({ convoId: 'e', exitCode: 143 });
+    expect(third.count).toBe(3);
+    expect(third.burst).toBe(true);
+  });
+
   it('caps remembered events even inside one window', () => {
     const w = createCrashWatch({ now: () => 5, windowMs: 60_000, threshold: 3, maxEvents: 10 });
     let last;
@@ -54,6 +102,20 @@ describe('createCrashWatch', () => {
     expect(last.events).toHaveLength(10);
     expect(last.events[0].convoId).toBe('s40');
     expect(w.size()).toBe(10);
+  });
+
+  it('reopens a burst when the event cap removes distinct conversations', () => {
+    const w = createCrashWatch({ now: () => 1000, maxEvents: 3 });
+    w.note({ convoId: 'a', exitCode: 143 });
+    w.note({ convoId: 'b', exitCode: 143 });
+    expect(w.note({ convoId: 'c', exitCode: 143 }).burst).toBe(true);
+    const repeated = w.note({ convoId: 'c', exitCode: 143 });
+    expect(repeated.count).toBe(2);
+    expect(repeated.burst).toBe(false);
+    expect(w.note({ convoId: 'd', exitCode: 143 }).burst).toBe(false);
+    const next = w.note({ convoId: 'e', exitCode: 143 });
+    expect(next.count).toBe(3);
+    expect(next.burst).toBe(true);
   });
 });
 
