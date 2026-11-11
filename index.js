@@ -2437,6 +2437,12 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   return role.coordinator;
 }
 
+// Once graceful shutdown has begun, a killed child must not be respawned by
+// the crash-restart handlers while the journal flush is still running.
+function shouldAutoRestart(exitCode, session, shuttingDown) {
+  return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
@@ -2822,7 +2828,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
         journalEvictConvoInput(session);
-      } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+      } else if (shuttingDown) {
+        // The bridge killed this child itself: no respawn, and no "session
+        // ended" notice or done state either; leave the convo for the next
+        // boot to resume. Viewers still must not keep a stale thinking/tool
+        // indicator, so the activity overlay is cleared.
+        journalActivity(session, 'idle');
+      } else if (shouldAutoRestart(exitCode, session, shuttingDown)) {
         // Auto-restart is about to replace `session` outright (no
         // journalSessionState('done') — the convo isn't over, it's
         // respawning) — but viewers still need to stop seeing a stale
@@ -3726,7 +3738,19 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
         journalEvictConvoInput(session);
-      } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+      } else if (shuttingDown) {
+        // The bridge killed this child itself: no respawn, and no "session
+        // ended" notice or done state either; leave the convo for the next
+        // boot to resume. Viewers still must not keep a stale thinking/tool
+        // indicator, so the activity overlay is cleared.
+        journalActivity(session, 'idle');
+        // A /logout that finished while shutting down still resets a room that
+        // borrowed interactive mode for the flow, or the next boot resumes it
+        // as a TUI.
+        if (session._accountLogoutPending && exitCode === 0 && session._accountFlowReturnToPrint) {
+          persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
+        }
+      } else if (shouldAutoRestart(exitCode, session, shuttingDown)) {
         // See the matching print-mode branch's comment: the terminal exit
         // paths already emit idle on restart, this auto-restart branch
         // didn't (Bugbot finding #3).

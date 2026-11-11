@@ -17,7 +17,7 @@ describe('Codex authentication recovery in the bridge', () => {
       _codexLastError: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses' };
     const reply = vi.fn();
     const finishCodexTurn = vi.fn(s => { s.busy = false; s._codexTurnFinished = true; });
-    const context = vm.createContext({ codex, session, clearInterval, CODEX_APP_SERVER: true, isCodexAuthError,
+    const context = vm.createContext({ codex, session, clearInterval, shuttingDown: false, CODEX_APP_SERVER: true, isCodexAuthError,
       refreshCodexTelemetry: vi.fn(), refreshCodexMetadata: vi.fn(), finishCodexTurn, offerCodexBuild: vi.fn(),
       runCodexControl: (s, command) => handleCodexControl(s, command, { reply }),
     });
