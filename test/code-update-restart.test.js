@@ -190,7 +190,7 @@ describe('createCodeUpdateWatcher — a landed update', () => {
     // deploy shell off mid-run. A running turn is a running turn.
     const { state, watcher } = harness({ head: { sha: NEW, at: T0 - DEFAULT_SETTLE_MS }, busy: 1 });
     await watcher.tick();
-    expect(state.log.join('\n')).toMatch(/Restarting when no session has work in flight, never while work is running\./);
+    expect(state.log.join('\n')).toMatch(/Restarting when no session has work in flight, subject to the work-hold age cap\./);
     for (let m = 1; m <= 6 * 60; m++) {
       state.now = T0 + m * 60_000;
       expect((await watcher.tick()).action).toBe('waiting');
@@ -198,7 +198,7 @@ describe('createCodeUpdateWatcher — a landed update', () => {
     expect(state.restarts).toEqual([]);
     // Six hours of waiting: a warning at 30, 60, … 360 min, none before.
     expect(state.warn).toHaveLength(12);
-    expect(state.warn[0]).toMatch(/still waiting to restart onto bbbbbbb: 1 session\(s\) with work in flight \(a turn, background job or subagent\) for 30 min; running work is never cut off/);
+    expect(state.warn[0]).toMatch(/still waiting to restart onto bbbbbbb: 1 session\(s\) with work in flight \(a turn, background job or subagent\) for 30 min; work holds are age-capped/);
     expect(state.warn[11]).toMatch(/work in flight \(a turn, background job or subagent\) for 360 min/);
     // The moment the turn ends, it goes.
     state.busy = 0;

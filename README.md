@@ -260,8 +260,12 @@ minutes (so `npm install` has finished), proves the tree boots with the same
 preflight the deploy scripts run, and then exits for the supervisor to
 relaunch it at the first poll where no session has work in flight: a turn
 running, a background job (shell, monitor) still alive under the session's
-agent process, or a subagent running. That work is never cut off: the bridge keeps waiting and logs a warning every 30
-minutes. A box that would rather force the restart after a while sets
+agent process, or a subagent running. These holds share the idle reaper's
+eight-hour cap from the session's last activity, so a stuck background job
+cannot defer updates forever. If the process table cannot be read, only
+the busy-turn check holds the update, with the same cap. While waiting,
+the bridge logs a warning every 30 minutes. A box that would rather force
+the restart after a while sets
 `MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
 themselves (`MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` gives them the "Carry on"
 card instead). Sessions between turns resume with their history on their next turn,

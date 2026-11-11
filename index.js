@@ -187,7 +187,7 @@ import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest,
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createJoinHold } from './lib/room-join-hold.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncementDetail, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
-import { parseProcessTable, liveWorkChildren, workHold, restartHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField, peerField, PEER_NAME_MAX } from './lib/peer-text.js';
@@ -10758,21 +10758,20 @@ function startCodeUpdateWatcher() {
   }
   const watcher = createCodeUpdateWatcher({
     readHead: () => readHeadReflog(gitDir),
-    // Sessions holding work a restart would kill: mid-turn, a background
-    // job (lib/work-hold.js restartHold), or a running subagent.
+    // Share the idle reaper's age cap so a background job cannot defer
+    // code updates forever.
     busySessions: () => {
       const live = [...sessions.values()].filter(s => s.alive);
       if (!live.length) return 0;
       const table = readProcessTable();
+      const now = Date.now();
       let n = 0;
       for (const s of live) {
-        const hold = restartHold({
-          busy: !!s.busy,
-          pid: sessionChildPid(s),
-          table,
-          signatures: MCP_SERVER_SIGNATURES,
-          subagentCount: s.subagentConvos?.runningCount() ?? 0,
-        });
+        const last = handoffIdleSince(s);
+        // Without a process table, only the busy-turn signal is reliable.
+        const hold = table.unreadable
+          ? workHold({ busy: !!s.busy, idleSince: last, now })
+          : sessionWorkHold(s, last, now, table);
         if (hold) {
           n++;
           debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
@@ -14857,7 +14856,8 @@ function sessionChildPid(session) {
 // `ps` rather than /proc so the same call works on the macOS bridges, and
 // Get-CimInstance on Windows (lib/process-table.js) in the same line shape.
 // Fails closed to an empty table: with no table there are no work children,
-// and the idle clock rules as it did before — never the other way round.
+// and the idle clock rules as it did before. Mark failures so the update
+// watcher can fall back to the busy-turn signal.
 function readProcessTable() {
   try {
     const { file, args: ptArgs } = processTableCommand();
@@ -14867,13 +14867,14 @@ function readProcessTable() {
     return parseProcessTable(execFileSync(file, ptArgs, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }));
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
-    return [];
+    return Object.assign([], { unreadable: true });
   }
 }
 
 // {reason} when this session has work in flight (a turn running, or a live
 // descendant of its claude process that is not one of its configured MCP
-// servers — a tool call, a background task), null when the idle clock
+// servers — a tool call, a background task — or a running subagent),
+// null when the idle clock
 // should rule. See lib/work-hold.js.
 function sessionWorkHold(session, last, now, table) {
   return workHold({
@@ -14881,6 +14882,7 @@ function sessionWorkHold(session, last, now, table) {
     children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
     idleSince: last,
     now,
+    subagentCount: session.subagentConvos?.runningCount() ?? 0,
   });
 }
 
