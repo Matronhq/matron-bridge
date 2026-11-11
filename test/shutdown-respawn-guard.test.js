@@ -43,4 +43,26 @@ describe('shutdown respawn guard', () => {
     // Shutdown takes a quiet branch before the respawn/ended decision.
     expect(handler).toMatch(/\} else if \(shuttingDown\) \{[\s\S]*?\} else if \(shouldAutoRestart\(/);
   });
+
+  it.each([
+    ['print', "proc.on('close', (exitCode) => {", 'function createCodexSessionForRoom('],
+    ['interactive', "iv.on('exit', exitCode => {", 'async function handleInteractivePrompt('],
+  ])('clears the activity overlay on the quiet branch (%s)', (_mode, start, end) => {
+    const from = source.indexOf(start);
+    const handler = source.slice(from, source.indexOf(end, from));
+    const branch = handler.match(/\} else if \(shuttingDown\) \{([\s\S]*?)\} else if \(shouldAutoRestart\(/)[1];
+    expect(branch).toContain("journalActivity(session, 'idle')");
+    // Still resumable: never marks the conversation done or posts an ended notice.
+    expect(branch).not.toContain("journalSessionState(session, 'done')");
+    expect(branch).not.toContain('Session ended');
+  });
+
+  it('keeps the print-mode reset when /logout completes during the quiet branch', () => {
+    const from = source.indexOf("iv.on('exit', exitCode => {");
+    const handler = source.slice(from, source.indexOf('async function handleInteractivePrompt(', from));
+    const branch = handler.match(/\} else if \(shuttingDown\) \{([\s\S]*?)\} else if \(shouldAutoRestart\(/)[1];
+    expect(branch).toMatch(/_accountLogoutPending && exitCode === 0/);
+    expect(branch).toContain('_accountFlowReturnToPrint');
+    expect(branch).toContain('interactiveMode: false');
+  });
 });
