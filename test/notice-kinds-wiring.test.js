@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 // Source-text assertions on index.js (the idiom of the other *-wiring tests:
-// index.js has no unit harness). Each bridge event that already existed gets
-// a payload.notice kind at its emit site; none of them is detected anew.
+// index.js has no unit harness). Routine events get a payload.notice kind
+// at their emit sites; warnings stay untagged so the web app keeps them prominent.
 describe('extra notice kinds are set where the events already happen', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 
@@ -18,9 +18,13 @@ describe('extra notice kinds are set where the events already happen', () => {
     expect(body).toMatch(/return false;/);
   });
 
-  it('tags both crash-restart notices (print mode and interactive mode) and keeps the untagged fallback', () => {
-    const sites = index.match(/sendKindNotice\(restarted, 'crash_restart', n\.plain, n\.html,\s*crashRestartNoticeMeta\(\{ exitCode, attempt: restarted\.restartCount \}\)\)\) restarted\.sendHtml\(n\.plain, n\.html\)/g);
+  it('keeps both crash-restart notices untagged (print mode and interactive mode)', () => {
+    const sites = index.match(/const n = notice\('warning',\s*\n\s*`\[Session crashed[\s\S]*?restarted\.sendHtml\(n\.plain, n\.html\);/g);
     expect(sites).toHaveLength(2);
+    for (const site of sites) {
+      expect(site).not.toMatch(/sendKindNotice|noticeMeta/);
+    }
+    expect(index).not.toContain('crash_restart');
   });
 
   it('tags the slow-tool notice and falls back to the plain callback', () => {
@@ -32,11 +36,13 @@ describe('extra notice kinds are set where the events already happen', () => {
     expect(index).toMatch(/sendKindNotice\(restarted, 'restart', restartedLine, markdownToHtml\(restartedLine\)\)\) await sendReply\(restartedLine\)/);
   });
 
-  it('tags the delivery failures: dropped queued messages, a failed room flush, stranded room messages, a lost timer', () => {
-    expect(index).toMatch(/noticeMeta\('delivery_failed', droppedLine\)/);
-    expect(index).toMatch(/noticeMeta\(flushed \? 'queue' : 'delivery_failed', flushLine\)/);
-    expect(index).toMatch(/noticeMeta\('delivery_failed', strandedLine\)/);
-    expect(index).toMatch(/noticeMeta\('delivery_failed', lostLine\)/);
+  it('keeps delivery failures untagged: dropped queued messages, a failed room flush, stranded room messages, a lost timer', () => {
+    // The web app collapses payload.notice rows, so these stay untagged to
+    // keep their full-width warning.
+    expect(index).toContain("journalPublishNotice(journalConvoIdFor(session), flushLine, flushed ? noticeMeta('queue', flushLine) : null);");
+    expect(index).toContain('journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));');
+    expect(index).not.toContain('delivery_failed');
+    expect(index).not.toContain('crash_' + 'restart');
   });
 
   it('adds no turn-start marker: no turn_start key is published', () => {

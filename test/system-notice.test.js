@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind, splitLeadingIcon, crashRestartNoticeMeta, NOTICE_SUMMARY_MAX,
+  noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind, splitLeadingIcon, NOTICE_SUMMARY_MAX,
 } from '../lib/system-notice.js';
 import { formatConsentNudge } from '../lib/consent-tools.js';
 
@@ -76,20 +76,14 @@ describe('unseenNoticeMeta / roomNoticeMeta / controlNoticeKind', () => {
   });
 });
 
-describe('restart, crash, slow-tool and delivery-failure kinds', () => {
+describe('restart and slow-tool kinds', () => {
   it('tags a restart line with its first line as the summary', () => {
     expect(noticeMeta('restart', 'Claude Code session restarted.\nSession: abcd1234...\nWorkdir: /w'))
       .toEqual({ kind: 'restart', icon: '🔄', summary: 'Claude Code session restarted.' });
   });
-  it('tags a crash restart with the exit code and attempt', () => {
-    expect(crashRestartNoticeMeta({ exitCode: 137, attempt: 2 }))
-      .toEqual({ kind: 'crash_restart', icon: '⚠️', summary: 'Session crashed (exit 137), restarted — attempt 2/3' });
-  });
-  it('lifts the leading icon off a slow-tool or delivery-failure line, else uses the kind icon', () => {
+  it('lifts the leading icon off a slow-tool line, else uses the kind icon', () => {
     expect(noticeMeta('slow_tool', '⏳ Still working', { summary: 'Bash still running (5m)' }))
       .toEqual({ kind: 'slow_tool', icon: '⏳', summary: 'Bash still running (5m)' });
-    expect(noticeMeta('delivery_failed', "⚠️ Couldn't deliver your queued message — the session ended before it was sent."))
-      .toEqual({ kind: 'delivery_failed', icon: '⚠️', summary: "Couldn't deliver your queued message — the session ended before it was sent." });
-    expect(noticeMeta('delivery_failed', 'no emoji here').icon).toBe('⚠️');
+    expect(noticeMeta('slow_tool', 'no emoji here').icon).toBe('⏳');
   });
 });

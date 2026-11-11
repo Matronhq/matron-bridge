@@ -213,7 +213,7 @@ import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContext
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
-import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind, crashRestartNoticeMeta } from './lib/system-notice.js';
+import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
@@ -2921,8 +2921,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          if (!sendKindNotice(restarted, 'crash_restart', n.plain, n.html,
-            crashRestartNoticeMeta({ exitCode, attempt: restarted.restartCount }))) restarted.sendHtml(n.plain, n.html);
+          restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
           restarted.sendCallback(
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
@@ -3856,8 +3855,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          if (!sendKindNotice(restarted, 'crash_restart', n.plain, n.html,
-            crashRestartNoticeMeta({ exitCode, attempt: restarted.restartCount }))) restarted.sendHtml(n.plain, n.html);
+          restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
           restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
@@ -6575,10 +6573,9 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       // journalPublishNotice already no-ops on a falsy convo id and fails
       // open like every journal call.
       const count = Array.isArray(queued) ? queued.length : 0;
-      const droppedLine = count > 1
+      journalPublishNotice(journalConvoIdFor(session), count > 1
         ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
-        : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.";
-      journalPublishNotice(journalConvoIdFor(session), droppedLine, noticeMeta('delivery_failed', droppedLine));
+        : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
       return false;
     }
     restore();
@@ -10277,8 +10274,8 @@ async function fireTimer(record) {
   let session = findSessionByClaudeSessionId(record.convoId);
   if (!session || !session.alive) session = journalResumeConvo(record.convoId);
   if (!session) {
-    const lostLine = `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`;
-    journalPublishNotice(record.convoId, lostLine, noticeMeta('delivery_failed', lostLine));
+    journalPublishNotice(record.convoId,
+      `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`);
     return;
   }
   if (record.source === 'agent') {
@@ -11188,9 +11185,8 @@ function flushRoomInbox(session) {
   // own 📨 at the next turn end).
   const sent = queued - roomDelivery.pendingCount(session.roomId);
   const flushLine = flushed ? formatRoomDeliveredNotice(sent) : formatRoomDeliveryFailedNotice(sent);
-  // A failed delivery carries its own kind, so a client can give it more
-  // weight than the routine "delivered" line.
-  journalPublishNotice(journalConvoIdFor(session), flushLine, noticeMeta(flushed ? 'queue' : 'delivery_failed', flushLine));
+  // A failed delivery stays a full-width warning.
+  journalPublishNotice(journalConvoIdFor(session), flushLine, flushed ? noticeMeta('queue', flushLine) : null);
 }
 
 // Hybrid idle/busy delivery of room messages into local sessions
@@ -12190,8 +12186,7 @@ function journalEvictConvoInput(session) {
   roomDelivery.dropSession(session?.roomId);
   const convoId = journalConvoIdFor(session);
   if (strandedRoomMessages && convoId) {
-    const strandedLine = formatRoomDeliveryFailedNotice(strandedRoomMessages);
-    journalPublishNotice(convoId, strandedLine, noticeMeta('delivery_failed', strandedLine));
+    journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));
   }
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
