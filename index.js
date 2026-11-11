@@ -2239,8 +2239,9 @@ function journalStatus(session) {
     // Spawn-time extras: the same effectiveExtras() list the spawn and the
     // restart notice use (session choice plus machine defaults). Always an
     // array, so "off" reaches clients as []. Legacy Codex exec spawns with an
-    // empty MCP config and so has none.
-    extras: isCodex && !CODEX_APP_SERVER ? [] : effectiveExtras(session.mcpExtras ?? [], DEFAULT_MCP_EXTRAS),
+    // empty MCP config and so has none. Share's token is only minted after
+    // pinning roots succeeds, so a failed setup must not report it as on.
+    extras: isCodex && !CODEX_APP_SERVER ? [] : effectiveExtras(session.mcpExtras ?? [], DEFAULT_MCP_EXTRAS).filter(extra => extra !== 'share' || session.showFileToken),
   });
   // The shared account email cache is Claude-specific — strip it from Codex
   // frames. Codex supplies its own limits; host vitals stay on both.
