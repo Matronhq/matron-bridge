@@ -1,6 +1,9 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
-import { spawn, execFileSync } from 'child_process';
+import { spawn, execFileSync, execFile } from 'child_process';
+import {
+  createCrashWatch, appendCrashLog, truncateSnapshot, describeExit, recoveryPrompt, burstNoticeText, CRASH_BURST_WINDOW_MS,
+} from './lib/crash-recovery.js';
 import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt, localWhisperAvailable } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
@@ -2443,6 +2446,55 @@ function shouldAutoRestart(exitCode, session, shuttingDown) {
   return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
 }
 
+// Crash restarts (lib/crash-recovery.js): the process died on its own and was
+// respawned. Count it, keep a bounded record, flag a burst to the user, and
+// carry a session that died mid-turn on with a turn saying so.
+const crashWatch = createCrashWatch();
+const CRASH_LOG_FILE = path.join(os.homedir(), '.matron-bridge-crash-log.jsonl');
+const CRASH_RECOVERY_DELAY_MS = 2_000;
+
+function onCrashRestart(session, restarted, exitCode, signal = null) {
+  // A child the bridge itself killed during shutdown is not a crash.
+  if (shuttingDown) return;
+  try {
+    const wasBusy = !!session.busy;
+    const convoId = journalConvoIdFor(restarted);
+    const result = crashWatch.note({ convoId, exitCode, signal, wasBusy });
+    appendCrashLog(CRASH_LOG_FILE, { at: new Date().toISOString(), convoId, exitCode, signal, wasBusy, concurrent: result.count });
+    console.warn(`[crash-restart] ${convoId} exit=${exitCode} signal=${signal ?? 'none'} busy=${wasBusy} concurrent=${result.count}`);
+    if (result.burst) {
+      console.error(`[crash-restart] BURST: ${result.count} sessions crashed within ${CRASH_BURST_WINDOW_MS / 1000}s; load=${os.loadavg().map(n => n.toFixed(2)).join(' ')}`);
+      // The sender of a signal is not visible from here, but a snapshot of the
+      // process table taken now shows what else was running. Same portable
+      // command the idle reaper uses; a failure only degrades the log line.
+      const { file, args } = processTableCommand();
+      execFile(file, args, { timeout: 5000, maxBuffer: 1 << 20 }, (err, out) => {
+        console.error(`[crash-restart] process snapshot at burst:\n${err ? `unavailable: ${err.message}` : truncateSnapshot(out)}`);
+      });
+      // One notice: the Coordinator's chat, or without a Coordinator the chat
+      // of the session whose crash crossed the threshold.
+      const noticeConvoId = coordinatorLookup.snapshot().convoId || convoId;
+      const text = burstNoticeText({ count: result.count, exits: result.events.map(e => describeExit(e)) });
+      journalPublishNotice(noticeConvoId, text, noticeMeta('alert', text, {
+        icon: '⚠️', summary: `${result.count} sessions crashed within ${CRASH_BURST_WINDOW_MS / 1000}s`,
+      }));
+    }
+    if (wasBusy) {
+      const text = recoveryPrompt({ exitCode, signal });
+      const timer = setTimeout(() => {
+        const target = sessions.get(restarted.roomId);
+        if (!target || !target.alive) return;
+        // The bridge's carry-on delivery, as a carry-on turn: it is not the
+        // user's own message and must not read as one.
+        void carryOnConvo(convoId, target, null, text, undefined, { causes: [carryOnCause()], keepRestartBudget: true });
+      }, CRASH_RECOVERY_DELAY_MS);
+      timer.unref?.();
+    }
+  } catch (e) {
+    try { console.warn(`[crash-restart] bookkeeping failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
@@ -2917,6 +2969,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
+        onCrashRestart(session, restarted, exitCode, proc.signalCode);
         if (restarted.sendHtml) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
@@ -3851,6 +3904,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // sent right after the restart was typed into a still-loading TUI
         // and dropped (Bugbot, PR #162).
         enterResumeHold(restarted);
+        onCrashRestart(session, restarted, exitCode);
         if (restarted.sendHtml) {
           const n = notice('warning',
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
@@ -10227,7 +10281,7 @@ function sleepingConvoIdFor(roomId) {
 // chat is told while it comes back (the automatic path after a self-restart
 // says why — the default "session was idle, your message will be delivered"
 // copy would be wrong there: no message is coming).
-async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined) {
+async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined, { causes = null, keepRestartBudget = false } = {}) {
   try {
     let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
     if (!target || !target.alive) target = journalResumeConvo(convoId, resumeNotice);
@@ -10244,7 +10298,7 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
       journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
       return;
     }
-    await journalRouteTextToSession(target, text);
+    await journalRouteTextToSession(target, text, { causes, keepRestartBudget });
   } catch (e) {
     console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
     journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
