@@ -619,7 +619,7 @@ describe('index.js wiring', () => {
     const start = src.indexOf('function journalStatus(');
     const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
     // Evaluate the actual status argument without starting the bridge.
-    const expression = body.match(/^    extras: (.+),$/m)[1];
+    const expression = body.match(/^ {4}extras: (.+),$/m)[1];
     const extrasFor = new Function('session', 'isCodex', 'CODEX_APP_SERVER', 'effectiveExtras', 'DEFAULT_MCP_EXTRAS', `return ${expression};`);
     const statusFor = (session, defaults = []) => buildSessionStatus({
       extras: extrasFor(session, isCodex, appServer, effectiveExtras, defaults),
