@@ -24,9 +24,11 @@ const good = {
 };
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
-function rig({ occupied = false } = {}) {
+function rig({ occupied = false, saved = {}, flagFails = () => false, commentReply = null } = {}) {
   const created = [];
   const comments = [];
+  const keys = [];
+  const store = { ...saved };
   const sent = [];
   const notices = [];
   let commentStatus = 201;
@@ -36,16 +38,22 @@ function rig({ occupied = false } = {}) {
       get: async () => ({ status: 404, data: {} }),
       create: async (body) => { created.push(body); return { status: 201, data: { item: { id: `it_${created.length}`, num: 200 + created.length } } }; },
       close: async () => ({ status: 200, data: {} }),
-      comment: async (id, body) => { if (commentStatus < 300) comments.push({ id, ...body }); return { status: commentStatus, data: {} }; },
+      comment: async (id, body, opts) => {
+        keys.push(opts?.idemKey ?? null);
+        if (commentStatus < 300) comments.push({ id, ...body });
+        return { status: commentStatus, data: commentReply ? commentReply(body) : {} };
+      },
     },
     journalConvoIdFor: (s) => `convo-${s.roomId}`,
     sendText: (s, text) => { sent.push(text); return true; },
     publishNotice: (convo, text) => { notices.push(text); },
     isOccupied: () => occupied,
-    flag: { set: () => {}, clear: () => {} },
+    flag: { set: () => { if (flagFails()) throw new Error('no flag'); }, clear: () => {} },
     store: { load: () => ({}), save: () => {} },
+    reviewStore: { load: () => store, save: (o) => { for (const k of Object.keys(store)) delete store[k]; Object.assign(store, JSON.parse(JSON.stringify(o))); } },
+    log: { warn: () => {} },
   });
-  return { fs, created, comments, sent, notices, commentFails: (status) => { commentStatus = status; } };
+  return { fs, created, comments, sent, notices, keys, store, commentFails: (status) => { commentStatus = status; } };
 }
 const sessionIn = (r, turn) => {
   const s = { roomId: 'sess-a', alive: true, foreignTurn: null };
@@ -254,6 +262,83 @@ describe('postReview', () => {
     expect((await r.fs.raiseNotice(s, { title: 't', text: 'x' })).status).toBe(409);
     expect((await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: {}, why: 'x' })).status).toBe(409);
     expect(r.created).toHaveLength(1);
+  });
+});
+
+describe('a notice is never left promising a review', () => {
+  it('a gate that cannot be armed says so under the notice', async () => {
+    let fail = false;
+    const r = rig({ flagFails: () => fail });
+    const s = sessionIn(r, roomTurn);
+    await r.fs.raiseNotice(s, { title: 't', text: 'x' });
+    r.fs.end(s);
+    fail = true;
+    expect(r.fs.drainParked(s)).toBe(false);
+    await tick();
+    expect(r.comments).toEqual([{ id: 'it_1', body: REVIEW_MISSING_COMMENT, as_convo_id: 'convo-sess-a' }]);
+  });
+  it('a review lost with the process is said so after a restart', async () => {
+    const r = rig();
+    const s = sessionIn(r, roomTurn);
+    await r.fs.raiseNotice(s, { title: 't', text: 'x' });
+    expect(Object.keys(r.store)).toEqual(['it_1']);
+    const next = rig({ saved: r.store });
+    expect(next.fs.owedReviewCount()).toBe(1);
+    next.fs.settleMissedReviews();
+    await tick();
+    expect(next.comments).toEqual([{ id: 'it_1', body: REVIEW_MISSING_COMMENT, as_convo_id: 'convo-sess-a' }]);
+    expect(next.keys).toEqual(['foreign-review-missing-it_1']);
+    expect(next.fs.owedReviewCount()).toBe(0);
+    expect(next.store).toEqual({});
+  });
+  it('a "no review" comment the journal does not take is tried again at the next seam', async () => {
+    const r = rig();
+    const s = await toReview(r);
+    r.commentFails(500);
+    r.fs.end(s);
+    await tick();
+    expect(r.comments).toEqual([]);
+    expect(r.fs.owedReviewCount()).toBe(1);
+    r.commentFails(201);
+    r.fs.drainParked(s);
+    await tick();
+    expect(r.comments).toHaveLength(1);
+    expect(r.fs.owedReviewCount()).toBe(0);
+  });
+  it('a stored review owes nothing more, and a retry reuses one key', async () => {
+    const r = rig();
+    const s = await toReview(r);
+    r.commentFails(500);
+    await r.fs.postReview(s, good);
+    r.commentFails(201);
+    await r.fs.postReview(s, good);
+    expect(r.keys).toEqual(['foreign-review-it_1', 'foreign-review-it_1']);
+    expect(r.fs.owedReviewCount()).toBe(0);
+    expect(r.store).toEqual({});
+  });
+  it('a review that fails after its turn ended is said so', async () => {
+    const r = rig();
+    const s = await toReview(r);
+    r.commentFails(500);
+    const posting = r.fs.postReview(s, good);
+    r.fs.end(s);
+    expect((await posting).status).toBe(502);
+    // The first try at the comment met the same outage; it stays owed.
+    await tick();
+    expect(r.fs.owedReviewCount()).toBe(1);
+    r.commentFails(201);
+    r.fs.settleMissedReviews();
+    await tick();
+    expect(r.comments).toEqual([{ id: 'it_1', body: REVIEW_MISSING_COMMENT, as_convo_id: 'convo-sess-a' }]);
+  });
+  it('a journal that drops the buttons is reported to the agent', async () => {
+    const r = rig({ commentReply: () => ({ comment: { id: 'ic_1' } }) });
+    const s = await toReview(r);
+    const out = await r.fs.postReview(s, good);
+    expect(out.status).toBe(200);
+    expect(out.body.note).toMatch(/does not store buttons on comments yet/);
+    const ok = rig({ commentReply: (b) => ({ comment: { id: 'ic_1', actions: b.actions } }) });
+    expect((await ok.fs.postReview(await toReview(ok), good)).body.note).toMatch(/if your user taps a button/);
   });
 });
 

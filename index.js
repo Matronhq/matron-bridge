@@ -11277,6 +11277,9 @@ const roomDelivery = createRoomDelivery({
 // tracker on the mission attached to it); acting beyond that takes an
 // "Allow once" tap from this session's own user.
 const FOREIGN_ACTIONS_FILE = path.join(os.homedir(), '.matron-bridge-foreign-actions.json');
+// Notices that were promised a review (foreign_notice): a review lost with the
+// process is said so under its notice after a restart.
+const FOREIGN_REVIEWS_FILE = path.join(os.homedir(), '.matron-bridge-foreign-reviews.json');
 const foreignSessions = createForeignSessions({
   sharing: sharingClient,
   items: itemsClient,
@@ -11289,8 +11292,16 @@ const foreignSessions = createForeignSessions({
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
   },
+  reviewStore: {
+    load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_REVIEWS_FILE, 'utf-8')); } catch { return {}; } },
+    save: (obj) => atomicWriteFileSync(FOREIGN_REVIEWS_FILE, JSON.stringify(obj), { mode: 0o600 }),
+  },
   log: console,
 });
+
+// Reviews a previous process still owed: once the journal client has had
+// time to connect. Every later drain tries again.
+setTimeout(() => { try { foreignSessions.settleMissedReviews(); } catch { /* never throw from a timer */ } }, 30_000).unref();
 
 function injectForeignRoomTurn(session, text, foreign) {
   // Codex has no PreToolUse gate: a Codex session never takes a turn from
