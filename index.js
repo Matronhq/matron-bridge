@@ -2895,7 +2895,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resetClaudeSteer(session);
     if (sessions.get(roomId) !== session || session._autoStopped || shuttingDown
       || !shouldAutoRestart(exitCode, session, shuttingDown)) {
-      notifyUndeliveredQueue(session, orphanSteers);
+      notifyFinalUndeliveredQueue(session, orphanSteers);
     }
 
     if (sessions.get(roomId) === session) {
@@ -3005,9 +3005,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           );
         }
       } else {
-        // With steering on, a stdin error can requeue input before close
-        // knows the process died; say so rather than drop it silently.
-        if (CLAUDE_STEER_ENABLED) notifyUndeliveredQueue(session, session.queuedMessages);
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
         // session up in the map, so a notice sent after sessions.delete()
         // is silently dropped (same fix as the iv-mode close handler).
@@ -4625,6 +4622,7 @@ function sendAllQuestions(session) {
       console.log(`[BUTTONS] sendAllQuestions: q.multiSelect=${q.multiSelect}, mode=${mode}`);
       const promptId = randomUUID();
       (session.questionPromptIds ||= []).push(promptId);
+      (session.questionPromptCards ||= new Map()).set(promptId, { seq: null, superseded: false });
       session.sendButtonMessage(prompt, buttons, mode, plainText, html, {
         question: prompt, options: buttons, mode, prompt_id: promptId,
       });
@@ -4646,6 +4644,7 @@ function submitAnswer(session, answerText, { causes = null } = {}) {
   session.pendingQuestions = null;
   session.currentQuestionIndex = 0;
   session.questionAnswers = [];
+  for (const promptId of session.questionPromptIds || []) session.questionPromptCards?.delete(promptId);
   session.questionPromptIds = [];
 
   if (mode === 'text-reply') {
@@ -5991,17 +5990,20 @@ function commitDispatchedUserTurn(session, historyText, pendingHandoff) {
 // (sendToSession's beginTurn). Only then is the turn its to end; a reject on
 // a session whose turn was already running, or one that only merged into
 // it, leaves that turn's causes where they are.
-function reportSessionSendFailure(session, message, { restoreJournalState = false, beganTurn = false } = {}) {
-  session.busy = false;
-  if (beganTurn) endTurn(session);
-  // Some callers (the Codex/iv/stdin dispatch failures in sendToSession) run
-  // AFTER session.busy = true, so a marker for this turn already exists. The
-  // dispatch failed, so no agent output is coming — clear it or the next boot
-  // offers to carry on a turn that never started.
-  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
-  if (restoreJournalState) {
-    journalSessionState(session, 'waiting');
-    journalActivity(session, 'idle');
+function reportSessionSendFailure(session, message, { restoreJournalState = false, beganTurn = false, preserveRunningTurn = false } = {}) {
+  if (!preserveRunningTurn) {
+    session.busy = false;
+    if (beganTurn) endTurn(session);
+    // Some callers (the Codex/iv/stdin dispatch failures in sendToSession) run
+    // AFTER session.busy = true, so a marker for this turn already exists. The
+    // dispatch failed, so no agent output is coming — clear it or the next boot
+    // offers to carry on a turn that never started. A failed steer still has
+    // the original turn's output coming, so it must keep that marker and state.
+    inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+    if (restoreJournalState) {
+      journalSessionState(session, 'waiting');
+      journalActivity(session, 'idle');
+    }
   }
   // Callers use false to decide whether dispatch-dependent work (history,
   // media mirroring, naming) may run. Surface the specific failure here
@@ -6268,10 +6270,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     return reportSessionSendFailure(
       session,
       `Could not send the message to Claude: ${error.message}`,
-      { restoreJournalState: true, beganTurn },
+      { restoreJournalState: true, beganTurn, preserveRunningTurn: steering },
     );
   }
   if (!steering) commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
+  // The handoff went into stdin with this message; consume it now so another
+  // write cannot prepend it again. User history still waits for CLI start.
+  else if (preparedHandoff.pending) commitDispatchedUserTurn(session, '', preparedHandoff.pending);
   if (session.resetTimeout) session.resetTimeout();
   return true;
 }
@@ -6385,6 +6390,40 @@ function notifyUndeliveredQueue(session, entries) {
     : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
 }
 
+// killSession and close can both run for the same final exit. Count all input
+// once, including messages requeued by a stdin error before the exit arrived.
+function notifyFinalUndeliveredQueue(session, orphanSteers) {
+  if (session._undeliveredQueueNotified) return;
+  const entries = [...orphanSteers, ...(CLAUDE_STEER_ENABLED ? session.queuedMessages || [] : [])];
+  if (!entries.length) return;
+  session._undeliveredQueueNotified = true;
+  notifyUndeliveredQueue(session, entries);
+}
+
+function retireSupersededQuestionCard(session, promptId) {
+  const card = session.questionPromptCards?.get(promptId);
+  if (!card?.superseded || !Number.isInteger(card.seq)) return;
+  journalPublisher.publishPromptReply(journalConvoIdFor(session), {
+    target_seq: card.seq,
+    choice: null,
+    text: STEER_PROMPT_SUPERSEDED_NOTICE,
+  });
+  session.questionPromptCards.delete(promptId);
+}
+
+// The journal assigns seq on append. If supersession beats the prompt echo,
+// keep the retirement pending until we can name the card clients displayed.
+function noteQuestionPromptEcho(frame) {
+  if (frame?.type !== 'prompt' || !Number.isInteger(frame.seq)
+    || typeof frame.sender !== 'string' || !frame.sender.startsWith('agent:')) return;
+  const session = findSessionByClaudeSessionId(frame.convo_id);
+  const promptId = frame.payload?.prompt_id;
+  const card = session?.questionPromptCards?.get(promptId);
+  if (!card) return;
+  card.seq = frame.seq;
+  retireSupersededQuestionCard(session, promptId);
+}
+
 // Stdin errors can precede close: only the current live session can retry.
 function requeueFailedSteer(session, uuid, error) {
   const entry = takeFailedSteer(session, uuid);
@@ -6409,7 +6448,9 @@ function supersedePromptsForSteerHold(session, event) {
   const planDenial = (event?.permission_denials || []).some(d => d?.tool_name === 'ExitPlanMode');
   if (hadQuestion) {
     for (const promptId of session.questionPromptIds || []) {
-      emitRelease(journalConvoIdFor(session), { promptId, action: 'expired', releasedIds: [`${promptId}::0`] });
+      const card = session.questionPromptCards?.get(promptId);
+      if (card) card.superseded = true;
+      retireSupersededQuestionCard(session, promptId);
     }
     session.questionPromptIds = [];
     session.waitingForAnswer = null;
@@ -12506,6 +12547,7 @@ const journalInputConsumer = createJournalInputConsumer({
 // CALLED once the socket is live, long after journalInputConsumer above has
 // been assigned).
 function journalHandleInboundEvent(frame) {
+  noteQuestionPromptEcho(frame);
   journalInputConsumer(frame);
   // Re-arm the deferred boot reconcile (F1) while one is pending: every inbound
   // frame pushes the quiet-timer out (during the post-reconnect burst these are
@@ -15215,7 +15257,7 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   const orphanSteers = takeUnstartedSteers(session);
   resetClaudeSteer(session);
   if (preserveQueue) requeueSteeredMessages(session, orphanSteers);
-  else notifyUndeliveredQueue(session, orphanSteers);
+  else notifyFinalUndeliveredQueue(session, orphanSteers);
   // Same before-the-alive-check stance: a process that dies without ever
   // delivering tool_result must not leave a slow-tool timer to fire into
   // the dead session.

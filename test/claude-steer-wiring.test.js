@@ -20,6 +20,7 @@ function sourceOf(name) {
 }
 
 const LIFTED = [
+  'reportSessionSendFailure', 'notifyFinalUndeliveredQueue', 'retireSupersededQuestionCard', 'noteQuestionPromptEcho', 'journalHandleInboundEvent',
   'clearPendingInterrupt', 'sendToSession', 'dispatchMergedFlush', 'applyPendingAgentHandoff', 'sendAllQuestions', 'notifyUndeliveredQueue', 'steerableBatchText', 'claudeSteerEligible', 'trySteerEntry', 'flushQueue', 'restoreQueuedBatch', 'commitSteeredMessage',
   'requeueSteeredMessages', 'settleDroppedSteers', 'releaseSteersToCli', 'requeueCancelledSteer',
   'requeueFailedSteer', 'supersedePromptsForSteerHold', 'beginHeldSteerTurn', 'releaseStaleSteerHold',
@@ -30,7 +31,7 @@ const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', '
 function setup({ session: overrides = {}, steerEnabled = true } = {}) {
   const close = source.indexOf("  proc.on('close', (exitCode) => {");
   const closeBody = source.slice(close + "  proc.on('close', (exitCode) => {".length, source.indexOf('\n  });', close));
-  const lifted = LIFTED.map(sourceOf).join('\n') + `\nfunction closeSession(session, exitCode) {${closeBody}\n}`;
+  const lifted = LIFTED.map(sourceOf).join('\n') + `\nfunction closeSession(session, exitCode, proc = session.proc) {${closeBody}\n}`;
   const stdinWrite = vi.fn();
   const session = {
     agent: 'claude', alive: true, busy: true, roomId: 'room', _turnInitSeen: true,
@@ -40,6 +41,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     ...overrides,
   };
   const replies = [];
+  const frames = [];
   const ctxObj = { sendReply: vi.fn(async (m) => { replies.push(m); }), sendHtml: vi.fn(), sender: 'user' };
   const explicit = {
     console: { log() {}, warn() {}, error() {} },
@@ -59,8 +61,13 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     inflightMarker: { touch: vi.fn(), noteTurnStart: vi.fn(), noteTurnEnd: vi.fn() },
     foreignSessions: { end: vi.fn() },
     planItems: { opened: vi.fn() },
-    journalPublisher: { flushCursor: vi.fn() },
-    journalInputConsumer: { queueRelease: null },
+    journalPublisher: {
+      flushCursor: vi.fn(),
+      publishPromptReply: vi.fn((convoId, payload) => frames.push({ convo_id: convoId, type: 'prompt_reply', payload })),
+    },
+    findSessionByClaudeSessionId: (convoId) => convoId === 'convo' ? session : null,
+    journalInputConsumer: Object.assign(vi.fn(), { queueRelease: null }),
+    _releaseReconcileTimer: null,
     journalConvoIdFor: () => 'convo',
     journalSessionCommandCtx: () => ctxObj,
     dispatchJournalBridgeCommand: vi.fn(async () => false),
@@ -101,7 +108,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
   vm.createContext(context);
   vm.runInContext(lifted, context);
   context.sessions.set(session.roomId, session);
-  return { session, context, stdinWrite, replies, ctxObj };
+  return { session, context, stdinWrite, replies, frames, ctxObj };
 }
 
 const lifecycle = (state, uuid = 'steer-uuid-1') => ({ type: 'command_lifecycle', command_uuid: uuid, state });
@@ -242,15 +249,88 @@ describe('shared running-turn writer', () => {
     expect(h.context.journalPublishNotice).toHaveBeenCalledTimes(1);
   });
 
-  it('gives shown question cards identities that the hold can expire', () => {
+  it.each([false, true])('retires question cards with a targeted prompt reply (echo delayed: %s)', (delayed) => {
     const sendButtonMessage = vi.fn();
     const h = setup({ session: { pendingQuestions: [{ question: 'Which?', options: [{ label: 'A' }] }], sendButtonMessage } });
     h.context.sendAllQuestions(h.session);
     expect(h.session.questionPromptIds).toEqual(['steer-uuid-1']);
     expect(sendButtonMessage.mock.calls[0][5]).toMatchObject({ prompt_id: 'steer-uuid-1', mode: 'pick_one' });
+    const echo = { type: 'prompt', sender: 'agent:bridge', convo_id: 'convo', seq: 42,
+      payload: sendButtonMessage.mock.calls[0][5] };
+    if (!delayed) h.context.journalHandleInboundEvent(echo);
     h.session.waitingForAnswer = 'text-reply';
     h.context.supersedePromptsForSteerHold(h.session, {});
-    expect(h.context.emitRelease).toHaveBeenCalledWith('convo', { promptId: 'steer-uuid-1', action: 'expired', releasedIds: ['steer-uuid-1::0'] });
+    if (delayed) {
+      expect(h.frames).toEqual([]);
+      h.context.journalHandleInboundEvent(echo);
+    }
+    expect(h.frames).toEqual([{ convo_id: 'convo', type: 'prompt_reply', payload: {
+      target_seq: 42, choice: null, text: steer.STEER_PROMPT_SUPERSEDED_NOTICE,
+    } }]);
+    expect(h.context.emitRelease).not.toHaveBeenCalled();
+    h.context.journalHandleInboundEvent(echo);
+    expect(h.frames).toHaveLength(1);
+  });
+
+  it.each(['close', 'kill'])('combines queued and unstarted steer counts on final %s, once', (exit) => {
+    const h = setup();
+    const batch = ['first', 'second'].map(text => tagCauses(markJournalOrigin([{ type: 'text', text }]), userCause));
+    h.context.flushQueue(h.session, batch, { convoId: 'convo', entries: [] });
+    h.session.queuedMessages = [[{ type: 'text', text: 'third' }]];
+    if (exit === 'kill') h.context.killSession(h.session);
+    h.context.closeSession(h.session, 0);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledExactlyOnceWith('convo',
+      "⚠️ Couldn't deliver 3 queued messages — the session ended before they were sent.");
+  });
+
+  it('forgets normally answered question cards without retiring them again on echo', () => {
+    const h = setup({ session: {
+      pendingQuestions: [{ question: 'Which?', options: [{ label: 'A' }] }],
+      sendButtonMessage: vi.fn(), waitingForAnswer: 'text-reply',
+    } });
+    h.context.sendAllQuestions(h.session);
+    vm.runInContext(sourceOf('submitAnswer'), h.context);
+    h.context.submitAnswer(h.session, 'A');
+    expect(h.session.questionPromptCards.size).toBe(0);
+    h.context.journalHandleInboundEvent({ type: 'prompt', sender: 'agent:bridge', convo_id: 'convo', seq: 42,
+      payload: { prompt_id: 'steer-uuid-1' } });
+    expect(h.frames).toEqual([]);
+    expect(h.context.sendTextToSession).toHaveBeenCalledWith(h.session, 'A', { skipJournalMirror: true, causes: null });
+  });
+
+  it('keeps the running turn and reports an immediate steering write failure', () => {
+    const currentTurn = { causes: userCause, startedAt: 1 };
+    const sendCallback = vi.fn();
+    const h = setup({ session: { currentTurn, sendCallback } });
+    h.stdinWrite.mockImplementation(() => { throw new Error('EPIPE'); });
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }])).toBe(false);
+    expect(h.session.busy).toBe(true);
+    expect(h.session.currentTurn).toBe(currentTurn);
+    expect(h.context.endTurn).not.toHaveBeenCalled();
+    expect(h.context.inflightMarker.noteTurnEnd).not.toHaveBeenCalled();
+    expect(h.context.journalSessionState).not.toHaveBeenCalled();
+    expect(h.context.journalActivity).not.toHaveBeenCalled();
+    expect(sendCallback).toHaveBeenCalledExactlyOnceWith('Could not send the message to Claude: EPIPE');
+    expect(h.session._steered.size).toBe(0);
+  });
+
+  it.each([false, true])('consumes a steered handoff only after a successful write (throws: %s)', (throws) => {
+    const pending = { prompt: 'Shared context', toIndex: 2 };
+    const h = setup({ session: { _pendingAgentHandoff: pending } });
+    h.context.persistSession = vi.fn();
+    h.context.recordConversationMessage = vi.fn();
+    vm.runInContext(sourceOf('commitDispatchedUserTurn'), h.context);
+    h.context.prependHandoffPrompt.mockImplementation((blocks) => [{ type: 'text', text: pending.prompt }, ...blocks]);
+    if (throws) h.stdinWrite.mockImplementation(() => { throw new Error('EPIPE'); });
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }])).toBe(!throws);
+    expect(JSON.parse(h.stdinWrite.mock.calls[0][0]).message.content[0].text).toBe(pending.prompt);
+    expect(h.session._pendingAgentHandoff).toBe(throws ? pending : null);
+    expect(h.context.recordConversationMessage).not.toHaveBeenCalled();
+    if (!throws) {
+      expect(h.session._agentHistoryCursor).toBe(2);
+      h.context.handleClaudeEvent(h.session, lifecycle('started'));
+      expect(h.context.recordConversationMessage).toHaveBeenCalledWith(h.session, 'user', 'follow up');
+    }
   });
 });
 
@@ -572,14 +652,16 @@ describe('review follow-ups', () => {
     h.session.waitingForAnswer = 'text-reply';
     h.session.pendingQuestions = [{ question: 'Which one?' }];
     h.session.questionPromptIds = ['question-card'];
+    h.session.questionPromptCards = new Map([['question-card', { seq: 42, superseded: false }]]);
     h.context.handleClaudeEvent(h.session, result('Which one?'));
     expect(h.session.busy).toBe(true);
     expect(h.session.waitingForAnswer).toBeNull();
     expect(h.session.pendingQuestions).toBeNull();
     expect(h.session.questionPromptIds).toEqual([]);
-    expect(h.context.emitRelease).toHaveBeenCalledWith('convo', {
-      promptId: 'question-card', action: 'expired', releasedIds: ['question-card::0'],
+    expect(h.context.journalPublisher.publishPromptReply).toHaveBeenCalledWith('convo', {
+      target_seq: 42, choice: null, text: steer.STEER_PROMPT_SUPERSEDED_NOTICE,
     });
+    expect(h.context.emitRelease).not.toHaveBeenCalled();
     expect(h.context.flushResponse).toHaveBeenCalledTimes(1);
     expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo', steer.STEER_PROMPT_SUPERSEDED_NOTICE);
   });
@@ -784,7 +866,7 @@ describe('second review: settling, cancellation, order, teardown', () => {
     expect(requeue).toBeGreaterThan(branch);
     expect(copy).toBeGreaterThan(requeue);
     expect(source.slice(close, branch)).not.toContain('requeueSteeredMessages(');
-    expect(source.slice(close, branch)).toContain('notifyUndeliveredQueue(session, orphanSteers);');
+    expect(source.slice(close, branch)).toContain('notifyFinalUndeliveredQueue(session, orphanSteers);');
     expect(source.slice(close, branch)).toContain('!shouldAutoRestart(exitCode, session, shuttingDown)');
   });
 
