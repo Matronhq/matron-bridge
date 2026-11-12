@@ -180,7 +180,7 @@ import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { buildPermissionSnapshot } from './lib/permission-eval.js';
-import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
+import { createSlowToolNotices, renderSlowToolNotice, slowToolNoticeSummary, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -2792,7 +2792,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     reminderMs: resolveSlowToolReminderMs(process.env.MATRON_SLOW_TOOL_REMINDER_MS),
     notify: ({ toolName, elapsedMs, reminder }) => {
       if (!session.alive || typeof session.sendCallback !== 'function') return;
-      session.sendCallback(renderSlowToolNotice({ toolName, elapsedMs, reminder }));
+      const text = renderSlowToolNotice({ toolName, elapsedMs, reminder });
+      const meta = noticeMeta('slow_tool', text, { summary: slowToolNoticeSummary({ toolName, elapsedMs, reminder }) });
+      if (!sendKindNotice(session, 'slow_tool', text, markdownToHtml(text), meta)) session.sendCallback(text);
     },
     log: debug,
   });
@@ -6649,6 +6651,22 @@ function notice(type, plainText, htmlContent) {
   };
 }
 
+// A bridge line in the session's chat, tagged payload.notice = {kind, icon,
+// summary} (lib/system-notice.js) so a client can recognise it without
+// matching the wording. Same delivery as session.sendHtml (sendToRoom), plus
+// the tag. Returns false when the session has no room to send through, so
+// the caller keeps its existing untagged path.
+function sendKindNotice(session, kind, plain, html, meta = noticeMeta(kind, plain)) {
+  if (!meta || !session?.roomId) return false;
+  try {
+    Promise.resolve(sendToRoom(session.roomId, plain, html, { notice: meta }))
+      .catch((e) => { try { debug(`sendKindNotice(${kind}) failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function markdownToHtml(text) {
   let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
 
@@ -7653,9 +7671,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : '';
       const restartModelLine = restartModelFlag.model ? `\nModel: ${aliasLabel(restartModelFlag.model)}` : '';
       const restartPermNote = permissionNote(restarted);
-      await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`
-      );
+      const restartedLine = `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`;
+      // Tagged for the apps (the summary is its first line); a restart with
+      // no live replacement session keeps the plain reply.
+      if (!restarted || !sendKindNotice(restarted, 'restart', restartedLine, markdownToHtml(restartedLine))) await sendReply(restartedLine);
       break;
     }
 

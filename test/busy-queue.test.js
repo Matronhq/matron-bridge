@@ -1840,6 +1840,7 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);
     expect(harness.journalPublishNotice.mock.calls[0][1]).toMatch(/2 queued messages/);
+    expect(harness.journalPublishNotice.mock.calls[0][2]).toBeUndefined();
   });
 
   it('defers Codex release commitment until the interrupted turn has exited and dispatch succeeds', () => {
