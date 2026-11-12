@@ -11277,6 +11277,9 @@ const roomDelivery = createRoomDelivery({
 // tracker on the mission attached to it); acting beyond that takes an
 // "Allow once" tap from this session's own user.
 const FOREIGN_ACTIONS_FILE = path.join(os.homedir(), '.matron-bridge-foreign-actions.json');
+// Notices that were promised a review (foreign_notice): a review lost with the
+// process is said so under its notice after a restart.
+const FOREIGN_REVIEWS_FILE = path.join(os.homedir(), '.matron-bridge-foreign-reviews.json');
 const foreignSessions = createForeignSessions({
   sharing: sharingClient,
   items: itemsClient,
@@ -11289,8 +11292,20 @@ const foreignSessions = createForeignSessions({
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
   },
+  reviewStore: {
+    load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_REVIEWS_FILE, 'utf-8')); } catch { return {}; } },
+    save: (obj) => atomicWriteFileSync(FOREIGN_REVIEWS_FILE, JSON.stringify(obj), { mode: 0o600 }),
+  },
   log: console,
 });
+
+// Reviews a previous process still owed, and "no review" comments the
+// journal has not taken yet: tried shortly after start, then every few
+// minutes (an idle box has no turn-end seam to try at). Nothing owed,
+// nothing sent.
+const settleOwedReviews = () => { try { foreignSessions.settleMissedReviews(); } catch { /* never throw from a timer */ } };
+setTimeout(settleOwedReviews, 30_000).unref();
+setInterval(settleOwedReviews, 5 * 60_000).unref();
 
 function injectForeignRoomTurn(session, text, foreign) {
   // Codex has no PreToolUse gate: a Codex session never takes a turn from
@@ -13364,7 +13379,9 @@ const apiServer = createServer(async (req, res) => {
         const gSession = typeof data?.roomId === 'string' ? sessions.get(data.roomId) : null;
         if (gSession?.foreignTurn && !foreignSessions.routeAllowed(gSession, url.pathname, data)) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Not allowed in a turn another person (${gSession.foreignTurn.person}) started. Reply in the room, or ask your own user with foreign_action_request.` }));
+          res.end(JSON.stringify({ error: gSession.foreignTurn.review
+            ? 'Not allowed in a turn that reviews a notice from another person\'s side. Read your user\'s tracker, then file the review with foreign_notice_review.'
+            : `Not allowed in a turn another person (${gSession.foreignTurn.person}) started. Reply in the room, or ask your own user with foreign_action_request.` }));
           return;
         }
       }
@@ -13380,6 +13397,14 @@ const apiServer = createServer(async (req, res) => {
         const fnSession = sessions.get(data.roomId);
         if (!fnSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
         const out = await foreignSessions.raiseNotice(fnSession, data);
+        res.writeHead(out.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out.body));
+        return;
+      }
+      if (url.pathname === '/foreign-notice-review') {
+        const frSession = sessions.get(data.roomId);
+        if (!frSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
+        const out = await foreignSessions.postReview(frSession, data);
         res.writeHead(out.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out.body));
         return;

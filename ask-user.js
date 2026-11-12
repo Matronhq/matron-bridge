@@ -426,6 +426,33 @@ server.tool(
 );
 
 server.tool(
+  'foreign_notice_review',
+  "Only in the review turn the bridge starts after you filed a foreign_notice: file your review of that notice for your own user, once. Say what the other side is asking, what your user already has on it, and 1 to 4 things your user might do. The bridge posts it under the notice with one button per action; nothing is done until your user taps one, which reaches you as their own turn.",
+  {
+    asking: z.string().max(1000).describe('What is being asked, in a sentence or two, in your own words'),
+    related: z.string().max(2000).optional().describe("Related work of your user's that you found: missions, items, earlier exchanges with this person. Leave out when there is none"),
+    actions: z.array(z.object({
+      label: z.string().max(40).describe('Button label, e.g. "Reply: yes" or "Ask for more detail"'),
+      does: z.string().max(300).describe('One sentence: what you will do if your user taps it'),
+    })).min(1).max(4).describe('1 to 4 things your user might do, most likely first'),
+  },
+  async ({ asking, related, actions }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-notice-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, asking, related, actions }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_notice_review failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      return { content: [{ type: 'text', text: `Review filed. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'foreign_notice',
   "Only in a turn started by ANOTHER PERSON (a message in a room with someone else's agent, or their comment on a shared item): put ONE read-only notice in your own user's For you list saying what they want, so your user does not miss it. The bridge labels it as coming from that person's agent and quotes your text as their side's words. It has a Seen button and no actions; your user answers by replying, which reaches you as their own turn. Each call files a notice of its own, so put one thing in each. Use it when they want something only your user can give (a review, a decision, a go-ahead); then tell them your user has been told.",
   {
