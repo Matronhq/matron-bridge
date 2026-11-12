@@ -14,15 +14,15 @@ function steerable(overrides = {}) {
 const ctx = (overrides = {}) => ({ enabled: true, origin: 'user', text: 'also check the tests', ...overrides });
 
 describe('claudeSteerEnabled', () => {
-  it('defaults off and turns on only for 1/true/on', () => {
+  it('queues in Matron by default and steers only when queueing is turned off', () => {
     expect(claudeSteerEnabled({})).toBe(false);
-    expect(claudeSteerEnabled({ MATRON_CLAUDE_STEER: '' })).toBe(false);
-    expect(claudeSteerEnabled({ MATRON_CLAUDE_STEER: 'yes' })).toBe(false);
-    for (const v of ['0', 'false', 'off']) {
-      expect(claudeSteerEnabled({ MATRON_CLAUDE_STEER: v })).toBe(false);
+    expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: '' })).toBe(false);
+    expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: 'no' })).toBe(false);
+    for (const v of ['1', 'true', 'on']) {
+      expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: v })).toBe(false);
     }
-    for (const v of ['1', 'true', 'on', 'ON', ' True ']) {
-      expect(claudeSteerEnabled({ MATRON_CLAUDE_STEER: v })).toBe(true);
+    for (const v of ['0', 'false', 'off', 'OFF', ' False ']) {
+      expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: v })).toBe(true);
     }
   });
 });

@@ -401,7 +401,8 @@ const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 // Mid-turn steering for print-mode Claude (lib/claude-steer.js): a message typed
 // while a turn runs is written into the running turn through flushQueue (the
 // same send-into-turn path Codex steering uses) instead of waiting in the busy
-// queue. Off by default; MATRON_CLAUDE_STEER=1|true|on enables it.
+// queue. Off by default: messages queue in Matron unless
+// MATRON_CLAUDE_QUEUE_IN_MATRON=0|false|off.
 const CLAUDE_STEER_ENABLED = claudeSteerEnabled(process.env);
 // The ~/.claude-matrix-* state file names below are historical; renaming them
 // would need a migration.
@@ -9766,7 +9767,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       emitRelease,
     });
     if (handledMagicWord) return;
-    // Print-mode Claude with MATRON_CLAUDE_STEER on: plain text the user typed
+    // Print-mode Claude with MATRON_CLAUDE_QUEUE_IN_MATRON=0: plain text the user typed
     // goes into the running turn through flushQueue (lib/claude-steer.js)
     // instead of waiting in the queue. Anything that cannot steer, and a
     // refused write, falls through to the queue below so nothing is lost.
