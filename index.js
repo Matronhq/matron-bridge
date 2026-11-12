@@ -11299,9 +11299,13 @@ const foreignSessions = createForeignSessions({
   log: console,
 });
 
-// Reviews a previous process still owed: once the journal client has had
-// time to connect. Every later drain tries again.
-setTimeout(() => { try { foreignSessions.settleMissedReviews(); } catch { /* never throw from a timer */ } }, 30_000).unref();
+// Reviews a previous process still owed, and "no review" comments the
+// journal has not taken yet: tried shortly after start, then every few
+// minutes (an idle box has no turn-end seam to try at). Nothing owed,
+// nothing sent.
+const settleOwedReviews = () => { try { foreignSessions.settleMissedReviews(); } catch { /* never throw from a timer */ } };
+setTimeout(settleOwedReviews, 30_000).unref();
+setInterval(settleOwedReviews, 5 * 60_000).unref();
 
 function injectForeignRoomTurn(session, text, foreign) {
   // Codex has no PreToolUse gate: a Codex session never takes a turn from

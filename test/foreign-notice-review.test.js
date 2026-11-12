@@ -287,7 +287,7 @@ describe('a notice is never left promising a review', () => {
     next.fs.settleMissedReviews();
     await tick();
     expect(next.comments).toEqual([{ id: 'it_1', body: REVIEW_MISSING_COMMENT, as_convo_id: 'convo-sess-a' }]);
-    expect(next.keys).toEqual(['foreign-review-missing-it_1']);
+    expect(next.keys).toEqual(['foreign-review-it_1']);
     expect(next.fs.owedReviewCount()).toBe(0);
     expect(next.store).toEqual({});
   });
