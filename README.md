@@ -308,6 +308,7 @@ the viewer's environment turns it off.
 | `DEBUG` | Set to `1` to log verbose bridge and coding-agent events | `0` |
 | `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work | `0` |
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
+| `MATRON_CLAUDE_QUEUE_IN_MATRON` | Messages typed during a running print-mode Claude turn wait in Matron's queue. Set to `0` (or `false`/`off`) to write plain messages straight into the running turn instead (see Mid-turn steering) | `1` (queue in Matron) |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
@@ -462,6 +463,12 @@ CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a reposito
 8. Agent handoffs persist one native session ID per provider plus a shared transcript cursor; the next prompt carries a bounded unseen transcript delta
 9. Crashed sessions auto-restart up to 3 times
 10. Messages sent while an agent is busy are queued and sent when the turn completes
+
+### Mid-turn steering (Claude, print mode)
+
+Off by default: messages queue in Matron. With `MATRON_CLAUDE_QUEUE_IN_MATRON=0`, a plain message typed while a print-mode Claude turn is running goes straight into the running `claude` process instead of the busy queue, through the same `flushQueue` seam that Codex steering uses. The chat shows `↪ Sent into the running turn` in place of the queued card. Steering is not an interrupt: no tool call is cut off. Claude sees the message once the current tool call finishes, in the same turn, or, if the turn ends first, as its own turn right after it; the session stays busy through that follow-up turn so queued work does not jump ahead of it. The message's cause (the user's message, or the item reply) is merged into the running turn, as for a Codex steer. A steered message Claude never ran goes back on the queue when the session carries on (a failed write, a cancellation by an interrupt, or a crash that respawns the session).
+
+Anything that cannot steer is queued exactly as before: slash and `!` commands, reminders, timers and carry-on taps, media, room messages, a turn another person started, a session with an open question or plan, a pending interrupt, a parked restart or command, a turn the CLI has not opened yet, and any message arriving while something is already queued (order is preserved). `send` and `cancel` still apply to whatever is queued.
 
 ## Development
 

@@ -1746,7 +1746,7 @@ describe('index.js queued-send finalizer', () => {
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
       {
-        AGENT_CODEX: 'codex',
+        AGENT_CODEX: 'codex', CLAUDE_STEER_ENABLED: false,
         console: { log: vi.fn() },
         dispatchMergedFlush,
         emitRelease,
@@ -1824,22 +1824,29 @@ describe('index.js queued-send finalizer', () => {
     expect(session.queuedMessages).toEqual([...queued, ...later]);
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
+    expect(harness.journalPublishNotice).not.toHaveBeenCalled();
   });
 
-  it('notifies and drops (no retain) when a DEAD/auto-stopped session rejects dispatch', () => {
-    // #161: dead-session flush failure must not strand the batch as a
+  it.each([
+    { alive: false, autoStopped: false, count: 2 },
+    { alive: false, autoStopped: false, count: 1 },
+    { alive: true, autoStopped: true, count: 1 },
+  ])('notifies and drops when dispatch rejects with alive=$alive, autoStopped=$autoStopped, count=$count', ({ alive, autoStopped, count }) => {
+    // A dead-session flush failure must not strand the batch as a
     // permanent retry; every entry was acknowledged with a "📨 Queued" tile,
     // so drop it AND tell the user (matching merged master).
     const harness = loadFlushHarness({ dispatchResult: false });
-    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]];
-    const session = { agent: 'claude', alive: false, busy: false, queuedMessages: null, roomId: '!room' };
+    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]].slice(0, count);
+    const session = { agent: 'claude', alive, _autoStopped: autoStopped, busy: false, queuedMessages: null, roomId: '!room' };
 
     expect(harness.flushQueue(session, queued)).toBe(false);
     expect(session.queuedMessages).toBeNull(); // dropped, not retained
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);
-    expect(harness.journalPublishNotice.mock.calls[0][1]).toMatch(/2 queued messages/);
+    expect(harness.journalPublishNotice).toHaveBeenCalledWith('convo-1', count > 1
+      ? "⚠️ Couldn't deliver 2 queued messages — the session ended before they were sent."
+      : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
     expect(harness.journalPublishNotice.mock.calls[0][2]).toBeUndefined();
   });
 
