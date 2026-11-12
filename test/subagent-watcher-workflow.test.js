@@ -466,18 +466,18 @@ describe('subagent convo tracker workflow status', () => {
     tracker.discover(A1, { label: 'Work · Phase', workflowRunId: RUN_ID, workflowPhase: 'Phase' });
     expect(statuses.at(-1)).toEqual({
       convoId: `parent-1:sub:${A1}`,
-      status: { workflowRunId: RUN_ID, workflowPhase: 'Phase' },
+      status: { workflow_run_id: RUN_ID, workflow_phase: 'Phase' },
     });
     tracker.onEvent(A1, { event: { type: 'assistant', message: { model: 'claude-opus-5-5' } } });
-    expect(statuses.at(-1).status).toMatchObject({ workflowRunId: RUN_ID, workflowPhase: 'Phase', model: 'claude-opus-5-5' });
+    expect(statuses.at(-1).status).toMatchObject({ workflow_run_id: RUN_ID, workflow_phase: 'Phase', model: 'claude-opus-5-5' });
   });
 
   it('reads workflow metadata from events, including a phase arriving after discovery', () => {
     const { tracker, statuses } = setup();
     tracker.onEvent(A1, { workflowRunId: RUN_ID });
-    expect(statuses.at(-1).status).toEqual({ workflowRunId: RUN_ID });
+    expect(statuses.at(-1).status).toEqual({ workflow_run_id: RUN_ID });
     tracker.onEvent(A1, { workflowRunId: RUN_ID, workflowPhase: 'Phase' });
-    expect(statuses.at(-1).status).toEqual({ workflowRunId: RUN_ID, workflowPhase: 'Phase' });
+    expect(statuses.at(-1).status).toEqual({ workflow_run_id: RUN_ID, workflow_phase: 'Phase' });
   });
 
   it('omits workflow fields for a plain subagent on discovery and events', () => {
@@ -487,8 +487,8 @@ describe('subagent convo tracker workflow status', () => {
     tracker.onEvent('plain', { event: { type: 'assistant', message: { model: 'claude-opus-5-5' } } });
     expect(statuses.length).toBeGreaterThanOrEqual(2);
     for (const { status } of statuses) {
-      expect(status).not.toHaveProperty('workflowRunId');
-      expect(status).not.toHaveProperty('workflowPhase');
+      expect(status).not.toHaveProperty('workflow_run_id');
+      expect(status).not.toHaveProperty('workflow_phase');
     }
   });
 });
