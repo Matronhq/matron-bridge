@@ -42,7 +42,8 @@ describe('code-update self-restart wiring', () => {
     expect(busy).toMatch(/filter\(s => s\.alive\)/);
     expect(busy).toContain('const last = handoffIdleSince(s);');
     expect(busy).toContain('sessionWorkHold(s, last, now, table)');
-    expect(busy).toContain('workHold({ busy: !!s.busy, idleSince: last, now })');
+    expect(busy).toContain("const hold = s.busy\n          ? { reason: 'turn in progress' }");
+    expect(busy).toContain('workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })');
     // One process-table read per poll, shared by all live sessions.
     expect(busy.match(/readProcessTable\(\)/g)).toHaveLength(1);
     expect(index).not.toMatch(/restartHold/);
@@ -122,6 +123,13 @@ describe('code-update work holds', () => {
     return make(new Map([['room', session]]), { now: () => now }, workHold, liveWorkChildren, parseProcessTable, handoffIdleSince, execFileSync, () => ({ file: 'ps', args: [] }), () => ({}), () => {}, []);
   }
 
+  it('holds a running turn even at or beyond the eight-hour age cap', () => {
+    for (const age of [WORK_HOLD_MAX_MS - 1, WORK_HOLD_MAX_MS, WORK_HOLD_MAX_MS + 1]) {
+      expect(harness({ busy: true, age, tableOutput: '' }).busySessions()).toBe(1);
+    }
+    expect(harness({ busy: true, alive: false }).busySessions()).toBe(0);
+  });
+
   it('stops holding a background process at the existing eight-hour age cap', () => {
     expect(harness({ age: WORK_HOLD_MAX_MS - 1 }).busySessions()).toBe(1);
     expect(harness({ age: WORK_HOLD_MAX_MS }).busySessions()).toBe(0);
@@ -133,6 +141,7 @@ describe('code-update work holds', () => {
     expect(harness({ subagentCount: 1, tableOutput: '' }).busySessions()).toBe(1);
     expect(harness({ subagentCount: 0, tableOutput: '' }).busySessions()).toBe(0);
     expect(harness({ subagentCount: 1, age: WORK_HOLD_MAX_MS, tableOutput: '' }).busySessions()).toBe(0);
+    expect(harness({ subagentCount: 1, age: WORK_HOLD_MAX_MS + 1, tableOutput: '' }).busySessions()).toBe(0);
   });
 
   it('distinguishes a failed process-table read from a successful empty table', () => {
@@ -144,9 +153,17 @@ describe('code-update work holds', () => {
     expect(harness({ tableOutput: '' }).readProcessTable()).toEqual([]);
   });
 
-  it('falls back to the busy-turn check on process-table failure, retaining the age cap', () => {
-    expect(harness({ unreadable: true, busy: false, subagentCount: 1 }).busySessions()).toBe(0);
+  it('holds an idle parent with a running subagent on process-table failure, bounded by the cap', () => {
+    expect(harness({ unreadable: true, subagentCount: 1 }).busySessions()).toBe(1);
+    expect(harness({ unreadable: true, subagentCount: 1, age: WORK_HOLD_MAX_MS - 1 }).busySessions()).toBe(1);
+    expect(harness({ unreadable: true, subagentCount: 1, age: WORK_HOLD_MAX_MS }).busySessions()).toBe(0);
+    expect(harness({ unreadable: true, subagentCount: 1, age: WORK_HOLD_MAX_MS + 1 }).busySessions()).toBe(0);
+  });
+
+  it('keeps busy turns uncapped on process-table failure', () => {
+    expect(harness({ unreadable: true, busy: false }).busySessions()).toBe(0);
     expect(harness({ unreadable: true, busy: true }).busySessions()).toBe(1);
-    expect(harness({ unreadable: true, busy: true, age: WORK_HOLD_MAX_MS }).busySessions()).toBe(0);
+    expect(harness({ unreadable: true, busy: true, age: WORK_HOLD_MAX_MS }).busySessions()).toBe(1);
+    expect(harness({ unreadable: true, busy: true, age: WORK_HOLD_MAX_MS + 1 }).busySessions()).toBe(1);
   });
 });

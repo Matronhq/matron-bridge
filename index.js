@@ -10758,8 +10758,8 @@ function startCodeUpdateWatcher() {
   }
   const watcher = createCodeUpdateWatcher({
     readHead: () => readHeadReflog(gitDir),
-    // Share the idle reaper's age cap so a background job cannot defer
-    // code updates forever.
+    // Share the idle reaper's age cap for background work, while a running
+    // turn always holds the update unless forcing is explicitly enabled.
     busySessions: () => {
       const live = [...sessions.values()].filter(s => s.alive);
       if (!live.length) return 0;
@@ -10768,10 +10768,13 @@ function startCodeUpdateWatcher() {
       let n = 0;
       for (const s of live) {
         const last = handoffIdleSince(s);
-        // Without a process table, only the busy-turn signal is reliable.
-        const hold = table.unreadable
-          ? workHold({ busy: !!s.busy, idleSince: last, now })
-          : sessionWorkHold(s, last, now, table);
+        // A quiet tool call can outlast the age cap without ending its turn.
+        // Subagent tracking is in memory, so it survives a failed ps read.
+        const hold = s.busy
+          ? { reason: 'turn in progress' }
+          : table.unreadable
+            ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
+            : sessionWorkHold(s, last, now, table);
         if (hold) {
           n++;
           debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
@@ -14857,7 +14860,7 @@ function sessionChildPid(session) {
 // Get-CimInstance on Windows (lib/process-table.js) in the same line shape.
 // Fails closed to an empty table: with no table there are no work children,
 // and the idle clock rules as it did before. Mark failures so the update
-// watcher can fall back to the busy-turn signal.
+// watcher can fall back to the in-memory work signals.
 function readProcessTable() {
   try {
     const { file, args: ptArgs } = processTableCommand();
