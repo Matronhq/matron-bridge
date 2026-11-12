@@ -13364,7 +13364,9 @@ const apiServer = createServer(async (req, res) => {
         const gSession = typeof data?.roomId === 'string' ? sessions.get(data.roomId) : null;
         if (gSession?.foreignTurn && !foreignSessions.routeAllowed(gSession, url.pathname, data)) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Not allowed in a turn another person (${gSession.foreignTurn.person}) started. Reply in the room, or ask your own user with foreign_action_request.` }));
+          res.end(JSON.stringify({ error: gSession.foreignTurn.review
+            ? 'Not allowed in a turn that reviews a notice from another person\'s side. Read your user\'s tracker, then file the review with foreign_notice_review.'
+            : `Not allowed in a turn another person (${gSession.foreignTurn.person}) started. Reply in the room, or ask your own user with foreign_action_request.` }));
           return;
         }
       }
@@ -13380,6 +13382,14 @@ const apiServer = createServer(async (req, res) => {
         const fnSession = sessions.get(data.roomId);
         if (!fnSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
         const out = await foreignSessions.raiseNotice(fnSession, data);
+        res.writeHead(out.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out.body));
+        return;
+      }
+      if (url.pathname === '/foreign-notice-review') {
+        const frSession = sessions.get(data.roomId);
+        if (!frSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
+        const out = await foreignSessions.postReview(frSession, data);
         res.writeHead(out.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out.body));
         return;
