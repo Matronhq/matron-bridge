@@ -276,6 +276,25 @@ describe('createItemTurnRouter', () => {
     expect(deps.injectBlocks).not.toHaveBeenCalled();
   });
 
+  it.each(['image/png', 'application/pdf', 'audio/mp4'])('queues a busy reply with a %s attachment without steering', async (mime) => {
+    const steerText = vi.fn(() => true);
+    const { deps, route } = fixture({ steerText });
+    const session = { busy: true, journalConvoId: 'c1' };
+    const payload = { ...base, action: 'commented', comment: {
+      id: 'ic', body: 'use this', attachments: [{ blob_ref: 'blob', mime, name: 'attachment', transcript: 'voice reply' }],
+    } };
+    await route(session, { payload }, { username: 'user' });
+    await route(session, { payload }, { username: 'user' });
+    expect(steerText).not.toHaveBeenCalled();
+    expect(deps.queueText).toHaveBeenCalledTimes(1);
+    expect(deps.queueText).toHaveBeenCalledWith(session, expect.objectContaining({
+      text: expect.stringContaining('use this'),
+      source: { item_id: base.item_id, comment_id: 'ic' },
+    }));
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
   it('injects an idle reply without calling the steering seam', async () => {
     const steerText = vi.fn(() => true);
     const { deps, route } = fixture({ steerText });

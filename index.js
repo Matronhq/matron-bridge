@@ -6394,7 +6394,7 @@ function notifyUndeliveredQueue(session, entries) {
 // once, including messages requeued by a stdin error before the exit arrived.
 function notifyFinalUndeliveredQueue(session, orphanSteers) {
   if (session._undeliveredQueueNotified) return;
-  const entries = [...orphanSteers, ...(CLAUDE_STEER_ENABLED ? session.queuedMessages || [] : [])];
+  const entries = [...orphanSteers, ...(CLAUDE_STEER_ENABLED && !session._queueTransferred ? session.queuedMessages || [] : [])];
   if (!entries.length) return;
   session._undeliveredQueueNotified = true;
   notifyUndeliveredQueue(session, entries);
@@ -6426,6 +6426,11 @@ function noteQuestionPromptEcho(frame) {
 
 // Stdin errors can precede close: only the current live session can retry.
 function requeueFailedSteer(session, uuid, error) {
+  // Exit can precede the write callback; close still owns the restart decision
+  // and must retain unstarted input until it can carry it to the replacement.
+  if (session.alive && !session._autoStopped && sessions.get(session.roomId) === session
+    && (session.proc?.exitCode != null || session.proc?.signalCode != null)
+    && shouldAutoRestart(session.proc.exitCode, session, shuttingDown)) return;
   const entry = takeFailedSteer(session, uuid);
   if (!entry) return;
   if (!session.alive || session._autoStopped || sessions.get(session.roomId) !== session
@@ -15106,6 +15111,8 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;
   next.queueNotifications = existing.queueNotifications;
+  // The replacement now owns delivery, even if it swaps the array on flush.
+  if (CLAUDE_STEER_ENABLED) existing._queueTransferred = true;
   next._codexUncertainSteer = existing._codexUncertainSteer;
   journalInputConsumer.queueRelease.carryForward(
     journalConvoIdFor(existing),

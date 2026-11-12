@@ -24,7 +24,7 @@ const LIFTED = [
   'clearPendingInterrupt', 'sendToSession', 'dispatchMergedFlush', 'applyPendingAgentHandoff', 'sendAllQuestions', 'notifyUndeliveredQueue', 'steerableBatchText', 'claudeSteerEligible', 'trySteerEntry', 'flushQueue', 'restoreQueuedBatch', 'commitSteeredMessage',
   'requeueSteeredMessages', 'settleDroppedSteers', 'releaseSteersToCli', 'requeueCancelledSteer',
   'requeueFailedSteer', 'supersedePromptsForSteerHold', 'beginHeldSteerTurn', 'releaseStaleSteerHold',
-  'handleClaudeEvent', 'journalRouteTextToSession', 'killSession',
+  'handleClaudeEvent', 'journalRouteTextToSession', 'killSession', 'recreateSession',
 ];
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async', 'super']);
 
@@ -224,6 +224,67 @@ describe('shared running-turn writer', () => {
     h.context.closeSession(h.session, 1);
     expect(h.context.sessions.get('room').queuedMessages).toBe(h.session.queuedMessages);
     expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+  });
+
+  it.each(['exit', 'signal'])('retains a failed steer between %s and close for auto-restart', (event) => {
+    const h = setup({ session: { restartCount: 0 } });
+    vm.runInContext(sourceOf('shouldAutoRestart'), h.context);
+    const restarted = {};
+    h.context.createSession.mockReturnValue(restarted);
+    h.context.journalInputConsumer.queueRelease = { carryForward: vi.fn() };
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }]);
+    h.session.proc.exitCode = event === 'exit' ? 1 : null;
+    h.session.proc.signalCode = event === 'signal' ? 'SIGTERM' : null;
+    const callback = h.stdinWrite.mock.calls[0][1];
+    callback(new Error('write EPIPE'));
+    expect(h.session._steered.size).toBe(1);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+    h.context.closeSession(h.session, h.session.proc.exitCode);
+    callback(new Error('write EPIPE'));
+    expect(restarted.queuedMessages).toEqual([[{ type: 'text', text: 'follow up' }]]);
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+  });
+
+  it.each(['clean exit', 'restart limit', 'resume failure', 'shutdown'])('reports a failed steer after a final %s', (reason) => {
+    const h = setup({ session: { restartCount: reason === 'restart limit' ? 3 : 0 } });
+    vm.runInContext(sourceOf('shouldAutoRestart'), h.context);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }]);
+    h.session.proc.exitCode = reason === 'clean exit' ? 0 : 1;
+    h.session._resumeFailed = reason === 'resume failure';
+    h.context.shuttingDown = reason === 'shutdown';
+    h.stdinWrite.mock.calls[0][1](new Error('write EPIPE'));
+    expect(h.session._steered.size).toBe(0);
+    h.context.closeSession(h.session, h.session.proc.exitCode);
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+    expect(h.context.journalPublishNotice).toHaveBeenCalledExactlyOnceWith('convo',
+      "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+  });
+
+  it.each([false, true])('leaves transferred queue notices to the replacement (steering enabled: %s)', (steerEnabled) => {
+    const queued = [[{ type: 'text', text: 'follow up' }]];
+    const h = setup({ steerEnabled, session: { queuedMessages: queued } });
+    const next = { alive: true, busy: false };
+    h.context.createSession.mockImplementation(() => {
+      h.context.sessions.set('room', next);
+      return next;
+    });
+    h.context.journalInputConsumer.queueRelease = { carryForward: vi.fn() };
+    h.context.flushPendingSessionQueue.mockImplementation((session) => {
+      session.queuedMessages = null;
+      return true;
+    });
+    expect(h.context.recreateSession('room', {}, h.ctxObj)).toBe(next);
+    expect(h.context.flushPendingSessionQueue).toHaveBeenCalledWith(next);
+    expect(h.session.queuedMessages).toBe(queued);
+    expect(h.session._queueTransferred).toBe(steerEnabled ? true : undefined);
+    h.context.closeSession(h.session, 0);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+    // A later queue on the replacement still gets its own final notice.
+    next.queuedMessages = queued;
+    h.context.notifyFinalUndeliveredQueue(next, []);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledTimes(steerEnabled ? 1 : 0);
   });
 
   it('restores item reply editing and source on a restart', () => {
