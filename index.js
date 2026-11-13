@@ -6945,7 +6945,10 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     void session.codex.steer(blocks).then(sent => {
       session._codexSteerPending = false;
       if (!session.alive || sessions.get(session.roomId) !== session) {
-        if (!sent) for (const entry of queued) runQueuedCleanup(entry);
+        // The replacement session may still hold these entries (restart with
+        // preserveQueue); only clean up ones nobody retains.
+        const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
+        if (!sent) for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
         return;
       }
       if (sent) {
@@ -6967,7 +6970,8 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     }).catch(() => {
       session._codexSteerPending = false;
       if (!session.alive || sessions.get(session.roomId) !== session) {
-        for (const entry of queued) runQueuedCleanup(entry);
+        const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
+        for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
         return;
       }
       restore();
@@ -10042,7 +10046,7 @@ const journalMediaRouter = createJournalMediaRouter({
       }),
     });
     const cleanups = result.frames.map(({ path: filePath }) => {
-      const { dev, ino } = fs.lstatSync(filePath);
+      const { dev, ino } = fs.lstatSync(filePath, { bigint: true });
       return makeIdentityAwareCleanup(filePath, { dev, ino });
     });
     return { blocks, cleanup: () => {

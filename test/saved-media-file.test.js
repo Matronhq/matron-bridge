@@ -43,6 +43,21 @@ describe('saved attachments', () => {
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 
+  it('syncs the temporary file through a writable descriptor and compares identities as bigint', () => {
+    const modes = [];
+    const stats = [];
+    const fsImpl = { ...fs,
+      openSync: (p, mode) => { modes.push(mode); return fs.openSync(p, mode); },
+      lstatSync: (p, opts) => { stats.push(opts); return fs.lstatSync(p, opts); },
+    };
+    const saved = writeSavedMediaFile(target, Buffer.from('x'), { fsImpl });
+    expect(modes[0]).toBe('r+');
+    expect(typeof saved.identity.ino).toBe('bigint');
+    makeIdentityAwareCleanup(saved.path, saved.identity, { fsImpl })();
+    expect(stats.every(o => o && o.bigint === true)).toBe(true);
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
   it('cleans the temporary file when name selection throws', () => {
     fs.writeFileSync(target, 'existing');
     expect(() => writeSavedMediaFile(target, Buffer.from('new'), {

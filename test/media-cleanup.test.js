@@ -68,6 +68,18 @@ describe('saved attachment cleanup on delivery', () => {
     expect(cleanup).toHaveBeenCalledTimes(2);
   });
 
+  it('cleans saved files when the session ended while the attachment was being prepared', async () => {
+    const cleanup = vi.fn();
+    const h = harness({ buildSavedBlocks: async () => {
+      h.session.alive = false;
+      return { blocks, cleanup };
+    }, injectBlocks: vi.fn(() => false) });
+    h.session.busy = true;
+    await h.route(h.session, media);
+    expect(h.deps.queueMedia).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
   it('cleans video frames when delivery is refused', async () => {
     const cleanup = vi.fn();
     const h = harness({ buildVideoBlocks: async () => ({ blocks, cleanup }), injectBlocks: vi.fn(() => false) });
