@@ -129,10 +129,9 @@ describe('classifyRescueKeystroke (journal command classification pin: !esc)', (
     expect(classifyRescueKeystroke('!Enter')).toBe('enter');
   });
 
-  it('accepts slash keystrokes for sign-in retries and cancellation', () => {
-    expect(classifyRescueKeystroke('/esc')).toBe('esc');
-    expect(classifyRescueKeystroke('/escape')).toBe('esc');
-    expect(classifyRescueKeystroke('/enter')).toBe('enter');
+  it('returns null for the / spelling — rescue keystrokes are ! only', () => {
+    expect(classifyRescueKeystroke('/esc')).toBeNull();
+    expect(classifyRescueKeystroke('/enter')).toBeNull();
   });
 
   it('returns null for unrelated text', () => {

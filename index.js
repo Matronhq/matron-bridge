@@ -62,7 +62,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn, designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, showsSignInScreen, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -4397,6 +4397,8 @@ const LOGIN_RETURN_TO_PRINT_DELAY_MS = 2500;
 // Watch only output emitted after typing /design-login; stop on a result or timeout.
 const DESIGN_LOGIN_WATCH_CAP_MS = 7 * 60 * 1000;
 const DESIGN_LOGIN_SETTLE_MS = 400;
+// No sign-in screen this soon after typing the command: the CLI doesn't know it.
+const DESIGN_LOGIN_NO_SCREEN_MS = 20 * 1000;
 const DESIGN_LOGIN_BUFFER_LIMIT = 65536;
 const DESIGN_LOGIN_RETRY_MS = 5000;
 const DESIGN_LOGIN_RETRY_LIMIT = 24;
@@ -4412,17 +4414,23 @@ function armDesignLoginWatch(session) {
   let raw = '';
   let settleTimer = null;
   let refusalShown = false;
+  let screenSeen = false;
   const watch = {
     stop() {
       iv.removeListener('pty-data', onData);
       if (settleTimer) clearTimeout(settleTimer);
       clearTimeout(cap);
+      clearTimeout(noScreen);
       if (session._designLoginWatch === watch) session._designLoginWatch = null;
     },
   };
   const check = () => {
     settleTimer = null;
     const text = stripAnsi(raw);
+    if (!screenSeen && showsSignInScreen(text)) {
+      screenSeen = true;
+      clearTimeout(noScreen);
+    }
     const outcome = classifyDesignLoginOutput(text);
     if (outcome) {
       watch.stop();
@@ -4455,6 +4463,15 @@ function armDesignLoginWatch(session) {
     scheduleDesignLoginFinish(roomId, flow, null, 0);
   }, DESIGN_LOGIN_WATCH_CAP_MS);
   if (typeof cap.unref === 'function') cap.unref();
+  const noScreen = setTimeout(() => {
+    if (screenSeen) return;
+    watch.stop();
+    debug('design-login: no sign-in screen appeared');
+    releaseDesignLoginBusy(session, flow);
+    if (!session.busy) flushAfterDesignLogin(session);
+    scheduleDesignLoginFinish(roomId, flow, 'unrecognised', 0);
+  }, DESIGN_LOGIN_NO_SCREEN_MS);
+  if (typeof noScreen.unref === 'function') noScreen.unref();
   iv.on('pty-data', onData);
   session._designLoginWatch = watch;
 }
@@ -9512,26 +9529,6 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     },
   });
   if (dispatchedCommand) return;
-
-  // Design generation needs the interactive Artifact tool. Keep access commands in print.
-  if (designNeedsInteractive(trimmed, session) && !sessionOccupiedForRoomDelivery(session)
-      && !session.pendingUnclassifiedPrompt) {
-    const ctx = journalSessionCommandCtx(session);
-    const next = applyModeSwitch(session.roomId, session, true, {
-      sendReply: ctx.sendReply, sendHtml: ctx.sendHtml,
-      announcement: DESIGN_SWITCH_ANNOUNCEMENT,
-    });
-    if (next) {
-      if (sendToSession(next, [{ type: 'text', text: trimmed }], { skipJournalMirror: true, causes }) !== true) {
-        ctx.sendReply('Switched to interactive mode, but couldn\'t hand it the brief — send /design again.');
-      }
-      return;
-    }
-    if (sessions.get(session.roomId) !== session) {
-      ctx.sendReply('Your design brief was not run. Send /design again once interactive mode works, or try /mode interactive first.');
-      return;
-    }
-  }
 
   if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
     const asyncQuestion = session.codexPrompts.active.kind === 'async-question';

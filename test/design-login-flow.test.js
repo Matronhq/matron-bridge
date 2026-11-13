@@ -161,7 +161,7 @@ describe('designLoginEndsPhantomTurn', async () => {
     const ctx = {
       ...flowLib, stripAnsi: prompt.stripAnsi, findInputCue: prompt.findInputCue,
       setTimeout, clearTimeout, debug: () => {},
-      DESIGN_LOGIN_WATCH_CAP_MS: 60000, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_BUFFER_LIMIT: 65536,
+      DESIGN_LOGIN_WATCH_CAP_MS: 60000, DESIGN_LOGIN_NO_SCREEN_MS: 60000, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_BUFFER_LIMIT: 65536,
       LOGIN_RETURN_TO_PRINT_DELAY_MS: 1,
       scheduleDesignLoginFinish: (...a) => finishes.push(a),
       endTurn: s => { s.currentTurn = null; },
@@ -196,6 +196,49 @@ describe('designLoginEndsPhantomTurn', async () => {
     expect(finishes.length).toBe(1);
   });
 
+  // A CLI build without /design-login never paints a sign-in screen.
+  it.each([
+    ['no sign-in screen shows', null, 'unrecognised'],
+    ['a sign-in screen showed', 'Waiting for browser authorization…', null],
+  ])('releases the watch when %s within the window', async (_name, screen, expected) => {
+    const { runInNewContext } = await import('node:vm');
+    const { EventEmitter } = await import('node:events');
+    const prompt = await import('../lib/prompt-detector.js');
+    const flowLib = await import('../lib/design-login-flow.js');
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    const start = src.indexOf('function armDesignLoginWatch(');
+    const end = src.indexOf('function scheduleDesignLoginFinish(');
+    const finishes = [];
+    const flushed = [];
+    const ctx = {
+      ...flowLib, stripAnsi: prompt.stripAnsi, findInputCue: prompt.findInputCue,
+      setTimeout, clearTimeout, debug: () => {},
+      DESIGN_LOGIN_WATCH_CAP_MS: 60000, DESIGN_LOGIN_NO_SCREEN_MS: 60, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_BUFFER_LIMIT: 65536,
+      scheduleDesignLoginFinish: (...a) => finishes.push(a),
+      endTurn: () => {}, inflightMarker: { noteTurnEnd: () => {} },
+      journalConvoIdFor: () => 'c1', journalSessionState: () => {}, journalActivity: () => {},
+      maybeFlushRoomDelivery: s => flushed.push(s), flushPendingSessionQueue: () => false,
+    };
+    const { arm } = runInNewContext(`${src.slice(start, end)}\n({ arm: armDesignLoginWatch })`, ctx);
+    const iv = new EventEmitter();
+    const session = { roomId: 'r', alive: true, iv, sendCallback: () => {} };
+    arm(session);
+    iv.emit('pty-data', screen ? `Design login\n${screen}` : 'Unknown command: /design-login');
+    await new Promise(r => setTimeout(r, 120));
+    if (expected) {
+      expect(session._designLoginWatch).toBe(null);
+      expect(iv.listenerCount('pty-data')).toBe(0);
+      expect(flushed).toEqual([session]);
+      expect(finishes).toHaveLength(1);
+      expect(finishes[0][2]).toBe(expected);
+      expect(flowLib.designLoginOutcomeMessage('unrecognised')).toMatch(/may not support/);
+    } else {
+      expect(session._designLoginWatch).not.toBe(null);
+      expect(finishes).toHaveLength(0);
+      session._designLoginWatch.stop();
+    }
+  });
+
   it('room delivery waits while the dialog is open', () => {
     const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
     const fn = src.slice(src.indexOf('function sessionOccupiedForRoomDelivery('), src.indexOf('function sessionOccupiedForRoomDelivery(') + 400);
@@ -208,11 +251,16 @@ describe('designLoginEndsPhantomTurn', async () => {
   });
 });
 
-describe('sign-in card needs an OAuth URL', async () => {
+describe('sign-in card prefers the OAuth URL', async () => {
   const { formatTuiCueMessage } = await import('../lib/tui-cue-message.js');
-  it('a repainted old sign-in screen next to a PR link is not a sign-in', () => {
-    const screen = 'Paste code here if prompted >\nDesign login cancelled.\nMerged as https://example.test/review';
-    expect(formatTuiCueMessage(screen, ['https://example.test/review'])).toBe(null);
+  it('with no OAuth URL, falls back to the first URL like an ordinary /login', () => {
+    const screen = 'Paste code here if prompted >\nhttps://example.test/login-next';
+    const msg = formatTuiCueMessage(screen, ['https://example.test/login-next']);
+    expect(msg.parts.map(p => p.plain)).toContain('https://example.test/login-next');
+  });
+  it('a repaint with no new URLs says nothing', () => {
+    const screen = 'Paste code here if prompted >\nhttps://example.test/login-next';
+    expect(formatTuiCueMessage(screen, ['https://example.test/login-next'], { hasNewUrls: false })).toBe(null);
   });
   it('a live sign-in screen still gets the card with its OAuth URL', () => {
     const oauth = 'https://auth.example.test/oauth/authorize?code=true&state=a';
@@ -221,28 +269,6 @@ describe('sign-in card needs an OAuth URL', async () => {
     expect(msg.parts.map(p => p.plain)).toContain(oauth);
   });
 });
-
-describe('designNeedsInteractive', async () => {
-  const { designNeedsInteractive } = await import('../lib/design-login-flow.js');
-  const print = { agent: 'claude', iv: null };
-  it('a brief or bare /design on a Claude print session switches', () => {
-    expect(designNeedsInteractive('/design A sign-in screen', print)).toBe(true);
-    expect(designNeedsInteractive('/design', print)).toBe(true);
-  });
-  it('only the /design word itself', () => {
-    expect(designNeedsInteractive('/design-sync', print)).toBe(false);
-    expect(designNeedsInteractive('please /design this', print)).toBe(false);
-  });
-  it('consent and revoke stay in print', () => {
-    expect(designNeedsInteractive('/design consent', print)).toBe(false);
-    expect(designNeedsInteractive('/design REVOKE', print)).toBe(false);
-  });
-  it('interactive and Codex sessions take it as typed', () => {
-    expect(designNeedsInteractive('/design A screen', { agent: 'claude', iv: {} })).toBe(false);
-    expect(designNeedsInteractive('/design A screen', { agent: 'codex', iv: null })).toBe(false);
-  });
-});
-
 
 describe('Design login lifecycle', async () => {
   const { runInNewContext } = await import('node:vm');
@@ -324,7 +350,7 @@ describe('Design login lifecycle', async () => {
     const finish = vi.fn();
     const arm = runInNewContext(`(${functionSource('armDesignLoginWatch')})`, {
       setTimeout, clearTimeout, debug: () => {}, scheduleDesignLoginFinish: finish,
-      DESIGN_LOGIN_WATCH_CAP_MS: 100, DESIGN_LOGIN_SETTLE_MS: 5,
+      DESIGN_LOGIN_WATCH_CAP_MS: 100, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_NO_SCREEN_MS: 1000,
     });
     arm(session);
     expect(iv.listenerCount('pty-data')).toBe(1);
