@@ -30,24 +30,17 @@ describe('New Chat agent switch wiring (source inspection)', () => {
     expect(src).toMatch(/createSession\([\s\S]*?\.\.\.\(agent \? \{ agent \} : \{\}\)/);
   });
 
-  // A fresh Codex session learns its thread id from the stream, so at spawn it
-  // has no journal convo id — and the RPC handler tears such a session down as
-  // unsupported_mode. The RPC path must mint the stable id itself (as /switch
-  // does) and flush the buffered seed so the app can navigate to a convo that
-  // exists.
-  it('mints a journal convo id for a Codex start and flushes the buffered seed', () => {
-    const src = rpcStart();
-    expect(src).toMatch(/AGENT_CODEX[\s\S]*?journalConvoId = newSessionConvoId\(\)/);
-    expect(src).toMatch(/journalConvoId = newSessionConvoId\(\)[\s\S]*?journalFlushForSession\(session\)/);
+  it('assigns a stable conversation id at Codex construction and persists fresh starts', () => {
+    const src = block('function createCodexSessionForRoom(', 'function codexToolIndicator(');
+    expect(src).toContain('journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || newSessionConvoId()');
+    expect(src).toMatch(/sessions\.set\(roomId, session\);[\s\S]*?if \(!resumeSessionId && !options\.journalConvoId && !persisted\?\.journalConvoId\) \{\s*persistSession\(roomId, session\.claudeSessionId, cwd, null\)/);
+    const event = block('function handleCodexEvent(', 'function flushPendingSessionQueue(');
+    expect(event).toContain('if (!session.journalConvoId) session.journalConvoId = event.thread_id;');
   });
 
-  // Bugbot (PR #263): the minted id must ALSO be persisted at once —
-  // journalResumeConvo matches on the persisted journalConvoId/sessionId,
-  // both unset until thread.started, so an idle reap or bridge restart in
-  // that window would orphan the chat the app just opened.
-  it('persists the minted Codex convo id immediately, not only at thread.started', () => {
+  it('persists requested Codex settings before its native thread starts', () => {
     const src = rpcStart();
-    expect(src).toMatch(/const mintedConvoId = session\.agent === AGENT_CODEX && !session\.journalConvoId/);
+    expect(src).toContain('const mintedConvoId = session.agent === AGENT_CODEX && !session.claudeSessionId;');
     expect(src).toMatch(/\(mcpExtras\.length > 0 \|\| model \|\| effort \|\| mintedConvoId\) && \(session\.claudeSessionId \|\| mintedConvoId\)/);
   });
 
