@@ -10934,7 +10934,30 @@ function startCodeUpdateWatcher() {
   }
   const watcher = createCodeUpdateWatcher({
     readHead: () => readHeadReflog(gitDir),
-    busySessions: () => { let n = 0; for (const [, s] of sessions) if (s.alive && s.busy) n++; return n; },
+    // Share the idle reaper's age cap for background work, while a running
+    // turn always holds the update unless forcing is explicitly enabled.
+    busySessions: () => {
+      const live = [...sessions.values()].filter(s => s.alive);
+      if (!live.length) return 0;
+      const table = readProcessTable();
+      const now = Date.now();
+      let n = 0;
+      for (const s of live) {
+        const last = handoffIdleSince(s);
+        // A quiet tool call can outlast the age cap without ending its turn.
+        // Subagent tracking is in memory, so it survives a failed ps read.
+        const hold = s.busy
+          ? { reason: 'turn in progress' }
+          : table.unreadable
+            ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
+            : sessionWorkHold(s, last, now, table);
+        if (hold) {
+          n++;
+          debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
+        }
+      }
+      return n;
+    },
     preflight: () => defaultPreflight(__dirname),
     restart: (info) => {
       if (shuttingDown) return;
@@ -15049,7 +15072,8 @@ function sessionChildPid(session) {
 // `ps` rather than /proc so the same call works on the macOS bridges, and
 // Get-CimInstance on Windows (lib/process-table.js) in the same line shape.
 // Fails closed to an empty table: with no table there are no work children,
-// and the idle clock rules as it did before — never the other way round.
+// and the idle clock rules as it did before. Mark failures so the update
+// watcher can fall back to the in-memory work signals.
 function readProcessTable() {
   try {
     const { file, args: ptArgs } = processTableCommand();
@@ -15059,13 +15083,14 @@ function readProcessTable() {
     return parseProcessTable(execFileSync(file, ptArgs, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }));
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
-    return [];
+    return Object.assign([], { unreadable: true });
   }
 }
 
 // {reason} when this session has work in flight (a turn running, or a live
 // descendant of its claude process that is not one of its configured MCP
-// servers — a tool call, a background task), null when the idle clock
+// servers — a tool call, a background task — or a running subagent),
+// null when the idle clock
 // should rule. See lib/work-hold.js.
 function sessionWorkHold(session, last, now, table) {
   return workHold({
@@ -15073,6 +15098,7 @@ function sessionWorkHold(session, last, now, table) {
     children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
     idleSince: last,
     now,
+    subagentCount: session.subagentConvos?.runningCount() ?? 0,
   });
 }
 
