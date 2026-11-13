@@ -28,6 +28,7 @@ import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatR
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
 import { formatTimelineReadAck, formatTimelineWriteAck } from './lib/timeline-tools.js';
 import { readApiHeaderFile, explainUnauthorized } from './lib/api-header-file.js';
+import { shouldRegister } from './lib/tool-roles.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -53,6 +54,16 @@ const server = new McpServer({
   name: 'ask-user',
   version: '1.0.0',
 });
+
+// Filter both SDK registration methods before any tools are registered.
+// Only a confirmed worker role hides tools; other roles keep the full list.
+const TOOL_ROLE = process.env.BRIDGE_TOOL_ROLE;
+for (const method of ['tool', 'registerTool']) {
+  const register = server[method].bind(server);
+  server[method] = (name, ...args) => shouldRegister(name, TOOL_ROLE)
+    ? register(name, ...args)
+    : undefined;
+}
 
 server.tool(
   'request_secret',

@@ -2540,6 +2540,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
   const coordinator = coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persistedMode);
   options = { ...options, coordinator };
+  options.roleKnown = coordinatorLookup.snapshot().known === true;
   // A Claude session that changes cwd mid-flight (EnterWorktree is the common
   // case) has its transcript relocated to the NEW cwd's project dir, while the
   // bridge's persisted workdir stays where the session was spawned. Resuming
@@ -2703,6 +2704,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // stripped, read-proxy header file, node bin dir on PATH, per-session
   // SHOW_FILE_TOKEN.
   const spawnEnv = buildClaudeSpawnEnv({
+    coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
@@ -3652,6 +3655,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   // Child env (lib/spawn-env.js): same shape as the print spawn.
   const interactiveEnv = buildClaudeSpawnEnv({
+    coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
