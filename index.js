@@ -31,6 +31,7 @@ import { createUnseenClient } from './lib/unseen-client.js';
 import { createUnseenHandlers, formatUnseenNudge } from './lib/unseen-tools.js';
 import { createRoutinesClient } from './lib/routines-client.js';
 import { createRoutineHandlers } from './lib/routines-tools.js';
+import { createUsageHistoryHandler } from './lib/usage-history-tool.js';
 import { createBriefingsClient } from './lib/briefings-client.js';
 import { createBriefingHandlers } from './lib/briefings-tools.js';
 import { createTimelineClient } from './lib/timeline-client.js';
@@ -13342,6 +13343,11 @@ sessionControlHandlers = createSessionControlHandlers({
   log: console,
 });
 
+// usage_history MCP tool: a plain read of the journal's weekly usage history.
+const usageHistoryHandler = createUsageHistoryHandler({
+  fetchUsageHistory: (weeks) => journalPublisher.fetchUsageHistory(weeks),
+});
+
 agentSpawnHandlers = createAgentSpawnHandlers({
   sessions,
   publisher: journalPublisher,
@@ -14010,6 +14016,12 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-chat-read') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatRead,
           (status, b) => debug(`agent-chat-read ${status} ${data?.room_id} ${b.error || `${(b.messages || []).length} messages`}`));
+        return;
+      }
+
+      if (url.pathname === '/usage-history') {
+        await respondAgentChatRoute(res, data, usageHistoryHandler,
+          (status, b) => debug(`usage-history ${status} ${b.error || `${(b.accounts || []).length} accounts`}`));
         return;
       }
 

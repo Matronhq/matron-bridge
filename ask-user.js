@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { SECRET_CONTEXT_MAX_LENGTH } from './lib/secret-context.js';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse, permissionInputRefusal } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
+import { formatUsageHistory } from './lib/usage-history-tool.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { formatSearchAll } from './lib/search-format.js';
@@ -534,6 +535,28 @@ server.tool(
       const boxes = data.boxes || [];
       if (!boxes.length) return { content: [{ type: 'text', text: 'No boxes found.' }] };
       return { content: [{ type: 'text', text: boxes.map((b) => formatBox(b)).join('\n\n') }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'usage_history',
+  "How much of each account's weekly allowance went unused, week by week: per Claude or Codex account (boxes on one login count once), the finished weeks with the percentage left unused when each reset, the week in progress, and the average. Use it when the user asks how much capacity was wasted or spare in past weeks, and in status reports. History starts when the journal began keeping it; agent_boxes has the live meters.",
+  {
+    weeks: z.number().int().min(1).max(104).optional().describe('How many weeks back to look (default 12, max 104)'),
+  },
+  async ({ weeks }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/usage-history`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, ...(weeks !== undefined ? { weeks } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) return { content: [{ type: 'text', text: `usage_history failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      return { content: [{ type: 'text', text: formatUsageHistory(data) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
