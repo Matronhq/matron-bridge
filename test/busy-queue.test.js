@@ -9,6 +9,7 @@ import {
   resolveQueueReleaseTap,
 } from '../lib/busy-queue.js';
 import { compactBatchSize } from '../lib/compact-priority.js';
+import { createQueuedReleaseRetry } from '../lib/queued-release-retry.js';
 
 // Busy-queue magic words, notifications and queue-release taps
 // (lib/busy-queue.js). queuedMessages and queueNotifications must move in
@@ -1644,19 +1645,12 @@ describe('notifyQueuedMessage — compact jump tile', () => {
 
 describe('queued-release publisher wiring', () => {
   it('emitRelease write-aheads before publishing exactly one structured prompt_reply with a deterministic idem_key', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
-    expect(end).toBeGreaterThan(start);
-
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => true); // durable write-ahead
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseRetry({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     try {
       const result = emitRelease('convo-1', {
@@ -1690,16 +1684,12 @@ describe('queued-release publisher wiring', () => {
   });
 
   it('emitRelease fail-closes when the write-ahead put returns false: no mutate, no publish', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => false); // disk fault
     const mutate = vi.fn();
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseRetry({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     const result = emitRelease('convo-1', {
       promptId: 'pr_9',
@@ -1746,7 +1736,7 @@ describe('index.js queued-send finalizer', () => {
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
       {
-        AGENT_CODEX: 'codex',
+        AGENT_CODEX: 'codex', CLAUDE_STEER_ENABLED: false,
         console: { log: vi.fn() },
         dispatchMergedFlush,
         emitRelease,
@@ -1824,22 +1814,30 @@ describe('index.js queued-send finalizer', () => {
     expect(session.queuedMessages).toEqual([...queued, ...later]);
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
+    expect(harness.journalPublishNotice).not.toHaveBeenCalled();
   });
 
-  it('notifies and drops (no retain) when a DEAD/auto-stopped session rejects dispatch', () => {
-    // #161: dead-session flush failure must not strand the batch as a
+  it.each([
+    { alive: false, autoStopped: false, count: 2 },
+    { alive: false, autoStopped: false, count: 1 },
+    { alive: true, autoStopped: true, count: 1 },
+  ])('notifies and drops when dispatch rejects with alive=$alive, autoStopped=$autoStopped, count=$count', ({ alive, autoStopped, count }) => {
+    // A dead-session flush failure must not strand the batch as a
     // permanent retry; every entry was acknowledged with a "📨 Queued" tile,
     // so drop it AND tell the user (matching merged master).
     const harness = loadFlushHarness({ dispatchResult: false });
-    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]];
-    const session = { agent: 'claude', alive: false, busy: false, queuedMessages: null, roomId: '!room' };
+    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]].slice(0, count);
+    const session = { agent: 'claude', alive, _autoStopped: autoStopped, busy: false, queuedMessages: null, roomId: '!room' };
 
     expect(harness.flushQueue(session, queued)).toBe(false);
     expect(session.queuedMessages).toBeNull(); // dropped, not retained
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);
-    expect(harness.journalPublishNotice.mock.calls[0][1]).toMatch(/2 queued messages/);
+    expect(harness.journalPublishNotice).toHaveBeenCalledWith('convo-1', count > 1
+      ? "⚠️ Couldn't deliver 2 queued messages — the session ended before they were sent."
+      : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+    expect(harness.journalPublishNotice.mock.calls[0][2]).toBeUndefined();
   });
 
   it('defers Codex release commitment until the interrupted turn has exited and dispatch succeeds', () => {

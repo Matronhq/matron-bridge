@@ -28,6 +28,7 @@ import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatR
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
 import { formatTimelineReadAck, formatTimelineWriteAck } from './lib/timeline-tools.js';
 import { readApiHeaderFile, explainUnauthorized } from './lib/api-header-file.js';
+import { shouldRegister } from './lib/tool-roles.js';
 
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
@@ -53,6 +54,16 @@ const server = new McpServer({
   name: 'ask-user',
   version: '1.0.0',
 });
+
+// Filter both SDK registration methods before any tools are registered.
+// Only a confirmed worker role hides tools; other roles keep the full list.
+const TOOL_ROLE = process.env.BRIDGE_TOOL_ROLE;
+for (const method of ['tool', 'registerTool']) {
+  const register = server[method].bind(server);
+  server[method] = (name, ...args) => shouldRegister(name, TOOL_ROLE)
+    ? register(name, ...args)
+    : undefined;
+}
 
 server.tool(
   'request_secret',
@@ -419,6 +430,33 @@ server.tool(
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_action_request failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       return { content: [{ type: 'text', text: `Filed ${data.item || 'the request'} for your user. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'foreign_notice_review',
+  "Only in the review turn the bridge starts after you filed a foreign_notice: file your review of that notice for your own user, once. Say what the other side is asking, what your user already has on it, and 1 to 4 things your user might do. The bridge posts it under the notice with one button per action; nothing is done until your user taps one, which reaches you as their own turn.",
+  {
+    asking: z.string().max(1000).describe('What is being asked, in a sentence or two, in your own words'),
+    related: z.string().max(2000).optional().describe("Related work of your user's that you found: missions, items, earlier exchanges with this person. Leave out when there is none"),
+    actions: z.array(z.object({
+      label: z.string().max(40).describe('Button label, e.g. "Reply: yes" or "Ask for more detail"'),
+      does: z.string().max(300).describe('One sentence: what you will do if your user taps it'),
+    })).min(1).max(4).describe('1 to 4 things your user might do, most likely first'),
+  },
+  async ({ asking, related, actions }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-notice-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, asking, related, actions }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_notice_review failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      return { content: [{ type: 'text', text: `Review filed. ${data.note || ''}`.trim() }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }

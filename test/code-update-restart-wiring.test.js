@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { WORK_HOLD_MAX_MS, workHold, liveWorkChildren, parseProcessTable } from '../lib/work-hold.js';
+import { handoffIdleSince } from '../lib/pre-reap-handoff.js';
 
 // Source-text assertions on index.js (the idiom of test/box-status-wiring.js
 // — index.js has no unit harness). The self-restart onto new code only
@@ -35,8 +37,16 @@ describe('code-update self-restart wiring', () => {
     expect(index).not.toMatch(/MAX_DEFER/);
   });
 
-  it('counts mid-turn sessions as alive && busy — the flag /sessions reports and restart_session parks on', () => {
-    expect(fn).toMatch(/busySessions: \(\) => \{[^}]*s\.alive && s\.busy/);
+  it('counts a live session as holding when it is busy (the flag /sessions reports and restart_session parks on), has a background work child, or has a running subagent', () => {
+    const busy = fn.slice(fn.indexOf('busySessions: () => {'), fn.indexOf('preflight:'));
+    expect(busy).toMatch(/filter\(s => s\.alive\)/);
+    expect(busy).toContain('const last = handoffIdleSince(s);');
+    expect(busy).toContain('sessionWorkHold(s, last, now, table)');
+    expect(busy).toContain("const hold = s.busy\n          ? { reason: 'turn in progress' }");
+    expect(busy).toContain('workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })');
+    // One process-table read per poll, shared by all live sessions.
+    expect(busy.match(/readProcessTable\(\)/g)).toHaveLength(1);
+    expect(index).not.toMatch(/restartHold/);
   });
 
   it('restarts through gracefulShutdown with the non-zero exit code, never while already shutting down', () => {
@@ -78,8 +88,82 @@ describe('code-update self-restart wiring', () => {
 
   it('carryOnConvo still delivers the literal "carry on" for a tap, and the marked text for the automatic path', () => {
     const fnCarry = index.slice(index.indexOf('async function carryOnConvo('), index.indexOf('async function carryOnConvo(') + 2400);
-    expect(fnCarry).toMatch(/async function carryOnConvo\(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined\)/);
-    expect(fnCarry).toMatch(/await journalRouteTextToSession\(target, text\);/);
+    expect(fnCarry).toMatch(/async function carryOnConvo\(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined, \{ causes = null, keepRestartBudget = false \} = \{\}\)/);
+    expect(fnCarry).toMatch(/await journalRouteTextToSession\(target, text, \{ causes, keepRestartBudget \}\);/);
     expect(fnCarry).toMatch(/journalResumeConvo\(convoId, resumeNotice\)/);
+  });
+});
+
+// Execute only the watcher callback and its hold helpers, without booting
+// index.js or touching session state on disk.
+describe('code-update work holds', () => {
+  const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const now = 1_700_000_000_000;
+  const output = '10 1 claude\n11 10 sleep infinity\n';
+
+  function functionSource(name) {
+    const start = index.indexOf(`function ${name}(`);
+    return index.slice(start, index.indexOf('\n}\n', start) + 3);
+  }
+
+  function harness({ busy = false, age = 0, subagentCount = 0, unreadable = false, tableOutput = output, alive = true } = {}) {
+    const start = index.indexOf('busySessions: () => {', index.indexOf('function startCodeUpdateWatcher()'));
+    const callback = index.slice(start + 'busySessions: '.length, index.indexOf('    preflight:', start)).trim().replace(/,$/, '');
+    const session = { alive, busy, lastActivityAt: now - age, proc: { pid: 10 }, subagentConvos: { runningCount: () => subagentCount } };
+    const execFileSync = () => {
+      if (unreadable) throw new Error('process table unavailable');
+      return tableOutput;
+    };
+    const make = new Function('sessions', 'Date', 'workHold', 'liveWorkChildren', 'parseProcessTable', 'handoffIdleSince', 'execFileSync', 'processTableCommand', 'stripJournalCreds', 'debug', 'MCP_SERVER_SIGNATURES', `
+      ${functionSource('readProcessTable')}
+      ${functionSource('sessionChildPid')}
+      ${functionSource('sessionWorkHold')}
+      return { busySessions: ${callback}, readProcessTable };
+    `);
+    return make(new Map([['room', session]]), { now: () => now }, workHold, liveWorkChildren, parseProcessTable, handoffIdleSince, execFileSync, () => ({ file: 'ps', args: [] }), () => ({}), () => {}, []);
+  }
+
+  it('holds a running turn even at or beyond the eight-hour age cap', () => {
+    for (const age of [WORK_HOLD_MAX_MS - 1, WORK_HOLD_MAX_MS, WORK_HOLD_MAX_MS + 1]) {
+      expect(harness({ busy: true, age, tableOutput: '' }).busySessions()).toBe(1);
+    }
+    expect(harness({ busy: true, alive: false }).busySessions()).toBe(0);
+  });
+
+  it('stops holding a background process at the existing eight-hour age cap', () => {
+    expect(harness({ age: WORK_HOLD_MAX_MS - 1 }).busySessions()).toBe(1);
+    expect(harness({ age: WORK_HOLD_MAX_MS }).busySessions()).toBe(0);
+    expect(harness({ age: WORK_HOLD_MAX_MS + 1 }).busySessions()).toBe(0);
+    expect(harness({ alive: false }).busySessions()).toBe(0);
+  });
+
+  it('holds a running subagent even with no process children, bounded by the same cap', () => {
+    expect(harness({ subagentCount: 1, tableOutput: '' }).busySessions()).toBe(1);
+    expect(harness({ subagentCount: 0, tableOutput: '' }).busySessions()).toBe(0);
+    expect(harness({ subagentCount: 1, age: WORK_HOLD_MAX_MS, tableOutput: '' }).busySessions()).toBe(0);
+    expect(harness({ subagentCount: 1, age: WORK_HOLD_MAX_MS + 1, tableOutput: '' }).busySessions()).toBe(0);
+  });
+
+  it('distinguishes a failed process-table read from a successful empty table', () => {
+    const failed = harness({ unreadable: true }).readProcessTable();
+    expect(Array.isArray(failed)).toBe(true);
+    expect(failed).toHaveLength(0);
+    expect(failed.unreadable).toBe(true);
+    expect(liveWorkChildren(10, failed)).toEqual([]);
+    expect(harness({ tableOutput: '' }).readProcessTable()).toEqual([]);
+  });
+
+  it('holds an idle parent with a running subagent on process-table failure, bounded by the cap', () => {
+    expect(harness({ unreadable: true, subagentCount: 1 }).busySessions()).toBe(1);
+    expect(harness({ unreadable: true, subagentCount: 1, age: WORK_HOLD_MAX_MS - 1 }).busySessions()).toBe(1);
+    expect(harness({ unreadable: true, subagentCount: 1, age: WORK_HOLD_MAX_MS }).busySessions()).toBe(0);
+    expect(harness({ unreadable: true, subagentCount: 1, age: WORK_HOLD_MAX_MS + 1 }).busySessions()).toBe(0);
+  });
+
+  it('keeps busy turns uncapped on process-table failure', () => {
+    expect(harness({ unreadable: true, busy: false }).busySessions()).toBe(0);
+    expect(harness({ unreadable: true, busy: true }).busySessions()).toBe(1);
+    expect(harness({ unreadable: true, busy: true, age: WORK_HOLD_MAX_MS }).busySessions()).toBe(1);
+    expect(harness({ unreadable: true, busy: true, age: WORK_HOLD_MAX_MS + 1 }).busySessions()).toBe(1);
   });
 });

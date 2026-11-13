@@ -258,9 +258,16 @@ new code on disk and the old process running. The bridge notices by itself:
 it polls its checkout's HEAD reflog, lets a landed update settle for five
 minutes (so `npm install` has finished), proves the tree boots with the same
 preflight the deploy scripts run, and then exits for the supervisor to
-relaunch it at the first poll where no session is mid-turn. A running turn
-is never cut off: the bridge keeps waiting and logs a warning every 30
-minutes. A box that would rather force the restart after a while sets
+relaunch it at the first poll where no session has work in flight: a turn
+running, a background job (shell, monitor) still alive under the session's
+agent process, or a subagent running. A running turn always holds the
+update. Background jobs and subagents share the idle reaper's eight-hour
+cap from the session's last activity, so a stuck background job cannot
+defer updates forever. If the process table cannot be read, running turns
+and subagents still hold the update, with the cap applying only to
+subagents. While waiting,
+the bridge logs a warning every 30 minutes. A box that would rather force
+the restart after a while sets
 `MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
 themselves (`MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` gives them the "Carry on"
 card instead). Sessions between turns resume with their history on their next turn,
@@ -308,6 +315,7 @@ the viewer's environment turns it off.
 | `DEBUG` | Set to `1` to log verbose bridge and coding-agent events | `0` |
 | `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work | `0` |
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
+| `MATRON_CLAUDE_QUEUE_IN_MATRON` | Messages typed during a running print-mode Claude turn wait in Matron's queue. Set to `0` (or `false`/`off`) to write plain messages straight into the running turn instead (see Mid-turn steering) | `1` (queue in Matron) |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
@@ -320,6 +328,8 @@ the viewer's environment turns it off.
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
+| `BRIDGE_TOOL_FILTER` | Set to `1` to hide Coordinator-only `ask-user` MCP tools from confirmed Claude worker sessions, in print and interactive modes. Unknown roles keep the full list. | off |
+| `BRIDGE_TOOL_ROLE` | Set per Claude session by the bridge when filtering is enabled: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
@@ -337,6 +347,14 @@ the viewer's environment turns it off.
 Voice notes are transcribed by the journal: at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`), falling back to its own whisper when the cloud call fails; tracker-item voice notes also use the journal's whisper when it has no key (see the journal's protocol doc). For a voice note sent in chat the bridge asks `GET /media/:id/transcript`; when the journal has no words for it (its job failed, or never ran) the bridge asks it to try again with `POST /media/:id/transcript` and waits for the answer. A voice note on a tracker item follows the same order, and the words are written back to the item's comment. Only when the journal still has no words does the bridge run its own whisper, and only where it is installed (see `WHISPER_MODEL_PATH`); otherwise a chat voice note is not delivered (any text typed with it still is) and the user is told why, and a tracker item's turn goes out with `(transcription failed)` in place of the words (`(no transcript)` when the journal heard none). Videos sent in chat arrive as key frames, which needs ffmpeg and ffprobe on this machine, narrated from the journal's timestamped transcript of their audio, or by the local whisper fallback where installed.
 
 ## Memory & MCP tuning
+
+Tool filtering reduces the worker's tool list; it does not change authorization.
+The list in `lib/tool-roles.js` covers project close/merge, routines, consent,
+session control, briefings, unseen summaries, and timeline read/write.
+`permission_request` and ordinary worker tools remain available. Roles are fixed
+at spawn: configuration changes or promotion to Coordinator need a respawn
+(for example, `/restart`) to refresh the list. Codex sessions and mobile clients
+are unaffected; this adds no client polling or background work.
 
 Sessions are lean by default so the bridge runs on small VPS boxes. Only the
 bridge's own `ask-user` MCP loads per session; everything else is opt-in.
@@ -462,6 +480,12 @@ CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a reposito
 8. Agent handoffs persist one native session ID per provider plus a shared transcript cursor; the next prompt carries a bounded unseen transcript delta
 9. Crashed sessions auto-restart up to 3 times
 10. Messages sent while an agent is busy are queued and sent when the turn completes
+
+### Mid-turn steering (Claude, print mode)
+
+Off by default: messages queue in Matron. With `MATRON_CLAUDE_QUEUE_IN_MATRON=0`, a plain message typed while a print-mode Claude turn is running goes straight into the running `claude` process instead of the busy queue, through the same `flushQueue` seam that Codex steering uses. The chat shows `↪ Sent into the running turn` in place of the queued card. Steering is not an interrupt: no tool call is cut off. Claude sees the message once the current tool call finishes, in the same turn, or, if the turn ends first, as its own turn right after it; the session stays busy through that follow-up turn so queued work does not jump ahead of it. The message's cause (the user's message, or the item reply) is merged into the running turn, as for a Codex steer. A steered message Claude never ran goes back on the queue when the session carries on (a failed write, a cancellation by an interrupt, or a crash that respawns the session).
+
+Anything that cannot steer is queued exactly as before: slash and `!` commands, reminders, timers and carry-on taps, media, room messages, a turn another person started, a session with an open question or plan, a pending interrupt, a parked restart or command, a turn the CLI has not opened yet, and any message arriving while something is already queued (order is preserved). `send` and `cancel` still apply to whatever is queued.
 
 ## Development
 
