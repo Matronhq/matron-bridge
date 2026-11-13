@@ -109,7 +109,7 @@ import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
-import { SubagentWatcher } from './lib/subagent-watcher.js';
+import { SubagentWatcher, routeWorkflowStreamEvent } from './lib/subagent-watcher.js';
 import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
@@ -4646,6 +4646,8 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
   session.subagentWatcher.on('subagent-start', payload => handleSubagentStart(session, payload));
   session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
+  // Workflow-tool agents settle one by one from the run's journal.
+  session.subagentWatcher.on('subagent-done', ({ agentId }) => session.subagentConvos?.finishAgent(agentId));
   session.subagentWatcher.snapshot();
 }
 
@@ -4759,12 +4761,12 @@ function reconcileStrandedSubagents(reason = 'startup') {
 // Watcher discovery: publish the child convo (running, linked to the parent,
 // titled from the sidecar meta) the instant the subagent's transcript appears,
 // even before it emits any event.
-function handleSubagentStart(session, { agentId, label, agentType }) {
+function handleSubagentStart(session, { agentId, label, agentType, workflowRunId, workflowPhase }) {
   if (!session || !session.subagentConvos) return;
-  session.subagentConvos.discover(agentId, { label, agentType });
+  session.subagentConvos.discover(agentId, { label, agentType, workflowRunId, workflowPhase });
 }
 
-function handleSubagentEvent(session, { agentId, label, agentType, event }) {
+function handleSubagentEvent(session, { agentId, label, agentType, workflowRunId, workflowPhase, event }) {
   if (!session || !session.alive) return;
   if (!event || !event.message) return;
   const content = event.message.content;
@@ -4774,7 +4776,7 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
   // Ensure the child convo exists, refresh its title, and publish the
   // per-subagent status (model/context from THIS subagent's own event). The
   // returned child carries the convo id every publish below routes to.
-  const child = session.subagentConvos.onEvent(agentId, { label, agentType, event });
+  const child = session.subagentConvos.onEvent(agentId, { label, agentType, workflowRunId, workflowPhase, event });
   if (!child) return;
   const convoId = child.convoId;
 
@@ -4894,6 +4896,12 @@ function handleClaudeEvent(session, event) {
   if (session.claudeSessionId && !session.subagentWatcher) {
     setupSubagentWatcher(session, session.workdir, session.claudeSessionId);
   }
+
+  // Workflow-tool runs: the Workflow tool_use, its launch tool_result (run id)
+  // and the run's task_notification drive per-run discovery of
+  // subagents/workflows/<runId>/ agents. One seam; the routing lives in
+  // lib/subagent-watcher.js where it is tested with real event shapes.
+  routeWorkflowStreamEvent(session.subagentWatcher, event);
 
   // Log all event types for plan mode debugging
   if (event.type) {
