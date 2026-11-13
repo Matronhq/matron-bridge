@@ -1398,8 +1398,8 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live) derived._badModelRecovered = !!live._badModelRecovered;
   if (live) derived._fableStallSwitched = !!live._fableStallSwitched;
   if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;
-  // Whether the LLM title is earned (llmTitleEarned in maybeUpdatePinnedSummary's
-  // neighbourhood) — only once the live session knows; unknown keeps the record's.
+  // Whether the LLM title is earned (llmTitleEarned in lib/title-summary.js)
+  // — only once the live session knows; unknown keeps the record's.
   if (typeof live?._llmTitleEarned === 'boolean') derived.llmTitleEarned = live._llmTitleEarned;
   // The Claude effort level the bridge last wrote (lib/effort-tracker.js),
   // so a resume passes it back as --effort (spawnEffortFor). Only a live
