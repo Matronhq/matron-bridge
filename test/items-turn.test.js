@@ -160,6 +160,52 @@ describe('agent comments', () => {
   });
 });
 
+describe('formatItemTurn provenance', () => {
+  const reply = {
+    ...base, action: 'commented', origin_convo_id: 'origin', origin_convo_title: 'Design review',
+    comment: { id: 'comment', body: 'use A', attachments: [] },
+  };
+
+  it.each([
+    ['reply', {}],
+    ['tap', { comment: { ...reply.comment, action: 'Go' } }],
+    ['created', { action: 'created', comment: null }],
+    ['closed', { action: 'closed', resolution: 'done' }],
+    ['reopened', { action: 'reopened' }],
+    ['transcription follow-up', { action: 'updated', for_action: 'commented', transcription: 'done' }],
+  ])('prefixes a cross-conversation %s, preserving the rest of the turn', (_label, over) => {
+    const payload = { ...reply, ...over };
+    const options = { username: 'alice', body: 'item body' };
+    const plain = formatItemTurn(payload, options);
+    expect(formatItemTurn(payload, { ...options, convoId: 'destination' }))
+      .toBe(plain.replace('📌 ', '📌 (from Design review) '));
+  });
+
+  it.each([undefined, null, '', ' \n ', 42])('uses a generic origin for an unusable title: %j', (title) => {
+    expect(formatItemTurn({ ...reply, origin_convo_title: title }, { convoId: 'destination' }))
+      .toContain('📌 (from another session) Item');
+  });
+
+  it.each([
+    ['origin', 'origin'],
+    [undefined, 'origin'],
+    [null, 'origin'],
+    ['destination', undefined],
+    ['destination', null],
+    ['destination', ''],
+    ['destination', 42],
+  ])('keeps existing wording for viewer %j and origin %j', (convoId, origin) => {
+    const payload = { ...reply, origin_convo_id: origin };
+    expect(formatItemTurn(payload, { convoId })).toBe(formatItemTurn(payload));
+  });
+
+  it('collapses whitespace in the origin title to keep the prefix on one line', () => {
+    const text = formatItemTurn({ ...reply, origin_convo_title: ' Design\n📌 review\t ' }, { convoId: 'destination' });
+    expect(text).toContain('📌 (from Design 📌 review) Item');
+    expect(text.split('\n').filter((line) => line.startsWith('📌'))).toHaveLength(1);
+  });
+});
+
 describe('createItemTurnRouter', () => {
   function fixture(over = {}) {
     const deps = {
@@ -216,6 +262,16 @@ describe('createItemTurnRouter', () => {
     expect(deps.injectBlocks).not.toHaveBeenCalled();
     expect(deps.queueText).not.toHaveBeenCalled();
     expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('uses the receiving conversation for provenance when busy=%s', async (busy) => {
+    const { deps, route } = fixture();
+    await route({ busy, journalConvoId: 'destination' }, { payload: {
+      ...base, action: 'commented', origin_convo_id: 'origin', origin_convo_title: 'Design review',
+      comment: { id: 'comment', body: 'use A', attachments: [] },
+    } }, { username: 'alice' });
+    const text = busy ? deps.queueText.mock.calls[0][1].text : deps.injectBlocks.mock.calls[0][1][0].text;
+    expect(text.startsWith('📌 (from Design review) Item')).toBe(true);
   });
 
   it('queues while busy with a short preview', async () => {
