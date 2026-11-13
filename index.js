@@ -113,7 +113,7 @@ import { SubagentWatcher } from './lib/subagent-watcher.js';
 import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
-import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
+import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks, removeCodexSinkForSession } from './lib/codex-paths.js';
 import { hookEntry } from './lib/hook-command.js';
 import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
@@ -4772,6 +4772,17 @@ function teardownSubagentTracking(session) {
   if (session.codexWatcher) {
     session.codexWatcher.stop().catch(() => {});
     session.codexWatcher = null;
+  }
+  // Use the same visualization gate as watcher setup, even if setup failed.
+  // Remove once per session object, and never while another live session
+  // owns the same id: teardown runs again from the old process's close event,
+  // which can land after a resume has recreated the sink.
+  const vizEnv = session.codexSpawnEnv || process.env;
+  if (vizEnv.MATRON_CODEX_VIZ === '1' && session.claudeSessionId && !session._codexSinkRemoved) {
+    session._codexSinkRemoved = true;
+    const resumed = [...sessions.values()].some(
+      (other) => other !== session && other.alive !== false && other.claudeSessionId === session.claudeSessionId);
+    if (!resumed) removeCodexSinkForSession(session.claudeSessionId);
   }
   if (session.subagentConvos) {
     session.subagentConvos.finishAll();
