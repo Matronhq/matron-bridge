@@ -6084,8 +6084,8 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // seam clears busy but keeps the running turn, so the reply typed into it
   // joins that turn rather than relabelling it, and a "no causes" side counts
   // as `other`. Mid-turn input (busy) adds its causes when it has some.
-  const beganTurn = beginOrJoinTurn(session, causes);
   const wasBusy = session.busy;
+  const beganTurn = beginOrJoinTurn(session, causes);
   session.busy = true;
   if (!steering) {
     // Only a write that starts a turn from idle advances the generation. A busy
