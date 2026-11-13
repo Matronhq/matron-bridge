@@ -76,6 +76,7 @@ import {
 import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
+import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import {
   resolveInteractive,
   resolveModel,
@@ -7814,6 +7815,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`Waiting for turn to finish before restarting${replacedNote}. Send again with --force to restart immediately.`);
         return;
       }
+      if (journalMediaRouter.hasInflightMedia(existing)) {
+        await sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+        return;
+      }
       // A forced restart discards any parked one along with `existing` —
       // recreateSession copies fields onto the replacement explicitly, and
       // _deferredCommandText is deliberately not among them.
@@ -9809,6 +9814,7 @@ const journalMediaRouter = createJournalMediaRouter({
   // rides in an injectBlocks turn, so the words are mirrored on their own.
   mirrorText: (session, text) => journalPublishUserItem(session, 'publishText', { body: text, from: 'user' }),
   queueMedia: (session, entry) => journalQueueMedia(session, entry),
+  isCanonicalSession: (session) => !!session?.alive && sessions.get(session.roomId) === session,
   echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
   escapeHtml,
@@ -14386,7 +14392,9 @@ function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.ag
 
 async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   const existing = sessions.get(roomId);
-  const decision = canSwitchAgent(existing, targetAgent);
+  const decision = canSwitchAgent(existing, targetAgent, {
+    hasInflightMedia: journalMediaRouter.hasInflightMedia(existing),
+  });
   if (!decision.ok) {
     await sendReply(decision.message);
     return null;
@@ -14741,7 +14749,9 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     }
     return switched;
   }
-  const decision = planPrintModelSwitch(session, arg);
+  const decision = planPrintModelSwitch(session, arg, {
+    hasInflightMedia: journalMediaRouter.hasInflightMedia(session),
+  });
   if (decision.defer) {
     // Mid-turn: park the switch on the shared deferred-command stash (see
     // dispatchDeferredCommand). The turn-end seam replays `!model <alias>`
@@ -14823,7 +14833,9 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
   }
-  const decision = planModeSwitch(session, wantInteractive);
+  const decision = planModeSwitch(session, wantInteractive, {
+    hasInflightMedia: journalMediaRouter.hasInflightMedia(session),
+  });
   if (!decision.ok) {
     // `refusalAnnouncement` replaces planModeSwitch's message for flows the
     // user didn't initiate as a mode switch (the /login auto-return): a bare
@@ -14864,6 +14876,11 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
 function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
+  // Recheck at teardown, including attachments arriving during a reply await.
+  if (journalMediaRouter.hasInflightMedia(existing)) {
+    sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+    return null;
+  }
   const sessionId = existing.claudeSessionId;
   // PR #151's pre-init resume gate, extended to this shared teardown path:
   // --resume only a session Claude actually persisted (confirmed on init,
