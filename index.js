@@ -6941,14 +6941,17 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     // model may still have seen is counted too. Never replaced.
     const steerCauses = queueCauses(queued);
     if (steerCauses) mergeIntoTurn(session, steerCauses);
-    session._codexSteerPending = { queued };
+    const steerPending = { queued, handedOff: false };
+    session._codexSteerPending = steerPending;
     void session.codex.steer(blocks).then(sent => {
       session._codexSteerPending = false;
       if (!session.alive || sessions.get(session.roomId) !== session) {
         // The replacement session may still hold these entries (restart with
         // preserveQueue); only clean up ones nobody retains.
+        // handedOff: killSession gave this batch to the replacement, which may
+        // already have sent it; never delete files the new turn was told to read.
         const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
-        if (!sent) for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
+        if (!sent && !steerPending.handedOff) for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
         return;
       }
       if (sent) {
@@ -6971,6 +6974,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       session._codexSteerPending = false;
       if (!session.alive || sessions.get(session.roomId) !== session) {
         const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
+        if (steerPending.handedOff) return;
         for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
         return;
       }
@@ -15304,6 +15308,7 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   if (!session) return;
   if (preserveQueue && session._codexSteerPending?.queued) {
     restoreQueuedBatch(session, session._codexSteerPending.queued);
+    session._codexSteerPending.handedOff = true;
     session._codexSteerPending = false;
     session._codexUncertainSteer = true;
     journalPublishNotice(journalConvoIdFor(session), 'Restart interrupted a send-now acknowledgement. Messages are retained but held; check the response before resending.');

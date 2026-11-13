@@ -24,41 +24,43 @@ describe('saved attachments', () => {
     expect(fs.readFileSync(target, 'utf8')).toBe('later upload');
   });
 
-  it('reselects after an install collision without replacing the existing upload', () => {
+  it('reselects after a name collision without replacing the existing upload', () => {
+    fs.writeFileSync(target, 'existing');
     const next = path.join(dir, 'report-2.pdf');
-    const fsImpl = { ...fs, linkSync: (source, dest) => {
-      if (dest === target) fs.writeFileSync(target, 'existing');
-      fs.linkSync(source, dest);
-    } };
-    const saved = writeSavedMediaFile(target, Buffer.from('new'), { fsImpl, reselectPath: () => next });
+    const saved = writeSavedMediaFile(target, Buffer.from('new'), { reselectPath: () => next });
     expect(saved.path).toBe(next);
     expect(fs.readFileSync(target, 'utf8')).toBe('existing');
     expect(fs.readFileSync(next, 'utf8')).toBe('new');
     expect(fs.readdirSync(dir).sort()).toEqual(['report-2.pdf', 'report.pdf']);
   });
 
-  it.each(['writeFileSync', 'fsyncSync', 'linkSync'])('removes temporary files when %s fails', (operation) => {
-    const fsImpl = { ...fs, [operation]: () => { throw new Error('disk failure'); } };
+  it('does not need hard links and leaves no temporary files', () => {
+    const fsImpl = { ...fs, linkSync: () => { throw Object.assign(new Error('no links'), { code: 'EPERM' }); } };
+    const saved = writeSavedMediaFile(target, Buffer.from('new'), { fsImpl });
+    expect(fs.readFileSync(saved.path, 'utf8')).toBe('new');
+    expect(fs.readdirSync(dir)).toEqual(['report.pdf']);
+  });
+
+  it('removes the partial file it created when the write fails', () => {
+    const fsImpl = { ...fs, writeFileSync: (p, b, o) => {
+      fs.writeFileSync(p, 'par', o);
+      throw new Error('disk failure');
+    } };
     expect(() => writeSavedMediaFile(target, Buffer.from('new'), { fsImpl })).toThrow('disk failure');
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 
-  it('syncs the temporary file through a writable descriptor and compares identities as bigint', () => {
-    const modes = [];
+  it('compares identities as bigint', () => {
     const stats = [];
-    const fsImpl = { ...fs,
-      openSync: (p, mode) => { modes.push(mode); return fs.openSync(p, mode); },
-      lstatSync: (p, opts) => { stats.push(opts); return fs.lstatSync(p, opts); },
-    };
+    const fsImpl = { ...fs, lstatSync: (p, opts) => { stats.push(opts); return fs.lstatSync(p, opts); } };
     const saved = writeSavedMediaFile(target, Buffer.from('x'), { fsImpl });
-    expect(modes[0]).toBe('r+');
     expect(typeof saved.identity.ino).toBe('bigint');
     makeIdentityAwareCleanup(saved.path, saved.identity, { fsImpl })();
     expect(stats.every(o => o && o.bigint === true)).toBe(true);
     expect(fs.existsSync(target)).toBe(false);
   });
 
-  it('cleans the temporary file when name selection throws', () => {
+  it('leaves the existing upload when name selection throws', () => {
     fs.writeFileSync(target, 'existing');
     expect(() => writeSavedMediaFile(target, Buffer.from('new'), {
       reselectPath: () => { throw new Error('selection failed'); },

@@ -110,3 +110,14 @@ describe('queued attachment cancellation', () => {
     expect(cleanup).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('stale Codex steer wiring', () => {
+  it('marks the batch handed off in killSession and honours it in both stale branches', async () => {
+    const { readFileSync } = await import('node:fs');
+    const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    expect(index).toContain('session._codexSteerPending.handedOff = true;');
+    const start = index.indexOf('const steerPending = {');
+    const steer = index.slice(start, index.indexOf("return 'deferred';", start));
+    expect(steer.match(/steerPending\.handedOff/g)).toHaveLength(2);
+  });
+});
