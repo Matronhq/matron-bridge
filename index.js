@@ -12460,7 +12460,7 @@ function journalHandleInboundEvent(frame) {
   // frame pushes the quiet-timer out (during the post-reconnect burst these are
   // the replay frames, which carry the release echoes), so reconcile runs only
   // once that stream has gone quiet. No-op after the one-shot reconcile has fired
-  // (releaseReconcilePending() is false), so steady-state traffic pays only a null check.
+  // (releaseReconcilePending() is false), so steady-state traffic pays only that check.
   if (releaseReconcilePending()) scheduleReleaseReconcile();
 }
 

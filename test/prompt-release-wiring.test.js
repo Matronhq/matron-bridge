@@ -48,7 +48,9 @@ describe('queued-message cards', () => {
     const retry = readFileSync(new URL('../lib/queued-release-retry.js', import.meta.url), 'utf8');
     const emitStart = retry.indexOf('function emitRelease(');
     expect(emitStart, 'function emitRelease( not found in lib/queued-release-retry.js').toBeGreaterThan(-1);
-    const emit = retry.slice(emitStart, retry.indexOf('\n  function ', emitStart));
+    const emitEnd = retry.indexOf('\n  function ', emitStart);
+    expect(emitEnd, 'end of emitRelease not found in lib/queued-release-retry.js').toBeGreaterThan(emitStart);
+    const emit = retry.slice(emitStart, emitEnd);
     expect(emit).toMatch(/publishPromptReply\(convoId, \{\s*kind: 'queued_release',\s*prompt_id: promptId,/);
   });
 
