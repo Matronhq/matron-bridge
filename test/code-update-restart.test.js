@@ -111,11 +111,11 @@ describe('resolveGitDir / readHeadReflog', () => {
 describe('defaultPreflight', () => {
   it('runs node --check then the import test, in the checkout, and reports the first failure', async () => {
     const calls = [];
-    const exec = (bin, args, opts, cb) => { calls.push({ bin, args, cwd: opts.cwd }); cb(null, '', ''); };
+    const exec = (bin, args, opts, cb) => { calls.push({ bin, args, cwd: opts.cwd, env: opts.env }); cb(null, '', ''); };
     expect(await defaultPreflight('/srv/bridge', { exec })).toEqual({ ok: true });
-    expect(calls.map(c => c.args[0])).toEqual(['--check', '--input-type=module']);
+    expect(calls.map(c => c.args)).toEqual([['--check', 'index.js'], ['index.js']]);
     expect(calls.every(c => c.cwd === '/srv/bridge' && c.bin === process.execPath)).toBe(true);
-    expect(calls[1].args[2]).toMatch(/import\('sharp'\)/);
+    expect(calls[1].env.MATRON_BRIDGE_PREFLIGHT).toBe('module');
 
     const failing = (bin, args, opts, cb) => cb(new Error('exit 1'), '', 'SyntaxError: Unexpected token\n    at line 3\n');
     const res = await defaultPreflight('/srv/bridge', { exec: failing });
