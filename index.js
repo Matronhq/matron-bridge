@@ -153,7 +153,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
-import { sendPrintInterrupt } from './lib/print-interrupt.js';
+import { sendPrintInterrupt, applyInterruptAck } from './lib/print-interrupt.js';
 import {
   checkFileLink,
   validateAndOpen,
@@ -4556,6 +4556,7 @@ function submitAnswer(session, answerText, { causes = null } = {}) {
     // begins the turn (ended by its result event) or joins the running one.
     const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
+    bumpTurnGeneration(session);
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
@@ -5817,6 +5818,10 @@ function handleClaudeEvent(session, event) {
       break;
     }
 
+    case 'control_response':
+      applyInterruptAck(session.pendingInterrupt, event);
+      break;
+
     // Progress on a message steered into a running turn (lib/claude-steer.js).
     // Bookkeeping only: never output, unknown uuids ignored.
     case 'command_lifecycle': {
@@ -6082,6 +6087,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   const beganTurn = beginOrJoinTurn(session, causes);
   session.busy = true;
   if (!steering) {
+    bumpTurnGeneration(session);
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
@@ -6393,6 +6399,7 @@ function beginHeldSteerTurn(session) {
   clearPendingInterrupt(session);
   session.responseBuffer = '';
   session.toolCalls = [];
+  bumpTurnGeneration(session);
   // The CLI has not opened the held turn yet (its system/init does).
   session._turnInitSeen = false;
   // No inflightMarker.noteTurnStart: the result path skipped noteTurnEnd, so
@@ -12475,6 +12482,7 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
     // result event ends the turn).
     const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
+    bumpTurnGeneration(session);
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
     session._turnInitSeen = false;
     const jsonMsg = JSON.stringify({
@@ -14978,29 +14986,44 @@ async function printModeInterrupt(session, sendReply) {
     await sendReply('Interrupt already sent — still waiting for claude to stop this turn.');
     return;
   }
-  session.pendingInterrupt = sendPrintInterrupt({
+  const armedGeneration = session.turnGeneration;
+  const interruptHandle = sendPrintInterrupt({
     stdin: session.proc.stdin,
+    ackTrusted: session._turnInitSeen === true,
+    shouldFireWedge: () => session.turnGeneration === armedGeneration,
+    onSettle: () => {
+      if (session.pendingInterrupt === interruptHandle) session.pendingInterrupt = null;
+    },
     onWedge: () => {
-      session.pendingInterrupt = null;
       if (!session.busy) return;
       session.busy = false;
       releaseSteersToCli(session);
       // Deliberately NO noteTurnEnd: this is a defensive unstick after an
-      // interrupt got no acknowledgement, and the reply below says so — "the
+      // interrupt never produced a result, and the reply below says so — "the
       // turn may still be running". Further agent output is still possible,
       // and the `result` seam will clear the marker if it arrives. Clearing
       // here would drop a card for a turn that really was interrupted.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
-      Promise.resolve(sendReply('⚠️ No response to the interrupt after 10s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.')).catch(() => {});
+      const reason = interruptHandle.acknowledged
+        ? 'Claude acknowledged the interrupt but the turn did not end within 60s'
+        : 'No response to the interrupt after 10s';
+      Promise.resolve(sendReply(`⚠️ ${reason} — cleared busy state. The turn may still be running; /stop kills the session if it stays stuck.`)).catch(() => {});
     },
     onError: (err) => {
       Promise.resolve(sendReply(`Could not send interrupt: ${err.message}`)).catch(() => {});
     },
   });
+  session.pendingInterrupt = interruptHandle;
   if (session.pendingInterrupt) {
     await sendReply('⏹ Interrupt sent — waiting for claude to stop this turn.');
   }
+}
+
+// Steering joins an existing turn; normal writes and held follow-up turns
+// advance this counter so an old interrupt cannot clear a newer turn's busy.
+function bumpTurnGeneration(session) {
+  session.turnGeneration = (session.turnGeneration || 0) + 1;
 }
 
 // Cancels a pending interrupt's wedge timer. Called wherever busy state
