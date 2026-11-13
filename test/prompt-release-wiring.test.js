@@ -23,6 +23,9 @@ describe('timer and reminder cards', () => {
     const payload = body('function timerCardPayload(', '\n}\n');
     expect(payload).toContain('prompt_id: timerPromptId(record),');
     expect(payload).toContain('blocking: false,');
+    // ...and silent: the card is a record, so it sends no push and never
+    // counts as unread or unseen.
+    expect(payload).toContain('silent: true,');
     expect(payload).toContain("mode: 'pick_one',");
     const cards = index.match(/'pick_one', summary, escapeHtml\(summary\), timerCardPayload\(record, summary\)\);/g) || [];
     // The typed /timer confirmation and the agent's reminder_create card.

@@ -9458,10 +9458,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // session at all). Fails open like every other journal call.
 // `notice` ({kind, icon, summary}, lib/system-notice.js) marks a notice the
 // apps may show as one compact row that expands to `body`.
-function journalPublishNotice(convoId, body, notice = null) {
+// `silent` marks a line that is only a record (see timerCardPayload): the
+// journal and the apps show it and tell nobody.
+function journalPublishNotice(convoId, body, notice = null, { silent = false } = {}) {
   if (!JOURNAL_ENABLED || !convoId) return;
   try {
-    journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}) });
+    journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}), ...(silent ? { silent: true } : {}) });
   } catch (e) {
     try { console.warn(`[journal-input] notice publish failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -10869,6 +10871,11 @@ function formatTimerFireAt(record) {
 // unanswered prompt, whether the timer is still pending, fired or
 // cancelled. The prompt_id (lib/timer-command.js timerPromptId) names the
 // card should anything need to refer to it.
+// It is also `silent: true`: the card is the chat's record of what was
+// scheduled, there to be seen and undone, and nobody needs telling about it.
+// A silent event sends no push and never counts as unread or unseen, on the
+// journal and in the apps. What the timer delivers when it fires is an
+// ordinary message and notifies as usual.
 function timerCardPayload(record, summary) {
   return {
     question: summary,
@@ -10876,6 +10883,7 @@ function timerCardPayload(record, summary) {
     mode: 'pick_one',
     prompt_id: timerPromptId(record),
     blocking: false,
+    silent: true,
   };
 }
 
@@ -10899,7 +10907,7 @@ async function announceAgentReminder(session, record) {
       [timerSendNowButton(record.id), timerCancelButton(record.id)],
       'pick_one', summary, escapeHtml(summary), timerCardPayload(record, summary));
   } else {
-    journalPublishNotice(journalConvoIdFor(session), summary);
+    journalPublishNotice(journalConvoIdFor(session), summary, null, { silent: true });
   }
 }
 
