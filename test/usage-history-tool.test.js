@@ -61,15 +61,17 @@ describe('usage_history', () => {
     const asked = [];
     const handler = createUsageHistoryHandler({ fetchUsageHistory: async (w) => { asked.push(w); return HISTORY; } });
     expect(await handler({ roomId: 'r' })).toEqual({ status: 200, body: HISTORY });
-    expect((await handler({ weeks: 4 })).status).toBe(200);
+    expect((await handler({ roomId: 'r', weeks: 4 })).status).toBe(200);
     expect(asked).toEqual([12, 4]);
-    for (const weeks of [0, 105, 1.5, '4']) expect((await handler({ weeks })).status).toBe(400);
+    for (const weeks of [0, 105, 1.5, '4']) expect((await handler({ roomId: 'r', weeks })).status).toBe(400);
+    // No room named: refused before the journal is asked.
+    expect((await handler({ weeks: 4 })).status).toBe(400);
     expect(asked).toEqual([12, 4]);
   });
 
   it('reports a journal that does not answer', async () => {
     const handler = createUsageHistoryHandler({ fetchUsageHistory: async () => null });
-    const r = await handler({});
+    const r = await handler({ roomId: 'r' });
     expect(r.status).toBe(502);
     expect(r.body.error).toMatch(/usage\/history/);
   });
