@@ -9,6 +9,7 @@ import {
   resolveQueueReleaseTap,
 } from '../lib/busy-queue.js';
 import { compactBatchSize } from '../lib/compact-priority.js';
+import { createQueuedReleaseRetry } from '../lib/queued-release-retry.js';
 
 // Busy-queue magic words, notifications and queue-release taps
 // (lib/busy-queue.js). queuedMessages and queueNotifications must move in
@@ -1644,19 +1645,12 @@ describe('notifyQueuedMessage — compact jump tile', () => {
 
 describe('queued-release publisher wiring', () => {
   it('emitRelease write-aheads before publishing exactly one structured prompt_reply with a deterministic idem_key', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
-    expect(end).toBeGreaterThan(start);
-
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => true); // durable write-ahead
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseRetry({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     try {
       const result = emitRelease('convo-1', {
@@ -1690,16 +1684,12 @@ describe('queued-release publisher wiring', () => {
   });
 
   it('emitRelease fail-closes when the write-ahead put returns false: no mutate, no publish', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => false); // disk fault
     const mutate = vi.fn();
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseRetry({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     const result = emitRelease('convo-1', {
       promptId: 'pr_9',

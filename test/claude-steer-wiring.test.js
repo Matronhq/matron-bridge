@@ -67,7 +67,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     },
     findSessionByClaudeSessionId: (convoId) => convoId === 'convo' ? session : null,
     journalInputConsumer: Object.assign(vi.fn(), { queueRelease: null }),
-    _releaseReconcileTimer: null,
+    releaseReconcilePending: () => false,
     journalConvoIdFor: () => 'convo',
     journalSessionCommandCtx: () => ctxObj,
     dispatchJournalBridgeCommand: vi.fn(async () => false),
