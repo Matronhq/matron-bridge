@@ -113,9 +113,55 @@ describe('session replacement', () => {
     const start = source.indexOf('function recreateSession(');
     const end = source.indexOf('\n}', start) + 2;
     const sendReply = vi.fn();
-    const context = vm.createContext({ sessions: new Map([['room', {}]]), journalMediaRouter: { hasInflightMedia: () => true }, INFLIGHT_MEDIA_REPLACE_REFUSAL });
+    const context = vm.createContext({ sessions: new Map([['room', {}]]), mediaGateActive: () => true, INFLIGHT_MEDIA_REPLACE_REFUSAL });
     vm.runInContext(source.slice(start, end), context);
     expect(context.recreateSession('room', {}, { sendReply })).toBeNull();
     expect(sendReply).toHaveBeenCalledWith(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+  });
+
+  const slice = (name, next) => {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    const start = source.indexOf(name);
+    if (start < 0) return '';
+    return source.slice(start, source.indexOf(next, start));
+  };
+
+  it('does not gate a replay of an already accepted deferred command', () => {
+    const src = slice('function mediaGateActive(', 'function dispatchDeferredCommand(');
+    let inflight = true;
+    const context = vm.createContext({ journalMediaRouter: { hasInflightMedia: () => inflight } });
+    vm.runInContext(src, context);
+    expect(context.mediaGateActive({})).toBe(true);
+    expect(context.mediaGateActive({ _replayingDeferred: true })).toBe(false);
+    inflight = false;
+    expect(context.mediaGateActive({})).toBe(false);
+  });
+
+  it('marks the replay for its whole duration and clears it afterwards', async () => {
+    const src = slice('function dispatchDeferredCommand(', 'function finishCodexTurn(');
+    const session = { alive: true, roomId: 'room', _deferredCommandText: '!restart --force' };
+    let seen;
+    const done = deferred();
+    const context = vm.createContext({
+      sessions: new Map([['room', session]]),
+      journalSessionCommandCtx: () => ({ sendReply: () => {}, sendHtml: () => {}, sender: 's' }),
+      handleCommand: () => { seen = session._replayingDeferred; return done.promise; },
+    });
+    vm.runInContext(src, context);
+    expect(context.dispatchDeferredCommand(session)).toBe(true);
+    expect(seen).toBe(true);
+    done.resolve();
+    await done.promise; await Promise.resolve(); await Promise.resolve();
+    expect(session._replayingDeferred).toBe(false);
+  });
+
+  it('the restart command returns without a summary when recreateSession refuses', () => {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    expect(source).toContain('if (!restarted) return;\n      // Persist AFTER the recreate');
+  });
+
+  it('counts in-flight media as occupied in the Coordinator transition', () => {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    expect(source).toContain('occupied: sessionOccupiedForRoomDelivery(session) || mediaGateActive(session),');
   });
 });
