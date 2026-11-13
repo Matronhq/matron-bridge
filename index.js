@@ -6085,9 +6085,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // joins that turn rather than relabelling it, and a "no causes" side counts
   // as `other`. Mid-turn input (busy) adds its causes when it has some.
   const beganTurn = beginOrJoinTurn(session, causes);
+  const wasBusy = session.busy;
   session.busy = true;
   if (!steering) {
-    bumpTurnGeneration(session);
+    // Only a write that starts a turn from idle advances the generation. A busy
+    // flush (send now, interrupt magic word) joins the same running turn, and
+    // bumping would make an armed interrupt timer look stale.
+    if (!wasBusy) bumpTurnGeneration(session);
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');

@@ -119,10 +119,19 @@ describe('interrupt acknowledgments', () => {
     return { handle, onWedge, onSettle, ack };
   }
 
-  it.each(['success', 'error'])('uses a 60s backstop from the matching %s response', (subtype) => {
+  it('keeps the 10s fallback for a matching error response', () => {
+    const h = setup();
+    const error = { ...h.ack(), response: { ...h.ack().response, subtype: 'error' } };
+    expect(applyInterruptAck(h.handle, error)).toBe(false);
+    expect(h.handle.acknowledged).toBe(false);
+    vi.advanceTimersByTime(INTERRUPT_FALLBACK_MS);
+    expect(h.onWedge).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a 60s backstop from the matching success response', () => {
     const h = setup();
     vi.advanceTimersByTime(9000);
-    expect(applyInterruptAck(h.handle, { ...h.ack(), response: { ...h.ack().response, subtype } })).toBe(true);
+    expect(applyInterruptAck(h.handle, h.ack())).toBe(true);
     expect(h.handle.acknowledged).toBe(true);
     vi.advanceTimersByTime(INTERRUPT_ACK_BACKSTOP_MS - 1);
     expect(h.onWedge).not.toHaveBeenCalled();
@@ -134,7 +143,7 @@ describe('interrupt acknowledgments', () => {
 
   it('accepts a top-level request id and ignores duplicate receipts', () => {
     const h = setup();
-    expect(applyInterruptAck(h.handle, { type: 'control_response', request_id: h.handle.requestId })).toBe(true);
+    expect(applyInterruptAck(h.handle, { type: 'control_response', request_id: h.handle.requestId, response: { subtype: 'success' } })).toBe(true);
     vi.advanceTimersByTime(50000);
     expect(applyInterruptAck(h.handle, h.ack())).toBe(false);
     vi.advanceTimersByTime(10000);

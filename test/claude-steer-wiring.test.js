@@ -1021,6 +1021,20 @@ describe('print interrupt acknowledgment wiring', () => {
     h.context.clearPendingInterrupt(h.session);
   });
 
+  it.each([false, true])('a busy flush keeps the generation so the armed timer still releases busy (acked: %s)', async (acked) => {
+    vi.useFakeTimers();
+    const h = setup({ session: { turnGeneration: 1 }, steerEnabled: false });
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    if (acked) h.context.handleClaudeEvent(h.session, ack(h.session.pendingInterrupt));
+    // "Send now": a busy write into the same stuck turn, not a new turn.
+    expect(h.session.busy).toBe(true);
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'now' }])).toBe(true);
+    expect(h.session.turnGeneration).toBe(1);
+    vi.advanceTimersByTime(60000);
+    expect(h.session.busy).toBe(false);
+    expect(h.session.pendingInterrupt).toBeNull();
+  });
+
   it('does not erase a newer interrupt handle when an old timer settles', async () => {
     vi.useFakeTimers();
     const h = setup({ session: { turnGeneration: 1 } });
