@@ -8,6 +8,7 @@ import {
   notifyQueuedMessage,
   resolveQueueReleaseTap,
 } from '../lib/busy-queue.js';
+import { attachQueuedCleanup, runQueuedCleanup } from '../lib/queue-flush.js';
 import { compactBatchSize } from '../lib/compact-priority.js';
 import { createQueuedReleaseRetry } from '../lib/queued-release-retry.js';
 
@@ -1738,6 +1739,7 @@ describe('index.js queued-send finalizer', () => {
       {
         AGENT_CODEX: 'codex', CLAUDE_STEER_ENABLED: false,
         console: { log: vi.fn() },
+        runQueuedCleanup,
         dispatchMergedFlush,
         emitRelease,
         journalConvoIdFor: () => 'convo-1',
@@ -1800,6 +1802,16 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 
+  it.each([true, false])('keeps saved files after live dispatch result=%s', dispatchResult => {
+    const harness = loadFlushHarness({ dispatchResult });
+    const cleanup = vi.fn();
+    const queued = [attachQueuedCleanup([{ type: 'text', text: 'saved file' }], cleanup)];
+    const session = { agent: 'claude', alive: true, busy: false, queuedMessages: null, roomId: 'room' };
+    expect(harness.flushQueue(session, queued)).toBe(dispatchResult);
+    expect(cleanup).not.toHaveBeenCalled();
+    if (!dispatchResult) expect(session.queuedMessages[0]).toBe(queued[0]);
+  });
+
   it('rolls the batch back without emitting or dropping releases when an ALIVE session rejects dispatch', () => {
     // #161 reconcile: retain-for-retry is reserved for a live session that
     // refused this flush. A dead/auto-stopped session takes the notify+drop
@@ -1826,11 +1838,14 @@ describe('index.js queued-send finalizer', () => {
     // permanent retry; every entry was acknowledged with a "📨 Queued" tile,
     // so drop it AND tell the user (matching merged master).
     const harness = loadFlushHarness({ dispatchResult: false });
-    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]].slice(0, count);
+    const cleanup = vi.fn();
+    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]].slice(0, count)
+      .map(entry => attachQueuedCleanup(entry, cleanup));
     const session = { agent: 'claude', alive, _autoStopped: autoStopped, busy: false, queuedMessages: null, roomId: '!room' };
 
     expect(harness.flushQueue(session, queued)).toBe(false);
     expect(session.queuedMessages).toBeNull(); // dropped, not retained
+    expect(cleanup).toHaveBeenCalledTimes(count);
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);

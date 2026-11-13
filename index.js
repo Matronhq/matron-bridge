@@ -75,6 +75,7 @@ import {
 } from './lib/mcp-config.js';
 import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
+import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
 import {
   resolveInteractive,
   resolveModel,
@@ -201,7 +202,7 @@ import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.j
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
-import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
+import { attachQueuedCleanup, runQueuedCleanup, markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import {
   canSteerClaude, buildSteerLine, noteSteerWritten, applySteerLifecycle, decideSteerHold, noteSteerTurnOpened,
@@ -6855,10 +6856,19 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     // model may still have seen is counted too. Never replaced.
     const steerCauses = queueCauses(queued);
     if (steerCauses) mergeIntoTurn(session, steerCauses);
-    session._codexSteerPending = { queued };
+    const steerPending = { queued, handedOff: false };
+    session._codexSteerPending = steerPending;
     void session.codex.steer(blocks).then(sent => {
       session._codexSteerPending = false;
-      if (!session.alive || sessions.get(session.roomId) !== session) return;
+      if (!session.alive || sessions.get(session.roomId) !== session) {
+        // The replacement session may still hold these entries (restart with
+        // preserveQueue); only clean up ones nobody retains.
+        // handedOff: killSession gave this batch to the replacement, which may
+        // already have sent it; never delete files the new turn was told to read.
+        const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
+        if (!sent && !steerPending.handedOff) for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
+        return;
+      }
       if (sent) {
         commitDispatchedUserTurn(session, blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n'), null);
         if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
@@ -6877,7 +6887,12 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       }
     }).catch(() => {
       session._codexSteerPending = false;
-      if (!session.alive) return;
+      if (!session.alive || sessions.get(session.roomId) !== session) {
+        const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
+        if (steerPending.handedOff) return;
+        for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
+        return;
+      }
       restore();
       session._codexUncertainSteer = true;
       journalPublishNotice(snapshot.convoId, 'Could not confirm Codex delivery. Messages retained; check before resending.');
@@ -6914,6 +6929,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
       // Their cards would otherwise sit offering Send / Cancel for messages
       // that no longer exist, and read as unanswered in the journal.
+      for (const entry of queued) runQueuedCleanup(entry);
       finalizeSentQueue(snapshot.convoId, snapshot.entries, 'expired');
       // journalPublishNotice already no-ops on a falsy convo id and fails
       // open like every journal call.
@@ -7480,13 +7496,23 @@ function safeMediaFilename(name) {
 // the pending-media mirror always carry the full-resolution original.
 function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, caption, workdirName, inline }) {
   const blocks = [];
+  let saved;
+  const save = (dir, name) => {
+    saved = writeSavedMediaFile(deduplicateFilename(dir, name), buffer, {
+      reselectPath: () => deduplicateFilename(dir, name),
+    });
+    return saved.path;
+  };
+  const result = (ivHandled) => ({
+    blocks, ivHandled,
+    cleanup: saved ? makeIdentityAwareCleanup(saved.path, saved.identity, { tmpPath: saved.tmpPath }) : null,
+  });
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
     // only an absolute-path annotation; Claude reads it with its Read tool.
     // No base64 blocks and no inline content dump (SDK mode keeps those).
     const dir = ivUploadDir(session.roomId);
-    const savePath = deduplicateFilename(dir, ivFilename);
-    fs.writeFileSync(savePath, buffer);
+    const savePath = save(dir, ivFilename);
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
@@ -7496,7 +7522,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     // journal media path never reads these back — its blob is already in the
     // journal — so the tag is simply inert there.)
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
-    return { blocks, ivHandled: true };
+    return result(true);
   }
   // SDK mode: lead with the caption so claude reads the user's words before
   // the "Image saved to …" bookkeeping and the image itself — the order a
@@ -7509,14 +7535,12 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
   const saveDir = sessionDownloadDir(session) || matronFilesDir(session.workdir);
   if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
-    const imgPath = deduplicateFilename(saveDir, workdirName);
-    fs.writeFileSync(imgPath, buffer);
+    const imgPath = save(saveDir, workdirName);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
-    const savePath = deduplicateFilename(saveDir, workdirName);
-    fs.writeFileSync(savePath, buffer);
+    const savePath = save(saveDir, workdirName);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
 
@@ -7533,7 +7557,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
       blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
     }
   }
-  return { blocks, ivHandled: false };
+  return result(false);
 }
 
 // --- Command Handler ---
@@ -9750,7 +9774,14 @@ const journalMediaRouter = createJournalMediaRouter({
         narration,
       }),
     });
-    return blocks;
+    const cleanups = result.frames.map(({ path: filePath }) => {
+      const { dev, ino } = fs.lstatSync(filePath, { bigint: true });
+      return makeIdentityAwareCleanup(filePath, { dev, ino });
+    });
+    return { blocks, cleanup: () => {
+      for (const cleanup of cleanups) cleanup();
+      try { fs.rmdirSync(outDir); } catch { /* keep a nonempty directory */ }
+    } };
   },
   buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption, onInlineSkip = null }) => {
     const safeName = safeMediaFilename(name);
@@ -9769,7 +9800,7 @@ const journalMediaRouter = createJournalMediaRouter({
     return buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
       ivFilename: safeName, caption, workdirName: safeName, inline,
-    }).blocks;
+    });
   },
   // causes: the user's media message(s) that started the turn (lib/turn-cause.js).
   injectText: (session, text, { causes = null } = {}) => sendTextToSession(session, text, { causes }),
@@ -9802,10 +9833,11 @@ const journalMediaRouter = createJournalMediaRouter({
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path. `cause` (one cause or a list: an item reply's, or a
 // media message's) rides on the entry for the flush (lib/turn-cause.js).
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, source = null, cause = null }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup, source = null, cause = null }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = tagCauses([...blocks], cause);
   if (!mirrorToJournal) markJournalOrigin(entry);
+  attachQueuedCleanup(entry, cleanup);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
   // The queued tile is cosmetic: the entry above IS queued and will flush at
@@ -12406,6 +12438,7 @@ function journalEvictConvoInput(session) {
   if (convoId) {
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
+        for (const entry of session.queuedMessages || []) runQueuedCleanup(entry);
         session.queuedMessages = null;
         session.queueNotifications = [];
       },
@@ -14151,7 +14184,8 @@ const apiServer = createServer(async (req, res) => {
           // Legacy queue entries have no durable item id. Preserve their
           // positional cancellation behavior while keeping both arrays in
           // lockstep.
-          queue.splice(queueIndex, 1);
+          const [removed] = queue.splice(queueIndex, 1);
+          runQueuedCleanup(removed);
           if (queueIndex < notifs.length) notifs.splice(queueIndex, 1);
         }
         const remaining = queue.length;
@@ -15044,6 +15078,7 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   if (!session) return;
   if (preserveQueue && session._codexSteerPending?.queued) {
     restoreQueuedBatch(session, session._codexSteerPending.queued);
+    session._codexSteerPending.handedOff = true;
     session._codexSteerPending = false;
     session._codexUncertainSteer = true;
     journalPublishNotice(journalConvoIdFor(session), 'Restart interrupted a send-now acknowledgement. Messages are retained but held; check the response before resending.');
