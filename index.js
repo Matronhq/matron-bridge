@@ -8889,6 +8889,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('Still finishing the login — send /design-login again in a few seconds.');
         break;
       }
+      // Typed mid-turn, the TUI may hold the command until the turn ends, and the
+      // no-sign-in-screen window would run out first. A re-run while a dialog is
+      // already open (its watch exists) is let through: a pasted code can leave
+      // busy set until the watch releases it.
+      if (isDesign && session.busy && !session._designLoginWatch) {
+        await sendReply('A turn is running — send /design-login again when it finishes.');
+        break;
+      }
       session._designLoginWatch?.stop();
       session._designLoginFlow = null;
       // Any session.iv — even a dead one — takes this branch: falling

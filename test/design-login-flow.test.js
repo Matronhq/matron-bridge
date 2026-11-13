@@ -239,6 +239,18 @@ describe('designLoginEndsPhantomTurn', async () => {
     }
   });
 
+  it('does not type /design-login into a busy session', () => {
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    const at = src.indexOf("case '!design-login':");
+    const body = src.slice(at, src.indexOf("case '!logout'", at) + 6000);
+    const guard = body.indexOf('isDesign && session.busy && !session._designLoginWatch');
+    expect(guard).toBeGreaterThan(-1);
+    expect(body.slice(guard, guard + 300)).toMatch(/send \/design-login again when it finishes[\s\S]*?break;/);
+    // The guard sits before the watch reset and before anything is typed.
+    expect(guard).toBeLessThan(body.indexOf('session._designLoginWatch?.stop()'));
+    expect(guard).toBeLessThan(body.indexOf('iv.sendText('));
+  });
+
   it('room delivery waits while the dialog is open', () => {
     const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
     const fn = src.slice(src.indexOf('function sessionOccupiedForRoomDelivery('), src.indexOf('function sessionOccupiedForRoomDelivery(') + 400);
