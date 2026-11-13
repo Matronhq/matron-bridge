@@ -83,6 +83,22 @@ describe('start retry outcomes', () => {
     expect(h.responses.map((r) => r.error?.code ?? r.ok)).toEqual(['spawn_failed', 'unsupported_mode', true, true]);
   });
 
+  it('logs a rejected start handler and still answers once', async () => {
+    const warn = vi.fn();
+    const sent = [];
+    let first = true;
+    const h = harness({
+      log: { warn },
+      joinMission: async () => ({ status: 200, body: {} }),
+      // The first reply throws inside the async mission path, so the start rejects.
+      respondRpc: (reply) => { if (first) { first = false; throw new Error('send broke'); } sent.push(reply); },
+    });
+    await h.handler(request('first', { workdir: '/w', mission_num: 1 }));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('start handler rejected: send broke'));
+    expect(sent).toHaveLength(1);
+    expect(sent[0].ok).toBe(false);
+  });
+
   it('scopes retry keys to the requesting device', () => {
     const h = harness();
     h.handler(request('same', { idempotency_key: 'opening' }, 7));
