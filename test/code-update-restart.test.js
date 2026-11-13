@@ -112,18 +112,35 @@ describe('defaultPreflight', () => {
   it('runs node --check then the import test, in the checkout, and reports the first failure', async () => {
     const calls = [];
     const exec = (bin, args, opts, cb) => { calls.push({ bin, args, cwd: opts.cwd, env: opts.env }); cb(null, '', ''); };
-    expect(await defaultPreflight('/srv/bridge', { exec })).toEqual({ ok: true });
+    const readFileSync = () => "if (process.env.MATRON_BRIDGE_PREFLIGHT === 'module') process.exit(0);";
+    expect(await defaultPreflight('/srv/bridge', { exec, readFileSync })).toEqual({ ok: true });
     expect(calls.map(c => c.args)).toEqual([['--check', 'index.js'], ['index.js']]);
     expect(calls.every(c => c.cwd === '/srv/bridge' && c.bin === process.execPath)).toBe(true);
     expect(calls[1].env.MATRON_BRIDGE_PREFLIGHT).toBe('module');
 
     const failing = (bin, args, opts, cb) => cb(new Error('exit 1'), '', 'SyntaxError: Unexpected token\n    at line 3\n');
-    const res = await defaultPreflight('/srv/bridge', { exec: failing });
+    const res = await defaultPreflight('/srv/bridge', { exec: failing, readFileSync });
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/--check index\.js: .*Unexpected token/);
 
     const throwing = () => { throw new Error('spawn ENOENT'); };
-    expect((await defaultPreflight('/srv/bridge', { exec: throwing })).ok).toBe(false);
+    expect((await defaultPreflight('/srv/bridge', { exec: throwing, readFileSync })).ok).toBe(false);
+  });
+
+  it('never runs index.js for a checkout without the module-mode marker (older revision)', async () => {
+    const calls = [];
+    const exec = (bin, args, opts, cb) => { calls.push({ args, env: opts.env }); cb(null, '', ''); };
+    const old = () => "import fs from 'node:fs'; startBridge();";
+    expect(await defaultPreflight('/srv/bridge', { exec, readFileSync: old })).toEqual({ ok: true });
+    expect(calls.map(c => c.args)).toEqual([
+      ['--check', 'index.js'],
+      ['--input-type=module', '-e', "await import('sharp'); await import('./lib/inline-image.js')"],
+    ]);
+    // An unreadable index.js falls back the same way.
+    calls.length = 0;
+    const unreadable = () => { throw new Error('ENOENT'); };
+    await defaultPreflight('/srv/bridge', { exec, readFileSync: unreadable });
+    expect(calls[1].args[0]).toBe('--input-type=module');
   });
 });
 
