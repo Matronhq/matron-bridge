@@ -31,8 +31,8 @@ describe('session control client', () => {
     h.onSessionControlFrame({ kind: 'session_control', event: 'sent', request_id: rid, target_waking: true });
     const res = await p;
     expect(res).toEqual({ status: 200, body: { sent: true, request_id: rid, target_waking: true } });
-    h.onSessionControlFrame({ kind: 'session_control', event: 'result', request_id: rid, ok: true, result: { applied: 'deferred', box: 'elm' } });
-    expect(notices).toEqual([['coord-convo', '⏳ Session model switch on elm parked: the session is busy; it applies at its next idle point.']]);
+    h.onSessionControlFrame({ kind: 'session_control', event: 'result', request_id: rid, ok: true, result: { applied: 'deferred', box: 'box-a' } });
+    expect(notices).toEqual([['coord-convo', '⏳ Session model switch on box-a parked: the session is busy; it applies at its next idle point.']]);
     // a duplicate result is ignored
     h.onSessionControlFrame({ kind: 'session_control', event: 'result', request_id: rid, ok: true, result: { applied: 'now' } });
     expect(notices).toHaveLength(1);
