@@ -208,6 +208,23 @@ gatedDescribe('session control on a gated box', () => {
     expect(controlSession).toHaveBeenCalledTimes(2);
   });
 
+  it('on a locked box outside an unlock window nothing goes through, compact and alert included', () => {
+    let open = false;
+    const t = tempKeys();
+    temps.push(t);
+    const gate = createApprovalGate({ keysFile: t.keysFile, uid: t.uid, noncesFile: path.join(t.dir, 'n.json'), journalHost: 'journal.example', user: 'alice', log: silent });
+    const approvals = createApprovalPaths({ gate, identity: () => ({ deviceId: 9, name: 'box-a' }), peersAllowed: () => open, log: silent });
+    const { handler, responses, controlSession } = rpc(approvals);
+    handler(control('alert', { message: 'run this' }));
+    handler(control('compact'));
+    expect(responses.map((r) => r.error?.code)).toEqual(['approval_required', 'approval_required']);
+    expect(controlSession).not.toHaveBeenCalled();
+    open = true;
+    handler(control('compact'));
+    handler(control('carry_on', { message: 'x' }));
+    expect(controlSession).toHaveBeenCalledTimes(1);
+  });
+
   it('with the gate off, every action reaches the session as before', () => {
     const { handler, controlSession } = rpc(ungated());
     handler(control('carry_on', { message: 'continue' }));

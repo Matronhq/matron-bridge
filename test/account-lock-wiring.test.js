@@ -66,8 +66,40 @@ describe('account lock wiring', () => {
     expect(local).toMatch(/accountLock\.isLocked\(\)/);
   });
 
+  it('room messages waiting for a session are not flushed (and so not lost) while locked, and idle sessions are flushed after the clear', () => {
+    const flush = body('function maybeFlushRoomDelivery(session) {', 'foreignSessions.drainParked');
+    expect(flush).toMatch(/if \(accountLock\.isLocked\(\)\) return;/);
+    const release = body('function releaseAfterAccountLock(held)', '\n}\n');
+    expect(release).toMatch(/flushPendingSessionQueue\(session\)/);
+    expect(release).toMatch(/maybeFlushRoomDelivery\(session\)/);
+  });
+
   it('it does not depend on the approval gate', () => {
     const make = body('const accountLock = createAccountLock({', '\n});');
     expect(make).not.toMatch(/approvalGate|boxLock/);
+  });
+});
+
+describe('locked mode and gate wiring beyond the event router', () => {
+  it('a locked box delivers a signed tap only on a check that spends the statement', () => {
+    const router = body('const journalInputConsumer = createJournalInputConsumer({', '\n});');
+    expect(router).toMatch(/verifySignedTap: tapVerifier \? \(payload\) => tapVerifier\.forDelivery\(payload\) : null/);
+  });
+
+  it('session control asks the lock whether another session may start work', () => {
+    expect(index).toMatch(/peersAllowed: \(\) => !boxLock \|\| boxLock\.allowsPeer\(\)/);
+  });
+
+  it('journal nudges and invite answers that would start a turn are dropped while outside work is refused', () => {
+    expect(body('function outsideWorkRefused()', '\n}\n')).toMatch(/accountLock\.isLocked\(\) \|\| \(!!boxLock && !boxLock\.allowsPeer\(\)\)/);
+    expect(index).toMatch(/function journalHandleConsentFrame\(frame\) \{\n[^\n]*\n {2}if \(outsideWorkRefused\(\)\) return;/);
+    expect(index).toMatch(/function journalHandleUnseenFrame\(frame\) \{\n[^\n]*\n {2}if \(outsideWorkRefused\(\)\) return;/);
+    expect(index).toMatch(/notifyRoom: \(\.\.\.args\) => \{ if \(!outsideWorkRefused\(\)\) journalNotifyRoomEvent\(\.\.\.args\); \}/);
+  });
+
+  it('a box with approval keys does not start a session from a typed command', () => {
+    const head = body('async function handleCommand(roomId, text, sendReply, sendHtml, sender) {', 'switch (cmd) {');
+    expect(head).toMatch(/approvalGate\.enabled && \(cmd === '!start' \|\| cmd === '!workdir'\)/);
+    expect(head).toMatch(/return;/);
   });
 });

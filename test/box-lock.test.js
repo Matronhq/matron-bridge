@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import path from 'node:path';
+import fs from 'node:fs';
 import { createApprovalGate } from '../lib/approval-gate.js';
 import { createBoxLock, LOCKED_USER_LINE, lockedPeerLine } from '../lib/box-lock.js';
 import { createRpcRequestHandler } from '../lib/journal-rpc.js';
@@ -165,6 +166,24 @@ gatedDescribe('lockdown', () => {
     expect(lock.report()).toEqual({ on: true, until: null, lockdown_until: clock.now + 30 * MIN });
   });
 
+  it('a statement from a key that is not pinned on this box never counts: an enrolled device the operator did not pin is honest', () => {
+    const { lock, gate, clock, t } = box();
+    fs.writeFileSync(t.keysFile, JSON.stringify({ keys: [] }));
+    for (let i = 0; i < 5; i++) expect(gate.check(sign({ type: 'consent', subject: {}, signedAt: clock.now }), { type: 'consent', subject: {} }).reason).toBe('unknown_key');
+    expect(lock.state().lockdownUntil).toBe(null);
+  });
+
+  it('a window cap beyond what a timer can hold does not spin', () => {
+    const t = tempKeys();
+    temps.push(t);
+    const clock = { now: SIGNED_AT + 1000 };
+    const gate = createApprovalGate({ keysFile: t.keysFile, uid: t.uid, noncesFile: path.join(t.dir, 'n.json'), journalHost: 'journal.example', user: 'alice', now: () => clock.now, log: silent });
+    const delays = [];
+    const lock = createBoxLock({ gate, locked: true, maxMinutes: 100000, now: () => clock.now, stateFile: path.join(t.dir, 'l.json'), boxName: () => 'box-a', schedule: (fn, ms) => { delays.push(ms); return null; }, log: silent });
+    expect(lock.unlock(unlockApproval(clock, '100000')).ok).toBe(true);
+    expect(Math.max(...delays)).toBeLessThanOrEqual(24 * 60 * MIN);
+  });
+
   it('refusals an honest app can cause never count', () => {
     const { lock, gate, clock } = box();
     for (let i = 0; i < 5; i++) lock.unlock(sign({ type: 'account', subject: { op: 'unlock_box', box: 'box-b', minutes: '30' }, signedAt: clock.now }));
@@ -289,11 +308,11 @@ gatedDescribe('unlock, lock and clear_lockdown over RPC', () => {
     expect(lock.inLockdown()).toBe(false);
   });
 
-  it('a bridge without the lock wired answers unsupported_mode', () => {
+  it('a box without approval keys answers these as it always did: unknown_method', () => {
     const { handler, responses } = rpc(null);
     handler(req('unlock', {}));
     handler(req('lock'));
     handler(req('clear_lockdown', {}));
-    expect(responses.map((r) => r.error.code)).toEqual(['unsupported_mode', 'unsupported_mode', 'unsupported_mode']);
+    expect(responses.map((r) => r.error.code)).toEqual(['unknown_method', 'unknown_method', 'unknown_method']);
   });
 });

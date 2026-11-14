@@ -1031,10 +1031,18 @@ function stopTurnsForAccountLock() {
   }
 }
 
-// After the clear: what fell due while locked is delivered now. Messages
-// that were waiting in a session's queue stay there until its next turn
-// ends or the user sends them; they are not pushed in by the clear itself.
+// After the clear: what fell due while locked is delivered now, and every
+// idle session gets the turn-end seam it missed, so messages that waited in
+// its queue or its room inbox go in.
 function releaseAfterAccountLock(held) {
+  for (const session of sessions.values()) {
+    try {
+      if (!session?.alive || session.busy) continue;
+      if (!flushPendingSessionQueue(session)) maybeFlushRoomDelivery(session);
+    } catch (e) {
+      try { console.warn(`[account-lock] could not flush a session after the clear: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    }
+  }
   for (const item of Array.isArray(held) ? held : []) {
     if (item && item.kind === 'timer' && item.record && typeof item.record === 'object') {
       fireTimer(item.record).catch((e) => {
@@ -1086,7 +1094,13 @@ const boxLock = approvalGate.enabled ? createBoxLock({
   log: console,
 }) : null;
 if (boxLock && APPROVAL_CONFIG.locked) console.log(`locked mode: on (unlock windows of at most ${APPROVAL_CONFIG.unlockMaxMinutes} minutes)`);
-const approvalPaths = createApprovalPaths({ gate: approvalGate, identity: () => journalPublisher.identity(), lockdown: () => !!boxLock && boxLock.inLockdown(), log: console });
+const approvalPaths = createApprovalPaths({ gate: approvalGate, identity: () => journalPublisher.identity(), lockdown: () => !!boxLock && boxLock.inLockdown(), peersAllowed: () => !boxLock || boxLock.allowsPeer(), log: console });
+// Work from outside this box (another session, the journal's own nudges) is
+// refused while the account is locked, or the box is in locked mode with no
+// unlock window open.
+function outsideWorkRefused() {
+  return accountLock.isLocked() || (!!boxLock && !boxLock.allowsPeer());
+}
 // A signed tap on a tracker item, checked against the pinned keys so the
 // agent is told whether it verified on this box. null with the gate off.
 const tapVerifier = createTapVerifier({ gate: approvalGate, getItem: (id) => itemsClient.getAsStored(id) });
@@ -7763,6 +7777,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
+  // A box with approval keys starts sessions only on the user's signed
+  // approval (the app's New Chat, or an approved spawn). A typed command
+  // carries none, and the journal cannot check one for it.
+  if (approvalGate.enabled && (cmd === '!start' || cmd === '!workdir')) {
+    await sendReply('🔒 This box starts sessions only with your signed approval. Start one from New Chat in the app.');
+    return;
+  }
+
   switch (cmd) {
     case '!start': {
       if (!sender) {
@@ -11514,6 +11536,9 @@ function drainDeferredControls(session) {
 
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
+  // Held where they are while the account is locked: a flush empties the
+  // inbox before it injects, and the injection would be refused.
+  if (accountLock.isLocked()) return;
   // The user's answer to an "Allow once" ask goes before the room inbox: it
   // continues a conversation the other person is waiting on.
   if (foreignSessions.drainParked(session)) return;
@@ -12346,7 +12371,8 @@ agentInvites = createAgentInvites({
   injectRequestTurn: journalInjectInviteRequest,
   approvals: approvalPaths,
   accountLocked: () => accountLock.isLocked(),
-  notifyRoom: journalNotifyRoomEvent,
+  // An invite's late answer carries the peer's words into a turn.
+  notifyRoom: (...args) => { if (!outsideWorkRefused()) journalNotifyRoomEvent(...args); },
   onMemberLeft: (roomId, fromDeviceId) => { forgetLeftMemberMute(roomId, fromDeviceId).catch(() => {}); },
   log: console,
 });
@@ -12475,7 +12501,7 @@ const journalInputConsumer = createJournalInputConsumer({
     else journalPublishNotice(convoId, `🔒 ${line}`);
   },
   onRoomRefused: (room, frame, line) => { journalPublisher.publishText(frame.convo_id, { body: line, from: 'agent' }); },
-  verifySignedTap: tapVerifier ? (payload) => tapVerifier.forMarker(payload) : null,
+  verifySignedTap: tapVerifier ? (payload) => tapVerifier.forDelivery(payload) : null,
   // A user message arrived before the owner's name was known: ask /me now;
   // the router replays what it held once the name is in.
   onOwnerUnknown: () => refreshJournalIdentity({ force: true }),
@@ -13148,6 +13174,8 @@ const consentHandlers = createConsentHandlers({
 // journal re-reads the role on every ask) or its session cannot be brought
 // back.
 function journalHandleConsentFrame(frame) {
+  // A nudge starts a Coordinator turn: not while outside work is refused.
+  if (outsideWorkRefused()) return;
   if (!frame || frame.event !== 'pending') return;
   const text = formatConsentNudge(frame);
   if (!text) return;
@@ -13211,6 +13239,8 @@ const timelineHandlers = createTimelineHandlers({
 // more. Delivered to the Coordinator exactly like a consent nudge — resumed
 // if idle-reaped, the same text left as a notice in its chat.
 function journalHandleUnseenFrame(frame) {
+  // A nudge starts a Coordinator turn: not while outside work is refused.
+  if (outsideWorkRefused()) return;
   if (!frame || frame.event !== 'pending') return;
   const text = formatUnseenNudge(frame, { trackerBase: trackerUrlBaseNow() });
   if (!text) return;

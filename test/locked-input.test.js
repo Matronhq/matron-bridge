@@ -110,6 +110,8 @@ describe('a locked box, outside an unlock window', () => {
     const { onEvent, calls } = consumer(state, { verifySignedTap });
     onEvent(tap({ signed: true, key_id: OTHER }));
     await vi.waitFor(() => expect(calls.item).toHaveBeenCalledTimes(1));
+    // The router hands on the tap as verified, never a re-read of the frame.
+    expect(calls.item.mock.calls[0][1].payload.comment.action).toBe('Approve');
     expect(verifySignedTap).toHaveBeenCalledTimes(1);
     expect(calls.refused).not.toHaveBeenCalled();
   });

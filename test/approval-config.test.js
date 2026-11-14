@@ -21,7 +21,7 @@ describe('approval config', () => {
     const c = readApprovalConfig({
       MATRON_APPROVAL_KEYS_FILE: '/etc/matron/approval-keys.json', MATRON_APPROVAL_MAX_AGE_MS: '60000',
       MATRON_STEP_UP_ALL: '1', MATRON_APPROVAL_JOURNAL_HOST: 'Public.Example',
-    }, { journalWsUrl: 'ws://10.0.0.1:8080/ws' });
+    }, { journalWsUrl: 'ws://journal.internal.example:8080/ws' });
     expect(c).toMatchObject({ keysFile: '/etc/matron/approval-keys.json', maxAgeMs: 60000, stepUpAll: true, journalHost: 'public.example' });
   });
 

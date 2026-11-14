@@ -88,6 +88,15 @@ describe.skipIf(!UNIX)('approval gate', () => {
     expect(gate.check(SPAWN, { type: 'consent', subject: SPAWN_SUBJECT }).ok).toBe(true);
   });
 
+  it('a label check has no freshness limit and still passes after the statement was spent', () => {
+    const { gate, clock } = gateWith();
+    const o = { type: 'consent', subject: SPAWN_SUBJECT };
+    expect(gate.check(SPAWN, o).ok).toBe(true);
+    clock.now = SIGNED_AT + 40 * 24 * 3600 * 1000;
+    expect(gate.check(SPAWN, { ...o, consume: false })).toMatchObject({ ok: true, keyId: KEY_ID });
+    expect(gate.check(SPAWN, { ...o, consume: false, subject: { ...SPAWN_SUBJECT, box: 'box-b' } })).toEqual({ ok: false, reason: 'mismatch' });
+  });
+
   it('refuses a key that is not pinned', () => {
     const { gate } = gateWith({}, { keys: [] });
     expect(gate.check(SPAWN, { type: 'consent', subject: SPAWN_SUBJECT })).toEqual({ ok: false, reason: 'unknown_key' });

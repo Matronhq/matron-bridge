@@ -72,6 +72,14 @@ describe('item tools: step_up and subject', () => {
     expect(client.comment.mock.calls.map((c) => c[1].step_up)).toEqual([true, undefined]);
   });
 
+  it('stepUpAll cannot be turned off by the agent for one question', async () => {
+    const { h, client } = fixture({}, { stepUpAll: true });
+    await h.create({ roomId: '!r:s', kind: 'question', title: 'Q', step_up: false });
+    await h.comment({ roomId: '!r:s', id: 'it_1', body: 'Go?', actions: ['Go'], step_up: false });
+    expect(client.create.mock.calls[0][0].step_up).toBe(true);
+    expect(client.comment.mock.calls[0][1].step_up).toBe(true);
+  });
+
   it('says in one line when the journal ignored step_up', () => {
     const out = withStepUpNote('#1 T — open', { step_up_ignored: true });
     expect(out.split('\n')).toHaveLength(2);
@@ -174,6 +182,20 @@ describe('signed taps in item_get', () => {
     expect(r.body.comments[1].approval_check).toBeUndefined();
   });
 
+  it('get does not call a tap verified when the comment it shows differs from the stored one that was checked', async () => {
+    const shown = data();
+    const stored = data({ action: 'Cancel' });
+    const verifyTap = vi.fn(async () => ({ ok: true, keyId: KEY_ID }));
+    const { h } = fixture({ get: vi.fn(async () => ({ status: 200, data: shown })), getAsStored: async () => ({ status: 200, data: stored }) }, { verifyTap });
+    const r = await h.get({ roomId: '!r:s', id: 'it_1' });
+    expect(r.body.comments[0].approval_check).toEqual({ ok: false, reason: 'marker_mismatch' });
+    expect(verifyTap).not.toHaveBeenCalled();
+    const retitled = data();
+    retitled.item.title = 'Something else';
+    const again = fixture({ get: vi.fn(async () => ({ status: 200, data: shown })), getAsStored: async () => ({ status: 200, data: retitled }) }, { verifyTap });
+    expect((await again.h.get({ roomId: '!r:s', id: 'it_1' })).body.comments[0].approval_check).toEqual({ ok: false, reason: 'marker_mismatch' });
+  });
+
   it('get checks against the thread as stored, read with inline attachment refs left alone', async () => {
     const shown = data();
     const stored = data();
@@ -226,7 +248,7 @@ describe('what a box expects of a signed tap', () => {
     const gate = { enabled: true, check: vi.fn(() => ({ ok: true, keyId: KEY_ID })) };
     const getItem = vi.fn(async () => ({ status: 200, data: thread }));
     const v = createTapVerifier({ gate, getItem });
-    expect(await v.forMarker({ item_id: 'it_abc123', comment: { id: 'ic_1' } })).toEqual({ ok: true, keyId: KEY_ID });
+    expect(await v.forMarker({ item_id: 'it_abc123', num: 7, title: 'Deploy box-a', comment: { id: 'ic_1', action: 'Approve', reply_to: null } })).toEqual({ ok: true, keyId: KEY_ID });
     expect(getItem).toHaveBeenCalledWith('it_abc123');
     const [sent, opts] = gate.check.mock.calls[0];
     expect(sent).toBe(approval);
@@ -234,10 +256,34 @@ describe('what a box expects of a signed tap', () => {
     expect(await v.forThread(thread, thread.comments[0])).toEqual({ ok: true, keyId: KEY_ID });
   });
 
+  it('a marker that names another item, title, button or question than the stored tap is not verified', async () => {
+    const approval = approvalFor(KEY_ID);
+    const thread = { item, comments: [{ id: 'ic_1', action: 'Cancel', reply_to: null, approval }] };
+    const gate = { enabled: true, check: vi.fn(() => ({ ok: true, keyId: KEY_ID })) };
+    const v = createTapVerifier({ gate, getItem: async () => ({ status: 200, data: thread }) });
+    const marker = (o = {}, c = {}) => ({ item_id: 'it_abc123', num: 7, title: 'Deploy box-a', comment: { id: 'ic_1', action: 'Cancel', reply_to: null, ...c }, ...o });
+    expect(await v.forMarker(marker())).toEqual({ ok: true, keyId: KEY_ID });
+    expect(await v.forMarker(marker({}, { action: 'Approve' }))).toEqual({ ok: false, reason: 'marker_mismatch' });
+    expect(await v.forMarker(marker({ num: 8 }))).toEqual({ ok: false, reason: 'marker_mismatch' });
+    expect(await v.forMarker(marker({ title: 'Drop the orders table?' }))).toEqual({ ok: false, reason: 'marker_mismatch' });
+    expect(await v.forMarker(marker({ item_id: 'it_other' }))).toEqual({ ok: false, reason: 'marker_mismatch' });
+    expect(await v.forMarker(marker({}, { reply_to: 'cm_x' }))).toEqual({ ok: false, reason: 'marker_mismatch' });
+    expect(gate.check).toHaveBeenCalledTimes(1);
+  });
+
+  it('forDelivery spends the statement, within the window of a box that may have had to wake', async () => {
+    const approval = approvalFor(KEY_ID);
+    const thread = { item, comments: [{ id: 'ic_1', action: 'Approve', reply_to: null, approval }] };
+    const gate = { enabled: true, check: vi.fn(() => ({ ok: true, keyId: KEY_ID })) };
+    const v = createTapVerifier({ gate, getItem: async () => ({ status: 200, data: thread }) });
+    await v.forDelivery({ item_id: 'it_abc123', num: 7, title: 'Deploy box-a', comment: { id: 'ic_1', action: 'Approve', reply_to: null } });
+    expect(gate.check.mock.calls[0][1]).toMatchObject({ consume: true, maxAgeMs: 30 * 60 * 1000 });
+  });
+
   it('a tap whose stored comment has no approval, or whose item cannot be read, is not verified', async () => {
     const gate = { enabled: true, check: vi.fn(() => ({ ok: true, keyId: KEY_ID })) };
     const none = createTapVerifier({ gate, getItem: async () => ({ status: 200, data: { item, comments: [{ id: 'ic_1', action: 'Approve' }] } }) });
-    expect(await none.forMarker({ item_id: 'it_abc123', comment: { id: 'ic_1' } })).toEqual({ ok: false, reason: 'no_approval' });
+    expect(await none.forMarker({ item_id: 'it_abc123', num: 7, title: 'Deploy box-a', comment: { id: 'ic_1', action: 'Approve' } })).toEqual({ ok: false, reason: 'no_approval' });
     const gone = createTapVerifier({ gate, getItem: async () => ({ status: 0, data: {} }) });
     expect(await gone.forMarker({ item_id: 'it_abc123', comment: { id: 'ic_1' } })).toEqual({ ok: false, reason: 'item_unreadable' });
     expect(gate.check).not.toHaveBeenCalled();
