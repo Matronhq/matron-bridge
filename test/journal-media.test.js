@@ -15,6 +15,7 @@ const silentLog = { warn: () => {}, error: () => {} };
 // override it to false.
 function makeRouter(overrides = {}) {
   const deps = {
+    isCanonicalSession: () => true,
     fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('bytes'), contentType: 'application/pdf' })),
     transcribe: vi.fn(async () => 'hello world'),
     hasLocalWhisper: vi.fn(() => true),
@@ -992,6 +993,7 @@ describe('createJournalMediaRouter — journal first, local whisper only when in
 
   it('voice: unwired hasLocalWhisper means no local whisper (it is opt-in)', async () => {
     const deps = {
+    isCanonicalSession: () => true,
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/ogg' })),
       transcribe: vi.fn(async () => 'never'),
       buildSavedBlocks: vi.fn(() => []),

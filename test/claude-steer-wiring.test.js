@@ -55,6 +55,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     AGENT_CODEX: 'codex',
     randomUUID: (() => { let n = 0; return () => `steer-uuid-${++n}`; })(),
     sessions: new Map(),
+    journalMediaRouter: { hasInflightMedia: () => false },
     markJournalOrigin, hasQueuedCompact, isCompactCommand, planQueueFlush, queueCauses, tagCauses, mergeIntoTurn, mergeCauses, beginOrJoinTurn,
     pendingMediaMirror: () => [],
     contextFullToNative: () => null,

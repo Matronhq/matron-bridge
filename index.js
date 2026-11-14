@@ -81,6 +81,7 @@ import {
 import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
+import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import {
   resolveInteractive,
   resolveModel,
@@ -3311,13 +3312,23 @@ function flushPendingSessionQueue(session) {
 // from acting on its replacement. The replay is fire-and-forget: this runs
 // inside synchronous turn-end bookkeeping, and each command's case reports
 // its own outcome.
+// In-flight attachments gate replacing a session, but not a replay of a
+// command that was accepted before the attachment arrived: the replay runs
+// with _replayingDeferred set, so it neither refuses nor loses the command.
+function mediaGateActive(session) {
+  return !session?._replayingDeferred && journalMediaRouter.hasInflightMedia(session);
+}
+
 function dispatchDeferredCommand(session) {
   const text = session._deferredCommandText;
   if (!text) return false;
   session._deferredCommandText = null;
   if (!session.alive || sessions.get(session.roomId) !== session) return false;
   const ctx = journalSessionCommandCtx(session);
-  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).catch((err) => {
+  session._replayingDeferred = true;
+  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).finally(() => {
+    session._replayingDeferred = false;
+  }).catch((err) => {
     // The command failed, so nothing is pending any more. For a self-restart
     // this is what lets restart_session be called again instead of 409ing
     // on the flag the failed !restart left behind.
@@ -7914,6 +7925,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`Waiting for turn to finish before restarting${replacedNote}. Send again with --force to restart immediately.`);
         return;
       }
+      if (mediaGateActive(existing)) {
+        await sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+        return;
+      }
       // A forced restart discards any parked one along with `existing` —
       // recreateSession copies fields onto the replacement explicitly, and
       // _deferredCommandText is deliberately not among them.
@@ -7935,6 +7950,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         bypass: restartBypass != null ? restartBypass
           : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
       }, { sendReply, sendHtml });
+      // Refused at teardown (an attachment arrived during the reply await):
+      // recreateSession already said so; don't announce a restart.
+      if (!restarted) return;
       // Persist AFTER the recreate: recreateSession persists mid-flight from
       // the replacement's live snapshot, which cannot know the new model yet.
       if (restartModelFlag.model && restarted) {
@@ -9934,6 +9952,7 @@ const journalMediaRouter = createJournalMediaRouter({
   // rides in an injectBlocks turn, so the words are mirrored on their own.
   mirrorText: (session, text) => journalPublishUserItem(session, 'publishText', { body: text, from: 'user' }),
   queueMedia: (session, entry) => journalQueueMedia(session, entry),
+  isCanonicalSession: (session) => !!session?.alive && sessions.get(session.roomId) === session,
   echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
   escapeHtml,
@@ -10132,7 +10151,9 @@ async function journalOnCoordinator(convoId, { role }) {
   const plan = planCoordinatorTransition({
     role,
     agent: session.agent,
-    occupied: sessionOccupiedForRoomDelivery(session),
+    // In-flight media counts as occupied: the role then applies at the next
+    // spawn instead of a respawn that recreateSession would refuse.
+    occupied: sessionOccupiedForRoomDelivery(session) || mediaGateActive(session),
     busy: !!session.busy,
     persisted: getPersistedSession(roomId),
     // A `!model <x>` the user queued mid-turn is their pick; only the
@@ -14511,7 +14532,9 @@ function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.ag
 
 async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   const existing = sessions.get(roomId);
-  const decision = canSwitchAgent(existing, targetAgent);
+  const decision = canSwitchAgent(existing, targetAgent, {
+    hasInflightMedia: mediaGateActive(existing),
+  });
   if (!decision.ok) {
     await sendReply(decision.message);
     return null;
@@ -14866,7 +14889,9 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     }
     return switched;
   }
-  const decision = planPrintModelSwitch(session, arg);
+  const decision = planPrintModelSwitch(session, arg, {
+    hasInflightMedia: mediaGateActive(session),
+  });
   if (decision.defer) {
     // Mid-turn: park the switch on the shared deferred-command stash (see
     // dispatchDeferredCommand). The turn-end seam replays `!model <alias>`
@@ -14948,7 +14973,9 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
   }
-  const decision = planModeSwitch(session, wantInteractive);
+  const decision = planModeSwitch(session, wantInteractive, {
+    hasInflightMedia: mediaGateActive(session),
+  });
   if (!decision.ok) {
     // `refusalAnnouncement` replaces planModeSwitch's message for flows the
     // user didn't initiate as a mode switch (the /login auto-return): a bare
@@ -14989,6 +15016,11 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
 function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
+  // Recheck at teardown, including attachments arriving during a reply await.
+  if (mediaGateActive(existing)) {
+    sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+    return null;
+  }
   const sessionId = existing.claudeSessionId;
   // PR #151's pre-init resume gate, extended to this shared teardown path:
   // --resume only a session Claude actually persisted (confirmed on init,
