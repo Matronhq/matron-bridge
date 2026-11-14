@@ -142,7 +142,7 @@ import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-fo
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
-import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   extractForceFlag,
@@ -256,6 +256,7 @@ import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
 import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
 import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './lib/header-files.js';
+import { launchWithClaudePromptFile } from './lib/claude-prompt-file.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -784,9 +785,15 @@ const memoryClient = createMemoryClient({
 //
 // The run directory holds the session API header files too.
 let HEADER_RUN_DIR = null;
+function ensureHeaderRunDir() {
+  if (!HEADER_RUN_DIR) {
+    HEADER_RUN_DIR = createRunDir(headerRunRoot());
+    process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+  }
+  return HEADER_RUN_DIR;
+}
 try {
-  HEADER_RUN_DIR = createRunDir(headerRunRoot());
-  process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+  ensureHeaderRunDir();
 } catch (e) {
   console.warn(`[api] could not create the header file directory under ${headerRunRoot()}: ${e.message}`);
 }
@@ -2552,7 +2559,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--output-format', 'stream-json',
     ...permissionSpawnArgs(bypassMode),
     '--disallowed-tools', ...printCoord.disallowedTools,
-    '--append-system-prompt', printCoord.appendSystemPrompt,
     '--include-partial-messages',
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
@@ -2601,12 +2607,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     workdir: cwd,
     sessionId: identity.sessionId,
     configureOptions: { warn: message => console.warn(message) },
-    launch: configuredEnv => spawn('claude', args, {
-      cwd,
-      env: configuredEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      // No console window per session on Windows (no-op elsewhere).
-      windowsHide: true,
+    launch: configuredEnv => launchWithClaudePromptFile({
+      prompt: printCoord.appendSystemPrompt,
+      onError: failedSpawnProcess,
+      args,
+      runDir: ensureHeaderRunDir,
+      launch: promptArgs => spawn('claude', promptArgs, {
+        cwd,
+        env: configuredEnv,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        // No console window per session on Windows (no-op elsewhere).
+        windowsHide: true,
+      }),
     }),
   });
 
@@ -3523,7 +3535,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // The Coordinator runs without file-editing tools (spec §2c). iv mode has
     // no other disallowed tool, so an ordinary session gets no flag at all.
     ...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),
-    '--append-system-prompt', ivCoord.appendSystemPrompt,
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(settings),
@@ -3554,12 +3565,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     workdir: cwd,
     sessionId,
     configureOptions: { warn: message => console.warn(message) },
-    launch: configuredEnv => createInteractiveSession({
-      roomId,
-      workdir: cwd,
-      sessionId,
-      claudeArgs,
-      env: configuredEnv,
+    launch: configuredEnv => launchWithClaudePromptFile({
+      prompt: ivCoord.appendSystemPrompt,
+      args: claudeArgs,
+      runDir: ensureHeaderRunDir,
+      exitEvent: 'exit',
+      launch: promptArgs => createInteractiveSession({
+        roomId,
+        workdir: cwd,
+        sessionId,
+        claudeArgs: promptArgs,
+        env: configuredEnv,
+      }),
     }),
   });
 
