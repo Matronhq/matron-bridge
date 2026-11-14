@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createSessionControlHandlers } from '../lib/session-control-client.js';
+import { createSessionControlHandlers, USER_ONLY_CARRY_ON } from '../lib/session-control-client.js';
 
 function fixture({ coordinator = true, send = true } = {}) {
   const sent = [];
@@ -52,6 +52,15 @@ describe('session control client', () => {
     sessions.get('!coord').currentTurn = null;
     await h2.carryOn({ roomId: '!coord', target_convo_id: 'tgt', message: 'go' });
     expect('causes' in sent[2]).toBe(false);
+  });
+  it('tells the Coordinator to ask the user first when a carry-on is refused for a user-only box', async () => {
+    const { h, sent } = fixture();
+    const p = h.carryOn({ roomId: '!coord', target_convo_id: 'tgt', message: 'go' });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.onOpError({ code: 'forbidden', ref: 'session_control', detail: 'user_only', requestId: sent[0].request_id })).toBe(true);
+    const r = await p;
+    expect(r.status).toBe(403);
+    expect(r.body.error).toBe(USER_ONLY_CARRY_ON);
   });
   it('maps journal error frames to HTTP statuses and times out without an ack', async () => {
     const { h, sent } = fixture();
