@@ -11258,6 +11258,34 @@ function startAutoResumeSweep() {
   return timer;
 }
 
+// The live sessions that hold a restart back right now: mid-turn, a live
+// background work child, or a running subagent. Background work and subagents
+// use the idle reaper's age cap, a running turn never does. One process-table
+// read per call, shared by every live session. `unreadable` reports a failed
+// `ps`: the verdict then rests on in-memory signals alone.
+function sessionsHoldingRestart() {
+  const live = [...sessions.values()].filter(s => s.alive);
+  if (!live.length) return { holders: [], unreadable: false };
+  const table = readProcessTable();
+  const now = Date.now();
+  const holders = [];
+  for (const s of live) {
+    const last = handoffIdleSince(s);
+    // A quiet tool call can outlast the age cap without ending its turn.
+    // Subagent tracking is in memory, so it survives a failed ps read.
+    const hold = s.busy
+      ? { reason: 'turn in progress' }
+      : table.unreadable
+        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
+        : sessionWorkHold(s, last, now, table);
+    if (hold) {
+      holders.push({ session: s, reason: hold.reason });
+      debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
+    }
+  }
+  return { holders, unreadable: !!table.unreadable };
+}
+
 // Restart onto new code by itself — lib/code-update-restart.js has the
 // policy and the why. A rollout that found a live session here left the
 // new code on disk and the old process running; this is the "next natural
@@ -11283,28 +11311,7 @@ function startCodeUpdateWatcher() {
     readHead: () => readHeadReflog(gitDir),
     // Share the idle reaper's age cap for background work, while a running
     // turn always holds the update unless forcing is explicitly enabled.
-    busySessions: () => {
-      const live = [...sessions.values()].filter(s => s.alive);
-      if (!live.length) return 0;
-      const table = readProcessTable();
-      const now = Date.now();
-      let n = 0;
-      for (const s of live) {
-        const last = handoffIdleSince(s);
-        // A quiet tool call can outlast the age cap without ending its turn.
-        // Subagent tracking is in memory, so it survives a failed ps read.
-        const hold = s.busy
-          ? { reason: 'turn in progress' }
-          : table.unreadable
-            ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
-            : sessionWorkHold(s, last, now, table);
-        if (hold) {
-          n++;
-          debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
-        }
-      }
-      return n;
-    },
+    busySessions: () => sessionsHoldingRestart().holders.length,
     preflight: () => defaultPreflight(__dirname),
     restart: (info) => {
       if (shuttingDown) return;

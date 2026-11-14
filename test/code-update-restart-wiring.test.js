@@ -38,14 +38,16 @@ describe('code-update self-restart wiring', () => {
   });
 
   it('counts a live session as holding when it is busy (the flag /sessions reports and restart_session parks on), has a background work child, or has a running subagent', () => {
-    const busy = fn.slice(fn.indexOf('busySessions: () => {'), fn.indexOf('preflight:'));
-    expect(busy).toMatch(/filter\(s => s\.alive\)/);
-    expect(busy).toContain('const last = handoffIdleSince(s);');
-    expect(busy).toContain('sessionWorkHold(s, last, now, table)');
-    expect(busy).toContain("const hold = s.busy\n          ? { reason: 'turn in progress' }");
-    expect(busy).toContain('workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })');
+    expect(fn).toContain('busySessions: () => sessionsHoldingRestart().holders.length,');
+    const holdStart = index.indexOf('function sessionsHoldingRestart() {');
+    const holdFn = index.slice(holdStart, index.indexOf('\n}\n', holdStart) + 3);
+    expect(holdFn).toMatch(/filter\(s => s\.alive\)/);
+    expect(holdFn).toContain('const last = handoffIdleSince(s);');
+    expect(holdFn).toContain('sessionWorkHold(s, last, now, table)');
+    expect(holdFn).toContain("const hold = s.busy\n      ? { reason: 'turn in progress' }");
+    expect(holdFn).toContain('workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })');
     // One process-table read per poll, shared by all live sessions.
-    expect(busy.match(/readProcessTable\(\)/g)).toHaveLength(1);
+    expect(holdFn.match(/readProcessTable\(\)/g)).toHaveLength(1);
     expect(index).not.toMatch(/restartHold/);
   });
 
@@ -107,8 +109,6 @@ describe('code-update work holds', () => {
   }
 
   function harness({ busy = false, age = 0, subagentCount = 0, unreadable = false, tableOutput = output, alive = true } = {}) {
-    const start = index.indexOf('busySessions: () => {', index.indexOf('function startCodeUpdateWatcher()'));
-    const callback = index.slice(start + 'busySessions: '.length, index.indexOf('    preflight:', start)).trim().replace(/,$/, '');
     const session = { alive, busy, lastActivityAt: now - age, proc: { pid: 10 }, subagentConvos: { runningCount: () => subagentCount } };
     const execFileSync = () => {
       if (unreadable) throw new Error('process table unavailable');
@@ -118,7 +118,8 @@ describe('code-update work holds', () => {
       ${functionSource('readProcessTable')}
       ${functionSource('sessionChildPid')}
       ${functionSource('sessionWorkHold')}
-      return { busySessions: ${callback}, readProcessTable };
+      ${functionSource('sessionsHoldingRestart')}
+      return { busySessions: () => sessionsHoldingRestart().holders.length, readProcessTable };
     `);
     return make(new Map([['room', session]]), { now: () => now }, workHold, liveWorkChildren, parseProcessTable, handoffIdleSince, execFileSync, () => ({ file: 'ps', args: [] }), () => ({}), () => {}, []);
   }
