@@ -11472,6 +11472,10 @@ async function applyControlEffort(session, level, ctx) {
 // when something was started, so the caller leaves room delivery to the
 // next seam rather than injecting into a turn this drain just began.
 function drainDeferredControls(session) {
+  // A parked control was checked against the box's lock when it arrived,
+  // but it may have waited past the end of the unlock window: it stays
+  // parked until outside work is allowed again.
+  if (outsideWorkRefused()) return false;
   const slots = session?._deferredControls;
   if (!slots || typeof slots !== 'object' || session._drainingControls) return false;
   const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);

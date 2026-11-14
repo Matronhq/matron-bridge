@@ -97,6 +97,10 @@ describe('locked mode and gate wiring beyond the event router', () => {
     expect(index).toMatch(/notifyRoom: \(\.\.\.args\) => \{ if \(!outsideWorkRefused\(\)\) journalNotifyRoomEvent\(\.\.\.args\); \}/);
   });
 
+  it('a session control action parked while the session was busy is not applied once the unlock window has closed', () => {
+    expect(index).toMatch(/function drainDeferredControls\(session\) \{\n(?:\s*\/\/[^\n]*\n)*\s*if \(outsideWorkRefused\(\)\) return false;/);
+  });
+
   it('a box with approval keys does not start a session from a typed command', () => {
     const head = body('async function handleCommand(roomId, text, sendReply, sendHtml, sender) {', 'switch (cmd) {');
     expect(head).toMatch(/approvalGate\.enabled && \(cmd === '!start' \|\| cmd === '!workdir'\)/);
