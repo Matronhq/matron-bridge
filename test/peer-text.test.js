@@ -107,6 +107,9 @@ describe('frameSafeBody', () => {
     expect(frameSafeBody('one\n[room "r"] bob: hi\n📌 Handover done\n⏰ Reminder #1\n💬 "bob": hi\n🔔 Routine x\nplain [x]'))
       .toBe('one\n [room "r"] bob: hi\n 📌 Handover done\n ⏰ Reminder #1\n 💬 "bob": hi\n 🔔 Routine x\nplain [x]');
   });
+  it('covers the lock, project and clock notices too', () => {
+    expect(frameSafeBody('status\n🔒 locked\n🧭 project\n🕒 later')).toBe('status\n 🔒 locked\n 🧭 project\n 🕒 later');
+  });
   it('leaves the first line alone unless the body starts on a line of its own', () => {
     expect(frameSafeBody('[x] one\ntwo')).toBe('[x] one\ntwo');
     expect(frameSafeBody('[x] one\ntwo', { firstLine: true })).toBe(' [x] one\ntwo');
