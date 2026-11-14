@@ -1573,21 +1573,8 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   session.sendCallback = sessionSendReply;
   session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
-  // A fresh Codex session learns its native thread id from the stream, so
-  // unlike Claude (which pre-assigns its id at spawn) it has no journal
-  // convo id yet — and the RPC handler must answer one synchronously or
-  // tear the session down as unsupported_mode. Mint the STABLE id here, the
-  // way /switch does (stableConvoId): the thread id lands later as
-  // claudeSessionId only, thread.started leaves an existing journalConvoId
-  // alone and persists it. Flushing now turns the buffered title seed into
-  // a real convo server-side before the app navigates to it, and re-seeds
-  // the header status the spawn skipped for want of an id.
-  const mintedConvoId = session.agent === AGENT_CODEX && !session.journalConvoId;
-  if (mintedConvoId) {
-    session.journalConvoId = newSessionConvoId();
-    journalFlushForSession(session);
-    journalSpawnStatus(session);
-  }
+  // Codex has a stable conversation id even before its native thread starts.
+  const mintedConvoId = session.agent === AGENT_CODEX && !session.claudeSessionId;
   // Same rules as !start: the requested model is the session's model from the
   // first turn, and it must be set before persisting (the live snapshot reads
   // currentModel). claudeSessionId is known immediately (pre-assigned at
@@ -1596,12 +1583,7 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   // explicit `extra` — persistSession auto-carries mcpExtras but deliberately
   // not model.
   if (model) session.currentModel = model;
-  // A minted Codex convo id is persisted NOW too (Bugbot, PR #263):
-  // journalResumeConvo matches on the persisted journalConvoId/sessionId,
-  // both otherwise unset until thread.started, so an idle reap or bridge
-  // restart in that window would orphan the chat the app just opened. The
-  // live snapshot carries journalConvoId; the native id is still null and
-  // persistSession keeps it null rather than inventing one.
+  // Persist requested settings before the native thread starts as well.
   if ((mcpExtras.length > 0 || model || effort || mintedConvoId) && (session.claudeSessionId || mintedConvoId)) {
     persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null,
       model ? { model, ...explicitModelFlag(model) } : undefined);
@@ -3044,7 +3026,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // Kept under the historical property name for compatibility with the
     // journal protocol and existing persistence/routing code.
     claudeSessionId: resumeSessionId || null,
-    journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || null,
+    journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || newSessionConvoId(),
     _agentSessions: mergeAgentStates({}, options.agentSessions || persisted?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -3157,6 +3139,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
 
   session.resetTimeout = () => {};
   sessions.set(roomId, session);
+  if (!resumeSessionId && !options.journalConvoId && !persisted?.journalConvoId) {
+    persistSession(roomId, session.claudeSessionId, cwd, null);
+  }
   return session;
 }
 
@@ -3202,28 +3187,8 @@ function handleCodexEvent(session, event) {
           console.log(`Updated Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
         }
         if (journalIdMissing) {
-          // Restart carry-on, first-turn repair. A FRESH Codex conversation has
-          // NO convo id until this very line: createCodexSessionForRoom leaves
-          // both claudeSessionId and journalConvoId null when there is nothing
-          // to resume (index.js:1582-1583), so sendToSession's noteTurnStart —
-          // the `session.busy = true` seam — ran with null and returned early.
-          // The first turn is often the longest one, and it would silently get
-          // no card. touch() cannot repair this: it no-ops when no record
-          // exists. The conversation IS genuinely resumable by then, because
-          // persistSession fired just above.
-          //
-          // Gated on journalIdMissing, NOT on the enclosing block: a later
-          // thread-id change (nativeIdChanged alone) leaves journalConvoId
-          // untouched, so that turn is already marked under this same id and
-          // re-marking would reset startedAt/touchedAt on an in-flight turn.
-          // This branch can therefore fire at most once per conversation.
-          //
-          // journalConvoIdFor(session) is now session.journalConvoId ===
-          // event.thread_id — the identical id persistSession just wrote as
-          // both sessionId and journalConvoId, that publishRestartCarryOnCards
-          // keys the card on, and that journalResumeConvo matches. Claude
-          // print/iv are unaffected: they mint the id at construction
-          // (index.js:1337, 2024), so journalIdMissing is never true for them.
+          // Repair an older session that reached its first turn without a
+          // stable conversation id. Fresh sessions already have one at spawn.
           if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
           journalFlushForSession(session);
         }
