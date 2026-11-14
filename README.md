@@ -319,6 +319,12 @@ the viewer's environment turns it off.
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
+| `MATRON_APPROVAL_KEYS_FILE` | Path of the pinned approval keys file. Set, the box verifies the user's signed approval itself before it starts a session, joins a chat or takes a file (see "Approval keys"). The file must not be owned by the bridge's user, writable by group or others, or a symlink | _(unset: off)_ |
+| `MATRON_APPROVAL_MAX_AGE_MS` | An upper bound on how old a signed approval may be, for every kind of request | _(per kind: 5 minutes to 24 hours)_ |
+| `MATRON_APPROVAL_JOURNAL_HOST` | The journal's public host as signed approvals name it, when it differs from the host in `JOURNAL_WS_URL` | host of `JOURNAL_WS_URL` |
+| `MATRON_STEP_UP_ALL` | `1` marks every question this box files, and every comment with buttons, as step-up: the tap needs the user's device signature | off |
+| `MATRON_LOCKED` | `1` puts the box in locked mode: outside input is taken only during a signed unlock window. Needs `MATRON_APPROVAL_KEYS_FILE`; the bridge refuses to start without it | off |
+| `MATRON_UNLOCK_MAX_MINUTES` | The longest unlock window a locked box grants | `120` |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset. Scripts run outside a session can list sessions (`POST /sessions`) with `curl -H @"${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"`, an owner-only file the bridge rewrites at each start | on |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
@@ -455,6 +461,57 @@ Every session gets these MCP tools via `ask-user.js`:
 The user's consent card is the gate: once an invite is approved, the target bridge joins its agent to the room on delivery and tells it so (with the room's opening message), rather than asking it to accept — a target mid-turn for the whole invite window could never accept in time, and pairs ended up with several rooms. Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
 
 A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
+
+## Approval keys
+
+The journal lets a user enrol *approval keys*: key pairs held in a phone's or a Mac's secure hardware, which sign a short statement naming exactly what is being approved (see "Approval keys (step-up)" in the journal's protocol doc). The bridge takes part in three ways. Every one of them is off unless you turn it on, and a box with none of the settings below behaves exactly as before.
+
+### Step-up questions
+
+`item_create` and `item_comment` take `step_up: true` and an optional `subject`. A step-up question's buttons can only be tapped with Face ID or Touch ID; a typed reply never satisfies it. `subject` is a flat object of short strings (at most 12 keys) that the user is shown verbatim and signs, for example `{"op":"drop_table","table":"orders"}`. When the user's account has no approval key the journal files an ordinary question and the tool result says that `step_up` was ignored.
+
+`MATRON_STEP_UP_ALL=1` marks every question this box files, and every comment with buttons, as step-up.
+
+A tap the journal accepted with a signature reaches the agent as `tapped "Approve" (signed with the user's device key 7734f909)`, and `item_get` shows the same on that comment.
+
+### The approval gate
+
+Set `MATRON_APPROVAL_KEYS_FILE` to a file of pinned keys and the bridge stops taking the journal's word for the user's approval. It then refuses, with `approval_required`:
+
+- a session start, whether an approved spawn from another agent or a client's own New Chat, unless it carries a statement signed by a pinned key over this box's name, the working directory and the hash of the task;
+- an inbound chat invite or join request, unless it carries one over the room, the device and the hash of the justification;
+- a file transfer, unless it carries one over the transfer's id, size and SHA-256 (the downloaded bytes must then match that hash before the file is released);
+- another person's talk request, always;
+- Coordinator session control that starts or redirects work (`carry_on`, `set_model`, a routine's fire). `compact` and an alert still go through.
+
+The bridge builds what the statement must say from what it is about to do, not from what the request claims, checks the signature against the pinned keys, requires the statement to be recent (five minutes for a tap or an unlock, ten for a direct start, thirty for a spawn, a day for an invite or a transfer; `MATRON_APPROVAL_MAX_AGE_MS` lowers all of them) and refuses a statement it has seen before. Sub-sessions, restarts and resumes of sessions already on the box need no new approval. On such a box a signed tap is also checked locally, and reads `…, verified on this box` or `signature NOT verified on this box: <reason>`.
+
+The keys file:
+
+```json
+{ "keys": [ { "key_id": "<64 hex characters>", "public_key": "<base64url>", "name": "phone" } ] }
+```
+
+- It must be owned by root (or any user other than the one the bridge runs as), must not be writable by its group or by everyone, and must not be a symlink. Agents run as the bridge's user, and a file that user could write would let an agent pin a key of its own. The bridge refuses to start when the rule is broken, and it re-checks the rule and re-reads the file on every approval, so a change takes effect without a restart and a loosened file is refused at once.
+- To produce it: on a signed-in machine, `GET /approval-keys` on the journal lists the account's keys with their `key_id` and `public_key`, and its `journal` field is the host a statement names. Copy the entries for the devices you trust, and compare each `key_id` with the fingerprint that device itself shows (compare the whole id where the device shows it; the short fingerprint is its first 8 characters). An entry whose `public_key` does not hash to its `key_id` is ignored. Never let a box fetch its keys from the journal by itself.
+- Install it with your configuration management, for example `install -o root -g root -m 0644 approval-keys.json /etc/matron/approval-keys.json`.
+
+A statement names the journal by its public host. When the bridge dials the journal by another address, set `MATRON_APPROVAL_JOURNAL_HOST` to that public host.
+
+Limits worth knowing: spent statements are remembered in a file in the bridge user's home, so an agent on the box could delete it and a statement could then be replayed after the next bridge restart, within its freshness window. If the box is renamed in the journal while connected, approvals are refused as `mismatch` until the bridge reconnects.
+
+### Locked mode
+
+`MATRON_LOCKED=1` (which needs the keys file) makes the box take instructions from outside only during an unlock window:
+
+- The user unlocks the box from an app with a statement over `{op:'unlock_box', box:<this box's name>, minutes:'<n>'}`, sent as the `unlock` request. `MATRON_UNLOCK_MAX_MINUTES` caps `n` (default 120). `lock` ends the window early and needs no signature. A bridge restart neither reopens nor extends a window.
+- During a window the bridge accepts the user's messages, files, voice notes, replies and commands only from the device that signed the unlock (the journal stamps each user event with the sending device's key), and room messages from other sessions.
+- Outside a window those are dropped, not queued, and wake no session: the user gets `This box is locked. Unlock it to send instructions.` in the conversation, and another session is told in the room that the box is locked. A signed tap on a step-up question that verifies against the pinned keys is delivered either way.
+- Turns already running continue, and a session's own reminders still fire. Locked mode does not defend against an agent already on the box.
+
+### Lockdown
+
+A genuine app never sends a bad signature. Three approvals within ten minutes that are forged or malformed (a bad signature, a malformed statement, a key that is not pinned) put a box with a keys file into lockdown: it refuses every request that needs an approval, valid or not, for thirty minutes, then an hour, doubling up to a day, closes any unlock window, and files a notice. The only early way out is a statement over `{op:'clear_lockdown', box:<this box's name>}`, sent as the `clear_lockdown` request. Refusals an honest app can cause (a stale statement, a mismatch, a missing approval) never count.
 
 ## Repository instructions (MATRON.md)
 
