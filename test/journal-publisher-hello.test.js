@@ -77,3 +77,31 @@ describe('journal publisher hello extras', () => {
     b.close();
   });
 });
+
+describe('journal publisher account lock frames', () => {
+  it('hands hello_ok\'s panic (or its absence) and each live panic frame to onPanic', async () => {
+    ControlledWebSocket.instances.length = 0;
+    const seen = [];
+    const order = [];
+    const publisher = createJournalPublisher({
+      url: 'ws://journal.test/ws', token: 'test-token', log: { warn() {} },
+      backoffBaseMs: 1, backoffCapMs: 1, keepaliveIntervalMs: 0, WebSocketImpl: ControlledWebSocket,
+      onPanic: (state, meta) => { seen.push([state, meta]); order.push('panic'); },
+      onReconnect: () => order.push('reconnect'),
+    });
+    await waitFor(() => ControlledWebSocket.instances[0]?.sent.some((frame) => frame.op === 'hello'));
+    const ws = ControlledWebSocket.instances[0];
+    ws.emit('message', JSON.stringify({ op: 'hello_ok', device_id: 9, name: 'box-a', panic: { on: true, since: 5, source: null } }));
+    expect(seen[0]).toEqual([{ on: true, since: 5, source: null }, { hello: true }]);
+    expect(order).toEqual(['panic', 'reconnect']);
+    ws.emit('message', JSON.stringify({ kind: 'panic', on: false }));
+    expect(seen[1]).toEqual([{ kind: 'panic', on: false }, { hello: false }]);
+    ws.emit('message', JSON.stringify({ kind: 'panic', on: true, since: 7, source: 'sentinel' }));
+    expect(seen[2][0]).toMatchObject({ on: true, since: 7, source: 'sentinel' });
+    ws.close();
+    await waitFor(() => ControlledWebSocket.instances[1]?.sent.some((frame) => frame.op === 'hello'));
+    ControlledWebSocket.instances[1].emit('message', JSON.stringify({ op: 'hello_ok', device_id: 9, name: 'box-a' }));
+    expect(seen[3]).toEqual([null, { hello: true }]);
+    publisher.close();
+  });
+});

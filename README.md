@@ -513,6 +513,12 @@ Limits worth knowing: spent statements are remembered in a file in the bridge us
 
 A genuine app never sends a bad signature. Three approvals within ten minutes that are forged or malformed (a bad signature, a malformed statement, a key that is not pinned) put a box with a keys file into lockdown: it refuses every request that needs an approval, valid or not, for thirty minutes, then an hour, doubling up to a day, closes any unlock window, and files a notice. The only early way out is a statement over `{op:'clear_lockdown', box:<this box's name>}`, sent as the `clear_lockdown` request. Refusals an honest app can cause (a stale statement, a mismatch, a missing approval) never count.
 
+### Account lock
+
+The journal can lock a whole account (its `panic` broadcast, sent to every box of the account and repeated in the answer to each connect while it lasts). A locked bridge interrupts its running turns and starts no new one from any source: the user's messages, other sessions' room messages, reminders, routines and session control are all refused, as are session starts, chat invites and file transfers. Each affected conversation gets one line: `This account is locked. Sessions are stopped until it is cleared.` Reminders that fall due meanwhile are kept and delivered after the clear.
+
+Only the journal clears the lock; nothing a client, an agent or a signed approval sends to the bridge does. The state is kept on disk, so a bridge that restarts while it cannot reach the journal stays locked until its next connect says otherwise. This needs no setting and no keys file.
+
 ## Repository instructions (MATRON.md)
 
 CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a repository, so instructions there about the tracker, rooms or missions confuse a run outside Matron, which has none of those tools. A repository puts such instructions in a `MATRON.md` instead, and the bridge adds it to the instructions of Matron sessions only.

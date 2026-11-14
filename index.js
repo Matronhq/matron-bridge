@@ -14,6 +14,7 @@ import { readApprovalConfig } from './lib/approval-config.js';
 import { createApprovalGate } from './lib/approval-gate.js';
 import { createApprovalPaths } from './lib/approval-paths.js';
 import { createBoxLock } from './lib/box-lock.js';
+import { createAccountLock, ACCOUNT_LOCKED_LINE } from './lib/account-lock.js';
 import { createTapVerifier } from './lib/items-approval.js';
 import { createTransferClient } from './lib/transfer-client.js';
 import { createTransferSender } from './lib/transfer-sender.js';
@@ -989,6 +990,60 @@ function refreshJournalIdentity(opts) {
     return name;
   });
 }
+// The account lock (lib/account-lock.js): the journal's `panic` broadcast.
+// While it holds, running turns are interrupted and nothing new starts on
+// this box, from any source, until the journal clears it. Persisted, so a
+// bridge that restarts while disconnected stays locked until its next hello.
+const ACCOUNT_LOCK_FILE = path.join(os.homedir(), '.matron-bridge-account-lock.json');
+const accountLock = createAccountLock({
+  stateFile: ACCOUNT_LOCK_FILE,
+  onLock: () => stopTurnsForAccountLock(),
+  onClear: (held) => releaseAfterAccountLock(held),
+  log: console,
+});
+if (accountLock.isLocked()) console.warn('account lock: this account was locked when the bridge last ran; nothing starts until the journal clears it');
+
+// One line per conversation per lock, in the bridge's own voice.
+function noticeAccountLocked(convoId) {
+  if (accountLock.shouldNotify(convoId)) journalPublishNotice(convoId, `🔒 ${ACCOUNT_LOCKED_LINE}`);
+}
+
+// Interrupt every running turn, the same way the user's own interrupt does
+// (Esc for an interactive session, the interrupt control request or signal
+// otherwise), and say why in each conversation that was stopped.
+function stopTurnsForAccountLock() {
+  for (const session of sessions.values()) {
+    try {
+      if (!session?.alive || !session.busy) continue;
+      if (session.iv && session.iv.alive) {
+        session.iv.sendKeystroke('esc');
+        session.pendingUnclassifiedPrompt = false;
+        session.busy = false;
+        inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+        endTurn(session);
+      } else {
+        printModeInterrupt(session, () => {}).catch(() => {});
+      }
+      noticeAccountLocked(journalConvoIdFor(session));
+    } catch (e) {
+      try { console.warn(`[account-lock] could not interrupt a session: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    }
+  }
+}
+
+// After the clear: what fell due while locked is delivered now. Messages
+// that were waiting in a session's queue stay there until its next turn
+// ends or the user sends them; they are not pushed in by the clear itself.
+function releaseAfterAccountLock(held) {
+  for (const item of Array.isArray(held) ? held : []) {
+    if (item && item.kind === 'timer' && item.record && typeof item.record === 'object') {
+      fireTimer(item.record).catch((e) => {
+        try { console.warn(`[account-lock] a held reminder could not be delivered: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+      });
+    }
+  }
+}
+
 // Approval keys (journal protocol "Approval keys (step-up)"). With
 // MATRON_APPROVAL_KEYS_FILE set this box verifies the user's signed approval
 // itself before it starts a session, joins a chat or takes a file
@@ -1243,6 +1298,7 @@ const journalPublisher = createJournalPublisher({
   // subagent reconcile AND (via journalOnReconnect) #536's release retry + deferred
   // boot reconcile. See handleJournalReconnect below.
   onReconnect: handleJournalReconnect,
+  onPanic: (panic, { hello }) => (hello ? accountLock.onHello(panic) : accountLock.onFrame(panic)),
   // The box's lock, said on every hello: a hello without it reads as "not
   // locked". A box without approval keys sends nothing.
   helloExtras: () => (boxLock ? { locked: boxLock.report() } : null),
@@ -1727,6 +1783,7 @@ const journalRpcHandler = createRpcRequestHandler({
   controlSession: (params, meta) => journalControlSession(params, meta),
   approvals: approvalPaths,
   boxLock,
+  accountLocked: () => accountLock.isLocked(),
   // Spawn onto a mission: join the new conversation before its opening turn
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
@@ -3338,6 +3395,8 @@ function handleCodexEvent(session, event) {
 }
 
 function flushPendingSessionQueue(session) {
+  // Held, not dropped, while the account is locked.
+  if (accountLock.isLocked()) return false;
   if (session._codexSteerPending || session._codexUncertainSteer) return false;
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queue = session.queuedMessages;
@@ -6057,6 +6116,13 @@ function inflightTurnOrigin(session) {
 // journal) leaves this false.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, causes = null, queuedEntries = null } = {}) {
   if (!session.alive || session._autoStopped) return false;
+  // The account lock: no turn starts, whatever asked for it (the user, a
+  // peer, a reminder, a routine, a carry-on, the bridge itself). Every turn
+  // goes through here, so this is the backstop behind the per-path refusals.
+  if (accountLock.isLocked()) {
+    noticeAccountLocked(journalConvoIdFor(session));
+    return false;
+  }
   // Backstop for the foreign-turn gate: a turn of the session's own that
   // starts while no turn is running ends any foreign turn a seam missed.
   // Mid-turn input leaves it armed — stricter, never looser. "No turn is
@@ -10532,6 +10598,9 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
 // after this is kicked off (lib/timer-command.js fireRepeating) — the notice
 // says so, so the user knows it will come back.
 async function fireTimer(record) {
+  // A reminder that falls due while the account is locked is kept (on disk)
+  // and delivered after the journal clears the lock.
+  if (accountLock.hold({ kind: 'timer', record })) return;
   let session = findSessionByClaudeSessionId(record.convoId);
   if (!session || !session.alive) session = journalResumeConvo(record.convoId);
   if (!session) {
@@ -11955,6 +12024,12 @@ function noticeCodexDeclinedPersonRoom(session, frame) {
 }
 
 function journalInjectInviteRequest(frame) {
+  // A same-bridge request does not pass the invites manager's frame
+  // handler, where the account lock refuses the others.
+  if (accountLock.isLocked() && frame.local) {
+    agentInvites.onInviteFrame({ event: 'answer', room_id: frame.room_id, accept: false, reason: 'account_locked', from_device_id: frame.from_device_id });
+    return;
+  }
   // request  -> a peer wants THIS bridge's session to join frame.room_id
   // join_request -> a peer asks to join a room THIS bridge owns
   const isJoin = frame.event === 'join_request';
@@ -12270,6 +12345,7 @@ agentInvites = createAgentInvites({
   rooms: agentRooms,
   injectRequestTurn: journalInjectInviteRequest,
   approvals: approvalPaths,
+  accountLocked: () => accountLock.isLocked(),
   notifyRoom: journalNotifyRoomEvent,
   onMemberLeft: (roomId, fromDeviceId) => { forgetLeftMemberMute(roomId, fromDeviceId).catch(() => {}); },
   log: console,
@@ -12391,8 +12467,13 @@ const journalInputConsumer = createJournalInputConsumer({
   // Locked mode: outside an unlock window the user's input and other
   // sessions' messages are refused here, before any session is found or
   // woken. The user is told in the conversation; a peer is told in the room.
-  inputLock: boxLock,
-  onInputRefused: (convoId, line) => journalPublishNotice(convoId, `🔒 ${line}`),
+  // The account lock comes first and has no exceptions; it says its line
+  // once per conversation.
+  inputLock: { verdict: (kind, keyId) => (accountLock.isLocked() ? accountLock.verdict() : (boxLock ? boxLock.verdict(kind, keyId) : { ok: true })) },
+  onInputRefused: (convoId, line) => {
+    if (accountLock.isLocked()) noticeAccountLocked(convoId);
+    else journalPublishNotice(convoId, `🔒 ${line}`);
+  },
   onRoomRefused: (room, frame, line) => { journalPublisher.publishText(frame.convo_id, { body: line, from: 'agent' }); },
   verifySignedTap: tapVerifier ? (payload) => tapVerifier.forMarker(payload) : null,
   // A user message arrived before the owner's name was known: ask /me now;
@@ -12879,6 +12960,7 @@ function transferTargetsFor(roomId, fromConvoId) {
 transferReceiver = createTransferReceiver({
   client: transferClient,
   approvals: approvalPaths,
+  accountLocked: () => accountLock.isLocked(),
   stateFile: TRANSFER_INBOX_FILE,
   log: console,
   dirFor: (target) => path.join(sessionDownloadDir(target) || matronFilesDir(target?.workdir), 'inbox'),
