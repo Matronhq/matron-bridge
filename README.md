@@ -252,6 +252,12 @@ undone within five minutes; use `-StopOnly`, which disables the task.
 `deploy.ps1`) hands itself to a one-shot Scheduled Task a few seconds out,
 because Task Scheduler would otherwise stop it along with the bridge.
 
+**Import preflight:** `MATRON_BRIDGE_PREFLIGHT=module node index.js` loads
+`index.js`'s whole static import graph (native bindings included) and exits 0
+before it reads `.env` or starts anything. `deploy.sh`, `deploy.ps1` and the
+self-restart check below all use it. Startup code added to `index.js` must stay
+below that early exit.
+
 **Self-restart onto new code (every platform):** a deploy that finds a live
 session (`deploy.sh --dry-run`, a fleet updater script) leaves the
 new code on disk and the old process running. The bridge notices by itself:

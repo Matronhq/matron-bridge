@@ -1,4 +1,8 @@
 import dotenv from 'dotenv';
+// Deploy preflight: every static import in this file has loaded by the time this
+// line runs. Exit here, before dotenv, config parsing, timers or connections.
+// Startup code added to this file must stay below this line.
+if (process.env.MATRON_BRIDGE_PREFLIGHT === 'module') process.exit(0);
 dotenv.config({ override: true });
 import { spawn, execFileSync, execFile } from 'child_process';
 import {
