@@ -65,7 +65,8 @@ import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, showsSignInScreen, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -3740,6 +3741,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           restarted._accountLogoutPending = session._accountLogoutPending;
           restarted._effortFlowReturnToPrint = session._effortFlowReturnToPrint;
           restarted._postReadySlashCommand = session._postReadySlashCommand;
+          restarted._designLoginFlow = session._designLoginFlow;
         }
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
@@ -4178,7 +4180,7 @@ function maybeResolveInteractivePrompt(session, userText) {
 // can only be URL continuation (no spaces, only URL-safe chars), so prose
 // that happens to follow a URL stays on its own line.
 function unwrapUrls(text) {
-  const URL_HEAD = /(https?:\/\/[A-Za-z0-9=&/%+\-._~?#:@!*'(),;$]+)\n([A-Za-z0-9=&/%+\-._~?#]+)/g;
+  const URL_HEAD = /(https?:\/\/[A-Za-z0-9=&/%+\-._~?#:@!*'(),;$]+)\n(?!https?:\/\/)([A-Za-z0-9=&/%+\-._~?#]+)/g;
   let prev;
   let out = text;
   do {
@@ -4202,9 +4204,6 @@ function handleInteractiveScreenUpdate(session, update) {
   // claude redraws (e.g. spinner ticks). The detector also dedups but
   // only within one session run — we want lifetime dedup across restarts.
   session.surfacedUrls = session.surfacedUrls || new Set();
-  const newUrls = urls.filter(u => !session.surfacedUrls.has(u));
-  if (newUrls.length === 0 && !hasInputCue) return;
-  for (const u of newUrls) session.surfacedUrls.add(u);
   // Un-wrap URLs that claude broke across lines at terminal width so
   // the parsed URL set is correct (`...redir\nect_uri=...` → joined).
   const unwrappedScreen = unwrapUrls(
@@ -4214,7 +4213,12 @@ function handleInteractiveScreenUpdate(session, update) {
   // screen. If the formatter can't make sense of the cue, skip rather
   // than spam a screen-dump full of status chrome.
   const allUrls = extractUrls(unwrappedScreen);
-  const message = formatTuiCueMessage(unwrappedScreen, allUrls, { hasNewUrls: newUrls.length > 0 });
+  const newUrls = allUrls.filter(u => !session.surfacedUrls.has(u));
+  if (newUrls.length === 0 && !hasInputCue) return;
+  for (const u of newUrls) session.surfacedUrls.add(u);
+  // A retry may repaint an older OAuth link above its fresh link.
+  const orderedUrls = [...newUrls, ...allUrls.filter(u => !newUrls.includes(u))];
+  const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0 });
   // Auto-Enter decision is independent of message formatting: an
   // acknowledgment screen the formatter can't summarise must STILL be
   // acknowledged, or claude sits blocked on a keystroke the user can't see.
@@ -4358,6 +4362,132 @@ function handleUnclassifiedPrompt(session, { screen }) {
 // interactive session back to print mode — long enough for the TUI to paint
 // its idle screen so planModeSwitch doesn't refuse the switch.
 const LOGIN_RETURN_TO_PRINT_DELAY_MS = 2500;
+
+// Watch only output emitted after typing /design-login; stop on a result or timeout.
+const DESIGN_LOGIN_WATCH_CAP_MS = 7 * 60 * 1000;
+const DESIGN_LOGIN_SETTLE_MS = 400;
+// No sign-in screen this soon after typing the command: the CLI doesn't know it.
+const DESIGN_LOGIN_NO_SCREEN_MS = 20 * 1000;
+const DESIGN_LOGIN_BUFFER_LIMIT = 65536;
+const DESIGN_LOGIN_RETRY_MS = 5000;
+const DESIGN_LOGIN_RETRY_LIMIT = 24;
+
+function armDesignLoginWatch(session) {
+  const iv = session.iv;
+  if (!iv || typeof iv.on !== 'function') return;
+  session._designLoginWatch?.stop();
+  const roomId = session.roomId;
+  // A newer attempt or an abandoned mode switch invalidates this finish.
+  const flow = { turnAtArm: session.currentTurn || null };
+  session._designLoginFlow = flow;
+  let raw = '';
+  let settleTimer = null;
+  let refusalShown = false;
+  let screenSeen = false;
+  const watch = {
+    stop() {
+      iv.removeListener('pty-data', onData);
+      if (settleTimer) clearTimeout(settleTimer);
+      clearTimeout(cap);
+      clearTimeout(noScreen);
+      if (session._designLoginWatch === watch) session._designLoginWatch = null;
+    },
+  };
+  const check = () => {
+    settleTimer = null;
+    const text = stripAnsi(raw);
+    if (!screenSeen && showsSignInScreen(text)) {
+      screenSeen = true;
+      clearTimeout(noScreen);
+    }
+    const outcome = classifyDesignLoginOutput(text);
+    if (outcome) {
+      watch.stop();
+      debug(`design-login finished (${outcome})`);
+      releaseDesignLoginBusy(session, flow);
+      if (!session.busy) flushAfterDesignLogin(session);
+      scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
+      return;
+    }
+    // Refusal keeps the dialog open: release the pasted-code turn, but hold room input.
+    if (!refusalShown && designLoginCodeRefused(text)) {
+      refusalShown = true;
+      releaseDesignLoginBusy(session, flow);
+      raw = '';
+      if (session.sendCallback) session.sendCallback(DESIGN_LOGIN_CODE_REFUSED_MESSAGE);
+    } else if (refusalShown && findInputCue(text) === 'oauth') {
+      refusalShown = false;
+      raw = '';
+    }
+  };
+  const onData = (data) => {
+    raw += String(data);
+    if (raw.length > DESIGN_LOGIN_BUFFER_LIMIT) raw = raw.slice(-DESIGN_LOGIN_BUFFER_LIMIT);
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = setTimeout(check, DESIGN_LOGIN_SETTLE_MS);
+  };
+  const cap = setTimeout(() => {
+    watch.stop();
+    debug('design-login watch timed out');
+    scheduleDesignLoginFinish(roomId, flow, null, 0);
+  }, DESIGN_LOGIN_WATCH_CAP_MS);
+  if (typeof cap.unref === 'function') cap.unref();
+  const noScreen = setTimeout(() => {
+    if (screenSeen) return;
+    watch.stop();
+    debug('design-login: no sign-in screen appeared');
+    releaseDesignLoginBusy(session, flow);
+    if (!session.busy) flushAfterDesignLogin(session);
+    scheduleDesignLoginFinish(roomId, flow, 'unrecognised', 0);
+  }, DESIGN_LOGIN_NO_SCREEN_MS);
+  if (typeof noScreen.unref === 'function') noScreen.unref();
+  iv.on('pty-data', onData);
+  session._designLoginWatch = watch;
+}
+
+function releaseDesignLoginBusy(session, flow) {
+  // Pasted codes start a turn that the dialog consumes without a Stop hook.
+  if (!designLoginEndsPhantomTurn(session, flow)) return;
+  debug('design-login: ending the turn the pasted code began');
+  session.busy = false;
+  if (session.currentTurn && session.currentTurn !== flow.turnAtArm) endTurn(session);
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+  journalSessionState(session, 'waiting');
+  journalActivity(session, 'idle');
+}
+
+function flushAfterDesignLogin(session) {
+  if (!session.alive) return;
+  if (flushPendingSessionQueue(session) !== true) maybeFlushRoomDelivery(session);
+}
+
+function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) {
+  const t = setTimeout(() => {
+    const current = sessions.get(roomId);
+    if (!ownsDesignLoginFinish(current, flow)) return;
+    const sendReply = current.sendCallback || (() => {});
+    const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
+    if (!shouldRunAccountFlowReturn(current)) {
+      current._designLoginFlow = null;
+      sendReply(designLoginOutcomeMessage(outcome, { returning: false }));
+      return;
+    }
+    if (!planModeSwitch(current, false).ok && attempt < DESIGN_LOGIN_RETRY_LIMIT) {
+      scheduleDesignLoginFinish(roomId, flow, outcome, DESIGN_LOGIN_RETRY_MS, attempt + 1);
+      return;
+    }
+    current._designLoginFlow = null;
+    const switched = applyModeSwitch(roomId, current, false, {
+      sendReply, sendHtml,
+      announcement: designLoginOutcomeMessage(outcome),
+      refusalAnnouncement: `${designLoginOutcomeMessage(outcome, { returning: false })} I couldn't switch back to non-interactive mode automatically — type /mode print when ready.`,
+    });
+    if (switched) current._accountFlowReturnToPrint = false;
+    const holder = sessions.get(roomId);
+    if (holder?.alive) maybeFlushRoomDelivery(holder);
+  }, delayMs);
+  if (typeof t.unref === 'function') t.unref();
+}
 
 // --- Structured Question Handling ---
 
@@ -6536,6 +6666,7 @@ function startResumeReadyWatcher(session) {
                  && session.iv.sendText(parkedSlash) !== false) {
         parkedSlashTyped = true;
         debug(`typed parked ${parkedSlash} into ready TUI`);
+        if (parkedSlash === DESIGN_LOGIN_COMMAND) armDesignLoginWatch(session);
         // An /effort-from-print flow: record the write like any bridge-typed
         // /effort (lib/effort-tracker.js), accept its confirmation on the
         // user's behalf (they asked for this level in so many words), and
@@ -8431,6 +8562,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/mode [interactive|print] — Show or switch interactive vs non-interactive\n` +
         `/login — Log in to your Anthropic account (auto-switches to interactive mode)\n` +
         `/logout — Log out of your Anthropic account (auto-switches to interactive mode)\n` +
+        `/design-login — Authorize Claude Design access (auto-switches to interactive mode)\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
@@ -8477,6 +8609,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
           ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
           ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
+          ['/design-login', 'Authorize Claude Design access (auto-switches to interactive mode)'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
@@ -8707,6 +8840,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     // NOT sendToSession: account commands run no claude turn, so no Stop
     // hook would ever clear `busy` — the same failure class /effort works
     // around (see lib/effort-command.js).
+    case '!design-login':
     case '!login':
     case '!logout': {
       const cmdWord = cmd.slice(1);
@@ -8715,6 +8849,25 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`No active session. /${cmdWord} runs inside a session — start one first.`);
         break;
       }
+      const isDesign = cmdWord === 'design-login';
+      if (isDesign && session.agent === AGENT_CODEX) {
+        await sendReply('/design-login is a Claude Code command. Switch this chat to Claude (/switch claude) to run it.');
+        break;
+      }
+      if (isDesign && session._accountFlowReturnScheduled) {
+        await sendReply('Still finishing the login — send /design-login again in a few seconds.');
+        break;
+      }
+      // Typed mid-turn, the TUI may hold the command until the turn ends, and the
+      // no-sign-in-screen window would run out first. A re-run while a dialog is
+      // already open (its watch exists) is let through: a pasted code can leave
+      // busy set until the watch releases it.
+      if (isDesign && session.busy && !session._designLoginWatch) {
+        await sendReply('A turn is running — send /design-login again when it finishes.');
+        break;
+      }
+      session._designLoginWatch?.stop();
+      session._designLoginFlow = null;
       // Any session.iv — even a dead one — takes this branch: falling
       // through to the mode switch would hit planModeSwitch's "already
       // interactive" no-op (it only checks iv truthiness) and silently do
@@ -8762,7 +8915,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // logout mark left by an earlier /logout attempt that never
         // finished, or a later clean exit would be misreported as a logout.
         session._accountLogoutPending = cmdWord === 'logout';
-        await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
+        if (isDesign) armDesignLoginWatch(session);
+        await sendReply(isDesign ? 'Signing in to Claude Design…' : cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
         break;
       }
       // A zero-turn print chat used to be turned away here with "send any
@@ -8781,7 +8935,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // nothing is parked.
       const next = applyModeSwitch(roomId, session, true, {
         sendReply, sendHtml,
-        announcement: cmdWord === 'logout'
+        announcement: isDesign
+          ? 'Signing in to Claude Design — switching to interactive mode to complete…'
+          : cmdWord === 'logout'
           ? 'Logging out — switching to interactive mode to complete…'
           : 'Logging in — switching to interactive mode to complete…',
       });
@@ -10828,7 +10984,7 @@ function pendingPeerFor(roomId) {
 function sessionOccupiedForRoomDelivery(session) {
   return !!session.busy || !!session._awaitingInputReady
     || !!session.waitingForAnswer || !!session.pendingInteractivePrompt
-    || effortFlowHoldsInput(session);
+    || effortFlowHoldsInput(session) || signInDialogHoldsInput(session);
 }
 
 // A turn another person starts needs more: no turn of any kind may still be
@@ -15045,6 +15201,7 @@ function clearPendingInterrupt(session) {
 
 function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}) {
   if (!session) return;
+  session._designLoginWatch?.stop();
   if (preserveQueue && session._codexSteerPending?.queued) {
     restoreQueuedBatch(session, session._codexSteerPending.queued);
     session._codexSteerPending.handedOff = true;
