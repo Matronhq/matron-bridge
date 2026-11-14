@@ -1078,7 +1078,7 @@ const boxLock = approvalGate.enabled ? createBoxLock({
   maxMinutes: APPROVAL_CONFIG.unlockMaxMinutes,
   stateFile: BOX_LOCK_FILE,
   boxName: () => journalPublisher.identity()?.name ?? null,
-  fileNotice: ({ title, body }) => itemsClient.create({ kind: 'notice', title, body, convo_id: JOURNAL_CONTROL_CONVO_ID }),
+  fileNotice: ({ title, body, labels }) => itemsClient.create({ kind: 'notice', title, body, labels, convo_id: JOURNAL_CONTROL_CONVO_ID }),
   // Tell the journal at once: the apps show the lock from its copy.
   onChange: () => {
     try { journalPublisher.sendRoomOp({ op: 'box_status', locked: boxLock.report() }); } catch { /* the next hello carries it */ }

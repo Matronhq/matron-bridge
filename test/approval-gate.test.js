@@ -8,9 +8,9 @@ import { vectors, KEY_ID, SIGNED_AT, PINNED, sign, otherKeyPem, tempKeys, UNIX }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // SHA-256 of lib/vendor/approval-verify.mjs as copied from the journal's
-// tools/approval-verify.mjs at commit 028c8bb. The file is vendored
+// tools/approval-verify.mjs at commit d3b72ff. The file is vendored
 // unchanged: update it only by copying a newer one, with this constant.
-const VERIFIER_SHA256 = '57240c690b2e17f91519350e64e6d7c54fc3792366a37b03d0222c72877d0ae5';
+const VERIFIER_SHA256 = '1bb87c2d81a0f91493195e8a1f6876179b47790ab9addd5a3aec0494a39ed9fa';
 
 const temps = [];
 afterEach(() => { while (temps.length) temps.pop().cleanup(); });

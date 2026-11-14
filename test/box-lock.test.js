@@ -41,7 +41,7 @@ gatedDescribe('a box that is not in locked mode', () => {
     expect(lock.allowsUser('anything')).toBe(true);
     expect(lock.allowsPeer()).toBe(true);
     expect(lock.state()).toEqual({ on: false, until: null, lockdownUntil: null });
-    expect(lock.report()).toEqual({ on: false });
+    expect(lock.report()).toEqual({ on: false, until: null, lockdown_until: null });
     expect(lock.verdict('user', null)).toEqual({ ok: true });
   });
 
@@ -55,7 +55,7 @@ gatedDescribe('locked mode', () => {
   it('refuses users and peers until unlocked, and says what to do', () => {
     const { lock } = box();
     expect(lock.state()).toEqual({ on: true, until: null, lockdownUntil: null });
-    expect(lock.report()).toEqual({ on: true, until: null });
+    expect(lock.report()).toEqual({ on: true, until: null, lockdown_until: null });
     expect(lock.allowsUser(KEY_ID)).toBe(false);
     expect(lock.allowsPeer()).toBe(false);
     expect(lock.verdict('user', KEY_ID)).toEqual({ ok: false, line: LOCKED_USER_LINE });
@@ -74,7 +74,7 @@ gatedDescribe('locked mode', () => {
     expect(lock.allowsUser(undefined)).toBe(false);
     expect(lock.allowsPeer()).toBe(true);
     expect(lock.state()).toEqual({ on: true, until: clock.now + 30 * MIN, lockdownUntil: null });
-    expect(lock.report()).toEqual({ on: false, until: clock.now + 30 * MIN });
+    expect(lock.report()).toEqual({ on: false, until: clock.now + 30 * MIN, lockdown_until: null });
     expect(onChange).toHaveBeenCalled();
   });
 
@@ -86,7 +86,7 @@ gatedDescribe('locked mode', () => {
     clock.now += 1;
     expect(lock.allowsUser(KEY_ID)).toBe(false);
     expect(lock.allowsPeer()).toBe(false);
-    expect(lock.report()).toEqual({ on: true, until: null });
+    expect(lock.report()).toEqual({ on: true, until: null, lockdown_until: null });
   });
 
   it('lock ends the window early, and needs no signature', () => {
@@ -160,7 +160,9 @@ gatedDescribe('lockdown', () => {
     expect(lock.state().lockdownUntil).toBe(clock.now + 30 * MIN);
     expect(fileNotice).toHaveBeenCalledTimes(1);
     expect(fileNotice.mock.calls[0][0].title).toMatch(/locked down/i);
-    expect(fileNotice.mock.calls[0][0].body).toMatch(/box-a/);
+    expect(fileNotice.mock.calls[0][0].body.split('\n')[0]).toBe('Box: box-a');
+    expect(fileNotice.mock.calls[0][0].labels).toEqual(['box-lockdown']);
+    expect(lock.report()).toEqual({ on: true, until: null, lockdown_until: clock.now + 30 * MIN });
   });
 
   it('refusals an honest app can cause never count', () => {
@@ -184,7 +186,7 @@ gatedDescribe('lockdown', () => {
     const { lock, gate, clock } = box({ locked: false });
     for (let i = 0; i < 3; i++) gate.check(sign({ type: 'consent', subject: {}, signedAt: clock.now, privateKeyPem: otherKeyPem() }), { type: 'consent', subject: {} });
     expect(lock.state().lockdownUntil).toBe(clock.now + 30 * MIN);
-    expect(lock.report()).toEqual({ on: true, until: clock.now + 30 * MIN });
+    expect(lock.report()).toEqual({ on: false, until: null, lockdown_until: clock.now + 30 * MIN });
   });
 
   it('in lockdown a valid unlock is refused, an open window is shut, and gated requests are refused', () => {
@@ -264,13 +266,18 @@ gatedDescribe('unlock, lock and clear_lockdown over RPC', () => {
     const { lock, clock } = box();
     const { handler, responses } = rpc(lock);
     handler(req('unlock', { approval: unlockApproval(clock, '15') }));
-    expect(responses[0]).toMatchObject({ ok: true, result: { locked: { on: false, until: clock.now + 15 * MIN } } });
+    expect(responses[0].result).toEqual({ locked: { on: false, until: clock.now + 15 * MIN, lockdown_until: null } });
     handler(req('lock'));
-    expect(responses[1]).toMatchObject({ ok: true, result: { locked: { on: true, until: null } } });
+    expect(responses[1].result).toEqual({ locked: { on: true, until: null, lockdown_until: null } });
     handler(req('unlock', {}));
-    expect(responses[2]).toMatchObject({ ok: false, error: { code: 'approval_required', detail: 'approval_required' } });
+    expect(responses[2].error).toEqual({ code: 'approval_required' });
     handler(req('unlock', { approval: forged(clock) }));
-    expect(responses[3]).toMatchObject({ ok: false, error: { code: 'approval_required', detail: 'signature' } });
+    expect(responses[3].error).toEqual({ code: 'approval_invalid', detail: 'signature' });
+    handler(req('unlock', { approval: unlockApproval(clock, '999') }));
+    expect(responses[4].error).toEqual({ code: 'bad_minutes' });
+    for (let i = 0; i < 2; i++) handler(req('unlock', { approval: forged(clock) }));
+    handler(req('unlock', { approval: unlockApproval(clock) }));
+    expect(responses[7].error).toEqual({ code: 'lockdown' });
   });
 
   it('clear_lockdown clears a lockdown', () => {

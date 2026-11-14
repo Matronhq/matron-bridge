@@ -78,8 +78,8 @@ const clientReq = (params = {}) => ({ request_id: 'r2', from_device_id: 4, appro
 const refused = (responses, detail) => {
   expect(responses).toHaveLength(1);
   expect(responses[0].ok).toBe(false);
-  expect(responses[0].error.code).toBe('approval_required');
-  if (detail) expect(responses[0].error.detail).toBe(detail);
+  if (detail === 'approval_required') expect(responses[0].error).toEqual({ code: 'approval_required' });
+  else expect(responses[0].error).toEqual({ code: 'approval_invalid', detail });
 };
 
 gatedDescribe('start on a gated box', () => {
@@ -97,7 +97,7 @@ gatedDescribe('start on a gated box', () => {
     expect(responses[0]).toMatchObject({ ok: true, result: { convo_id: 'session-1' } });
     expect(startSession).toHaveBeenCalledTimes(1);
     handler(spawnReq({ approval }));
-    expect(responses[1].error).toEqual({ code: 'approval_required', detail: 'nonce_reused' });
+    expect(responses[1].error).toEqual({ code: 'approval_invalid', detail: 'nonce_reused' });
     expect(startSession).toHaveBeenCalledTimes(1);
   });
 
