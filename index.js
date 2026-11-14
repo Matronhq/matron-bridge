@@ -48,6 +48,7 @@ import { createTimelineHandlers } from './lib/timeline-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
+import { formatProposalOutcome } from './lib/memory-format.js';
 import { createUserDefaultsLookup, defaultDeclinedText, defaultOfferFor, defaultSavedText, effectiveDefaultEffort, effectiveDefaultModel } from './lib/user-defaults.js';
 import { createBoxDefaultsStore, createBoxDefaultsSetter, resolveDefaultAgent, boxModelFor, boxEffortFor, codexEnvDefaults } from './lib/box-defaults.js';
 import { createUserSettings } from './lib/user-settings.js';
@@ -12553,6 +12554,19 @@ const journalInputConsumer = createJournalInputConsumer({
   // A `memory` marker on any of this bridge's conversations: the user's
   // memories changed, so the cached index is re-read (spec 2026-09-27).
   onMemoryEvent: () => { memoryLookup.refresh({ force: true }); },
+  // What became of a memory save or delete this conversation proposed
+  // (the journal's `memory_proposal` event): a turn for the live session,
+  // delivered like a spawn outcome (injected when idle, coalesced when
+  // busy). It names no cause, so nothing the agent does in that turn counts
+  // as the user's ask. A session that is gone hears nothing: the item the
+  // user answered is the record.
+  onMemoryProposal: (convoId, payload) => {
+    const text = formatProposalOutcome(payload);
+    if (!text || outsideWorkRefused()) return;
+    const session = findSessionByClaudeSessionId(convoId);
+    if (!session || !session.alive) return;
+    roomDelivery.deliver(session, session.roomId, { roomId: 'memory', roomTitle: 'memory', from: 'bridge', body: text, at: Date.now(), cause: null });
+  },
   onCoordinatorEvent: (convoId, ev) => {
     journalOnCoordinator(convoId, ev).catch((e) => {
       try { console.warn(`[coordinator] handling ${ev?.role} for ${convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
