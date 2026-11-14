@@ -13,6 +13,7 @@ import { createItemsClient } from './lib/items-client.js';
 import { readApprovalConfig } from './lib/approval-config.js';
 import { createApprovalGate } from './lib/approval-gate.js';
 import { createApprovalPaths } from './lib/approval-paths.js';
+import { createBoxLock } from './lib/box-lock.js';
 import { createTapVerifier } from './lib/items-approval.js';
 import { createTransferClient } from './lib/transfer-client.js';
 import { createTransferSender } from './lib/transfer-sender.js';
@@ -1012,7 +1013,25 @@ try {
   process.exit(1);
 }
 console.log(approvalGate.enabled ? `approval gate: on, ${approvalGate.keyCount()} keys` : 'approval gate: off');
-const approvalPaths = createApprovalPaths({ gate: approvalGate, identity: () => journalPublisher.identity(), log: console });
+// Locked mode and lockdown (lib/box-lock.js): only on a box with pinned
+// keys. MATRON_LOCKED=1 makes it take outside input only during a signed
+// unlock window; lockdown after repeated forged approvals applies either way.
+const BOX_LOCK_FILE = path.join(os.homedir(), '.matron-bridge-box-lock.json');
+const boxLock = approvalGate.enabled ? createBoxLock({
+  gate: approvalGate,
+  locked: APPROVAL_CONFIG.locked,
+  maxMinutes: APPROVAL_CONFIG.unlockMaxMinutes,
+  stateFile: BOX_LOCK_FILE,
+  boxName: () => journalPublisher.identity()?.name ?? null,
+  fileNotice: ({ title, body }) => itemsClient.create({ kind: 'notice', title, body, convo_id: JOURNAL_CONTROL_CONVO_ID }),
+  // Tell the journal at once: the apps show the lock from its copy.
+  onChange: () => {
+    try { journalPublisher.sendRoomOp({ op: 'box_status', locked: boxLock.report() }); } catch { /* the next hello carries it */ }
+  },
+  log: console,
+}) : null;
+if (boxLock && APPROVAL_CONFIG.locked) console.log(`locked mode: on (unlock windows of at most ${APPROVAL_CONFIG.unlockMaxMinutes} minutes)`);
+const approvalPaths = createApprovalPaths({ gate: approvalGate, identity: () => journalPublisher.identity(), lockdown: () => !!boxLock && boxLock.inLockdown(), log: console });
 // A signed tap on a tracker item, checked against the pinned keys so the
 // agent is told whether it verified on this box. null with the gate off.
 const tapVerifier = createTapVerifier({ gate: approvalGate, getItem: (id) => itemsClient.getAsStored(id) });
@@ -1205,6 +1224,7 @@ function publishBoxStatus(reason) {
     ...(disk ? { disk } : {}),
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
     ...(defaults ? { defaults } : {}),
+    ...(boxLock ? { locked: boxLock.report() } : {}),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
   return sent;
@@ -1223,6 +1243,9 @@ const journalPublisher = createJournalPublisher({
   // subagent reconcile AND (via journalOnReconnect) #536's release retry + deferred
   // boot reconcile. See handleJournalReconnect below.
   onReconnect: handleJournalReconnect,
+  // The box's lock, said on every hello: a hello without it reads as "not
+  // locked". A box without approval keys sends nothing.
+  helloExtras: () => (boxLock ? { locked: boxLock.report() } : null),
   // The user's settings: hello_ok's (or GET /settings when it carries none)
   // and every pushed change.
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
@@ -1703,6 +1726,7 @@ const journalRpcHandler = createRpcRequestHandler({
   // /compact and turn-injection paths. Late-bound like joinMission.
   controlSession: (params, meta) => journalControlSession(params, meta),
   approvals: approvalPaths,
+  boxLock,
   // Spawn onto a mission: join the new conversation before its opening turn
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
@@ -12364,6 +12388,13 @@ const journalInputConsumer = createJournalInputConsumer({
   routeRoomFrame: journalOnRoomFrame,
   selfAgentName: () => journalPublisher.identity()?.name || null,
   ownerName: () => journalIdentity.name(),
+  // Locked mode: outside an unlock window the user's input and other
+  // sessions' messages are refused here, before any session is found or
+  // woken. The user is told in the conversation; a peer is told in the room.
+  inputLock: boxLock,
+  onInputRefused: (convoId, line) => journalPublishNotice(convoId, `🔒 ${line}`),
+  onRoomRefused: (room, frame, line) => { journalPublisher.publishText(frame.convo_id, { body: line, from: 'agent' }); },
+  verifySignedTap: tapVerifier ? (payload) => tapVerifier.forMarker(payload) : null,
   // A user message arrived before the owner's name was known: ask /me now;
   // the router replays what it held once the name is in.
   onOwnerUnknown: () => refreshJournalIdentity({ force: true }),

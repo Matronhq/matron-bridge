@@ -26,6 +26,23 @@ function gated({ identity = { deviceId: 9, name: 'box-a' } } = {}) {
 }
 const ungated = () => createApprovalPaths({ gate: createApprovalGate({ keysFile: '' }), identity: () => ({ deviceId: 9, name: 'box-a' }), log: silent });
 
+describe('lockdown', () => {
+  it('refuses every gated request, valid or not, while the box is locked down', () => {
+    const t = tempKeys();
+    temps.push(t);
+    const gate = createApprovalGate({ keysFile: t.keysFile, uid: t.uid, noncesFile: path.join(t.dir, 'n.json'), journalHost: 'journal.example', user: 'alice', now: () => SIGNED_AT + 1000, log: silent });
+    let down = true;
+    const paths = createApprovalPaths({ gate, identity: () => ({ deviceId: 9, name: 'box-a' }), lockdown: () => down, log: silent });
+    const approval = sign({ type: 'consent', subject: { op: 'spawn', ask: 'sp_1', box: 'box-a', workdir: '/srv/project', task_sha256: sha256Hex('t'), decision: 'approve' } });
+    const request = { request_id: 'r', from_device_id: 0, params: { workdir: '/srv/project', prompt: 't', spawn_id: 'sp_1', approval } };
+    expect(paths.start(request)).toEqual({ ok: false, reason: 'lockdown' });
+    expect(paths.invite({ event: 'request', room_id: 'r1', justification: '' })).toEqual({ ok: false, reason: 'lockdown' });
+    expect(paths.transfer({ id: 't1', sha256: 'x', size: 1 })).toEqual({ ok: false, reason: 'lockdown' });
+    down = false;
+    expect(paths.start(request).ok).toBe(true);
+  });
+});
+
 describe('subjects', () => {
   it('a value over 200 characters is signed as its hash under <name>_sha256', () => {
     const long = '/'.padEnd(300, 'w');
