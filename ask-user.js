@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { SECRET_CONTEXT_MAX_LENGTH } from './lib/secret-context.js';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse, permissionInputRefusal } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
-import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
+import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings, withStepUpNote } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
@@ -1285,12 +1285,14 @@ server.tool(
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
+    step_up: z.boolean().optional().describe("true = the user must confirm the tap with Face ID or Touch ID (a signature from their device's approval key). Use for anything destructive or hard to undo. A typed reply never satisfies it. Cannot be un-set once filed: close the item and file a new one."),
+    subject: z.record(z.string(), z.string()).optional().describe('With step_up: what exactly is being approved, as a flat object of short strings (at most 12 keys), e.g. {"op":"drop_table","table":"orders","box":"box-a"}. Shown to the user verbatim and signed.'),
     shared_by: z.string().max(PERSON_MAX).optional().describe("Another person's mission you may contribute to: their user name (name@host for someone on another journal), with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
     mission: z.number().int().min(1).optional().describe('With shared_by: THEIR mission number to file the item on'),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_create', 'item_create', args, formatContribAck('Filed'))
-    : callItems('create', args, (d) => withImageWarnings(itemLine(d.item), d))),
+    : callItems('create', args, (d) => withStepUpNote(withImageWarnings(itemLine(d.item), d), d))),
 );
 
 server.tool(
@@ -1324,12 +1326,14 @@ server.tool(
     attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
+    step_up: z.boolean().optional().describe("true = the user must confirm the tap with Face ID or Touch ID (a signature from their device's approval key). Use for anything destructive or hard to undo. A typed reply never satisfies it. Needs actions."),
+    subject: z.record(z.string(), z.string()).optional().describe('With step_up: what exactly is being approved, as a flat object of short strings (at most 12 keys), e.g. {"op":"drop_table","table":"orders","box":"box-a"}. Shown to the user verbatim and signed.'),
     add_labels: z.array(z.string()).max(10).optional().describe('Labels to add to the item, keeping the ones it has (e.g. ["dispatched"] on a spare-allowance backlog task you started)'),
     shared_by: z.string().max(PERSON_MAX).optional().describe("An item on another person's mission you may contribute to: their user name (name@host for someone on another journal); id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_comment', 'item_comment', args, formatContribAck('Commented'))
-    : callItems('comment', args, (d) => withImageWarnings(formatCommentAck(d, args.awaiting), d))),
+    : callItems('comment', args, (d) => withStepUpNote(withImageWarnings(formatCommentAck(d, args.awaiting), d), d))),
 );
 
 server.tool(
