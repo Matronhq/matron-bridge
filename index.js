@@ -10,6 +10,10 @@ import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.
 import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
+import { readApprovalConfig } from './lib/approval-config.js';
+import { createApprovalGate } from './lib/approval-gate.js';
+import { createApprovalPaths } from './lib/approval-paths.js';
+import { createTapVerifier } from './lib/items-approval.js';
 import { createTransferClient } from './lib/transfer-client.js';
 import { createTransferSender } from './lib/transfer-sender.js';
 import { createTransferOutcomeNotify } from './lib/transfer-outcome.js';
@@ -984,6 +988,35 @@ function refreshJournalIdentity(opts) {
     return name;
   });
 }
+// Approval keys (journal protocol "Approval keys (step-up)"). With
+// MATRON_APPROVAL_KEYS_FILE set this box verifies the user's signed approval
+// itself before it starts a session, joins a chat or takes a file
+// (lib/approval-gate.js, lib/approval-paths.js). Unset, nothing changes. A
+// keys file that cannot be trusted stops the bridge here rather than letting
+// it run ungated.
+const APPROVAL_NONCES_FILE = path.join(os.homedir(), '.matron-bridge-approval-nonces.json');
+let APPROVAL_CONFIG;
+let approvalGate;
+try {
+  APPROVAL_CONFIG = readApprovalConfig(process.env, { journalWsUrl: JOURNAL_WS_URL });
+  approvalGate = createApprovalGate({
+    keysFile: APPROVAL_CONFIG.keysFile,
+    maxAgeMs: APPROVAL_CONFIG.maxAgeMs,
+    noncesFile: APPROVAL_NONCES_FILE,
+    journalHost: APPROVAL_CONFIG.journalHost,
+    user: () => journalIdentity.name(),
+    log: console,
+  });
+} catch (e) {
+  console.error(`[approval-gate] ${e.message}`);
+  process.exit(1);
+}
+console.log(approvalGate.enabled ? `approval gate: on, ${approvalGate.keyCount()} keys` : 'approval gate: off');
+const approvalPaths = createApprovalPaths({ gate: approvalGate, identity: () => journalPublisher.identity(), log: console });
+// A signed tap on a tracker item, checked against the pinned keys so the
+// agent is told whether it verified on this box. null with the gate off.
+const tapVerifier = createTapVerifier({ gate: approvalGate, getItem: (id) => itemsClient.getAsStored(id) });
+
 const trackerUrlBaseNow = () => trackerUrlBase({ httpBase: journalHttpBase, userName: journalIdentity.name() });
 function trackerLinksNow(text) {
   return renderTrackerLinks(text, trackerUrlBaseNow());
@@ -1669,6 +1702,7 @@ const journalRpcHandler = createRpcRequestHandler({
   // the target, park while occupied, apply through the /model, /switch,
   // /compact and turn-injection paths. Late-bound like joinMission.
   controlSession: (params, meta) => journalControlSession(params, meta),
+  approvals: approvalPaths,
   // Spawn onto a mission: join the new conversation before its opening turn
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
@@ -9915,6 +9949,7 @@ const itemTurnRouter = createItemTurnRouter({
   // item arrives with transcript:null and only the bridge can fill it in.
   setTranscript: (id, commentId, body) => itemsClient.setTranscript(id, commentId, body),
   getItem: (id) => itemsClient.get(id),
+  verifyTap: tapVerifier ? (payload) => tapVerifier.forMarker(payload) : null,
   // A turn held for the journal's transcript may outlive its session.
   resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
   log: console,
@@ -12210,6 +12245,7 @@ agentInvites = createAgentInvites({
   sendRoomOp: journalPublisher.sendRoomOp,
   rooms: agentRooms,
   injectRequestTurn: journalInjectInviteRequest,
+  approvals: approvalPaths,
   notifyRoom: journalNotifyRoomEvent,
   onMemberLeft: (roomId, fromDeviceId) => { forgetLeftMemberMute(roomId, fromDeviceId).catch(() => {}); },
   log: console,
@@ -12811,6 +12847,7 @@ function transferTargetsFor(roomId, fromConvoId) {
 }
 transferReceiver = createTransferReceiver({
   client: transferClient,
+  approvals: approvalPaths,
   stateFile: TRANSFER_INBOX_FILE,
   log: console,
   dirFor: (target) => path.join(sessionDownloadDir(target) || matronFilesDir(target?.workdir), 'inbox'),
@@ -12915,6 +12952,9 @@ const itemsHandlers = createItemsHandlers({
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
   checkLocalFile: (session, reqPath) => checkLocalUpload({ session, reqPath }),
   saveAttachments: saveItemAttachments,
+  // MATRON_STEP_UP_ALL=1: every question this box files needs a signed tap.
+  stepUpAll: APPROVAL_CONFIG.stepUpAll,
+  verifyTap: tapVerifier ? (thread, comment) => tapVerifier.forThread(thread, comment) : null,
 });
 
 const missionsHandlers = createMissionsHandlers({

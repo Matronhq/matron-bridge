@@ -173,6 +173,21 @@ describe('signed taps in item_get', () => {
     expect(r.body.comments[0].approval_check).toEqual({ ok: true, keyId: KEY_ID });
     expect(r.body.comments[1].approval_check).toBeUndefined();
   });
+
+  it('get checks against the thread as stored, read with inline attachment refs left alone', async () => {
+    const shown = data();
+    const stored = data();
+    stored.item.body = 'as stored';
+    const verifyTap = vi.fn(async () => ({ ok: true, keyId: KEY_ID }));
+    const getAsStored = vi.fn(async () => ({ status: 200, data: stored }));
+    const { h } = fixture({ get: vi.fn(async () => ({ status: 200, data: shown })), getAsStored }, { verifyTap });
+    await h.get({ roomId: '!r:s', id: 'it_1' });
+    expect(getAsStored).toHaveBeenCalledWith('it_1');
+    expect(verifyTap.mock.calls[0][0]).toBe(stored);
+    const gone = fixture({ get: vi.fn(async () => ({ status: 200, data: shown })), getAsStored: async () => ({ status: 0, data: {} }) }, { verifyTap });
+    const r = await gone.h.get({ roomId: '!r:s', id: 'it_1' });
+    expect(r.body.comments[0].approval_check).toEqual({ ok: false, reason: 'item_unreadable' });
+  });
 });
 
 describe('what a box expects of a signed tap', () => {
