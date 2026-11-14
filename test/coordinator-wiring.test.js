@@ -53,7 +53,8 @@ describe('coordinator spawn wiring (source inspection)', () => {
     expect(cs).toContain("'--disallowed-tools', ...printCoord.disallowedTools,");
     expect(cs).toContain('launch: configuredEnv => launchWithClaudePromptFile({');
     expect(cs).toContain('prompt: printCoord.appendSystemPrompt,');
-    expect(cs).toContain('runDir: HEADER_RUN_DIR,');
+    expect(cs).toContain('onError: failedSpawnProcess,');
+    expect(cs).toContain('runDir: ensureHeaderRunDir,');
     expect(cs).toContain("launch: promptArgs => spawn('claude', promptArgs, {");
   });
 
@@ -63,7 +64,7 @@ describe('coordinator spawn wiring (source inspection)', () => {
     expect(iv).toContain("...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),");
     expect(iv).toContain('launch: configuredEnv => launchWithClaudePromptFile({');
     expect(iv).toContain('prompt: ivCoord.appendSystemPrompt,');
-    expect(iv).toContain('runDir: HEADER_RUN_DIR,');
+    expect(iv).toContain('runDir: ensureHeaderRunDir,');
     expect(iv).toContain("exitEvent: 'exit',");
     expect(iv).toContain('claudeArgs: promptArgs,');
   });

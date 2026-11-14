@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRunDir, sweepDeadRunDirs } from '../lib/header-files.js';
 import { launchWithClaudePromptFile } from '../lib/claude-prompt-file.js';
+import { failedSpawnProcess, attachSpawnErrorHandler } from '../lib/spawn-guard.js';
 
 const roots = [];
 function privateRunDir() {
@@ -144,5 +145,61 @@ describe('Claude prompt file transport', () => {
     expect(fs.readdirSync(runDir)).toHaveLength(1);
     expect(sweepDeadRunDirs(path.dirname(runDir), { alive: () => false, selfPid: -1 })).toEqual([path.basename(runDir)]);
     expect(fs.existsSync(runDir)).toBe(false);
+  });
+
+  it('recreates a removed private run directory before the next spawn', () => {
+    const runDir = privateRunDir();
+    fs.rmSync(runDir, { recursive: true });
+    const child = launchWithClaudePromptFile({
+      prompt: 'rules', args: [], runDir,
+      launch: args => {
+        expect(fs.readFileSync(args.at(-1), 'utf8')).toBe('rules');
+        if (process.platform !== 'win32') expect(fs.statSync(runDir).mode & 0o777).toBe(0o700);
+        return new EventEmitter();
+      },
+    });
+    child.emit('close');
+  });
+
+  it('refuses a symlink in place of the private run directory', () => {
+    const runDir = privateRunDir();
+    const other = path.join(path.dirname(runDir), 'other');
+    fs.mkdirSync(other);
+    fs.rmSync(runDir, { recursive: true });
+    fs.symlinkSync(other, runDir, 'junction');
+    const launch = vi.fn();
+    expect(() => launchWithClaudePromptFile({ prompt: 'rules', args: [], runDir, launch })).toThrow('not a directory');
+    expect(launch).not.toHaveBeenCalled();
+    expect(fs.readdirSync(other)).toEqual([]);
+  });
+
+  it('reports unavailable storage through the normal error/close path and can retry later', async () => {
+    const runDir = privateRunDir();
+    const allocate = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('storage unavailable'); })
+      .mockReturnValue(runDir);
+    const launch = vi.fn(() => new EventEmitter());
+    const make = () => launchWithClaudePromptFile({
+      prompt: 'rules', args: [], runDir: allocate, launch, onError: failedSpawnProcess,
+    });
+    const failed = make(); // does not throw out of an automatic restart
+    const notify = vi.fn();
+    attachSpawnErrorHandler(failed, { notify, log: () => {} });
+    failed.stdout.on('data', () => {});
+    failed.stderr.on('data', () => {});
+    const events = [];
+    failed.on('error', () => events.push('error'));
+    const code = await new Promise(resolve => failed.on('close', code => { events.push('close'); resolve(code); }));
+    expect(code).toBe(-1);
+    expect(events).toEqual(['error', 'close']);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('storage unavailable'));
+    expect(failed.kill()).toBe(false);
+    expect(launch).not.toHaveBeenCalled();
+    expect(fs.readdirSync(runDir)).toEqual([]);
+    const child = make();
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(fs.readdirSync(runDir)).toHaveLength(1);
+    child.emit('close');
+    expect(fs.readdirSync(runDir)).toEqual([]);
   });
 });

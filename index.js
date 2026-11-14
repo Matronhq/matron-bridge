@@ -140,7 +140,7 @@ import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-fo
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
-import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   extractForceFlag,
@@ -783,9 +783,15 @@ const memoryClient = createMemoryClient({
 //
 // The run directory holds the session API header files too.
 let HEADER_RUN_DIR = null;
+function ensureHeaderRunDir() {
+  if (!HEADER_RUN_DIR) {
+    HEADER_RUN_DIR = createRunDir(headerRunRoot());
+    process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+  }
+  return HEADER_RUN_DIR;
+}
 try {
-  HEADER_RUN_DIR = createRunDir(headerRunRoot());
-  process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+  ensureHeaderRunDir();
 } catch (e) {
   console.warn(`[api] could not create the header file directory under ${headerRunRoot()}: ${e.message}`);
 }
@@ -2719,8 +2725,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     configureOptions: { warn: message => console.warn(message) },
     launch: configuredEnv => launchWithClaudePromptFile({
       prompt: printCoord.appendSystemPrompt,
+      onError: failedSpawnProcess,
       args,
-      runDir: HEADER_RUN_DIR,
+      runDir: ensureHeaderRunDir,
       launch: promptArgs => spawn('claude', promptArgs, {
         cwd,
         env: configuredEnv,
@@ -3675,7 +3682,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     launch: configuredEnv => launchWithClaudePromptFile({
       prompt: ivCoord.appendSystemPrompt,
       args: claudeArgs,
-      runDir: HEADER_RUN_DIR,
+      runDir: ensureHeaderRunDir,
       exitEvent: 'exit',
       launch: promptArgs => createInteractiveSession({
         roomId,
