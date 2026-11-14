@@ -14,6 +14,10 @@ export const KEY_ID = vectors.key_id;
 export const SIGNED_AT = 1790000000000;
 export const PINNED = { keys: [{ key_id: vectors.key_id, public_key: vectors.public_key, name: 'test phone' }] };
 
+// The gate needs Unix user ids and file modes; its suites skip on Windows,
+// where the bridge refuses to start with a keys file at all.
+export const UNIX = process.platform !== 'win32';
+
 export const sha256Hex = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 
 let counter = 0;
@@ -38,5 +42,5 @@ export function tempKeys(keys = PINNED) {
   const keysFile = path.join(dir, 'approval-keys.json');
   fs.writeFileSync(keysFile, JSON.stringify(keys), { mode: 0o644 });
   fs.chmodSync(keysFile, 0o644);
-  return { dir, keysFile, uid: process.getuid() + 1, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  return { dir, keysFile, uid: typeof process.getuid === 'function' ? process.getuid() + 1 : 1, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }

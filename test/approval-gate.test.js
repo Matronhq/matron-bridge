@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApprovalGate, WINDOWS } from '../lib/approval-gate.js';
-import { vectors, KEY_ID, SIGNED_AT, PINNED, sign, otherKeyPem, tempKeys } from './approval-helpers.js';
+import { vectors, KEY_ID, SIGNED_AT, PINNED, sign, otherKeyPem, tempKeys, UNIX } from './approval-helpers.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // SHA-256 of lib/vendor/approval-verify.mjs as copied from the journal's
@@ -36,7 +36,19 @@ describe('the vendored verifier', () => {
   });
 });
 
-describe('approval gate', () => {
+describe('approval gate on a platform without user ids', () => {
+  it('refuses to start with a keys file: the ownership rule cannot be checked', () => {
+    const t = tempKeys();
+    temps.push(t);
+    expect(() => createApprovalGate({ keysFile: t.keysFile, uid: null, journalHost: 'journal.example', user: 'alice' })).toThrow(/no user ids/);
+  });
+
+  it('is simply off without one', () => {
+    expect(createApprovalGate({ keysFile: '', uid: null }).enabled).toBe(false);
+  });
+});
+
+describe.skipIf(!UNIX)('approval gate', () => {
   it('is off without a keys file, and refuses whatever it is asked', () => {
     const gate = createApprovalGate({ keysFile: '', journalHost: 'journal.example', user: 'alice' });
     expect(gate.enabled).toBe(false);

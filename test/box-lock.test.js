@@ -3,7 +3,10 @@ import path from 'node:path';
 import { createApprovalGate } from '../lib/approval-gate.js';
 import { createBoxLock, LOCKED_USER_LINE, lockedPeerLine } from '../lib/box-lock.js';
 import { createRpcRequestHandler } from '../lib/journal-rpc.js';
-import { KEY_ID, SIGNED_AT, sign, tempKeys, otherKeyPem } from './approval-helpers.js';
+import { KEY_ID, SIGNED_AT, sign, tempKeys, otherKeyPem, UNIX } from './approval-helpers.js';
+
+// The lock runs on a real gate.
+const gatedDescribe = describe.skipIf(!UNIX);
 
 const silent = { warn() {}, log() {}, error() {} };
 const MIN = 60 * 1000;
@@ -31,7 +34,7 @@ const unlockApproval = (clock, minutes = '30', extra = {}) => sign({ type: 'acco
 const clearApproval = (clock, extra = {}) => sign({ type: 'account', subject: { op: 'clear_lockdown', box: 'box-a' }, signedAt: clock.now, ...extra });
 const forged = (clock) => unlockApproval(clock, '30', { privateKeyPem: otherKeyPem() });
 
-describe('a box that is not in locked mode', () => {
+gatedDescribe('a box that is not in locked mode', () => {
   it('lets every user and peer through, and reports no lock', () => {
     const { lock } = box({ locked: false });
     expect(lock.allowsUser(null)).toBe(true);
@@ -48,7 +51,7 @@ describe('a box that is not in locked mode', () => {
   });
 });
 
-describe('locked mode', () => {
+gatedDescribe('locked mode', () => {
   it('refuses users and peers until unlocked, and says what to do', () => {
     const { lock } = box();
     expect(lock.state()).toEqual({ on: true, until: null, lockdownUntil: null });
@@ -147,7 +150,7 @@ describe('locked mode', () => {
   });
 });
 
-describe('lockdown', () => {
+gatedDescribe('lockdown', () => {
   it('three forged-looking refusals within ten minutes lock the gate down for thirty minutes and file a notice', () => {
     const { lock, clock, fileNotice } = box();
     lock.unlock(forged(clock));
@@ -246,7 +249,7 @@ describe('lockdown', () => {
   });
 });
 
-describe('unlock, lock and clear_lockdown over RPC', () => {
+gatedDescribe('unlock, lock and clear_lockdown over RPC', () => {
   function rpc(lock) {
     const responses = [];
     const handler = createRpcRequestHandler({

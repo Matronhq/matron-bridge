@@ -8,7 +8,10 @@ import { createApprovalPaths, subjectValue } from '../lib/approval-paths.js';
 import { createRpcRequestHandler } from '../lib/journal-rpc.js';
 import { createAgentInvites } from '../lib/agent-invites.js';
 import { createTransferReceiver } from '../lib/transfer-receiver.js';
-import { SIGNED_AT, sign, sha256Hex, tempKeys, otherKeyPem } from './approval-helpers.js';
+import { SIGNED_AT, sign, sha256Hex, tempKeys, otherKeyPem, UNIX } from './approval-helpers.js';
+
+// Everything here but the subject rule runs a real gate.
+const gatedDescribe = describe.skipIf(!UNIX);
 
 const silent = { warn() {}, log() {}, error() {} };
 const temps = [];
@@ -26,7 +29,7 @@ function gated({ identity = { deviceId: 9, name: 'box-a' } } = {}) {
 }
 const ungated = () => createApprovalPaths({ gate: createApprovalGate({ keysFile: '' }), identity: () => ({ deviceId: 9, name: 'box-a' }), log: silent });
 
-describe('lockdown', () => {
+gatedDescribe('lockdown', () => {
   it('refuses every gated request, valid or not, while the box is locked down', () => {
     const t = tempKeys();
     temps.push(t);
@@ -79,7 +82,7 @@ const refused = (responses, detail) => {
   if (detail) expect(responses[0].error.detail).toBe(detail);
 };
 
-describe('start on a gated box', () => {
+gatedDescribe('start on a gated box', () => {
   it('a spawn with no approval is refused and nothing starts', () => {
     const { handler, responses, startSession } = rpc(gated());
     handler(spawnReq());
@@ -175,7 +178,7 @@ describe('start on a gated box', () => {
   });
 });
 
-describe('start with the gate off', () => {
+gatedDescribe('start with the gate off', () => {
   it('behaves as before, with and without an approval field', () => {
     for (const approvals of [ungated(), undefined]) {
       const { handler, responses, startSession } = rpc(approvals);
@@ -188,7 +191,7 @@ describe('start with the gate off', () => {
   });
 });
 
-describe('session control on a gated box', () => {
+gatedDescribe('session control on a gated box', () => {
   const control = (action, extra = {}) => ({ request_id: `c-${action}`, from_device_id: 5, method: 'session_control', params: { convo_id: 'c1', action, ...extra } });
 
   it('carry_on, set_model and a routine fire are refused; compact and alert go through', async () => {
@@ -228,7 +231,7 @@ const WHY = 'Compare notes on the migration';
 const request = (extra = {}) => ({ kind: 'invite', event: 'request', room_id: 'room-1', from_device_id: 3, from_name: 'box-b', justification: WHY, ...extra });
 const chatSubject = (o = {}) => ({ op: 'chat', ask: 'room-1/9', box: 'box-a', message_sha256: sha256Hex(WHY), decision: 'approve', ...o });
 
-describe('chat invites on a gated box', () => {
+gatedDescribe('chat invites on a gated box', () => {
   it('an invite with no approval is refused through the answer op and never reaches a session', () => {
     const { m, sent, injectRequestTurn } = invites(gated());
     m.onInviteFrame(request());
@@ -312,7 +315,7 @@ function receiver(approvals, { bytes = CONTENT } = {}) {
   return { r, client, deliver, files };
 }
 
-describe('transfers on a gated box', () => {
+gatedDescribe('transfers on a gated box', () => {
   it('a transfer with no approval is refused: nothing is downloaded or written, and the journal is told', async () => {
     const { r, client, deliver, files } = receiver(gated());
     r.onReady(transferOf());
