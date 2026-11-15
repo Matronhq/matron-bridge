@@ -329,6 +329,50 @@ describe('createRoomDelivery', () => {
     expect(delivery.pendingKeys()).toEqual([]);
   });
 
+  it('held: an arrival for an idle session is queued, not injected, and nothing starts a turn until the hold ends', () => {
+    let locked = true;
+    const injectTurn = vi.fn(() => true);
+    const delivery = createRoomDelivery({ isBusy: (session) => !!session.busy, injectTurn, isHeld: () => locked, log: { warn: () => {} } });
+    const session = { alive: true, busy: false };
+    expect(delivery.deliver(session, 's1', msg({ body: 'one' }))).toBe(true);
+    expect(delivery.deliver(session, 's1', msg({ body: 'two', foreign: { person: 'bob' }, roomId: 'room-2' }))).toBe(true);
+    expect(delivery.deliver(session, 's1', msg({ body: 'three', cause: null, roomId: 'spawn' }))).toBe(true);
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.pendingCount('s1')).toBe(3);
+    expect(delivery.flush(session, 's1')).toBe(null);
+    expect(injectTurn).not.toHaveBeenCalled();
+    locked = false;
+    expect(delivery.flush(session, 's1')).toBe(true);
+    expect(injectTurn).toHaveBeenCalledTimes(1);
+    expect(injectTurn.mock.calls[0][1]).toMatch(/one[\s\S]*three/);
+    expect(delivery.pendingCount('s1')).toBe(1); // the other person's room gets its own turn
+  });
+
+  it('an arrival never overtakes older queued messages: it goes behind them and the inbox is flushed in order', () => {
+    let locked = false;
+    const injectTurn = vi.fn(() => true);
+    const delivery = createRoomDelivery({ isBusy: (session) => !!session.busy, injectTurn, isHeld: () => locked, log: { warn: () => {} } });
+    const session = { alive: true, busy: true };
+    delivery.deliver(session, 's1', msg({ body: 'first' }));
+    session.busy = false;
+    locked = true;
+    delivery.deliver(session, 's1', msg({ body: 'second' }));
+    expect(delivery.flush(session, 's1')).toBe(null);
+    // Unlocked, and a new message arrives before anything drained the inbox.
+    locked = false;
+    expect(delivery.deliver(session, 's1', msg({ body: 'third' }))).toBe(true);
+    expect(injectTurn).toHaveBeenCalledTimes(1);
+    const text = injectTurn.mock.calls[0][1];
+    expect(text.indexOf('first')).toBeGreaterThan(-1);
+    expect(text.indexOf('first')).toBeLessThan(text.indexOf('second'));
+    expect(text.indexOf('second')).toBeLessThan(text.indexOf('third'));
+    expect(delivery.pendingCount('s1')).toBe(0);
+    // With nothing waiting, an idle arrival is one immediate turn as before.
+    expect(delivery.deliver(session, 's1', msg({ body: 'fourth' }))).toBe(true);
+    expect(injectTurn).toHaveBeenCalledTimes(2);
+    expect(injectTurn.mock.calls[1][1]).toMatch(/fourth$/);
+  });
+
   it('held with nothing queued is an ordinary empty flush; a lock that cannot answer holds', () => {
     const injectTurn = vi.fn(() => true);
     const delivery = createRoomDelivery({ isBusy: (session) => !!session.busy, injectTurn, isHeld: () => { throw new Error('boom'); }, log: { warn: () => {} } });
