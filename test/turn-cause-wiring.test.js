@@ -65,7 +65,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
 
   it('an item reply\'s cause rides the inject and the queue', () => {
     expect(index).toContain("injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),");
-    expect(index).toMatch(/queueText: \(session, \{ text, preview, source, cause = null \}\) => journalQueueMedia\(session, \{[\s\S]{0,160}?\n {4}cause,\n/);
+    expect(index).toMatch(/queueText: \(session, \{ text, preview, source, cause = null, bridgeOrigin = false \}\) => journalQueueMedia\(session, \{[\s\S]{0,160}?\n {4}cause,\n {4}bridgeOrigin,\n/);
   });
 
   it('room turns forward their causes; reminders and timers are reminder turns', () => {

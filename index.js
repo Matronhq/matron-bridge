@@ -10244,13 +10244,14 @@ const itemTurnRouter = createItemTurnRouter({
     entry.steerSource = source;
     return trySteerEntry(session, entry);
   },
-  queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
+  queueText: (session, { text, preview, source, cause = null, bridgeOrigin = false }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
     preview,
     fullText: text,
     source,
     cause,
+    bridgeOrigin,
   }),
   publishNotice: journalPublishNotice,
   // The journal strips any client-supplied transcript, so a voice note on an
