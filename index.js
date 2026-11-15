@@ -11895,7 +11895,14 @@ function setForeignFlags(key) {
   const id = sessions.get(key)?.claudeSessionId;
   if (!id) return;
   const claudeKey = claudeSessionFlagKey(id);
-  setForeignFlag(claudeKey, { dir: claudeSessionFlagDir() });
+  try {
+    setForeignFlag(claudeKey, { dir: claudeSessionFlagDir() });
+  } catch (e) {
+    // Both or neither: begin() refuses the turn on a throw, and must not
+    // leave the first flag armed behind it.
+    clearForeignFlag(key);
+    throw e;
+  }
   claudeFlagKeys.set(key, claudeKey);
 }
 function clearForeignFlags(key) {

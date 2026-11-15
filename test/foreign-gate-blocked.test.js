@@ -101,6 +101,8 @@ describe('index.js wiring', () => {
     expect(index).toMatch(/flag: \{ set: setForeignFlags, clear: clearForeignFlags \}/);
     expect(index).toMatch(/gateBlocked: \(session\) => \(session\?\.codex \? null : foreignGateBlocked\(session\)\)/);
     expect(fnBody('function setForeignFlags(')).toMatch(/setForeignFlag\(claudeKey, \{ dir: claudeSessionFlagDir\(\) \}\)/);
+    // A failed second write takes the first flag back down before begin() refuses the turn.
+    expect(fnBody('function setForeignFlags(')).toMatch(/catch \(e\) \{[\s\S]*clearForeignFlag\(key\);[\s\S]*throw e;/);
   });
 
   it('an interactive session is refused where only managed hooks run: its turn ends through the bridge\'s own Stop hook', () => {
