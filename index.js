@@ -193,7 +193,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
-import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
@@ -14602,7 +14602,7 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
         const queue = session.queuedMessages;
-        if (!queue || index < 0 || index >= queue.length) {
+        if (!queue || index < 0 || index >= queue.length || isBridgeOrigin(queue[Math.trunc(index)])) {
           res.writeHead(404);
           res.end(JSON.stringify({ error: 'No queued message at that index' }));
           return;
@@ -14634,8 +14634,8 @@ const apiServer = createServer(async (req, res) => {
           runQueuedCleanup(removed);
           if (queueIndex < notifs.length) notifs.splice(queueIndex, 1);
         }
-        const remaining = queue.length;
-        if (remaining === 0) session.queuedMessages = null;
+        const remaining = countUserQueued(session);
+        if (queue.length === 0) session.queuedMessages = null;
         if (session.sendCallback) {
           const msg = remaining === 0
             ? '✕ Cancelled queued message (queue empty)'
@@ -14644,7 +14644,7 @@ const apiServer = createServer(async (req, res) => {
         }
         // The cancelled message may have been held for editing, blocking
         // the rest while the agent sat idle.
-        if (remaining > 0) queueEditHoldReleased(session);
+        if (queue.length > 0) queueEditHoldReleased(session);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, remaining }));
 
