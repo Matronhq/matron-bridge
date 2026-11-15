@@ -6145,13 +6145,16 @@ function recordConversationMessage(session, role, text) {
   });
   // Bounded: the whole history is rewritten into the sessions file below, on
   // every message (lib/chat-history-cap.js).
-  trimChatHistory(session);
+  const dropped = trimChatHistory(session);
   // Once a message is dispatched to, or emitted by, the active native
   // session, that provider has seen the shared transcript through this item.
   session._agentHistoryCursor = session.chatHistory.length;
   debug(`Added ${role} message to chatHistory, length now: ${session.chatHistory.length}`);
   persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
     chatHistory: session.chatHistory,
+    // A cut moved the summary cursor; the record must not pair the shorter
+    // history with the old one.
+    ...(dropped > 0 ? { lastSummaryMsgCount: session.lastSummaryMsgCount || 0 } : {}),
   });
 }
 

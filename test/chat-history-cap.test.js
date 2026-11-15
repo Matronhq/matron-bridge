@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
-import { trimChatHistory, rebaseHistoryIndex, CHAT_HISTORY_MAX, CHAT_HISTORY_KEEP } from '../lib/chat-history-cap.js';
+import { trimChatHistory, rebaseHistoryIndex, historyDropCount, CHAT_HISTORY_MAX, CHAT_HISTORY_KEEP } from '../lib/chat-history-cap.js';
 
 const entries = (n, from = 0) => Array.from({ length: n }, (_, i) => ({
   role: (from + i) % 2 ? 'assistant' : 'user',
@@ -13,7 +13,7 @@ describe('trimChatHistory', () => {
     expect(trimChatHistory(session, { max: 10, keep: 5 })).toBe(0);
     expect(session.chatHistory).toHaveLength(10);
     expect(session.lastSummaryMsgCount).toBe(7);
-    expect(session.chatHistoryDropped).toBeUndefined();
+    expect(historyDropCount(session.chatHistory)).toBe(0);
   });
 
   it('cuts back to the newest entries and keeps the opening user message', () => {
@@ -24,7 +24,7 @@ describe('trimChatHistory', () => {
     expect(session.chatHistory.map((m) => m.text)).toEqual([
       'message 0', 'message 6', 'message 7', 'message 8', 'message 9', 'message 10',
     ]);
-    expect(session.chatHistoryDropped).toBe(5);
+    expect(historyDropCount(session.chatHistory)).toBe(5);
   });
 
   it('keeps the same array, so every holder of it sees the cut', () => {
@@ -91,14 +91,25 @@ describe('trimChatHistory', () => {
 describe('rebaseHistoryIndex', () => {
   it('moves an index read before a cut by what the cut removed', () => {
     const session = { chatHistory: entries(11) };
-    const before = session.chatHistoryDropped || 0;
+    const before = historyDropCount(session.chatHistory);
     const nextCount = session.chatHistory.length;
     trimChatHistory(session, { max: 10, keep: 5 });
-    expect(rebaseHistoryIndex(session, nextCount, before)).toBe(session.chatHistory.length);
+    expect(rebaseHistoryIndex(session.chatHistory, nextCount, before)).toBe(session.chatHistory.length);
+  });
+
+  it('sees a cut made by another session that shares the array', () => {
+    const history = entries(11);
+    const old = { chatHistory: history, lastSummaryMsgCount: 0 };
+    const before = historyDropCount(history);
+    const nextCount = history.length;
+    // A restart hands the same array to a new session object, which cuts it.
+    const replacement = { chatHistory: history, lastSummaryMsgCount: 0 };
+    trimChatHistory(replacement, { max: 10, keep: 5 });
+    expect(rebaseHistoryIndex(old.chatHistory, nextCount, before)).toBe(history.length);
   });
 
   it('leaves an index alone when nothing was cut', () => {
-    expect(rebaseHistoryIndex({ chatHistory: entries(3) }, 3, 0)).toBe(3);
+    expect(rebaseHistoryIndex(entries(3), 3, 0)).toBe(3);
   });
 });
 
@@ -112,8 +123,16 @@ describe('wiring', () => {
     expect(fn).toMatch(/chatHistory\.push\([\s\S]*trimChatHistory\(session\)[\s\S]*persistSession\(/);
   });
 
+  it('saves the moved summary cursor with the cut history', () => {
+    const body = index.slice(index.indexOf('function recordConversationMessage('));
+    const fn = body.slice(0, body.indexOf('\n}\n'));
+    expect(fn).toMatch(/const dropped = trimChatHistory\(session\)/);
+    expect(fn).toMatch(/dropped > 0 \? \{ lastSummaryMsgCount: session\.lastSummaryMsgCount/);
+  });
+
   it('moves the summary cursor by any cut made during the model call', () => {
-    expect(titleSummary).toMatch(/droppedBefore = session\.chatHistoryDropped/);
-    expect(titleSummary).toMatch(/lastSummaryMsgCount = rebaseHistoryIndex\(session, nextCount, droppedBefore\)/);
+    expect(titleSummary).toMatch(/droppedBefore = historyDropCount\(windowHistory\)/);
+    expect(titleSummary).toMatch(/session\.chatHistory === windowHistory/);
+    expect(titleSummary).toMatch(/lastSummaryMsgCount = rebaseHistoryIndex\(windowHistory, nextCount, droppedBefore\)/);
   });
 });
