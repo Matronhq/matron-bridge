@@ -34,7 +34,7 @@ import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
 import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
 import { createSharingClient } from './lib/sharing-client.js';
-import { personOfSender, personLabel, foreignFlagPath, setForeignFlag, clearForeignFlag, foreignHookOutput, claudeSessionFlagKey } from './lib/foreign-turn.js';
+import { personOfSender, personLabel, foreignFlagPath, setForeignFlag, clearForeignFlag, foreignHookOutput, claudeSessionFlagKey, claudeSessionFlagDir } from './lib/foreign-turn.js';
 import { foreignGateBlockedReason, managedHookPolicy } from './lib/claude-managed-settings.js';
 import { createForeignSessions } from './lib/foreign-session.js';
 import { createSharingHandlers } from './lib/sharing-tools.js';
@@ -11865,7 +11865,7 @@ const foreignSessions = createForeignSessions({
   // A turn another person started needs the PreToolUse gate. Where Claude
   // Code's managed settings keep the bridge's own hooks from running and no
   // managed gate stands in, the turn is not taken (as for Codex).
-  gateBlocked: (session) => (session?.codex ? null : foreignGateBlocked()),
+  gateBlocked: (session) => (session?.codex ? null : foreignGateBlocked(session)),
   store: {
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
@@ -11895,38 +11895,44 @@ function setForeignFlags(key) {
   const id = sessions.get(key)?.claudeSessionId;
   if (!id) return;
   const claudeKey = claudeSessionFlagKey(id);
-  setForeignFlag(claudeKey);
+  setForeignFlag(claudeKey, { dir: claudeSessionFlagDir() });
   claudeFlagKeys.set(key, claudeKey);
 }
 function clearForeignFlags(key) {
   clearForeignFlag(key);
   const id = sessions.get(key)?.claudeSessionId;
   for (const claudeKey of new Set([claudeFlagKeys.get(key), id ? claudeSessionFlagKey(id) : null])) {
-    if (claudeKey) clearForeignFlag(claudeKey);
+    if (claudeKey) clearForeignFlag(claudeKey, { dir: claudeSessionFlagDir() });
   }
   claudeFlagKeys.delete(key);
 }
 
-// Why a turn another person started cannot be gated on this machine, or null
-// when it can (lib/claude-managed-settings.js). Read again at most once a
-// minute: the managed settings change only when an administrator changes them.
-let foreignGateCache = { at: 0, reason: null, bridgeHooksRun: true };
+// The managed-settings policy for the gate (lib/claude-managed-settings.js),
+// read fresh every time: the files are small, and a cached answer could let
+// a call through in the window after an administrator changed them.
+let lastForeignGateReason = null;
 function readForeignGatePolicy() {
-  const now = Date.now();
-  if (now - foreignGateCache.at > 60_000) {
-    let reason = null;
-    let bridgeHooksRun = true;
-    try {
-      reason = foreignGateBlockedReason();
-      bridgeHooksRun = managedHookPolicy().bridgeHooksRun;
-    } catch { /* unreadable settings: as if there were none */ }
-    if (reason && reason !== foreignGateCache.reason) console.warn(`[foreign] turns started by another person are refused here: ${reason}`);
-    foreignGateCache = { at: now, reason, bridgeHooksRun };
-  }
-  return foreignGateCache;
+  let reason = null;
+  let bridgeHooksRun = true;
+  try {
+    reason = foreignGateBlockedReason();
+    bridgeHooksRun = managedHookPolicy().bridgeHooksRun;
+  } catch { /* unreadable settings: as if there were none */ }
+  if (reason && reason !== lastForeignGateReason) console.warn(`[foreign] turns started by another person are refused here: ${reason}`);
+  lastForeignGateReason = reason;
+  return { reason, bridgeHooksRun };
 }
-function foreignGateBlocked() {
-  return readForeignGatePolicy().reason;
+// Why a turn another person started cannot be gated for this session, or
+// null when it can. An interactive session also needs the bridge's own Stop
+// hook to end the turn (iv-mode's turn-end seam), and managed-only hooks keep
+// that from running too.
+function foreignGateBlocked(session = null) {
+  const { reason, bridgeHooksRun } = readForeignGatePolicy();
+  if (reason) return reason;
+  if (session?.iv && !bridgeHooksRun) {
+    return "Claude Code's managed settings run only managed hooks, and an interactive session needs the bridge's own Stop hook to end such a turn";
+  }
+  return null;
 }
 const foreignGateNotice = (person, reason) => `⚠️ Not delivered: a turn started by another person (${person}) needs the bridge's safety gate, and it cannot run on this machine: ${reason}. The message is safe in the room.`;
 
@@ -11934,6 +11940,13 @@ function injectForeignRoomTurn(session, text, foreign) {
   // Codex has no PreToolUse gate: a Codex session never takes a turn from
   // another person (deliverRoomFrameTo refuses earlier; belt and braces).
   if (session?.codex) return false;
+  // The same for a machine where the gate cannot run: a message already in
+  // the inbox when the managed settings changed is not delivered either.
+  const gateReason = foreignGateBlocked(session);
+  if (gateReason) {
+    journalPublishNotice(journalConvoIdFor(session), foreignGateNotice(foreign.person, gateReason));
+    return false;
+  }
   const turn = foreignSessions.turnFor(foreign.roomId, foreign.person, foreignSessions.cachedContext(foreign.roomId));
   return foreignSessions.inject(session, text, turn);
 }
@@ -11945,7 +11958,7 @@ function deliverForeignItemTurn(session, payload, person) {
     journalPublishNotice(journalConvoIdFor(session), `⚠️ Not delivered: a Codex session cannot take a turn started by another person (${person}, on a tracker item). Switch this session to Claude to answer them.`);
     return;
   }
-  const gateReason = foreignGateBlocked();
+  const gateReason = foreignGateBlocked(session);
   if (gateReason) {
     journalPublishNotice(journalConvoIdFor(session), foreignGateNotice(`${person}, on a tracker item`, gateReason).replace('The message is safe in the room.', 'The comment is safe on the item.'));
     return;
@@ -12181,7 +12194,7 @@ function deliverRoomFrameTo(room, frame) {
       journalPublishNotice(journalConvoIdFor(session), `⚠️ Not delivered: a Codex session cannot take a turn started by another person (${person}). Switch this session to Claude to talk with them.`);
       return;
     }
-    const gateReason = foreignGateBlocked();
+    const gateReason = foreignGateBlocked(session);
     if (gateReason) {
       journalPublishNotice(journalConvoIdFor(session), foreignGateNotice(person, gateReason));
       return;

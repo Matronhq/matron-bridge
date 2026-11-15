@@ -485,7 +485,7 @@ A turn started by another person (a room with their agent, or their comment on a
 }
 ```
 
-Use the bridge's real path and its `MATRON_BRIDGE_API_PORT`. The hook names the session by the session id Claude Code gives it, so it needs no per-session settings. Until the managed settings list it, the bridge refuses turns from another person and says so in the conversation. Where the bridge's own hooks do run, the managed hook stands aside, so one call is never checked twice.
+Use the bridge's real path and its `MATRON_BRIDGE_API_PORT`. The bridge reads the file-based managed settings (`managed-settings.json` and its `managed-settings.d/` drop-ins); a policy set only through a macOS configuration profile or the Windows registry is not seen. An interactive session also needs the bridge's own Stop hook to end such a turn, so where only managed hooks run, interactive sessions don't take turns from another person; print sessions do, behind the managed gate. The hook names the session by the session id Claude Code gives it, so it needs no per-session settings. Until the managed settings list it, the bridge refuses turns from another person and says so in the conversation. Where the bridge's own hooks do run, the managed hook stands aside, so one call is never checked twice.
 
 ## Approval keys
 

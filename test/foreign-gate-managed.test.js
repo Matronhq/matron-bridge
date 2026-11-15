@@ -7,7 +7,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { decide } from '../hooks/foreign-gate-managed.mjs';
-import { foreignFlagPath, claudeSessionFlagKey, setForeignFlag, clearForeignFlag } from '../lib/foreign-turn.js';
+import { claudeSessionFlagPath, claudeSessionFlagKey, claudeSessionFlagDir, setForeignFlag, clearForeignFlag } from '../lib/foreign-turn.js';
 
 // hooks/foreign-gate-managed.mjs: the gate as one managed hook for every
 // session on the machine. The session is the hook input's session_id, the
@@ -60,7 +60,7 @@ describe('decide', () => {
 
   it('when the bridge refuses the call, the session-id flag decides', async () => {
     answer = 401;
-    const flagged = (p) => p === foreignFlagPath(claudeSessionFlagKey('s-2'));
+    const flagged = (p) => p === claudeSessionFlagPath('s-2');
     const out = await decide({ input: input('s-2'), argv: ['--port', String(port)], env, exists: flagged });
     expect(out.hookSpecificOutput.permissionDecision).toBe('deny');
     expect(await decide({ input: input('s-3'), argv: ['--port', String(port)], env, exists: flagged })).toBe(null);
@@ -92,6 +92,19 @@ describe('decide', () => {
   });
 });
 
+describe('the session-id flag', () => {
+  it('lives in a fixed directory on POSIX, whatever TMPDIR says', () => {
+    const before = process.env.TMPDIR;
+    process.env.TMPDIR = '/somewhere/else';
+    try {
+      expect(claudeSessionFlagDir('linux').startsWith('/tmp/matron-foreign-')).toBe(true);
+      expect(claudeSessionFlagPath('s-1').startsWith('/tmp/matron-foreign-')).toBe(process.platform !== 'win32');
+    } finally {
+      if (before === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = before;
+    }
+  });
+});
+
 describe('as a hook', () => {
   function run(stdin, args) {
     return new Promise((resolve) => {
@@ -112,13 +125,13 @@ describe('as a hook', () => {
   it('denies from the real flag file while the bridge refuses the call', async () => {
     answer = 401;
     const id = `test-${randomUUID()}`;
-    setForeignFlag(claudeSessionFlagKey(id));
+    setForeignFlag(claudeSessionFlagKey(id), { dir: claudeSessionFlagDir() });
     try {
       const r = await run(input(id), ['--port', String(port)]);
       expect(r.code).toBe(0);
       expect(JSON.parse(r.out).hookSpecificOutput.permissionDecision).toBe('deny');
     } finally {
-      clearForeignFlag(claudeSessionFlagKey(id));
+      clearForeignFlag(claudeSessionFlagKey(id), { dir: claudeSessionFlagDir() });
     }
     const r2 = await run(input(id), ['--port', String(port)]);
     expect(r2.out).toBe('');

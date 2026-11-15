@@ -86,17 +86,28 @@ describe('index.js wiring', () => {
   };
 
   it('room messages and item comments from another person check the gate before delivery', () => {
-    const room = fnBody('function deliverRoomFrameTo(');
-    expect(room.indexOf('const gateReason = foreignGateBlocked();')).toBeGreaterThan(-1);
-    expect(room.indexOf('const gateReason = foreignGateBlocked();')).toBeLessThan(room.indexOf('const deliverForeign = () =>'));
-    const item = fnBody('function deliverForeignItemTurn(');
-    expect(item.indexOf('foreignGateBlocked()')).toBeLessThan(item.indexOf('foreignSessions.deliverItemTurn('));
+    const before = (body, a, b) => {
+      expect(body.indexOf(a), a).toBeGreaterThan(-1);
+      expect(body.indexOf(b), b).toBeGreaterThan(-1);
+      expect(body.indexOf(a)).toBeLessThan(body.indexOf(b));
+    };
+    before(fnBody('function deliverRoomFrameTo('), 'const gateReason = foreignGateBlocked(session);', 'const deliverForeign = () =>');
+    before(fnBody('function deliverForeignItemTurn('), 'foreignGateBlocked(session)', 'foreignSessions.deliverItemTurn(');
+    // A message already queued when the settings changed is checked again at inject.
+    before(fnBody('function injectForeignRoomTurn('), 'foreignGateBlocked(session)', 'foreignSessions.inject(');
   });
 
   it('the foreign sessions get the gate check and arm both flags', () => {
     expect(index).toMatch(/flag: \{ set: setForeignFlags, clear: clearForeignFlags \}/);
-    expect(index).toMatch(/gateBlocked: \(session\) => \(session\?\.codex \? null : foreignGateBlocked\(\)\)/);
-    expect(fnBody('function setForeignFlags(')).toMatch(/setForeignFlag\(claudeKey\)/);
+    expect(index).toMatch(/gateBlocked: \(session\) => \(session\?\.codex \? null : foreignGateBlocked\(session\)\)/);
+    expect(fnBody('function setForeignFlags(')).toMatch(/setForeignFlag\(claudeKey, \{ dir: claudeSessionFlagDir\(\) \}\)/);
+  });
+
+  it('an interactive session is refused where only managed hooks run: its turn ends through the bridge\'s own Stop hook', () => {
+    const body = fnBody('function foreignGateBlocked(');
+    expect(body).toMatch(/if \(session\?\.iv && !bridgeHooksRun\)/);
+    // Read fresh each time: no cached answer outlives a settings change.
+    expect(fnBody('function readForeignGatePolicy(')).not.toMatch(/60_000|Cache/);
   });
 
   it('/foreign-check names the session by its Claude session id when no room is given, and a managed call stands aside where the session gate runs', () => {

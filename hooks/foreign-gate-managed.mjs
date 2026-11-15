@@ -16,7 +16,8 @@
 //   - when the bridge cannot be reached or refuses the call, a flag file
 //     named after that same session id decides (present -> deny). The
 //     bridge writes it for the length of a turn another person started.
-// Neither the session nor the fallback flag comes from the environment, so
+// Neither the session nor the fallback flag comes from the environment (the
+// flag's directory is fixed: lib/foreign-turn.js claudeSessionFlagDir), so
 // an environment the session changed can at worst make the bridge refuse
 // the call, and then the flag decides.
 //
@@ -28,7 +29,7 @@
 // --port defaults to MATRON_BRIDGE_API_PORT, then 9802.
 import fs from 'node:fs';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
-import { foreignFlagPath, claudeSessionFlagKey } from '../lib/foreign-turn.js';
+import { claudeSessionFlagPath } from '../lib/foreign-turn.js';
 import { readStdinText, bridgePort } from './hook-util.mjs';
 
 const DENY = {
@@ -51,7 +52,7 @@ export async function decide({ input, argv = [], env = process.env, fetchImpl = 
     const parsed = JSON.parse(input);
     if (typeof parsed?.session_id === 'string' && parsed.session_id) sessionId = parsed.session_id;
   } catch { /* no session id: nothing to name a flag by */ }
-  const fallback = () => (sessionId && exists(foreignFlagPath(claudeSessionFlagKey(sessionId))) ? DENY : null);
+  const fallback = () => (sessionId && exists(claudeSessionFlagPath(sessionId)) ? DENY : null);
   if (!sessionId) return null;
   try {
     const res = await fetchImpl(`http://127.0.0.1:${portFrom(argv, env)}/foreign-check`, {
