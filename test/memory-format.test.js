@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { memoryLine, formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from '../lib/memory-format.js';
+import { memoryLine, formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatProposalOutcome } from '../lib/memory-format.js';
 
 const m = { id: 'me_1', name: 'avoid-box-a', type: 'feedback', description: 'Never use box-a.', body: '**Why:** reserved.', created_by: 'agent', updated_by: 'user', created_at: 1000, updated_at: 2000, origin_convo_id: 'c1' };
 
@@ -35,6 +35,30 @@ describe('memory renderers', () => {
     expect(formatSaveAck({ memory: m, created: true })).toBe('Saved memory `avoid-box-a` (created, scope global): Never use box-a.');
     expect(formatSaveAck({ memory: { ...m, scope: 'repo:acme-app' }, created: false })).toBe('Saved memory `avoid-box-a` (updated, scope repo:acme-app): Never use box-a.');
     expect(formatDeleteAck({ memory: m })).toBe('Deleted memory `avoid-box-a`');
+  });
+  it('a pending save or delete says plainly that nothing changed, names the item, and says not to retry', () => {
+    const saved = formatSaveAck({ pending: true, action: 'save', name: 'avoid-elm', item_num: 41, item_id: 'it_9' });
+    expect(saved).toMatch(/^NOT saved yet: memory `avoid-elm` is a proposal waiting for the user's approval on item #41\./);
+    expect(saved).toContain('outside a turn the user started themselves');
+    expect(saved).toContain('reach you as a later turn');
+    expect(saved).toContain('Do not retry');
+    expect(saved).not.toMatch(/^Saved memory/);
+    const deleted = formatDeleteAck({ pending: true, action: 'delete', name: 'avoid-elm', item_num: null });
+    expect(deleted).toMatch(/^NOT deleted yet: memory `avoid-elm` is a proposal waiting for the user's approval on a tracker item\./);
+    expect(deleted).toContain('the memory still applies');
+  });
+  it('formatProposalOutcome words each outcome; anything that is not one is null', () => {
+    const p = { proposal_id: 'mp_1', name: 'avoid-elm', action: 'save', outcome: 'approved', item: { id: 'it_9', num: 41 } };
+    expect(formatProposalOutcome(p)).toBe('[Matron: memory proposal (item #41)] The user approved it: memory `avoid-elm` is now saved.');
+    expect(formatProposalOutcome({ ...p, action: 'delete' })).toContain('is now deleted');
+    expect(formatProposalOutcome({ ...p, outcome: 'declined' })).toContain('The user declined it: memory `avoid-elm` was not saved');
+    expect(formatProposalOutcome({ ...p, outcome: 'replaced', item: null })).toBe('[Matron: memory proposal] A newer proposal for memory `avoid-elm` took its place; this one was set aside and nothing changed.');
+    expect(formatProposalOutcome({ ...p, outcome: 'expired' })).toContain('Nobody answered within 7 days');
+    expect(formatProposalOutcome({ ...p, outcome: 'stale' })).toMatch(/had changed since you proposed, so nothing was saved\..*propose it once more/);
+    expect(formatProposalOutcome({ ...p, outcome: 'stale', action: 'delete' })).toContain('nothing was deleted');
+    for (const bad of [null, 'x', {}, { ...p, outcome: 'saved' }, { ...p, outcome: undefined }, { ...p, action: undefined }, { ...p, action: 'update' }, { ...p, action: 'Save' }, { ...p, action: null }, { ...p, name: 'Not A Slug' }, { ...p, name: 'a`b' }, { ...p, name: 'a\nb' }]) {
+      expect(formatProposalOutcome(bad)).toBe(null);
+    }
   });
   it('unknown shapes degrade, never throw', () => {
     expect(memoryLine(null)).toBe('(unknown memory)');

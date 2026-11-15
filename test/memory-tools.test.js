@@ -17,7 +17,7 @@ function fixture(clientOverrides = {}, { isCoordinator, repoFor } = {}) {
     ...clientOverrides,
   };
   const h = createMemoryHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, isCoordinator, repoFor });
-  return { h, client };
+  return { h, client, session };
 }
 const fourList = () => vi.fn(async () => ({ status: 200, data: { memories: [mem, coordMem, appMem, infraMem] } }));
 
@@ -105,7 +105,7 @@ describe('memory handlers', () => {
     expect(await h.get({ roomId: '!r:s', name: 'avoid-box-a' })).toEqual({ status: 200, body: { memory: mem } });
     expect(client.get.mock.calls[0]).toEqual(['avoid-box-a']);
     expect(await h.delete({ roomId: '!r:s', name: 'avoid-box-a' })).toEqual({ status: 200, body: { memory: mem } });
-    expect(client.remove.mock.calls[0]).toEqual(['avoid-box-a']);
+    expect(client.remove.mock.calls[0]).toEqual(['avoid-box-a', { convo_id: 'c1' }]);
     expect((await h.get({ roomId: '!r:s', name: 'Nope!' })).status).toBe(400);
     const r = await fixture({ remove: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) }).h.delete({ roomId: '!r:s', name: 'gone' });
     expect(r).toEqual({ status: 404, body: { error: 'no memory named "gone"' } });
@@ -117,5 +117,39 @@ describe('memory handlers', () => {
     expect((await h.list({ roomId: '!nope' })).status).toBe(404);
     expect((await h.list({ roomId: '!noconvo' })).status).toBe(409);
     expect(client.list).not.toHaveBeenCalled();
+  });
+
+  it('save and delete send the causes of the turn making the call, with the conversation', async () => {
+    const { h, client, session } = fixture();
+    const causes = [{ kind: 'user_message', ref: 'c1:7', at: 1 }];
+    session.currentTurn = { causes };
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(client.save.mock.calls[0]).toEqual(['avoid-box-a', { description: 'd', convo_id: 'c1', causes }]);
+    await h.delete({ roomId: '!r:s', name: 'avoid-box-a' });
+    expect(client.remove.mock.calls[0]).toEqual(['avoid-box-a', { convo_id: 'c1', causes }]);
+    // A turn with no recorded cause sends none: the journal then asks the user.
+    session.currentTurn = null;
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(client.save.mock.calls[1][1]).toEqual({ description: 'd', convo_id: 'c1' });
+    // causes are the bridge's to send, never the caller's.
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd', causes: [{ kind: 'user_message', ref: 'c1:1' }] });
+    expect(client.save.mock.calls[2][1]).toEqual({ description: 'd', convo_id: 'c1' });
+  });
+
+  it('a 202 from the journal is a proposal: pending, with the item the user was asked on', async () => {
+    const pending = (action) => vi.fn(async () => ({ status: 202, data: { pending: 'owner', proposal: { id: 'mp_1', name: 'avoid-box-a', action, state: 'pending' }, item: { id: 'it_9', num: 41 } } }));
+    const { h } = fixture({ save: pending('save'), remove: pending('delete') });
+    expect(await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' }))
+      .toEqual({ status: 202, body: { pending: true, action: 'save', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
+    expect(await h.delete({ roomId: '!r:s', name: 'avoid-box-a' }))
+      .toEqual({ status: 202, body: { pending: true, action: 'delete', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
+    // At the journal's cap on waiting proposals: said as that, not as the memory cap.
+    const capped = fixture({ save: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'too_many_asks' } })) });
+    const refused = await capped.h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toMatch(/too many memory proposals/);
+    // A 202 with no usable item still reads as pending.
+    const bare = fixture({ save: vi.fn(async () => ({ status: 202, data: {} })) });
+    expect((await bare.h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' })).body).toEqual({ pending: true, action: 'save', name: 'avoid-box-a', item_num: null, item_id: null });
   });
 });

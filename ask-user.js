@@ -1792,7 +1792,7 @@ const MEMORY_WHAT = "The user's memories are their standing rules and facts abou
 
 server.tool(
   'memory_save',
-  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. The \`description\` is the one line every session sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
+  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. A save made outside a turn the user started themselves (a routine, a reminder, a room message, a spawn outcome), and any save on some boxes, is not applied: it becomes a proposal the user approves on a tracker item. The result then says NOT saved yet and names the item; say so in one line and carry on — the answer arrives as a later turn, so do not retry or record the rule another way. The \`description\` is the one line every session sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
   {
     name: z.string().describe("Kebab-case slug, unique per user: lowercase letters, digits and dashes, ≤64 chars, e.g. 'avoid-box-a-and-box-b'. Reuse an existing name to update it."),
     description: z.string().describe('One line, ≤200 chars: the rule as every session should read it.'),
@@ -1819,7 +1819,7 @@ server.tool(
 
 server.tool(
   'memory_delete',
-  'Delete one of the user\'s memories — when the user retires a rule, or a memory turns out to be wrong. To change a memory, memory_save it under the same name instead.',
+  'Delete one of the user\'s memories — when the user retires a rule, or a memory turns out to be wrong. To change a memory, memory_save it under the same name instead. A delete made outside a turn the user started themselves, and any delete on some boxes, is a proposal the user approves on a tracker item: the result then says NOT deleted yet and names the item; say so in one line and carry on, do not retry.',
   { name: z.string().describe('The memory name') },
   async (args) => callMemory('delete', args, formatDeleteAck),
 );
