@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createMemoryHandlers } from '../lib/memory-tools.js';
 
-const mem = { id: 'me_1', name: 'avoid-elm', description: 'Never use elm.', type: 'feedback' };
+const mem = { id: 'me_1', name: 'avoid-box-a', description: 'Never use box-a.', type: 'feedback' };
 const coordMem = { id: 'me_2', name: 'compact-at-40', description: 'Compact at 40%.', type: 'feedback', scope: 'coordinator' };
 const appMem = { id: 'me_3', name: 'merge-train', description: 'The train merges.', type: 'project', scope: 'repo:acme-app' };
 const infraMem = { id: 'me_4', name: 'infra-rule', description: 'Infra.', type: 'project', scope: 'repo:acme-infra' };
@@ -24,14 +24,14 @@ const fourList = () => vi.fn(async () => ({ status: 200, data: { memories: [mem,
 describe('memory handlers', () => {
   it('save: fills convo_id, trims the description, passes body and type, reports created', async () => {
     const { h, client } = fixture();
-    const r = await h.save({ roomId: '!r:s', name: 'avoid-elm', description: '  Never use elm.  ', body: 'why', type: 'user' });
+    const r = await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: '  Never use box-a.  ', body: 'why', type: 'user' });
     expect(r).toEqual({ status: 201, body: { memory: mem, created: true } });
-    expect(client.save.mock.calls[0]).toEqual(['avoid-elm', { description: 'Never use elm.', body: 'why', type: 'user', convo_id: 'c1' }]);
+    expect(client.save.mock.calls[0]).toEqual(['avoid-box-a', { description: 'Never use box-a.', body: 'why', type: 'user', convo_id: 'c1' }]);
   });
 
   it('save: an update is 200 with created:false; body and type omitted stay omitted', async () => {
     const { h, client } = fixture({ save: vi.fn(async () => ({ status: 200, data: { memory: mem } })) });
-    const r = await h.save({ roomId: '!r:s', name: 'avoid-elm', description: 'd' });
+    const r = await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
     expect(r).toEqual({ status: 200, body: { memory: mem, created: false } });
     expect(client.save.mock.calls[0][1]).toEqual({ description: 'd', convo_id: 'c1' });
   });
@@ -102,10 +102,10 @@ describe('memory handlers', () => {
 
   it('get and delete: by name, 404 → no memory named, bad name → 400', async () => {
     const { h, client } = fixture();
-    expect(await h.get({ roomId: '!r:s', name: 'avoid-elm' })).toEqual({ status: 200, body: { memory: mem } });
-    expect(client.get.mock.calls[0]).toEqual(['avoid-elm']);
-    expect(await h.delete({ roomId: '!r:s', name: 'avoid-elm' })).toEqual({ status: 200, body: { memory: mem } });
-    expect(client.remove.mock.calls[0]).toEqual(['avoid-elm', { convo_id: 'c1' }]);
+    expect(await h.get({ roomId: '!r:s', name: 'avoid-box-a' })).toEqual({ status: 200, body: { memory: mem } });
+    expect(client.get.mock.calls[0]).toEqual(['avoid-box-a']);
+    expect(await h.delete({ roomId: '!r:s', name: 'avoid-box-a' })).toEqual({ status: 200, body: { memory: mem } });
+    expect(client.remove.mock.calls[0]).toEqual(['avoid-box-a', { convo_id: 'c1' }]);
     expect((await h.get({ roomId: '!r:s', name: 'Nope!' })).status).toBe(400);
     const r = await fixture({ remove: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) }).h.delete({ roomId: '!r:s', name: 'gone' });
     expect(r).toEqual({ status: 404, body: { error: 'no memory named "gone"' } });

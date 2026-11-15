@@ -142,6 +142,33 @@ gatedDescribe('locked mode', () => {
     expect(later.lock.state().until).toBe(null);
   });
 
+  it('a stored window longer than any unlock could open is dropped at start, and the file corrected', () => {
+    const first = box();
+    first.lock.unlock(unlockApproval(first.clock, '30'));
+    const file = path.join(first.t.dir, 'lock.json');
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // Exactly the longest window from now is kept.
+    fs.writeFileSync(file, JSON.stringify({ ...stored, window: { ...stored.window, until: first.clock.now + 120 * MIN } }));
+    const kept = box({ reuse: first });
+    expect(kept.lock.state().until).toBe(first.clock.now + 120 * MIN);
+    expect(kept.lock.allowsUser(KEY_ID)).toBe(true);
+    // One millisecond more is not.
+    fs.writeFileSync(file, JSON.stringify({ ...stored, window: { ...stored.window, until: first.clock.now + 120 * MIN + 1 } }));
+    const dropped = box({ reuse: first });
+    expect(dropped.lock.state()).toEqual({ on: true, until: null, lockdownUntil: null });
+    expect(dropped.lock.report()).toEqual({ on: true, until: null, lockdown_until: null });
+    expect(dropped.lock.allowsUser(KEY_ID)).toBe(false);
+    expect(dropped.lock.allowsPeer()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).window).toBe(null);
+    // The limit is the one in force at start: a lower one applies to a window opened under a higher one.
+    fs.writeFileSync(file, JSON.stringify({ ...stored, window: { ...stored.window, until: first.clock.now + 20 * MIN } }));
+    expect(box({ reuse: first, maxMinutes: 10 }).lock.allowsUser(KEY_ID)).toBe(false);
+    // The box can be unlocked again as usual.
+    first.clock.now += 1000;
+    const again = box({ reuse: first });
+    expect(again.lock.unlock(unlockApproval(first.clock, '5'))).toEqual({ ok: true, until: first.clock.now + 5 * MIN });
+  });
+
   it('a second unlock replaces the window: it never extends one silently', () => {
     const { lock, clock } = box();
     lock.unlock(unlockApproval(clock, '60'));
@@ -260,6 +287,21 @@ gatedDescribe('lockdown', () => {
     const again = box({ reuse: first });
     expect(again.lock.inLockdown()).toBe(true);
     expect(again.lock.state().lockdownUntil).toBe(first.lock.state().lockdownUntil);
+  });
+
+  it('a stored lockdown longer than a lockdown can last is shortened to a day at start, never dropped', () => {
+    const first = box();
+    for (let i = 0; i < 3; i++) first.lock.unlock(forged(first.clock));
+    const file = path.join(first.t.dir, 'lock.json');
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, JSON.stringify({ ...stored, lockdown: { until: first.clock.now + 400 * 24 * 60 * MIN } }));
+    const again = box({ reuse: first });
+    expect(again.lock.inLockdown()).toBe(true);
+    expect(again.lock.state().lockdownUntil).toBe(first.clock.now + 24 * 60 * MIN);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).lockdown).toEqual({ until: first.clock.now + 24 * 60 * MIN });
+    // One within the limit is kept as stored.
+    fs.writeFileSync(file, JSON.stringify({ ...stored, lockdown: { until: first.clock.now + 24 * 60 * MIN } }));
+    expect(box({ reuse: first }).lock.state().lockdownUntil).toBe(first.clock.now + 24 * 60 * MIN);
   });
 
   it('a notice that cannot be filed does not stop the lockdown', () => {

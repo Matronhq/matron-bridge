@@ -1852,7 +1852,7 @@ describe('createJournalPublisher — agent-chat room ops', () => {
 
   it('hands hello_ok box_defaults and live kind:box_defaults frames to onBoxDefaultsFrame', async () => {
     const fake = await startFakeServer({
-      onHello: () => ({ seq: 0, device_id: 7, name: 'elm', box_defaults: { default_agent: 'codex', default_model: null, default_effort: null } }),
+      onHello: () => ({ seq: 0, device_id: 7, name: 'box-a', box_defaults: { default_agent: 'codex', default_model: null, default_effort: null } }),
     });
     const seen = [];
     const pub = createJournalPublisher({
@@ -1870,7 +1870,7 @@ describe('createJournalPublisher — agent-chat room ops', () => {
   });
 
   it('calls no onBoxDefaultsFrame for a hello_ok without box_defaults', async () => {
-    const fake = await startFakeServer({ onHello: () => ({ seq: 0, device_id: 7, name: 'elm' }) });
+    const fake = await startFakeServer({ onHello: () => ({ seq: 0, device_id: 7, name: 'box-a' }) });
     const seen = [];
     const pub = createJournalPublisher({
       url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,

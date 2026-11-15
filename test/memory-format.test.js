@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { memoryLine, formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatProposalOutcome } from '../lib/memory-format.js';
 
-const m = { id: 'me_1', name: 'avoid-elm', type: 'feedback', description: 'Never use elm.', body: '**Why:** reserved.', created_by: 'agent', updated_by: 'user', created_at: 1000, updated_at: 2000, origin_convo_id: 'c1' };
+const m = { id: 'me_1', name: 'avoid-box-a', type: 'feedback', description: 'Never use box-a.', body: '**Why:** reserved.', created_by: 'agent', updated_by: 'user', created_at: 1000, updated_at: 2000, origin_convo_id: 'c1' };
 
 describe('memory renderers', () => {
   it('memoryLine: name, type, description, updated time and who', () => {
-    expect(memoryLine(m)).toBe('`avoid-elm` (feedback, global): Never use elm. — updated 1970-01-01T00:00:02.000Z by user');
+    expect(memoryLine(m)).toBe('`avoid-box-a` (feedback, global): Never use box-a. — updated 1970-01-01T00:00:02.000Z by user');
     expect(memoryLine({ ...m, scope: 'repo:acme-app' })).toContain('(feedback, repo:acme-app)');
   });
   it('formatMemoryList: one line per memory, or a placeholder', () => {
@@ -23,7 +23,7 @@ describe('memory renderers', () => {
   });
   it('formatMemoryDetail: the fields then the body', () => {
     const out = formatMemoryDetail({ memory: m });
-    expect(out).toContain('name: avoid-elm');
+    expect(out).toContain('name: avoid-box-a');
     expect(out).toContain('type: feedback');
     expect(out).toContain('scope: global');
     expect(formatMemoryDetail({ memory: { ...m, scope: 'coordinator' } })).toContain('scope: coordinator');
@@ -32,9 +32,9 @@ describe('memory renderers', () => {
     expect(formatMemoryDetail({ memory: { ...m, body: '', origin_convo_id: null } })).toContain('(no body)');
   });
   it('formatSaveAck says created or updated; formatDeleteAck names the memory', () => {
-    expect(formatSaveAck({ memory: m, created: true })).toBe('Saved memory `avoid-elm` (created, scope global): Never use elm.');
-    expect(formatSaveAck({ memory: { ...m, scope: 'repo:acme-app' }, created: false })).toBe('Saved memory `avoid-elm` (updated, scope repo:acme-app): Never use elm.');
-    expect(formatDeleteAck({ memory: m })).toBe('Deleted memory `avoid-elm`');
+    expect(formatSaveAck({ memory: m, created: true })).toBe('Saved memory `avoid-box-a` (created, scope global): Never use box-a.');
+    expect(formatSaveAck({ memory: { ...m, scope: 'repo:acme-app' }, created: false })).toBe('Saved memory `avoid-box-a` (updated, scope repo:acme-app): Never use box-a.');
+    expect(formatDeleteAck({ memory: m })).toBe('Deleted memory `avoid-box-a`');
   });
   it('a pending save or delete says plainly that nothing changed, names the item, and says not to retry', () => {
     const saved = formatSaveAck({ pending: true, action: 'save', name: 'avoid-elm', item_num: 41, item_id: 'it_9' });

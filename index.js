@@ -208,7 +208,7 @@ import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice,
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
-import { quotedField, peerField, PEER_NAME_MAX } from './lib/peer-text.js';
+import { quotedField, peerField, frameSafeBody, PEER_NAME_MAX } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
 import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.js';
@@ -10784,8 +10784,9 @@ async function fireTimer(record) {
     const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
     journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
     // A reminder turn, naming the turn that set it (lib/reminder-tools.js).
+    // A later line of the text cannot open a frame of its own.
     await journalRouteTextToSession(session,
-      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`,
+      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${frameSafeBody(String(record.text ?? ''))}`,
       { causes: mergeCauses([plainCause('reminder'), record.causes]) });
     return;
   }
