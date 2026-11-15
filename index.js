@@ -13166,15 +13166,18 @@ const wakeHandlers = new Map([['', makeWakeHandler(process.env.MATRON_WAKE_CONVO
 // deliverRoomFrameTo with its own binding (lib/transfer-outcome.js), so
 // busy coalescing and the mute apply, and a session the idle reap took
 // down while the upload ran is woken with the line.
+const notifyTransferSession = createTransferOutcomeNotify({
+  getRoom: (roomId) => agentRooms.get(roomId),
+  deliverRoomFrameTo,
+  log: console,
+});
 transferSender = createTransferSender({
   client: transferClient,
   stateFile: TRANSFERS_FILE,
   log: console,
-  notify: createTransferOutcomeNotify({
-    getRoom: (roomId) => agentRooms.get(roomId),
-    deliverRoomFrameTo,
-    log: console,
-  }),
+  notify: notifyTransferSession,
+  // Told only once the journal has created the transfer and its card.
+  onCreated: notifyTransferSession,
 });
 // Room files released to this device: downloaded into the receiving
 // session's inbox (outside any working tree) and announced to every bound
