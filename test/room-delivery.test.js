@@ -304,6 +304,51 @@ describe('createRoomDelivery', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('2 message(s)'));
   });
 
+  it('held (the box is locked): a flush tries nothing and keeps the queue; it goes once the hold ends', () => {
+    let locked = false;
+    const injectTurn = vi.fn(() => true);
+    const delivery = createRoomDelivery({ isBusy: (session) => !!session.busy, injectTurn, isHeld: () => locked, log: { warn: () => {} } });
+    const session = { alive: true, busy: true };
+    // Queued behind a running turn while the box was unlocked.
+    delivery.deliver(session, 's1', msg({ body: 'one' }));
+    delivery.deliver(session, 's1', msg({ body: 'two' }));
+    // The turn ends after the box has locked again.
+    session.busy = false;
+    locked = true;
+    expect(delivery.flush(session, 's1')).toBe(null);
+    expect(delivery.flush(session, 's1')).toBe(null);
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.pendingCount('s1')).toBe(2);
+    expect(delivery.pendingKeys()).toEqual(['s1']);
+    // Unlocked: the same flush delivers both, in order, as one turn.
+    locked = false;
+    expect(delivery.flush(session, 's1')).toBe(true);
+    expect(injectTurn).toHaveBeenCalledTimes(1);
+    expect(injectTurn.mock.calls[0][1]).toMatch(/one[\s\S]*two/);
+    expect(delivery.pendingCount('s1')).toBe(0);
+    expect(delivery.pendingKeys()).toEqual([]);
+  });
+
+  it('held with nothing queued is an ordinary empty flush; a lock that cannot answer holds', () => {
+    const injectTurn = vi.fn(() => true);
+    const delivery = createRoomDelivery({ isBusy: (session) => !!session.busy, injectTurn, isHeld: () => { throw new Error('boom'); }, log: { warn: () => {} } });
+    const session = { alive: true, busy: true };
+    expect(delivery.flush(session, 's1')).toBe(false);
+    delivery.deliver(session, 's1', msg());
+    session.busy = false;
+    expect(delivery.flush(session, 's1')).toBe(null);
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.pendingCount('s1')).toBe(1);
+  });
+
+  it('pendingKeys names only sessions with something waiting', () => {
+    const { delivery } = makeDelivery();
+    delivery.deliver({ alive: true, busy: true }, 's1', msg());
+    delivery.deliver({ alive: true, busy: true }, 's2', msg());
+    delivery.dropSession('s2');
+    expect(delivery.pendingKeys()).toEqual(['s1']);
+  });
+
   it('flush with nothing pending returns false without injecting', () => {
     const { delivery, injectTurn } = makeDelivery();
     expect(delivery.flush({ alive: true, busy: false }, 'k1')).toBe(false);

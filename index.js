@@ -1096,6 +1096,8 @@ const boxLock = approvalGate.enabled ? createBoxLock({
   // Tell the journal at once: the apps show the lock from its copy.
   onChange: () => {
     try { journalPublisher.sendRoomOp({ op: 'box_status', locked: boxLock.report() }); } catch { /* the next hello carries it */ }
+    // An unlock lets the room messages that were held in their inboxes go.
+    try { drainHeldRoomDeliveries(); } catch (e) { try { console.warn(`[box-lock] draining held room messages failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } }
   },
   log: console,
 }) : null;
@@ -11685,6 +11687,18 @@ function drainDeferredControls(session) {
   return true;
 }
 
+// The box was unlocked (lib/box-lock.js onChange): every session whose room
+// inbox was held while it was locked gets the free gate again. A no-op when
+// the box is still locked, and for a session that is busy (its own turn end
+// is the next seam).
+function drainHeldRoomDeliveries() {
+  if (outsideWorkRefused()) return;
+  for (const key of roomDelivery.pendingKeys()) {
+    const session = sessions.get(key);
+    if (session?.alive) maybeFlushRoomDelivery(session);
+  }
+}
+
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
   // Held where they are while the account is locked: a flush empties the
@@ -11712,8 +11726,9 @@ function flushRoomInbox(session) {
   // and no notice to publish (the ordinary idle path never queued anything).
   const queued = roomDelivery.pendingCount(session.roomId);
   const flushed = roomDelivery.flush(session, session.roomId);
-  // null: another person's turn is waiting for a running turn to end; it
-  // stays queued for the next seam, with nothing to report yet.
+  // null: another person's turn is waiting for a running turn to end, or
+  // the box is locked; the messages stay queued for the next seam (or the
+  // next unlock), with nothing to report yet.
   if (!queued || flushed === null) return;
   // A flush delivers one turn's worth: own messages and each other person's
   // room go in separate turns, so some may still be waiting (they get their
@@ -11733,6 +11748,10 @@ function flushRoomInbox(session) {
 // Live room frames held while the bridge joins a room for the agent.
 const roomJoinHold = createJoinHold();
 const roomDelivery = createRoomDelivery({
+  // Queued messages stay queued while the box is locked with no unlock
+  // window open: the same rule a message meets when it arrives. (The
+  // account lock holds them one step earlier, in maybeFlushRoomDelivery.)
+  isHeld: () => !!boxLock && !boxLock.allowsPeer(),
   isBusy: (session, { foreign = false } = {}) => (foreign
     ? sessionOccupiedForForeignTurn(session)
     : sessionOccupiedForRoomDelivery(session)),
