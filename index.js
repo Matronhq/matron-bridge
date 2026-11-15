@@ -271,6 +271,7 @@ import { loopbackRefusal } from './lib/loopback-guard.js';
 import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
 import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './lib/header-files.js';
 import { launchWithClaudePromptFile } from './lib/claude-prompt-file.js';
+import { trimChatHistory } from './lib/chat-history-cap.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -6142,12 +6143,18 @@ function recordConversationMessage(session, role, text) {
     text: normalized,
     ...(role === 'assistant' && session.agent ? { agent: session.agent } : {}),
   });
+  // Bounded: the whole history is rewritten into the sessions file below, on
+  // every message (lib/chat-history-cap.js).
+  const dropped = trimChatHistory(session);
   // Once a message is dispatched to, or emitted by, the active native
   // session, that provider has seen the shared transcript through this item.
   session._agentHistoryCursor = session.chatHistory.length;
   debug(`Added ${role} message to chatHistory, length now: ${session.chatHistory.length}`);
   persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
     chatHistory: session.chatHistory,
+    // A cut moved the summary cursor; the record must not pair the shorter
+    // history with the old one.
+    ...(dropped > 0 ? { lastSummaryMsgCount: session.lastSummaryMsgCount || 0 } : {}),
   });
 }
 
