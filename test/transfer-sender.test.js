@@ -236,6 +236,87 @@ describe('transfer sender', () => {
     expect(readState(fx.stateFile).jobs).toEqual({});
   });
 
+  it('the session hears of the approval card only once the transfer and card exist', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    let releaseCreate;
+    client.create = vi.fn(() => new Promise((resolve) => {
+      releaseCreate = () => resolve({ ok: true, status: 201, body: { transfer_id: 'tr-1', chunk_bytes: 4, chunks: 4 } });
+    }));
+    const notify = vi.fn();
+    const onCreated = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, onCreated, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await vi.waitFor(() => expect(client.create).toHaveBeenCalledTimes(1));
+    // The create is still in flight: nothing about a card yet.
+    expect(onCreated).not.toHaveBeenCalled();
+    releaseCreate();
+    await sender.idle();
+    expect(notify).not.toHaveBeenCalled();
+    expect(onCreated).toHaveBeenCalledTimes(1);
+    expect(onCreated).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: '!s1', roomId: 'room-1', text: expect.stringMatching(/^\[transfer of "notes\.txt" waiting for approval: .*approval card/),
+    }));
+  });
+
+  it('a refused create never claims an approval card', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.create = vi.fn(async () => ({ ok: false, status: 413, body: { error: 'quota_exceeded' } }));
+    const notify = vi.fn();
+    const onCreated = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, onCreated, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(onCreated).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].text).not.toMatch(/approval card/);
+  });
+
+  it('a non-transient refusal of the status read after create tells the session why, and drops the job', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.status = vi.fn(async () => ({ ok: false, status: 403, body: { error: 'forbidden' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(client.putChunk).not.toHaveBeenCalled();
+    const texts = notify.mock.calls.map((c) => c[0].text);
+    expect(texts).toContainEqual(expect.stringMatching(/^\[transfer of "notes\.txt" (failed|stopped): .*forbidden/));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('a 404 on the status read after create says the outcome is unknown rather than failed', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.status = vi.fn(async () => ({ ok: false, status: 404, body: { error: 'not_found' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    const texts = notify.mock.calls.map((c) => c[0].text);
+    expect(texts).toContainEqual(expect.stringMatching(/^\[transfer of "notes\.txt" stopped: .*not_found.*unknown/));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('a resumed, already uploaded job whose status read is refused tells the session', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    const notify = vi.fn();
+    const first = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    first.start(startArgs(fx));
+    await first.idle();
+    expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true });
+    notify.mockClear();
+    client.status = vi.fn(async () => ({ ok: false, status: 404, body: { error: 'not_found' } }));
+    const second = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    await second.resumeAll();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].text).toMatch(/^\[transfer of "notes\.txt" stopped: .*not_found/);
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
   it('a declined outcome is told once, however many times the journal says so', async () => {
     const fx = fixture();
     const client = fakeClient();
