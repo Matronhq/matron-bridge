@@ -54,7 +54,7 @@ describe('memory renderers', () => {
     expect(formatProposalOutcome({ ...p, outcome: 'declined' })).toContain('The user declined it: memory `avoid-elm` was not saved');
     expect(formatProposalOutcome({ ...p, outcome: 'replaced', item: null })).toBe('[Matron: memory proposal] A newer proposal for memory `avoid-elm` took its place; this one was set aside and nothing changed.');
     expect(formatProposalOutcome({ ...p, outcome: 'expired' })).toContain('Nobody answered within 7 days');
-    for (const bad of [null, 'x', {}, { ...p, outcome: 'saved' }, { ...p, name: 'Not A Slug' }, { ...p, name: 'a`b' }, { ...p, name: 'a\nb' }]) {
+    for (const bad of [null, 'x', {}, { ...p, outcome: 'saved' }, { ...p, outcome: undefined }, { ...p, action: undefined }, { ...p, action: 'update' }, { ...p, action: 'Save' }, { ...p, action: null }, { ...p, name: 'Not A Slug' }, { ...p, name: 'a`b' }, { ...p, name: 'a\nb' }]) {
       expect(formatProposalOutcome(bad)).toBe(null);
     }
   });

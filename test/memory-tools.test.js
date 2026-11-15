@@ -143,6 +143,11 @@ describe('memory handlers', () => {
       .toEqual({ status: 202, body: { pending: true, action: 'save', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
     expect(await h.delete({ roomId: '!r:s', name: 'avoid-box-a' }))
       .toEqual({ status: 202, body: { pending: true, action: 'delete', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
+    // At the journal's cap on waiting proposals: said as that, not as the memory cap.
+    const capped = fixture({ save: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'too_many_asks' } })) });
+    const refused = await capped.h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toMatch(/too many memory proposals/);
     // A 202 with no usable item still reads as pending.
     const bare = fixture({ save: vi.fn(async () => ({ status: 202, data: {} })) });
     expect((await bare.h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' })).body).toEqual({ pending: true, action: 'save', name: 'avoid-box-a', item_num: null, item_id: null });
