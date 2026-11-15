@@ -21,6 +21,24 @@ describe('session control client', () => {
     expect((await h.setModel({ roomId: '!coord', target_convo_id: 'x' })).status).toBe(400);
     expect((await h.carryOn({ roomId: '!coord', target_convo_id: 'x' })).status).toBe(400);
   });
+  it('accepts a caller the journal names as the Coordinator though it spawned before the role was known', async () => {
+    const sent = [];
+    // Spawned ordinary (coordinator:false) while GET /coordinator had not answered.
+    const sessions = new Map([['!coord', { alive: true, coordinator: false, journalConvoId: 'coord-convo' }], ['!plain', { alive: true, coordinator: false, journalConvoId: 'plain-convo' }]]);
+    const journalSays = 'coord-convo';
+    const h = createSessionControlHandlers({
+      sessions,
+      publisher: { sendRoomOp: (f) => { sent.push(f); return true; } },
+      journalConvoIdFor: (s) => s.journalConvoId,
+      isCoordinator: (s, convoId) => s?.coordinator === true || convoId === journalSays,
+      pendingTimeoutMs: 20,
+    });
+    await h.compact({ roomId: '!coord', target_convo_id: 'tgt' });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ op: 'session_control', from_convo_id: 'coord-convo', action: 'compact' });
+    expect((await h.compact({ roomId: '!plain', target_convo_id: 'tgt' })).status).toBe(403);
+    expect(sent).toHaveLength(1);
+  });
   it('sends the op and answers on the sent ack; the result frame becomes a notice in the Coordinator chat', async () => {
     const { h, sent, notices } = fixture();
     const p = h.setModel({ roomId: '!coord', target_convo_id: 'tgt', model: 'sonnet', agent: 'claude', reason: 'limit hit' });

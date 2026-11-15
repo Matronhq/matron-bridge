@@ -13,6 +13,7 @@ import {
   isModelExplicit,
   planCoordinatorTransition,
   decideCoordinatorEvent,
+  coordinatorNeedsAssigning,
   withCoordinatorModel,
   recreateSpawnModel,
   COORDINATOR_MODEL,
@@ -639,5 +640,23 @@ describe('recreateSpawnModel (final review #1)', () => {
   it('Codex keeps its explicit null and ignores any pending model', () => {
     expect(recreateSpawnModel({ agent: 'codex', currentModel: null, pendingModel: 'opus[1m]' })).toBeNull();
     expect(recreateSpawnModel({ agent: 'codex', currentModel: 'gpt-5' })).toBe('gpt-5');
+  });
+});
+
+describe('coordinatorNeedsAssigning', () => {
+  const truth = { fetched: true, known: true, convoId: 'a' };
+  it('a live session the journal names, spawned without the role, gets it', () => {
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: false })).toBe(true);
+  });
+  it('nothing when the answer was not fetched, the role is unknown, or nobody holds it', () => {
+    expect(coordinatorNeedsAssigning({ truth: { ...truth, fetched: false }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: { fetched: false, known: false, convoId: null }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: { ...truth, convoId: null }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: null, live: true, sessionCoordinator: false })).toBe(false);
+  });
+  it('nothing for a session that is not running, already has the role, or has a role change queued', () => {
+    expect(coordinatorNeedsAssigning({ truth, live: false, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: true })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: false, pendingRole: 'assigned' })).toBe(false);
   });
 });
