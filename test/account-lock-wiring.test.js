@@ -97,6 +97,21 @@ describe('locked mode and gate wiring beyond the event router', () => {
     expect(index).toMatch(/notifyRoom: \(\.\.\.args\) => \{ if \(!outsideWorkRefused\(\)\) journalNotifyRoomEvent\(\.\.\.args\); \}/);
   });
 
+  it('room messages queued behind a turn stay queued while the box is locked, and go when it is unlocked', () => {
+    const make = body('const roomDelivery = createRoomDelivery({', '\n});');
+    expect(make).toMatch(/isHeld: \(\) => outsideWorkRefused\(\)/);
+    // An arrival behind waiting messages asks the gated drain; it never flushes by itself.
+    expect(make).toMatch(/requestDrain: \(session\) => maybeFlushRoomDelivery\(session\)/);
+    // Every drain goes through the one flush, which asks the hold first.
+    expect(index.match(/roomDelivery\.flush\(/g) || []).toHaveLength(1);
+    const drain = body('function drainHeldRoomDeliveries()', '\n}\n');
+    expect(drain).toMatch(/if \(outsideWorkRefused\(\)\) return;/);
+    expect(drain).toMatch(/roomDelivery\.pendingKeys\(\)/);
+    expect(drain).toMatch(/maybeFlushRoomDelivery\(session\)/);
+    const lock = body('const boxLock = approvalGate.enabled ? createBoxLock({', '\n}) : null;');
+    expect(lock).toMatch(/onChange: \(\) => \{[\s\S]*drainHeldRoomDeliveries\(\)/);
+  });
+
   it('a session control action parked while the session was busy is not applied once the unlock window has closed', () => {
     expect(index).toMatch(/function drainDeferredControls\(session\) \{\n(?:\s*\/\/[^\n]*\n)*\s*if \(outsideWorkRefused\(\)\) return false;/);
   });
