@@ -57,7 +57,7 @@ import { createJournalIdentity } from './lib/journal-identity.js';
 import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
 import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } from './lib/tracker-link-check.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
+import { createCoordinatorLookup, coordinatorNeedsAssigning, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
@@ -1233,8 +1233,9 @@ function handleJournalReconnect() {
   publishBoxStatus('reconnect');
   // A fresh epoch may follow a gap in which the Coordinator moved; the
   // replayed `coordinator` events cover a live bridge, this covers a cursor
-  // reset (snapshot_required) that skipped them.
-  coordinatorLookup.refresh({ force: true });
+  // reset (snapshot_required) that skipped them. The answer also catches a
+  // Coordinator session that spawned while the role was unknown.
+  void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
   refreshJournalIdentity({ force: true });
@@ -2448,7 +2449,12 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
     options.presetSessionId,
   ];
   const role = coordinatorLookup.roleFor(candidates);
-  coordinatorLookup.refresh();
+  // Role not known yet: ask the journal now, and once it answers, give this
+  // session the role if it is the Coordinator (reconcileLiveCoordinator).
+  // The session is in `sessions` by then: the answer comes back on a later
+  // tick than this synchronous spawn.
+  if (role.known) coordinatorLookup.refresh();
+  else void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);
   memoryLookup.refresh();
   userDefaults.refresh();
   refreshJournalIdentity();
@@ -10270,6 +10276,22 @@ function journalOnItem(session, item, ctx) {
 // injected turn (queued behind a running turn, never dropped). A Coordinator
 // that is not running only has its persisted model updated; its next resume
 // reads the role from the cache.
+// A Coordinator that spawned while the role was unknown (lib/coordinator.js
+// coordinatorNeedsAssigning) gets it now, through the same path as a live
+// `assigned` event: re-checked against the journal, then a respawn when
+// idle or a role queued for the next spawn when busy, and the assigned turn.
+// Never throws: it runs behind fire-and-forget refreshes.
+async function reconcileLiveCoordinator(truth) {
+  try {
+    const session = truth?.convoId ? findSessionByClaudeSessionId(truth.convoId) : null;
+    if (!coordinatorNeedsAssigning({ truth, live: !!(session && session.alive), sessionCoordinator: session?.coordinator, pendingRole: session?._coordinatorPending ?? null })) return;
+    console.warn(`[coordinator] ${truth.convoId} started as an ordinary session before the role was known — giving it the Coordinator role now`);
+    await journalOnCoordinator(truth.convoId, { role: 'assigned' });
+  } catch (e) {
+    try { console.warn(`[coordinator] reconcile failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+  }
+}
+
 async function journalOnCoordinator(convoId, { role }) {
   coordinatorLookup.apply(convoId, role);
   const truth = await coordinatorLookup.refresh({ force: true });
@@ -13497,6 +13519,9 @@ sessionControlHandlers = createSessionControlHandlers({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
+  // Same test as the consent tools: the spawn-time flag, or the journal's
+  // current role holder.
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
   notify: (convoId, text) => journalPublishNotice(convoId, text, noticeMeta('control', text)),
   compactSelf: (d) => selfCompactHandler(d),
   log: console,

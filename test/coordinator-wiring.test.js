@@ -28,7 +28,7 @@ describe('coordinator spawn wiring (source inspection)', () => {
   it('builds one lookup on the journal HTTP base and refreshes it at boot and on every hello_ok', () => {
     expect(index).toMatch(/const coordinatorLookup = createCoordinatorLookup\(\{\s*baseUrl: journalHttpBase,\s*token: _journalToken,/);
     const reconnect = body('function handleJournalReconnect()', '\nfunction ');
-    expect(reconnect).toContain('coordinatorLookup.refresh({ force: true });');
+    expect(reconnect).toContain('void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);');
     const boot = body('if (JOURNAL_ENABLED) {', '\nfunction expandHome(');
     expect(boot).toContain('coordinatorLookup.refresh({ force: true });');
   });
@@ -42,9 +42,22 @@ describe('coordinator spawn wiring (source inspection)', () => {
   it('an unknown role spawns an ordinary session and logs it — never a failed spawn', () => {
     const fn = body('function coordinatorRoleAtSpawn(', '\nfunction ');
     expect(fn).toContain('coordinatorLookup.roleFor(candidates)');
-    expect(fn).toContain('coordinatorLookup.refresh();');
+    expect(fn).toContain('if (role.known) coordinatorLookup.refresh();');
+    expect(fn).toContain('else void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);');
     expect(fn).toMatch(/starting as an ordinary session/);
     expect(fn).not.toMatch(/throw /);
+  });
+
+  it('a Coordinator that spawned before the role was known gets it through the assigned-event path', () => {
+    const fn = body('async function reconcileLiveCoordinator(truth) {', '\nasync function journalOnCoordinator(');
+    expect(fn).toContain('coordinatorNeedsAssigning({ truth, live: !!(session && session.alive), sessionCoordinator: session?.coordinator, pendingRole: session?._coordinatorPending ?? null })');
+    expect(fn).toContain("await journalOnCoordinator(truth.convoId, { role: 'assigned' });");
+    expect(fn).toMatch(/catch \(e\)/);
+  });
+
+  it('session control accepts the journal\'s current role holder, like the consent tools', () => {
+    const sc = body('sessionControlHandlers = createSessionControlHandlers({', '\n});');
+    expect(sc).toContain('isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),');
   });
 
   it('print mode: prompt and disallowed tools come from claudeCoordinatorArgs', () => {
