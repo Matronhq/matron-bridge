@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import WebSocket, { WebSocketServer } from 'ws';
 import net from 'net';
 import http from 'node:http';
@@ -1116,6 +1117,81 @@ describe('createJournalPublisher', () => {
 
     pub.close();
     await httpServer.close();
+  });
+
+  it('fetchMedia: accepts exactly 100 MB by default and refuses a declared extra byte', async () => {
+    const maxBytes = 100_000_000;
+    const chunk = Buffer.alloc(64 * 1024, 0x5a);
+    const expectedHash = createHash('sha256');
+    const responses = new Set();
+    const httpServer = await startFakeHttpServer((entry, res) => {
+      if (!entry.url.startsWith('/media/')) { res.writeHead(404); res.end(); return; }
+      responses.add(res);
+      res.on('close', () => responses.delete(res));
+      const oversize = entry.url.endsWith('/oversize');
+      res.writeHead(200, {
+        'content-type': 'video/quicktime',
+        'content-length': maxBytes + (oversize ? 1 : 0),
+      });
+      res.flushHeaders();
+      if (oversize) return; // No body is needed to refuse the declared size.
+      let remaining = maxBytes;
+      const writeMore = () => {
+        while (remaining > 0 && !res.destroyed) {
+          const part = chunk.subarray(0, Math.min(remaining, chunk.length));
+          expectedHash.update(part);
+          remaining -= part.length;
+          if (!res.write(part)) { res.once('drain', writeMore); return; }
+        }
+        res.end();
+      };
+      writeMore();
+    });
+    const warnings = [];
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${httpServer.port}/ws`, token: 'tok',
+      log: { warn: (...a) => warnings.push(a.join(' ')), error: () => {} },
+      ...FAST_BACKOFF,
+    });
+    try {
+      const result = await pub.fetchMedia('boundary');
+      expect(result?.contentType).toBe('video/quicktime');
+      expect(result?.buffer.length).toBe(maxBytes);
+      expect(createHash('sha256').update(result.buffer).digest('hex')).toBe(expectedHash.digest('hex'));
+      expect(await pub.fetchMedia('oversize')).toBeNull();
+      expect(warnings.some(w => /fetchMedia.*exceeds 100000000 cap/.test(w))).toBe(true);
+    } finally {
+      pub.close();
+      for (const res of responses) res.destroy();
+      await httpServer.close();
+    }
+  }, 10_000);
+
+  it('fetchMedia: aborts an oversized chunked body before the server finishes sending it', async () => {
+    let response;
+    const httpServer = await startFakeHttpServer((entry, res) => {
+      if (entry.url !== '/media/chunked') { res.writeHead(404); res.end(); return; }
+      response = res;
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.write(Buffer.alloc(9, 0x41)); // No Content-Length or end: cap is 8.
+    });
+    const warnings = [];
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${httpServer.port}/ws`, token: 'tok',
+      log: { warn: (...a) => warnings.push(a.join(' ')), error: () => {} },
+      ...FAST_BACKOFF, fetchMediaMaxBytes: 8, fetchMediaTimeoutMs: 2000,
+    });
+    try {
+      expect(await pub.fetchMedia('chunked')).toBeNull();
+      expect(warnings.some(w => /fetchMedia.*exceeds 8 cap/.test(w))).toBe(true);
+      expect(warnings.some(w => /fetchMedia failed/.test(w))).toBe(false);
+      await waitFor(() => response.destroyed);
+      expect(response.writableEnded).toBe(false);
+    } finally {
+      pub.close();
+      response?.destroy();
+      await httpServer.close();
+    }
   });
 
   it('fetchTranscript: asks GET /media/:id/transcript?wait=20 with Bearer auth and returns the answer', async () => {
