@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
-  handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart,
+  handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart,
   DEFAULT_HANDOFF_IDLE_MS, DEFAULT_COMPACT_PCT, STATUS_FRESH_GRACE_MS, HANDOFF_TURN_PREFIX,
 } from '../lib/pre-reap-handoff.js';
+import { isCompactCommand, hasQueuedCompact, compactBatchSize } from '../lib/compact-priority.js';
 
 const HOUR = 3_600_000;
 const MIN = 60_000;
@@ -136,6 +137,33 @@ describe('planHandoff', () => {
   });
   it('rounds the gauge to a whole percent', () => {
     expect(plan({ contextTokens: 123_456 }).pct).toBe(12);
+  });
+});
+
+describe('preReapCompactCommand', () => {
+  it('passes one line of working-state instructions to the compact summarizer', () => {
+    const command = preReapCompactCommand();
+    expect(command.startsWith('/compact ')).toBe(true);
+    expect(command).not.toMatch(/[\r\n]/);
+    expect(isCompactCommand(command)).toBe(true);
+    for (const topic of [
+      'session goal', "user's latest asks", 'mission', 'PR',
+      'worktree', 'branch', 'names and paths', 'open tracker items',
+      'unanswered questions', 'pending background jobs', 'reminders',
+      'waits', 'promises made', 'exact next step',
+    ]) expect(command).toContain(topic);
+  });
+
+  it('keeps compact queue priority and the frozen idle anchor', () => {
+    const command = preReapCompactCommand();
+    const queue = [command, 'continue working'].map(text => [{ type: 'text', text }]);
+    expect(hasQueuedCompact(queue)).toBe(true);
+    expect(compactBatchSize(queue)).toBe(1);
+    const mark = { idleSince: T, at: T + MIN };
+    const session = { _preReapHandoff: mark };
+    noteTurnStart(session, command);
+    expect(session._preReapHandoff).toBe(mark);
+    expect(handoffIdleSince(session)).toBe(T);
   });
 });
 
