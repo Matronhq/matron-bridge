@@ -348,29 +348,114 @@ describe('createRoomDelivery', () => {
     expect(delivery.pendingCount('s1')).toBe(1); // the other person's room gets its own turn
   });
 
-  it('an arrival never overtakes older queued messages: it goes behind them and the inbox is flushed in order', () => {
-    let locked = false;
-    const injectTurn = vi.fn(() => true);
-    const delivery = createRoomDelivery({ isBusy: (session) => !!session.busy, injectTurn, isHeld: () => locked, log: { warn: () => {} } });
+  // The drain site as index.js has it: gates first (maybeFlushRoomDelivery),
+  // then the one flush and its delivered notice (flushRoomInbox).
+  function gatedHarness() {
+    const state = { boxLocked: false, accountLocked: false, parked: false };
+    const notices = [];
+    // As sendToSession: refused while the account is locked.
+    const injectTurn = vi.fn(() => !state.accountLocked);
+    let delivery = null;
+    const drain = vi.fn((session, key) => {
+      if (session.busy || state.accountLocked || state.parked) return;
+      const queued = delivery.pendingCount(key);
+      const flushed = delivery.flush(session, key);
+      if (!queued || flushed === null) return;
+      notices.push(flushed ? formatRoomDeliveredNotice(queued - delivery.pendingCount(key)) : formatRoomDeliveryFailedNotice(queued));
+    });
+    delivery = createRoomDelivery({
+      isBusy: (session) => !!session.busy, injectTurn,
+      isHeld: () => state.boxLocked || state.accountLocked,
+      requestDrain: drain, log: { warn: () => {} },
+    });
+    return { state, notices, injectTurn, drain, delivery };
+  }
+
+  it('an arrival behind waiting messages is queued and goes through the gated drain, which publishes the delivered notice', () => {
+    const { state, notices, injectTurn, drain, delivery } = gatedHarness();
     const session = { alive: true, busy: true };
     delivery.deliver(session, 's1', msg({ body: 'first' }));
     session.busy = false;
-    locked = true;
+    state.boxLocked = true;
     delivery.deliver(session, 's1', msg({ body: 'second' }));
-    expect(delivery.flush(session, 's1')).toBe(null);
-    // Unlocked, and a new message arrives before anything drained the inbox.
-    locked = false;
+    expect(drain).not.toHaveBeenCalled(); // held: nothing to ask for
+    state.boxLocked = false;
     expect(delivery.deliver(session, 's1', msg({ body: 'third' }))).toBe(true);
+    expect(drain).toHaveBeenCalledTimes(1);
     expect(injectTurn).toHaveBeenCalledTimes(1);
     const text = injectTurn.mock.calls[0][1];
     expect(text.indexOf('first')).toBeGreaterThan(-1);
     expect(text.indexOf('first')).toBeLessThan(text.indexOf('second'));
     expect(text.indexOf('second')).toBeLessThan(text.indexOf('third'));
+    expect(notices).toEqual([formatRoomDeliveredNotice(3)]);
     expect(delivery.pendingCount('s1')).toBe(0);
     // With nothing waiting, an idle arrival is one immediate turn as before.
     expect(delivery.deliver(session, 's1', msg({ body: 'fourth' }))).toBe(true);
     expect(injectTurn).toHaveBeenCalledTimes(2);
-    expect(injectTurn.mock.calls[1][1]).toMatch(/fourth$/);
+    expect(drain).toHaveBeenCalledTimes(1);
+  });
+
+  it('deliver never flushes by itself: a gate that refuses, or no drain at all, leaves everything queued', () => {
+    const { state, notices, injectTurn, drain, delivery } = gatedHarness();
+    const session = { alive: true, busy: true };
+    delivery.deliver(session, 's1', msg({ body: 'first' }));
+    session.busy = false;
+    // Something else goes first at the drain site (a parked control, say).
+    state.parked = true;
+    expect(delivery.deliver(session, 's1', msg({ body: 'second' }))).toBe(true);
+    expect(drain).toHaveBeenCalledTimes(1);
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.pendingCount('s1')).toBe(2);
+    expect(notices).toEqual([]);
+    // The next seam delivers both, in order.
+    state.parked = false;
+    drain(session, 's1');
+    expect(injectTurn.mock.calls[0][1]).toMatch(/first[\s\S]*second/);
+    expect(notices).toEqual([formatRoomDeliveredNotice(2)]);
+    // No drain wired: still only queued.
+    const bare = createRoomDelivery({ isBusy: (s) => !!s.busy, injectTurn: vi.fn(() => true), log: { warn: () => {} } });
+    const other = { alive: true, busy: true };
+    bare.deliver(other, 's2', msg({ body: 'a' }));
+    other.busy = false;
+    expect(bare.deliver(other, 's2', msg({ body: 'b' }))).toBe(true);
+    expect(bare.pendingCount('s2')).toBe(2);
+  });
+
+  it('account locked: arrivals and drains keep the inbox as it is, nothing is lost, and it goes in order afterwards', () => {
+    const { state, notices, injectTurn, drain, delivery } = gatedHarness();
+    const session = { alive: true, busy: true };
+    delivery.deliver(session, 's1', msg({ body: 'first' }));
+    session.busy = false;
+    state.accountLocked = true;
+    expect(delivery.deliver(session, 's1', msg({ body: 'second' }))).toBe(true);
+    // Even a flush that reaches the inbox past the drain site's own gate tries nothing.
+    expect(delivery.flush(session, 's1')).toBe(null);
+    drain(session, 's1');
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.pendingCount('s1')).toBe(2);
+    expect(notices).toEqual([]);
+    state.accountLocked = false;
+    drain(session, 's1');
+    expect(injectTurn).toHaveBeenCalledTimes(1);
+    expect(injectTurn.mock.calls[0][1]).toMatch(/first[\s\S]*second/);
+    expect(notices).toEqual([formatRoomDeliveredNotice(2)]);
+    expect(delivery.pendingCount('s1')).toBe(0);
+  });
+
+  it('box locked: an arrival stays queued through every drain, and the unlock drains in order', () => {
+    const { state, notices, injectTurn, drain, delivery } = gatedHarness();
+    const session = { alive: true, busy: false };
+    state.boxLocked = true;
+    delivery.deliver(session, 's1', msg({ body: 'first' }));
+    delivery.deliver(session, 's1', msg({ body: 'second' }));
+    drain(session, 's1');
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.pendingCount('s1')).toBe(2);
+    state.boxLocked = false;
+    for (const key of delivery.pendingKeys()) drain(session, key); // what the unlock hook does
+    expect(injectTurn).toHaveBeenCalledTimes(1);
+    expect(injectTurn.mock.calls[0][1]).toMatch(/first[\s\S]*second/);
+    expect(notices).toEqual([formatRoomDeliveredNotice(2)]);
   });
 
   it('held with nothing queued is an ordinary empty flush; a lock that cannot answer holds', () => {

@@ -11749,9 +11749,13 @@ function flushRoomInbox(session) {
 const roomJoinHold = createJoinHold();
 const roomDelivery = createRoomDelivery({
   // Queued messages stay queued while the box is locked with no unlock
-  // window open: the same rule a message meets when it arrives. (The
-  // account lock holds them one step earlier, in maybeFlushRoomDelivery.)
-  isHeld: () => !!boxLock && !boxLock.allowsPeer(),
+  // window open (the same rule a message meets when it arrives) and while
+  // the account is locked: sendToSession refuses then, and a flush that
+  // emptied the inbox into that refusal would lose the batch.
+  isHeld: () => outsideWorkRefused(),
+  // A message that has to go behind others already waiting is only queued;
+  // the one gated drain decides when the inbox goes, and reports it.
+  requestDrain: (session) => maybeFlushRoomDelivery(session),
   isBusy: (session, { foreign = false } = {}) => (foreign
     ? sessionOccupiedForForeignTurn(session)
     : sessionOccupiedForRoomDelivery(session)),

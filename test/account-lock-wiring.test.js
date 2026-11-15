@@ -99,7 +99,9 @@ describe('locked mode and gate wiring beyond the event router', () => {
 
   it('room messages queued behind a turn stay queued while the box is locked, and go when it is unlocked', () => {
     const make = body('const roomDelivery = createRoomDelivery({', '\n});');
-    expect(make).toMatch(/isHeld: \(\) => !!boxLock && !boxLock\.allowsPeer\(\)/);
+    expect(make).toMatch(/isHeld: \(\) => outsideWorkRefused\(\)/);
+    // An arrival behind waiting messages asks the gated drain; it never flushes by itself.
+    expect(make).toMatch(/requestDrain: \(session\) => maybeFlushRoomDelivery\(session\)/);
     // Every drain goes through the one flush, which asks the hold first.
     expect(index.match(/roomDelivery\.flush\(/g) || []).toHaveLength(1);
     const drain = body('function drainHeldRoomDeliveries()', '\n}\n');
