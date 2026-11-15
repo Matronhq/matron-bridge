@@ -10159,10 +10159,12 @@ const journalMediaRouter = createJournalMediaRouter({
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path. `cause` (one cause or a list: an item reply's, or a
 // media message's) rides on the entry for the flush (lib/turn-cause.js).
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup, source = null, cause = null }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup, source = null, cause = null, bridgeOrigin = false }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = tagCauses([...blocks], cause);
   if (!mirrorToJournal) markJournalOrigin(entry);
+  // Bridge-composed text queues silently: the card is for text a person wrote.
+  if (bridgeOrigin) markBridgeOrigin(entry);
   attachQueuedCleanup(entry, cleanup);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
@@ -10180,16 +10182,30 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       // Same capability gate as the text path above.
       allowSendOne: session.agent !== AGENT_CODEX,
       source,
+      bridgeOrigin,
       // A tracker reply is edited by holding it, cancelling it (which
       // withdraws the comment) and posting the edited reply as a new
       // comment: the journal comment is the record, so the bridge can't
-      // rewrite it in place. Other media can't be edited.
-      editMode: source?.item_id && source?.comment_id ? 'resend' : null,
+      // rewrite it in place. Other media can't be edited, and neither can
+      // a bridge-composed turn.
+      editMode: !bridgeOrigin && source?.item_id && source?.comment_id ? 'resend' : null,
       editHoldMs: QUEUE_EDIT_HOLD_MS,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
   }
+}
+
+// The secret-request turns ("secret submitted", "request expired") are written
+// by the bridge, so they queue without a send/cancel card.
+function queueSecretTurn(session, { text, preview }) {
+  return journalQueueMedia(session, {
+    blocks: [{ type: 'text', text }],
+    mirrorToJournal: false,
+    preview,
+    fullText: text,
+    bridgeOrigin: true,
+  });
 }
 
 // A user-authored tracker marker (item comment / filed task / close / reopen)
@@ -10421,6 +10437,7 @@ async function deliverCoordinatorTurn(session, text) {
       mirrorToJournal: false,
       preview: text.split('\n')[0],
       fullText: text,
+      bridgeOrigin: true,
     });
     return;
   }
@@ -13098,12 +13115,7 @@ const secretRequests = createSecretRequests({
   // _resumeOutbox until the resumed TUI is ready to receive it.
   resumeSession: (roomId, notice) => journalResumeRoom(roomId, notice),
   inject: (session, text) => sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true }),
-  queue: (session, { text, preview }) => journalQueueMedia(session, {
-    blocks: [{ type: 'text', text }],
-    mirrorToJournal: false,
-    preview,
-    fullText: text,
-  }),
+  queue: queueSecretTurn,
   publishNotice: journalPublishNotice,
   // Is the turn naming this path still held for the room? A busy session
   // parks it on queuedMessages (journalQueueMedia above), a just-resumed one

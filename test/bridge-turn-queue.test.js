@@ -15,6 +15,7 @@ import { notifyQueuedMessage } from '../lib/busy-queue.js';
 import { isBridgeOrigin, markBridgeOrigin, markJournalOrigin } from '../lib/queue-flush.js';
 import { tagCauses, mergeCauses, plainCause } from '../lib/turn-cause.js';
 import { hasQueuedCompact, isCompactCommand } from '../lib/compact-priority.js';
+import { createWakeHandler } from '../lib/wake-route.js';
 
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 function sourceOf(name) {
@@ -27,7 +28,8 @@ function sourceOf(name) {
 
 const LIFTED = [
   'journalRouteTextToSession', 'fireTimer', 'carryOnConvo', 'fireAutoResume',
-  'drainPreReapCompact', 'requeueSteeredMessages',
+  'drainPreReapCompact', 'requeueSteeredMessages', 'journalQueueMedia', 'deliverCoordinatorTurn',
+  'queueSecretTurn', 'makeWakeHandler', 'applyControlSteps',
 ];
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async', 'super']);
 
@@ -46,7 +48,9 @@ function setup({ busy = true } = {}) {
     AGENT_CODEX: 'codex',
     randomUUID: undefined,
     sessions: new Map([['room', session]]),
-    notifyQueuedMessage,
+    notifyQueuedMessage, createWakeHandler,
+    attachQueuedCleanup: vi.fn(),
+    sessionOccupiedForRoomDelivery: (s) => !!s.busy,
     markJournalOrigin, markBridgeOrigin, isBridgeOrigin, tagCauses, mergeCauses, plainCause, hasQueuedCompact, isCompactCommand,
     requeuedSteerAt: new WeakMap(),
     journalInputConsumer: { queueRelease },
@@ -220,23 +224,74 @@ describe('bridge-originated injection paths raise no card', () => {
   });
 });
 
-// Callers not liftable into the harness: pin that they declare bridge origin.
-describe('bridge injection callers declare bridgeOrigin', () => {
-  const callOf = (needle) => {
-    const at = source.indexOf(needle);
-    expect(at, `${needle} not found in index.js`).toBeGreaterThan(-1);
-    return source.slice(at, at + 260);
-  };
+describe('more bridge-originated paths raise no card', () => {
+  it('Coordinator assign/release turn on a busy session (deliverCoordinatorTurn)', async () => {
+    const h = setup();
+    await h.context.deliverCoordinatorTurn(h.session, 'You are now the Coordinator.\nDetails follow.');
+    expect(texts(h.session)).toEqual(['You are now the Coordinator.\nDetails follow.']);
+    expectNoCard(h);
+    expectLockstep(h, 1);
+  });
+
   it.each([
-    ['wake route', 'routeText: (session, t) => journalRouteTextToSession('],
-    ['control compact step', "journalRouteTextToSession(current, step.command || '/compact'"],
-    ['limit-reset compact', "await journalRouteTextToSession(session, '/compact'"],
-    ['limit-reset carry-on', 'await journalRouteTextToSession(sessions.get(roomId) || session'],
-    ['pre-reap compact', 'journalRouteTextToSession(session, preReapCompactCommand()'],
-    ['carryOnConvo', 'await journalRouteTextToSession(target, text'],
-    ['timer text', 'await journalRouteTextToSession(session, record.text'],
-    ['agent reminder', 'await journalRouteTextToSession(session,\n      `⏰ Reminder'],
-  ])('%s', (_name, needle) => {
-    expect(callOf(needle)).toContain('bridgeOrigin: true');
+    ['secret submitted', 'The secret was saved to a file.'],
+    ['request expired', 'The secret request expired.'],
+  ])('secret-request turn: %s', async (_name, text) => {
+    const h = setup();
+    await h.context.queueSecretTurn(h.session, { text, preview: text });
+    expect(texts(h.session)).toEqual([text]);
+    expectNoCard(h);
+    expectLockstep(h, 1);
+  });
+
+  it('wake route', async () => {
+    const h = setup();
+    const handle = h.context.makeWakeHandler('convo', 'wake up');
+    const res = await handle();
+    expect(res.status).toBe(200);
+    expect(texts(h.session)).toEqual(['wake up']);
+    expectNoCard(h);
+    expectLockstep(h, 1);
+  });
+
+  it('control-plane compact step', async () => {
+    const h = setup();
+    const res = await h.context.applyControlSteps(h.session, [{ op: 'compact', command: '/compact keep the summary' }]);
+    expect(res.ok).toBe(true);
+    expect(texts(h.session)).toEqual(['/compact keep the summary']);
+    expectNoCard(h);
+    expectLockstep(h, 1);
+  });
+
+  it('after-limit-reset /compact and carry-on both queued on a busy session', async () => {
+    const h = setup();
+    h.context.shouldCompactBefore = () => true;
+    await h.context.fireAutoResume('room', 'convo', { kind: 'limit', text: 'carry on' });
+    expect(texts(h.session)).toEqual(['/compact', 'carry on']);
+    expectNoCard(h);
+    expectLockstep(h, 2);
+  });
+});
+
+describe('user-authored queue callers keep the card', () => {
+  const media = [{ type: 'text', text: 'transcribed voice note' }];
+
+  it('media and voice notes (queueMedia)', async () => {
+    const h = setup();
+    await h.context.journalQueueMedia(h.session, { blocks: media, mirrorToJournal: true, preview: 'voice note', fullText: 'voice note' });
+    expect(h.session.sendButtonMessage).toHaveBeenCalledTimes(1);
+    expect(h.session.sendButtonMessage.mock.calls[0][5].kind).toBe('queued_release');
+    expectLockstep(h, 1);
+  });
+
+  it('tracker replies (queueText) keep the card and its resend edit', async () => {
+    const h = setup();
+    await h.context.journalQueueMedia(h.session, {
+      blocks: media, mirrorToJournal: false, preview: 'reply', fullText: 'reply',
+      source: { item_id: 'it_1', comment_id: 'c_1' },
+    });
+    expect(h.session.sendButtonMessage).toHaveBeenCalledTimes(1);
+    expect(h.session.sendButtonMessage.mock.calls[0][5].edit.mode).toBe('resend');
+    expectLockstep(h, 1);
   });
 });
