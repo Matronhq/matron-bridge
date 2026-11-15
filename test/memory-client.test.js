@@ -28,7 +28,7 @@ describe('createMemoryClient', () => {
   it('remove sends the conversation and causes as a JSON body when given', async () => {
     const { fetchImpl, calls } = fakeFetch(() => ({ status: 202, body: { pending: 'owner' } }));
     const c = createMemoryClient({ baseUrl: 'https://j', token: 't', fetchImpl });
-    const r = await c.remove('avoid-elm', { convo_id: 'c1', causes: [{ kind: 'user_message', ref: 'c1:7' }] });
+    const r = await c.remove('avoid-box-a', { convo_id: 'c1', causes: [{ kind: 'user_message', ref: 'c1:7' }] });
     expect(r.status).toBe(202);
     expect(calls[0].init.method).toBe('DELETE');
     expect(JSON.parse(calls[0].init.body)).toEqual({ convo_id: 'c1', causes: [{ kind: 'user_message', ref: 'c1:7' }] });

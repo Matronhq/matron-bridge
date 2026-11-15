@@ -123,28 +123,28 @@ describe('memory handlers', () => {
     const { h, client, session } = fixture();
     const causes = [{ kind: 'user_message', ref: 'c1:7', at: 1 }];
     session.currentTurn = { causes };
-    await h.save({ roomId: '!r:s', name: 'avoid-elm', description: 'd' });
-    expect(client.save.mock.calls[0]).toEqual(['avoid-elm', { description: 'd', convo_id: 'c1', causes }]);
-    await h.delete({ roomId: '!r:s', name: 'avoid-elm' });
-    expect(client.remove.mock.calls[0]).toEqual(['avoid-elm', { convo_id: 'c1', causes }]);
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(client.save.mock.calls[0]).toEqual(['avoid-box-a', { description: 'd', convo_id: 'c1', causes }]);
+    await h.delete({ roomId: '!r:s', name: 'avoid-box-a' });
+    expect(client.remove.mock.calls[0]).toEqual(['avoid-box-a', { convo_id: 'c1', causes }]);
     // A turn with no recorded cause sends none: the journal then asks the user.
     session.currentTurn = null;
-    await h.save({ roomId: '!r:s', name: 'avoid-elm', description: 'd' });
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
     expect(client.save.mock.calls[1][1]).toEqual({ description: 'd', convo_id: 'c1' });
     // causes are the bridge's to send, never the caller's.
-    await h.save({ roomId: '!r:s', name: 'avoid-elm', description: 'd', causes: [{ kind: 'user_message', ref: 'c1:1' }] });
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd', causes: [{ kind: 'user_message', ref: 'c1:1' }] });
     expect(client.save.mock.calls[2][1]).toEqual({ description: 'd', convo_id: 'c1' });
   });
 
   it('a 202 from the journal is a proposal: pending, with the item the user was asked on', async () => {
-    const pending = (action) => vi.fn(async () => ({ status: 202, data: { pending: 'owner', proposal: { id: 'mp_1', name: 'avoid-elm', action, state: 'pending' }, item: { id: 'it_9', num: 41 } } }));
+    const pending = (action) => vi.fn(async () => ({ status: 202, data: { pending: 'owner', proposal: { id: 'mp_1', name: 'avoid-box-a', action, state: 'pending' }, item: { id: 'it_9', num: 41 } } }));
     const { h } = fixture({ save: pending('save'), remove: pending('delete') });
-    expect(await h.save({ roomId: '!r:s', name: 'avoid-elm', description: 'd' }))
-      .toEqual({ status: 202, body: { pending: true, action: 'save', name: 'avoid-elm', item_num: 41, item_id: 'it_9' } });
-    expect(await h.delete({ roomId: '!r:s', name: 'avoid-elm' }))
-      .toEqual({ status: 202, body: { pending: true, action: 'delete', name: 'avoid-elm', item_num: 41, item_id: 'it_9' } });
+    expect(await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' }))
+      .toEqual({ status: 202, body: { pending: true, action: 'save', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
+    expect(await h.delete({ roomId: '!r:s', name: 'avoid-box-a' }))
+      .toEqual({ status: 202, body: { pending: true, action: 'delete', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
     // A 202 with no usable item still reads as pending.
     const bare = fixture({ save: vi.fn(async () => ({ status: 202, data: {} })) });
-    expect((await bare.h.save({ roomId: '!r:s', name: 'avoid-elm', description: 'd' })).body).toEqual({ pending: true, action: 'save', name: 'avoid-elm', item_num: null, item_id: null });
+    expect((await bare.h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' })).body).toEqual({ pending: true, action: 'save', name: 'avoid-box-a', item_num: null, item_id: null });
   });
 });
