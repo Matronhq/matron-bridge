@@ -41,6 +41,83 @@ describe('items handlers', () => {
     expect(client.create).not.toHaveBeenCalled();
   });
 
+  // The journal 400s a bad create AFTER the blobs are uploaded, and unreferenced
+  // blobs are not reaped, so everything it would reject is checked first.
+  it('create: a supersedes id that does not exist fails before any upload', async () => {
+    const { h, client, uploadLocalFile } = fixture({ get: vi.fn(async () => ({ status: 404, data: { error: 'not found' } })) });
+    const r = await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', attachments: ['shot.png'], supersedes: 'it_999' });
+    expect(r.status).toBe(400);
+    expect(client.get).toHaveBeenCalledWith('it_999');
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
+  it('create: a missing supersedes is also caught before a body-referenced local image is uploaded', async () => {
+    const { h, client, uploadLocalFile } = fixture({ get: vi.fn(async () => ({ status: 404, data: { error: 'not found' } })) });
+    const r = await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', body: 'see ![shot](shot.png)', supersedes: 'it_999' });
+    expect(r.status).toBe(400);
+    expect(client.get).toHaveBeenCalledWith('it_999');
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
+  it('create: a remote image or plain body does not trigger the supersedes pre-check', async () => {
+    const { h, client } = fixture();
+    await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', body: 'see ![x](https://x.example/a.png)', supersedes: 'it_2' });
+    expect(client.get).not.toHaveBeenCalled();
+  });
+
+  it('create: supersedes is not pre-checked when there is nothing to upload', async () => {
+    const { h, client } = fixture();
+    await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', supersedes: 'it_2' });
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.create.mock.calls[0][0]).toMatchObject({ supersedes: 'it_2' });
+  });
+
+  it('create: invalid labels are rejected before any upload', async () => {
+    const { h, client, uploadLocalFile } = fixture();
+    const base = { roomId: '!r:s', kind: 'task', title: 'T' };
+    const r = await h.create({ ...base, attachments: ['shot.png'], labels: Array.from({ length: 51 }, (_, i) => `l${i}`) });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/labels/);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+    for (const labels of [['x'.repeat(41)], [''], ['  '], [7], 'ui']) {
+      expect((await h.create({ ...base, labels })).status).toBe(400);
+    }
+  });
+
+  it('create: invalid links are rejected before any upload', async () => {
+    const { h, client, uploadLocalFile } = fixture();
+    const base = { roomId: '!r:s', kind: 'task', title: 'T' };
+    const r = await h.create({ ...base, attachments: ['shot.png'], links: [{ url: 'javascript:alert(1)' }] });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/links/);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+    const bad = [
+      { url: 'https://x' }, // wrapped in an object, not an array
+      Array.from({ length: 51 }, () => ({ url: 'https://x.example' })),
+      [{}], [{ url: 5 }], [{ url: 'ftp://x.example/f' }],
+      [{ url: 'https://x.example/' + 'a'.repeat(2049) }],
+      [{ url: 'https://x.example', title: 5 }],
+      [{ url: 'https://x.example', title: 'x'.repeat(201) }],
+    ];
+    for (const links of bad) {
+      expect((await h.create({ ...base, links })).status).toBe(400);
+    }
+  });
+
+  it('create: well-formed labels and links (including matron://) still upload and pass through', async () => {
+    const { h, client, uploadLocalFile } = fixture();
+    const labels = Array.from({ length: 50 }, (_, i) => `l${i}`);
+    const links = [{ url: 'https://x.example/a', title: 'A' }, { url: 'matron://item/it_1' }];
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['shot.png'], labels, links });
+    expect(r.status).toBe(201);
+    expect(uploadLocalFile).toHaveBeenCalled();
+    expect(client.create.mock.calls[0][0]).toMatchObject({ labels, links });
+  });
+
   it('create: uploads overlap, at most four at once, and attachments stay in the order listed', async () => {
     let running = 0;
     let peak = 0;
