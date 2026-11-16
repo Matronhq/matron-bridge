@@ -58,6 +58,8 @@ const WINDOWS_EXCLUDES = [
   // Real git repositories and sh scripts in a temp dir.
   'test/worktree.test.js',
   'test/worktree-service.test.js',
+  'test/worktree-setup.test.js',
+  'test/worktree-setup-flow.test.js',
 ];
 
 export default defineConfig({
