@@ -31,6 +31,7 @@ const WINDOWS_EXCLUDES = [
   // tracked as follow-up work in the Windows design spec.
   'test/atomic-write.test.js',
   'test/file-link-guard.test.js',
+  'test/file-link-guard-identity.test.js',
   'test/interactive-session.test.js',
   'test/item-attachments.test.js',
   'test/iv-uploads.test.js',
@@ -43,6 +44,7 @@ const WINDOWS_EXCLUDES = [
   'test/subagent-watcher-workflow.test.js',
   'test/transcript-dir.test.js',
   'test/viewer-download.test.js',
+  'test/viewer-scope-pinning.test.js',
   'test/viewer-view.test.js',
   // Coordinator block / RPC handler suites: first Windows run failed on
   // line-ending or path-separator handling; re-checked once .gitattributes
@@ -57,6 +59,9 @@ const WINDOWS_EXCLUDES = [
 
 export default defineConfig({
   test: {
+    // Every test file gets a throwaway HOME so no test can read or delete the
+    // developer's real ~/.claude (see test/setup-isolated-home.js).
+    setupFiles: ['./test/setup-isolated-home.js'],
     exclude: [
       ...configDefaults.exclude,
       ...(process.platform === 'win32' ? WINDOWS_EXCLUDES : []),

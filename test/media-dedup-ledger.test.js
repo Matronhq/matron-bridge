@@ -1,0 +1,53 @@
+import { describe, expect, it } from 'vitest';
+import { createMediaDedupLedger, dedupKey, sha256Hex } from '../lib/media-dedup-ledger.js';
+
+describe('dedupKey', () => {
+  const base = { token: 't', realPath: '/w/a.png', sha256: 'abc', caption: 'c' };
+
+  it('is stable for the same identity and differs when any field differs', () => {
+    expect(dedupKey(base)).toBe(dedupKey({ ...base }));
+    for (const k of Object.keys(base)) {
+      expect(dedupKey({ ...base, [k]: base[k] + 'x' })).not.toBe(dedupKey(base));
+    }
+  });
+
+  it('cannot be forged by moving a boundary between fields', () => {
+    expect(dedupKey({ ...base, token: 'a', realPath: 'bc' })).not.toBe(dedupKey({ ...base, token: 'ab', realPath: 'c' }));
+  });
+
+  it('keeps an absent caption distinct from any string, including a sentinel-looking one', () => {
+    const { caption: _c, ...noCaption } = base;
+    expect(dedupKey(noCaption)).not.toBe(dedupKey({ ...base, caption: '' }));
+    expect(dedupKey(noCaption)).not.toBe(dedupKey({ ...base, caption: 'undefined' }));
+  });
+});
+
+describe('sha256Hex', () => {
+  it('hashes bytes', () => {
+    expect(sha256Hex(Buffer.from('abc'))).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+  });
+});
+
+describe('createMediaDedupLedger', () => {
+  it('returns a recorded entry until the TTL passes', () => {
+    let t = 1000;
+    const ledger = createMediaDedupLedger({ ttlMs: 100, now: () => t });
+    ledger.set('k', { mediaId: 'm1', kind: 'image', sha256: 's' });
+    expect(ledger.get('k')).toEqual({ mediaId: 'm1', kind: 'image', sha256: 's', at: 1000 });
+    t += 101;
+    expect(ledger.get('k')).toBeUndefined();
+    expect(ledger.size).toBe(0);
+  });
+
+  it('evicts the least recently used entry past the cap', () => {
+    const ledger = createMediaDedupLedger({ maxEntries: 2 });
+    ledger.set('a', { mediaId: 'ma', kind: 'file' });
+    ledger.set('b', { mediaId: 'mb', kind: 'file' });
+    ledger.get('a'); // touch a, so b is now the oldest
+    ledger.set('c', { mediaId: 'mc', kind: 'file' });
+    expect(ledger.size).toBe(2);
+    expect(ledger.get('b')).toBeUndefined();
+    expect(ledger.get('a')).toBeDefined();
+    expect(ledger.get('c')).toBeDefined();
+  });
+});

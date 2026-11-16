@@ -74,7 +74,7 @@ import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue, unwrapScreenUrls, newUrlsAgainst, dropCutUrls, isCutOf } from './lib/prompt-detector.js';
 import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, showsSignInScreen, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
@@ -182,6 +182,7 @@ import {
   shareAgentMedia,
 } from './lib/show-file.js';
 import { processShowFile } from './lib/show-file-handler.js';
+import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
@@ -574,6 +575,8 @@ const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYT
 // reserves before an upload and releases in its finally). An object so the
 // extracted handler can mutate it by reference.
 const showFileBudget = { inFlight: 0, reservedBytes: 0 };
+// Retry dedup for show_file (lib/media-dedup-ledger.js). In-memory, TTL + size bounded.
+const showFileDedupLedger = createMediaDedupLedger();
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
@@ -1422,7 +1425,7 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath, workdir) {
+function generateFileLink(filePath, workdir, pinnedRoots = null) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   // Normalize BEFORE gating and signing: a relative session.workdir (or
   // target) would otherwise resolve against the wrong process cwd in the
@@ -1438,7 +1441,23 @@ function generateFileLink(filePath, workdir) {
     return null;
   }
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
+  // Sign the workdir's pinned identity, not just its pathname, so a workdir
+  // renamed and replaced after the link is minted is rejected at serve time.
+  // Prefer the root pinned at session creation; otherwise pin now (a failure to
+  // resolve means no link, the caller renders plain text).
+  let roots;
+  if (absWorkdir) {
+    try {
+      const pinned = pinnedRoots?.roots?.[0] || pinAllowedRootsSync([absWorkdir]).roots[0];
+      roots = [{ realPath: pinned.realPath, dev: pinned.dev, ino: pinned.ino }];
+    } catch (err) {
+      console.log(`file-link denied (${err.reason || 'bad-workdir'}): ${absTarget}`);
+      return null;
+    }
+  }
+  const payload = Buffer.from(JSON.stringify(roots
+    ? { path: absTarget, exp, workdir: absWorkdir, roots }
+    : { path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
@@ -2056,7 +2075,7 @@ function buildEditDiffPayload(session, toolName, input, label) {
   return {
     file_path: absPath,
     display_path: input.file_path,
-    viewer_url: generateFileLink(absPath, session.workdir),
+    viewer_url: generateFileLink(absPath, session.workdir, session.showFilePinnedRoots),
     tool: toolName,
     label: label || null,
     diff: result.diff,
@@ -4346,21 +4365,6 @@ function maybeResolveInteractivePrompt(session, userText) {
   return false;
 }
 
-// Iteratively rejoin URLs that claude wrapped at terminal width. We only
-// merge a `\n` into a URL when the next line begins with characters that
-// can only be URL continuation (no spaces, only URL-safe chars), so prose
-// that happens to follow a URL stays on its own line.
-function unwrapUrls(text) {
-  const URL_HEAD = /(https?:\/\/[A-Za-z0-9=&/%+\-._~?#:@!*'(),;$]+)\n(?!https?:\/\/)([A-Za-z0-9=&/%+\-._~?#]+)/g;
-  let prev;
-  let out = text;
-  do {
-    prev = out;
-    out = out.replace(URL_HEAD, '$1$2');
-  } while (out !== prev);
-  return out;
-}
-
 // Surface free-text TUI output (e.g. the /login OAuth URL screen, "press
 // enter to continue" notices) to the user. Triggered by the prompt-detector's
 // `screen-update` event whenever the screen settles with URLs or input
@@ -4377,17 +4381,26 @@ function handleInteractiveScreenUpdate(session, update) {
   session.surfacedUrls = session.surfacedUrls || new Set();
   // Un-wrap URLs that claude broke across lines at terminal width so
   // the parsed URL set is correct (`...redir\nect_uri=...` → joined).
-  const unwrappedScreen = unwrapUrls(
-    screen.split('\n').map(l => l.trim()).join('\n')
-  );
-  // Build a clean cue-specific message instead of dumping the raw
-  // screen. If the formatter can't make sense of the cue, skip rather
-  // than spam a screen-dump full of status chrome.
-  const allUrls = extractUrls(unwrappedScreen);
-  const newUrls = allUrls.filter(u => !session.surfacedUrls.has(u));
+  const unwrappedScreen = unwrapScreenUrls(screen);
+  const allUrls = dropCutUrls(extractUrls(unwrappedScreen));
+  // Newness is judged on the unwrapped URLs: the detector's are cut at the
+  // wrap, and a wrapped OAuth URL's first line is identical on every sign-in
+  // attempt, so a retry's fresh link read as already sent and never reached
+  // the user.
+  // A mid-repaint capture can cut a URL short: a cut of a link already sent
+  // is not new, but a fuller URL extending a cut that was sent IS (the cut
+  // was unusable), and it replaces the cut. Two sign-in attempts differ
+  // inside the query (state, challenge), never by a prefix.
+  const seen = [...session.surfacedUrls];
+  const newUrls = newUrlsAgainst(seen, allUrls);
   if (newUrls.length === 0 && !hasInputCue) return;
-  for (const u of newUrls) session.surfacedUrls.add(u);
-  // A retry may repaint an older OAuth link above its fresh link.
+  for (const u of newUrls) {
+    for (const v of seen) if (isCutOf(v, u)) session.surfacedUrls.delete(v);
+    session.surfacedUrls.add(u);
+  }
+  // Fresh URLs lead: the sign-in card picks the first OAuth link, and a
+  // stale one still in the capture buffer (a retry's earlier link) must not
+  // be sent in place of the fresh one just marked surfaced.
   const orderedUrls = [...newUrls, ...allUrls.filter(u => !newUrls.includes(u))];
   const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0 });
   // Auto-Enter decision is independent of message formatting: an
@@ -5167,6 +5180,16 @@ function handleClaudeEvent(session, event) {
   // watcher on either spawn path.
   if (session.claudeSessionId && !session.subagentWatcher) {
     setupSubagentWatcher(session, session.workdir, session.claudeSessionId);
+  }
+
+  // Re-home the subagent watcher when the session changes cwd mid-flight
+  // (EnterWorktree). Stream events carry the live cwd; act only on a change.
+  if (session.subagentWatcher && typeof event.cwd === 'string' && event.cwd
+      && event.cwd !== session._lastWatcherCwd) {
+    session._lastWatcherCwd = event.cwd;
+    if (session.subagentWatcher.repoint(event.cwd)) {
+      console.log(`[subagent-rehome] room ${session.roomId}: moved to ${event.cwd}; re-pointed subagent watcher`);
+    }
   }
 
   // Workflow-tool runs: the Workflow tool_use, its launch tool_result (run id)
@@ -14046,6 +14069,7 @@ const apiServer = createServer(async (req, res) => {
           uploadMedia: journalPublisher.uploadMedia,
           journalPublish,
           denialToStatus,
+          dedupLedger: showFileDedupLedger,
           foreignAllowed: (s) => foreignSessions.routeAllowed(s, '/show-file', {}),
         },
       });
@@ -14318,6 +14342,12 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-chat-join') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatJoin,
           (status, b) => debug(`agent-chat-join ${status} ${data?.room_id} ${b.status || b.error || ''}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-chat-invite') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatInvite,
+          (status, b) => debug(`agent-chat-invite ${status} ${data?.room_id} ${b.status || b.error || ''}`));
         return;
       }
 
