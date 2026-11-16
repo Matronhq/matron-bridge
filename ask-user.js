@@ -14,7 +14,7 @@ import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetai
 import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
-import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
+import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatRecall } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
@@ -1862,7 +1862,7 @@ async function callMemory(name, args, render) {
   }
 }
 
-const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and listed under \"Your memories\" in every session's instructions at spawn. Each has a scope: 'global' (every session), 'coordinator' (the user's Coordinator only) or 'repo:<name>' (sessions working in that repo); a session is given the global memories, its repo's, and all of them when it is the Coordinator.";
+const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and listed under \"Your memories\" in every session's instructions at spawn. Each has a scope: 'global' (every session), 'coordinator' (the user's Coordinator only) or 'repo:<name>' (sessions working in that repo); a session is given the global memories, its repo's, and all of them when it is the Coordinator. Each also has a tier: 'always' memories are listed in full, 'on_demand' ones are named under their topic and read with memory_get or found with memory_recall when the work touches that topic.";
 
 server.tool(
   'memory_save',
@@ -1873,6 +1873,8 @@ server.tool(
     body: z.string().optional().describe('Markdown, ≤8 KB: **Why:** and **How to apply:**. Omitted on an update clears the stored body — send it back.'),
     type: z.enum(['user', 'feedback', 'project', 'reference']).optional().describe("Defaults to 'feedback' (how the user wants work done). 'user' = who they are; 'project' = ongoing work or constraints; 'reference' = a pointer (URL, dashboard, ticket)."),
     scope: z.string().optional().describe("Who the memory is for: 'global' (every session; the default on create), 'coordinator' (a rule only the Coordinator acts on: sweeps, compaction, usage limits, box capacity) or 'repo:<name>' (a rule about one repo's workflow, e.g. 'repo:my-app' — the bare repo name). Omitted on an update keeps the stored scope."),
+    tier: z.enum(['always', 'on_demand']).optional().describe("'always' (listed in full in every session of its scope: safety rules, consent and desk boundaries, merge and deploy gates, how to talk to the user) or 'on_demand' (named under its topic, read when the work touches it: anything that only matters for one kind of task). The always tier is capped per scope; a new memory saved without a tier past the cap lands on_demand, and the result says so. Omitted on an update keeps the stored tier."),
+    topic: z.string().optional().describe("A short label, ≤40 chars, naming the situation the rule is for, e.g. 'booking courier collections'. Sessions see on-demand memories grouped by it, and recall matches on it. '' clears it; omitted on an update keeps it."),
   },
   async (args) => callMemory('save', args, formatSaveAck),
 );
@@ -1889,6 +1891,16 @@ server.tool(
   'Read one memory in full, body included (the why and the how behind the one-line description).',
   { name: z.string().describe('The memory name') },
   async (args) => callMemory('get', args, formatMemoryDetail),
+);
+
+server.tool(
+  'memory_recall',
+  "Find the user's memories that bear on what you are about to do, in your own words (\"booking a courier collection\", \"cleaning up disk space on a Mac\"), and read them whole. Use it when your work touches a topic in the on-demand list of your memories, or whenever you suspect a standing rule might apply and you don't know its name. Searches the memories in this session's scopes (every scope for the Coordinator).",
+  {
+    query: z.string().max(1000).describe('What you are doing or about to do, in your own words'),
+    limit: z.number().int().min(1).max(10).optional().describe('Default 5'),
+  },
+  async (args) => callMemory('recall', args, formatRecall),
 );
 
 server.tool(
