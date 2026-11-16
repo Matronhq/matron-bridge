@@ -57,6 +57,9 @@ const WINDOWS_EXCLUDES = [
 
 export default defineConfig({
   test: {
+    // Every test file gets a throwaway HOME so no test can read or delete the
+    // developer's real ~/.claude (see test/setup-isolated-home.js).
+    setupFiles: ['./test/setup-isolated-home.js'],
     exclude: [
       ...configDefaults.exclude,
       ...(process.platform === 'win32' ? WINDOWS_EXCLUDES : []),
