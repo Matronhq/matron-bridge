@@ -86,7 +86,7 @@ describe('createAgentChatHandlers', () => {
   describe('caller-session gate (all handlers)', () => {
     it('rejects a missing or non-string roomId with 400', async () => {
       const { handlers } = makeFixture();
-      for (const h of ['roster', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
+      for (const h of ['roster', 'agentSessions', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
         expect((await handlers[h]({})).status).toBe(400);
         expect((await handlers[h]({ roomId: 42 })).status).toBe(400);
       }
@@ -97,6 +97,64 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.roster({ roomId: '!nope' });
       expect(res.status).toBe(404);
       expect(res.body.error).toMatch(/no active session/i);
+    });
+  });
+
+  describe('agentSessions', () => {
+    it('lists same-box and cross-box sessions with state, and flags only the caller as self', async () => {
+      const conversations = [
+        // The caller's journal convo id is 'convo-sess', not its session key '!sess'.
+        { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1 },
+        { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1 },
+        { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7 },
+      ];
+      const { handlers } = makeFixture({
+        publisher: { fetchRoster: async () => ({ ...ROSTER, conversations }) },
+      });
+
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+
+      expect(res).toEqual({
+        status: 200,
+        body: {
+          sessions: [
+            { convo_id: 'convo-sess', title: 'This session', session_state: 'running', is_self: true },
+            { convo_id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', is_self: false },
+            { convo_id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', is_self: false },
+          ],
+          total: 3,
+        },
+      });
+    });
+
+    it('flags nothing as self when the caller has no journal conversation yet', async () => {
+      const { handlers } = makeFixture({ session: { convoId: null } });
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+      expect(res.body.sessions.some((s) => s.is_self)).toBe(false);
+    });
+
+    it('caps the list at 30 most recent, clips titles, and always keeps the caller\'s own row', async () => {
+      const conversations = Array.from({ length: 45 }, (_, i) => ({
+        id: `c${i}`, title: `T${i}\n${'x'.repeat(300)}`, session_state: 'done', agent_device_id: 7, last_ts: 1000 + i,
+      }));
+      // The caller's convo is the oldest, so it would fall outside the cap.
+      conversations.push({ id: 'convo-sess', title: 'mine', session_state: 'running', agent_device_id: 1, last_ts: 1 });
+      const { handlers } = makeFixture({ publisher: { fetchRoster: async () => ({ ...ROSTER, conversations }) } });
+
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+
+      expect(res.body.sessions).toHaveLength(30);
+      expect(res.body.total).toBe(46);
+      expect(res.body.sessions[0]).toMatchObject({ convo_id: 'convo-sess', is_self: true });
+      expect(res.body.sessions[1].convo_id).toBe('c44');
+      expect(res.body.sessions.every((s) => s.title.length <= 120 && !s.title.includes('\n'))).toBe(true);
+    });
+
+    it('502s when the roster fetch fails', async () => {
+      const { handlers } = makeFixture({ publisher: { fetchRoster: async () => null } });
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/journal unreachable/i);
     });
   });
 
@@ -1361,6 +1419,7 @@ describe('createAgentChatHandlers', () => {
 describe('index.js routes + ask-user.js tools (source inspection)', () => {
   const ROUTES = [
     ['/agent-roster', 'roster'],
+    ['/agent-sessions', 'agentSessions'],
     ['/agent-chat-start', 'chatStart'],
     ['/agent-chat-send', 'chatSend'],
     ['/agent-chat-accept', 'chatAccept'],
@@ -1374,7 +1433,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['/agent-chat-read', 'chatRead'],
   ];
   const TOOLS = [
-    'agent_roster', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
+    'agent_roster', 'agent_sessions', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
     'agent_chat_refuse', 'agent_chat_join', 'agent_chat_read',
     'agent_chat_mute', 'agent_chat_unmute',
   ];
@@ -1642,6 +1701,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   // must fail here.
   const TOOL_WIRING = [
     ['agent_roster', '/agent-roster', ['roomId: ROOM_ID']],
+    ['agent_sessions', '/agent-sessions', ['roomId: ROOM_ID']],
     ['agent_chat_start', '/agent-chat-start', ['roomId: ROOM_ID', 'target_convo_id', 'topic', 'justification', 'message']],
     ['agent_chat_send', '/agent-chat-send', ['roomId: ROOM_ID', 'room_id', 'message', 'wait_seconds']],
     ['agent_chat_accept', '/agent-chat-accept', ['roomId: ROOM_ID', 'room_id']],

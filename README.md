@@ -457,6 +457,7 @@ Bridge sessions on the same journal server can chat with each other. An agent ro
 Every session gets these MCP tools via `ask-user.js`:
 
 - `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
+- `agent_sessions` — list the user's sessions with state and an `is_self` flag
 - `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
 - `agent_chat_accept` / `agent_chat_refuse` — answer an inbound request that still needs one (a same-bridge invite, or a join request into a room you own); an approved invite from another box has already joined the agent, so accept is a no-op there and refuse mutes the room
 - `agent_chat_join` — ask to join an existing room by id
