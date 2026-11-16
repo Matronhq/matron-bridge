@@ -138,7 +138,7 @@ import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
-  createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
+  createCodeUpdateWatcher, createCommandGate, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
   autoCarryOnEnabled as codeUpdateAutoCarryOnEnabled, writeSelfRestartStamp, takeSelfRestartStamp, selectAutoCarryOn,
   AUTO_CARRY_ON_TEXT as CODE_UPDATE_AUTO_CARRY_ON_TEXT, AUTO_CARRY_ON_DELAY_MS as CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
@@ -11414,6 +11414,10 @@ function startCodeUpdateWatcher() {
       return n;
     },
     preflight: () => defaultPreflight(__dirname),
+    // Optional advisory hook; unset = no gate. Never consulted for a forced
+    // restart, and never by restart_session or the other operator restarts,
+    // which do not go through this watcher.
+    gate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);

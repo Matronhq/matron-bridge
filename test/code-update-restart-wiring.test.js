@@ -21,6 +21,11 @@ describe('code-update self-restart wiring', () => {
     expect(main).toMatch(/publishRestartCarryOnCards\(\);[\s\S]*startCodeUpdateWatcher\(\);/);
   });
 
+  it('reads the restart gate from MATRON_RESTART_GATE_CMD and only inside the watcher', () => {
+    expect(fn).toMatch(/gate: createCommandGate\(process\.env\.MATRON_RESTART_GATE_CMD\)/);
+    expect(index.match(/MATRON_RESTART_GATE_CMD/g)).toHaveLength(1);
+  });
+
   it('watches the checkout index.js runs from, and is off without a reflog or when disabled', () => {
     expect(fn).toMatch(/if \(!CODE_UPDATE_RESTART\) \{/);
     expect(fn).toMatch(/resolveGitDir\(__dirname\)/);
