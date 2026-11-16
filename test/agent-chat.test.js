@@ -1285,6 +1285,25 @@ describe('createAgentChatHandlers', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     });
 
+    it('refuses a second invite into the room while the first is unanswered, then allows it', async () => {
+      let release;
+      const gate = new Promise((r) => { release = r; });
+      const { handlers, rooms, invites } = makeFixture();
+      invites.invite.mockImplementationOnce(async () => { await gate; return { kind: 'accepted', peerDeviceId: 7 }; });
+      ownerRoom(rooms);
+      const args = { roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' };
+      const first = handlers.chatInvite(args);
+      await new Promise((r) => setTimeout(r, 0));
+      const second = await handlers.chatInvite(args);
+      expect(second.status).toBe(409);
+      expect(second.body.error).toMatch(/still waiting/i);
+      expect(invites.invite).toHaveBeenCalledTimes(1);
+      release();
+      expect((await first).status).toBe(200);
+      expect((await handlers.chatInvite(args)).status).toBe(200);
+      expect(invites.invite).toHaveBeenCalledTimes(2);
+    });
+
     it('surfaces an unreachable journal roster as 502', async () => {
       const { handlers, rooms } = makeFixture({ publisher: { fetchRoster: async () => null } });
       ownerRoom(rooms);
