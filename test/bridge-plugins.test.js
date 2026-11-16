@@ -85,6 +85,15 @@ describe('loadBridgePlugins', () => {
     expect((await load(file)).length).toBe(1);
   });
 
+  it.skipIf(!posix)('skips a plugin whose check throws and still loads the next', async () => {
+    const a = writePlugin(path.join(home, 'plugins'), 'a.mjs', okSrc('aa'));
+    const b = writePlugin(path.join(home, 'plugins'), 'b.mjs', okSrc('bb'));
+    const missing = path.join(home, 'plugins', 'gone.mjs');
+    const plugins = await load([missing, a, b]);
+    expect(plugins.map((p) => p.name)).toEqual(['aa', 'bb']);
+    expect(warnings[0]).toMatch(/gone\.mjs/);
+  });
+
   it.skipIf(!posix)('refuses a method without the x_<plugin>_ prefix', async () => {
     const file = writePlugin(path.join(home, 'plugins'), 'bad.mjs',
       "export default () => ({ name: 'demo', handlers: { start: () => ({}) } });\n");
