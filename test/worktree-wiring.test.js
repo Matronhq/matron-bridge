@@ -54,7 +54,7 @@ describe('worktree wiring in index.js', () => {
     expect(block('function recreateSession(', 'killSession(existing')).toContain('worktreeRemovedFor(existing.workdir)');
     expect(block('function noteWorktreeGone(', '\n}')).toContain('worktreeRemovedFor(session.workdir)');
     // Both exit handlers (print and interactive) stop a respawn into a removed worktree.
-    expect(indexSource.match(/sweepToolStreams\(session\);\n    noteWorktreeGone\(session\);/g)).toHaveLength(2);
+    expect(indexSource.match(/sweepToolStreams\(session\);\n {4}noteWorktreeGone\(session\);/g)).toHaveLength(2);
   });
 
   it('the background step runs after the session started, not before', () => {
