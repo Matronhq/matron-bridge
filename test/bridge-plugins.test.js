@@ -30,13 +30,16 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(home, { recursive: true, force: true }));
 
+// Ownership checks need POSIX uids; on other platforms the loader refuses all.
+const posix = typeof process.getuid === 'function';
+
 describe('loadBridgePlugins', () => {
   it('is a no-op when the env is unset or empty', async () => {
     expect(await loadBridgePlugins({ env: {}, log })).toEqual([]);
     expect(await loadBridgePlugins({ env: { MATRON_BRIDGE_PLUGINS: ' , ' }, log })).toEqual([]);
   });
 
-  it('loads a valid plugin', async () => {
+  it.skipIf(!posix)('loads a valid plugin', async () => {
     const file = writePlugin(path.join(home, 'plugins'), 'demo.mjs', okSrc());
     const [p] = await load(file);
     expect(p.name).toBe('demo');
@@ -58,26 +61,26 @@ describe('loadBridgePlugins', () => {
     expect(warnings.every((w) => /session folder/.test(w))).toBe(true);
   });
 
-  it('refuses a file the bridge user does not own', async () => {
+  it.skipIf(!posix)('refuses a file the bridge user does not own', async () => {
     const file = writePlugin(path.join(home, 'plugins'), 'demo.mjs', okSrc());
     expect(await load(file, { uid: process.getuid() + 1 })).toEqual([]);
     expect(warnings[0]).toMatch(/not owned/);
   });
 
-  it.each([0o620, 0o602, 0o666])('refuses mode %o', async (mode) => {
+  it.skipIf(!posix).each([0o620, 0o602, 0o666])('refuses mode %o', async (mode) => {
     const file = writePlugin(path.join(home, 'plugins'), 'demo.mjs', okSrc(), mode);
     expect(await load(file)).toEqual([]);
     expect(warnings[0]).toMatch(/writable/);
   });
 
-  it('refuses a method without the x_<plugin>_ prefix', async () => {
+  it.skipIf(!posix)('refuses a method without the x_<plugin>_ prefix', async () => {
     const file = writePlugin(path.join(home, 'plugins'), 'bad.mjs',
       "export default () => ({ name: 'demo', handlers: { start: () => ({}) } });\n");
     expect(await load(file)).toEqual([]);
     expect(warnings[0]).toMatch(/x_demo_/);
   });
 
-  it('refuses a second plugin with the same name', async () => {
+  it.skipIf(!posix)('refuses a second plugin with the same name', async () => {
     const a = writePlugin(path.join(home, 'plugins'), 'a.mjs', okSrc());
     const b = writePlugin(path.join(home, 'plugins'), 'b.mjs', okSrc());
     expect((await load([a, b])).length).toBe(1);

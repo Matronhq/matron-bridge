@@ -1326,6 +1326,12 @@ function publishBoxStatus(reason) {
   return sent;
 }
 
+// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
+// Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
+const bridgePlugins = await loadBridgePlugins({
+  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
+});
+
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
   token: _journalToken,
@@ -1756,12 +1762,8 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
-// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
-// Never loaded from the default folder or a session folder.
-const bridgePlugins = await loadBridgePlugins({
-  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
-});
 const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
+
 
 const journalRpcHandler = createRpcRequestHandler({
   plugins: bridgePlugins,
