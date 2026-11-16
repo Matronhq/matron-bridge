@@ -14309,6 +14309,12 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === '/agent-sessions') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.agentSessions,
+          (status, b) => debug(`agent-sessions ${status} ${b.error || `${(b.sessions || []).length} sessions`}`));
+        return;
+      }
+
       if (url.pathname === '/agent-chat-start') {
         await respondAgentChatRoute(res, data, linkChecked('agent-chat-start', agentChatHandlers.chatStart),
           (status, b) => debug(`agent-chat-start ${status} ${b.room_id || ''} ${b.status || b.error || ''}`));
