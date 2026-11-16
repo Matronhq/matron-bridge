@@ -52,7 +52,7 @@ describe('loadBridgePlugins', () => {
     expect(warnings[0]).toMatch(/not absolute/);
   });
 
-  it('refuses a file under a session folder, also through a symlink', async () => {
+  it.skipIf(!posix)('refuses a file under a session folder, also through a symlink', async () => {
     const inside = writePlugin(path.join(sessionDir, 'sub'), 'demo.mjs', okSrc());
     const link = path.join(home, 'link.mjs');
     fs.symlinkSync(inside, link);
