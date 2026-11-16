@@ -182,6 +182,7 @@ import {
   shareAgentMedia,
 } from './lib/show-file.js';
 import { processShowFile } from './lib/show-file-handler.js';
+import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
@@ -574,6 +575,8 @@ const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYT
 // reserves before an upload and releases in its finally). An object so the
 // extracted handler can mutate it by reference.
 const showFileBudget = { inFlight: 0, reservedBytes: 0 };
+// Retry dedup for show_file (lib/media-dedup-ledger.js). In-memory, TTL + size bounded.
+const showFileDedupLedger = createMediaDedupLedger();
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
@@ -14066,6 +14069,7 @@ const apiServer = createServer(async (req, res) => {
           uploadMedia: journalPublisher.uploadMedia,
           journalPublish,
           denialToStatus,
+          dedupLedger: showFileDedupLedger,
           foreignAllowed: (s) => foreignSessions.routeAllowed(s, '/show-file', {}),
         },
       });
