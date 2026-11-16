@@ -481,6 +481,19 @@ describe('restart gate', () => {
     expect(h.state.restarts).toEqual([]);
   });
 
+  it('re-validates HEAD after the gate answers: a newer revision goes back through settle and preflight', async () => {
+    const state = {};
+    let release;
+    const slow = () => new Promise(r => { release = () => r({ hold: false }); });
+    const h = harness({ head: landed, gate: gateOf(state, slow) });
+    const p = h.watcher.tick();
+    await Promise.resolve();
+    h.state.head = { sha: 'c'.repeat(40), at: T0 };
+    release();
+    expect((await p).action).toBe('settling');
+    expect(h.state.restarts).toEqual([]);
+  });
+
   it('never asks the gate for a forced restart', async () => {
     const state = {};
     const h = harness({ head: { sha: NEW, at: T0 - 10_000 }, busy: 1, settleMs: 10_000, forceAfterMs: 20_000, gate: gateOf(state, { hold: true, reason: 'x' }) });
@@ -493,6 +506,20 @@ describe('restart gate', () => {
 
 describe('createCommandGate', () => {
   const fake = (err, stdout = '') => vi.fn((file, args, opts, cb) => cb(err, stdout, ''));
+
+  it('settles on its own deadline and kills the child when the callback never arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const kill = vi.fn();
+      const exec = vi.fn(() => ({ kill }));
+      const p = createCommandGate('hook', { exec, timeoutMs: 1000 })();
+      await vi.advanceTimersByTimeAsync(1300);
+      expect(await p).toEqual({ hold: false, error: 'timed out after 1000ms' });
+      expect(kill).toHaveBeenCalledWith('SIGKILL');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it('is off for an unset or blank command', () => {
     expect(createCommandGate(undefined)).toBeNull();
