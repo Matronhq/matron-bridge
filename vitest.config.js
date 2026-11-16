@@ -60,6 +60,8 @@ const WINDOWS_EXCLUDES = [
   'test/worktree-service.test.js',
   'test/worktree-setup.test.js',
   'test/worktree-setup-flow.test.js',
+  'test/worktree-cleanup.test.js',
+  'test/worktree-cleanup-service.test.js',
 ];
 
 export default defineConfig({
