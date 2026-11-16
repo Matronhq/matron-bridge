@@ -1289,7 +1289,7 @@ describe('createAgentChatHandlers', () => {
       let release;
       const gate = new Promise((r) => { release = r; });
       const { handlers, rooms, invites } = makeFixture();
-      invites.invite.mockImplementationOnce(async () => { await gate; return { kind: 'accepted', peerDeviceId: 7 }; });
+      invites.invite.mockImplementationOnce(async () => { await gate; return { kind: 'refused', reason: 'no' }; });
       ownerRoom(rooms);
       const args = { roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' };
       const first = handlers.chatInvite(args);
@@ -1299,9 +1299,40 @@ describe('createAgentChatHandlers', () => {
       expect(second.body.error).toMatch(/still waiting/i);
       expect(invites.invite).toHaveBeenCalledTimes(1);
       release();
-      expect((await first).status).toBe(200);
+      expect((await first).status).toBe(200); // refused: reservation released
       expect((await handlers.chatInvite(args)).status).toBe(200);
       expect(invites.invite).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the room reserved after a pending_busy return until the answer frame arrives', async () => {
+      // Stand-in for the invites manager's answer tracking: pending_* sets it,
+      // an answer frame clears it.
+      let unanswered = false;
+      const { handlers, rooms, invites } = makeFixture({
+        invites: { hasUnansweredInvite: () => unanswered },
+      });
+      invites.invite.mockImplementation(async () => { unanswered = true; return { kind: 'pending_busy' }; });
+      ownerRoom(rooms);
+      const args = { roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' };
+      expect((await handlers.chatInvite(args)).body.status).toBe('pending_busy');
+      const second = await handlers.chatInvite(args);
+      expect(second.status).toBe(409);
+      expect(second.body.error).toMatch(/still waiting/i);
+      expect(invites.invite).toHaveBeenCalledTimes(1);
+      unanswered = false; // answer frame arrived (or the invite expired)
+      expect((await handlers.chatInvite(args)).status).toBe(200);
+      expect(invites.invite).toHaveBeenCalledTimes(2);
+    });
+
+    it('refuses to invite a session this tool already brought into the room', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      ownerRoom(rooms);
+      const args = { roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' };
+      expect((await handlers.chatInvite(args)).status).toBe(200); // accepted -> device 7 joined
+      const again = await handlers.chatInvite(args);
+      expect(again.status).toBe(409);
+      expect(again.body.error).toMatch(/already a participant/i);
+      expect(invites.invite).toHaveBeenCalledTimes(1);
     });
 
     it('surfaces an unreachable journal roster as 502', async () => {
