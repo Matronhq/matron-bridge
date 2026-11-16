@@ -26,6 +26,7 @@ import { createTransferOutcomeNotify } from './lib/transfer-outcome.js';
 import { createTransferReceiver } from './lib/transfer-receiver.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
+import { createRestartNotes, takeNoteDeliveries, restartNoteTurnText } from './lib/restart-notes.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createSearchHandlers } from './lib/search-tools.js';
@@ -406,6 +407,8 @@ const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff(process.env.MATRON_COD
 // them. MATRON_CODE_UPDATE_AUTO_CARRY_ON=0 keeps the tap.
 const CODE_UPDATE_AUTO_CARRY_ON = codeUpdateAutoCarryOnEnabled(process.env.MATRON_CODE_UPDATE_AUTO_CARRY_ON);
 const SELF_RESTART_STAMP_FILE = path.join(os.homedir(), '.matron-bridge-self-restart.json');
+// Notes a session left itself with reminder_create restart_note (lib/restart-notes.js).
+const restartNotes = createRestartNotes({ file: path.join(os.homedir(), '.matron-bridge-restart-notes.json') });
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -13663,6 +13666,7 @@ const reminderHandlers = createReminderHandlers({
   journalConvoIdFor,
   timerStore,
   announce: announceAgentReminder,
+  restartNotes,
 });
 
 // Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
@@ -15993,11 +15997,29 @@ function publishRestartCarryOnCards() {
   // so a stale stamp from an earlier boot can never claim a later crash's
   // interruptions.
   const stamp = takeSelfRestartStamp(SELF_RESTART_STAMP_FILE);
-  if (!stale.length) return;
   const persisted = loadPersistedSessions();
   const resumable = new Set(Object.values(persisted)
     .flatMap(rec => [rec?.journalConvoId, rec?.sessionId])
     .filter(Boolean));
+  // Resume notes first, before selectAutoCarryOn: a conversation with a note
+  // gets the note as its one bridge-made first turn, in place of both the
+  // automatic carry-on and the card. The notes are deleted before delivery.
+  const noteResult = takeNoteDeliveries({
+    store: restartNotes, stale, resumable, isResumeConvoId,
+    log: (m) => { try { console.log(m); } catch { /* logging must never throw */ } },
+  });
+  stale = noteResult.stale;
+  if (noteResult.deliveries.length) {
+    setTimeout(() => {
+      for (const note of noteResult.deliveries) {
+        void carryOnConvo(note.convoId, null, null,
+          restartNoteTurnText(note.text, note.ageMs, frameSafeBody),
+          '🔄 The bridge restarted — resuming this chat with the note you left for it.',
+          { causes: [carryOnCause()] });
+      }
+    }, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS);
+  }
+  if (!stale.length) return;
   // The previous process's self-restart onto new code cut these turns off;
   // with the option on they carry on by themselves (lib/code-update-restart.js
   // AUTO_CARRY_ON_TEXT), after the journal socket has said hello and the
