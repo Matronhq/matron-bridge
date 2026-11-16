@@ -5169,6 +5169,16 @@ function handleClaudeEvent(session, event) {
     setupSubagentWatcher(session, session.workdir, session.claudeSessionId);
   }
 
+  // Re-home the subagent watcher when the session changes cwd mid-flight
+  // (EnterWorktree). Stream events carry the live cwd; act only on a change.
+  if (session.subagentWatcher && typeof event.cwd === 'string' && event.cwd
+      && event.cwd !== session._lastWatcherCwd) {
+    session._lastWatcherCwd = event.cwd;
+    if (session.subagentWatcher.repoint(event.cwd)) {
+      console.log(`[subagent-rehome] room ${session.roomId}: moved to ${event.cwd}; re-pointed subagent watcher`);
+    }
+  }
+
   // Workflow-tool runs: the Workflow tool_use, its launch tool_result (run id)
   // and the run's task_notification drive per-run discovery of
   // subagents/workflows/<runId>/ agents. One seam; the routing lives in
