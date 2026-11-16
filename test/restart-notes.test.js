@@ -40,7 +40,8 @@ describe('restart note store', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0][0]).not.toBe(file);
     expect(calls[0][1]).toBe(file);
-    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    // POSIX permission bits don't exist on Windows.
+    if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o777).toBe(0o600);
   });
 
   it('throws when the write fails and leaves the earlier note intact', () => {
