@@ -141,6 +141,25 @@ describe('processShowFile', () => {
     expect(deps.auditShowFile).toHaveBeenCalledWith(expect.objectContaining({ result: 'ok' }));
   });
 
+  it('passes the session token and dedup ledger to shareAgentMedia and surfaces a dedup hit', async () => {
+    const dedupLedger = { get: vi.fn(), set: vi.fn() };
+    const deps = makeDeps({
+      dedupLedger,
+      shareAgentMedia: vi.fn().mockResolvedValue({
+        ok: true, media_id: 'm', kind: 'image', realPath: '/p', size: 1, sha256: 's', deduped: true, deduped_at: 1234,
+      }),
+    });
+    const res = await run({
+      body: JSON.stringify({ path: '/work/chart.png', token: 'good-token' }),
+      sessions: makeSessions(),
+      deps,
+    });
+    expect(res.body).toEqual({ ok: true, media_id: 'm', kind: 'image', deduped: true, deduped_at: 1234 });
+    const args = deps.shareAgentMedia.mock.calls[0][0];
+    expect(args.token).toBe('good-token');
+    expect(args.deps.dedupLedger).toBe(dedupLedger);
+  });
+
   it('publish() closure routes to journalPublish bound to the resolved session', async () => {
     let capturedPublish;
     const deps = makeDeps({
