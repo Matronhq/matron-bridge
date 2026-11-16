@@ -276,6 +276,7 @@ import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './
 import { launchWithClaudePromptFile } from './lib/claude-prompt-file.js';
 import { trimChatHistory } from './lib/chat-history-cap.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
+import { toolRoleFor } from './lib/tool-roles.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
@@ -3167,7 +3168,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       apiHeaderFile: apiHeaderFileFor(roomId),
     }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
-      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId) }) : {},
+      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId),
+      toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true }) }) : {},
   });
   codex.planMode = CODEX_APP_SERVER && persisted?.codexPlanMode === true;
 

@@ -340,8 +340,8 @@ the viewer's environment turns it off.
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
-| `BRIDGE_TOOL_FILTER` | Set to `1` to hide Coordinator-only `ask-user` MCP tools from confirmed Claude worker sessions, in print and interactive modes. Unknown roles keep the full list. | off |
-| `BRIDGE_TOOL_ROLE` | Set per Claude session by the bridge when filtering is enabled: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
+| `BRIDGE_TOOL_FILTER` | Coordinator-only `ask-user` MCP tools are hidden from every session that is known not to be the Coordinator (Claude print and interactive, and Codex app-server sessions), which keeps each session's tool definitions about a quarter smaller. Set to `0` to give every session every tool. A session whose role is not known yet keeps the full list. | on |
+| `BRIDGE_TOOL_ROLE` | Set per session by the bridge unless filtering is off: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
