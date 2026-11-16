@@ -378,10 +378,15 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 // Host CPU/RAM on box_status: sampled every HOST_VITALS_SAMPLE_MS (CPU is the
 // busy share over that whole interval), sent when either reading has moved by
 // HOST_VITALS_DELTA_PCT points since the last send, and at least every
-// HOST_VITALS_HEARTBEAT_MS (clients treat a reading over a minute old as stale).
-const HOST_VITALS_SAMPLE_MS = Math.max(5000, parseInt(process.env.HOST_VITALS_SAMPLE_MS || '10000', 10) || 10000);
+// HOST_VITALS_HEARTBEAT_MS (the web client greys out a reading older than 60 s,
+// see HOST_VITALS_STALE_MS in matron-web). The heartbeat is only checked after
+// a sample, so the sample interval is capped at the heartbeat.
+const HOST_VITALS_HEARTBEAT_MS = Math.max(5000, parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '45000', 10) || 45000);
+const HOST_VITALS_SAMPLE_MS = Math.min(
+  HOST_VITALS_HEARTBEAT_MS,
+  Math.max(5000, parseInt(process.env.HOST_VITALS_SAMPLE_MS || '10000', 10) || 10000),
+);
 const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '8', 10);
-const HOST_VITALS_HEARTBEAT_MS = parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '45000', 10);
 let lastBoxVitalsSent = null; // { cpu_pct, ram_pct, at } of the last send that went out
 // Pre-reap handoff (lib/pre-reap-handoff.js): shortly before the reap, while
 // the prompt cache is still warm, an idle session is asked to refresh its
