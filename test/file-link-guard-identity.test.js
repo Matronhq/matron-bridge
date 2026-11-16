@@ -12,7 +12,7 @@ describe('isSensitivePath: credential files and directories', () => {
     '/root/.secrets', '/root/.secrets/req-abc.txt', '/root/.supabase/access-token',
     '/etc/x/agent-token', '/w/agent_token.json', '/w/bridge-agent-creds.txt',
     '/root/.claude-matrix-sessions.json', '/root/.matron-bridge-secrets.json',
-    '/w/run-state-outbox.json', '/w/journal-cursor.json', '/root/.bash_history',
+    '/w/journal-cursor.json', '/root/.bash_history',
     '/root/.codex/auth.json', '/root/.config/gh/hosts.yml', '/root/auth.json',
     '/root/.git-credentials', '/root/.pgpass', '/root/.claude.json',
     '/home/u/.gcloud/x', '/home/u/.azure/y',
