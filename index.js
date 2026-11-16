@@ -2507,11 +2507,22 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
 
 // Once graceful shutdown has begun, a killed child must not be respawned by
 // the crash-restart handlers while the journal flush is still running.
-// A session whose bridge-made worktree was removed is not respawned either:
-// the respawn would resume in a different folder.
 function shouldAutoRestart(exitCode, session, shuttingDown) {
-  return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed
-    && !worktreeService.removedFor(session.workdir);
+  return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
+}
+
+// Small seams over the worktree service, so the exit handlers and
+// recreateSession (lifted into sandboxes by some tests) call functions.
+function worktreeRemovedFor(workdir) { return worktreeService.removedFor(workdir); }
+function worktreeRemovedMessage(entry) { return new WorktreeRemovedError(entry).message; }
+// An exit handler that would respawn a session into a removed worktree stops
+// instead (the respawn would resume in a different folder): marked like a
+// failed resume, with the reason said in the conversation.
+function noteWorktreeGone(session) {
+  const gone = worktreeRemovedFor(session.workdir);
+  if (!gone) return;
+  session._resumeFailed = true;
+  Promise.resolve(sendToRoom(session.roomId, worktreeRemovedMessage(gone))).catch(() => {});
 }
 
 // Crash restarts (lib/crash-recovery.js): the process died on its own and was
@@ -2617,7 +2628,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       // PR #216: without this, a found transcript was still demoted.)
       let usable = fs.existsSync(found.workdir);
       // Never recreate a removed worktree as an empty folder.
-      const wasWorktree = !usable && !!worktreeService.removedFor(found.workdir);
+      const wasWorktree = !usable && !!worktreeRemovedFor(found.workdir);
       if (!usable && !wasWorktree) {
         try {
           fs.mkdirSync(found.workdir, { recursive: true });
@@ -2965,6 +2976,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // server's 30-min idle sweep. Runs on every path below, including
     // auto-restart.
     sweepToolStreams(session);
+    noteWorktreeGone(session);
     clearPendingInterrupt(session);
     // Only a restart can retry input the CLI never started.
     const orphanSteers = takeUnstartedSteers(session);
@@ -3902,6 +3914,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Same orphan-pump sweep as the print-mode close handler above: the
     // process exited on its own without the tool_result seam running.
     sweepToolStreams(session);
+    noteWorktreeGone(session);
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
@@ -15557,9 +15570,9 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     return null;
   }
   // Refuse before anything is killed: the old session stays as it is.
-  const removedWorktree = worktreeService.removedFor(existing.workdir);
+  const removedWorktree = worktreeRemovedFor(existing.workdir);
   if (removedWorktree) {
-    sendReply(new WorktreeRemovedError(removedWorktree).message);
+    sendReply(worktreeRemovedMessage(removedWorktree));
     return null;
   }
   const sessionId = existing.claudeSessionId;
