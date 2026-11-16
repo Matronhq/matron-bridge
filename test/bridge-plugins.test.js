@@ -73,6 +73,18 @@ describe('loadBridgePlugins', () => {
     expect(warnings[0]).toMatch(/writable/);
   });
 
+  it.skipIf(!posix)('refuses a file under a group- or world-writable directory', async () => {
+    const dir = path.join(home, 'plugins');
+    const file = writePlugin(dir, 'demo.mjs', okSrc());
+    fs.chmodSync(dir, 0o777);
+    expect(await load(file)).toEqual([]);
+    expect(warnings[0]).toMatch(/directory .* writable/);
+    fs.chmodSync(dir, 0o770);
+    expect(await load(file)).toEqual([]);
+    fs.chmodSync(dir, 0o755);
+    expect((await load(file)).length).toBe(1);
+  });
+
   it.skipIf(!posix)('refuses a method without the x_<plugin>_ prefix', async () => {
     const file = writePlugin(path.join(home, 'plugins'), 'bad.mjs',
       "export default () => ({ name: 'demo', handlers: { start: () => ({}) } });\n");

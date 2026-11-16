@@ -15,7 +15,10 @@ going) a plugin whose file:
 - has a relative path;
 - sits under `DEFAULT_WORKDIR` or any session folder;
 - is not owned by the bridge's user;
-- is writable by group or others.
+- is writable by group or others;
+- sits under a directory (any level up to `/`) that is writable by group or
+  others, unless that directory is sticky and owned by root (like `/tmp`), or
+  that is owned by someone other than root or the bridge's user.
 
 Symlinks are followed and the checks apply to the resolved file, which is also
 the file that gets imported.
