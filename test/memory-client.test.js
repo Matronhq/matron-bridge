@@ -14,15 +14,24 @@ function fakeFetch(handler) {
 
 describe('createMemoryClient', () => {
   it('save PUTs /memories/:name with bearer, JSON body and the status', async () => {
-    const { fetchImpl, calls } = fakeFetch(() => ({ status: 201, body: { memory: { id: 'me_1', name: 'avoid-elm' } } }));
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 201, body: { memory: { id: 'me_1', name: 'avoid-box-a' } } }));
     const c = createMemoryClient({ baseUrl: 'https://j/', token: 'tok', fetchImpl });
-    const r = await c.save('avoid-elm', { description: 'x', convo_id: 'c1' });
-    expect(r).toEqual({ status: 201, data: { memory: { id: 'me_1', name: 'avoid-elm' } } });
-    expect(calls[0].url).toBe('https://j/memories/avoid-elm');
+    const r = await c.save('avoid-box-a', { description: 'x', convo_id: 'c1' });
+    expect(r).toEqual({ status: 201, data: { memory: { id: 'me_1', name: 'avoid-box-a' } } });
+    expect(calls[0].url).toBe('https://j/memories/avoid-box-a');
     expect(calls[0].init.method).toBe('PUT');
     expect(calls[0].init.headers.Authorization).toBe('Bearer tok');
     expect(calls[0].init.headers['Content-Type']).toBe('application/json');
     expect(JSON.parse(calls[0].init.body)).toEqual({ description: 'x', convo_id: 'c1' });
+  });
+
+  it('remove sends the conversation and causes as a JSON body when given', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 202, body: { pending: 'owner' } }));
+    const c = createMemoryClient({ baseUrl: 'https://j', token: 't', fetchImpl });
+    const r = await c.remove('avoid-box-a', { convo_id: 'c1', causes: [{ kind: 'user_message', ref: 'c1:7' }] });
+    expect(r.status).toBe(202);
+    expect(calls[0].init.method).toBe('DELETE');
+    expect(JSON.parse(calls[0].init.body)).toEqual({ convo_id: 'c1', causes: [{ kind: 'user_message', ref: 'c1:7' }] });
   });
 
   it('routes every verb to the documented path and encodes the key', async () => {
@@ -54,5 +63,19 @@ describe('createMemoryClient', () => {
     const c = createMemoryClient({ baseUrl: '', token: 't', fetchImpl });
     expect((await c.list()).status).toBe(0);
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('recall POSTs /memories/recall; a per-call timeout aborts a slow journal sooner', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 200, body: { memories: [] } }));
+    const c = createMemoryClient({ baseUrl: 'https://j', token: 't', fetchImpl });
+    expect(await c.recall({ text: 'x', mode: 'auto' })).toEqual({ status: 200, data: { memories: [] } });
+    expect(calls[0].url).toBe('https://j/memories/recall');
+    expect(calls[0].init.method).toBe('POST');
+    expect(JSON.parse(calls[0].init.body)).toEqual({ text: 'x', mode: 'auto' });
+    const slow = vi.fn((url, init) => new Promise((resolve, reject) => { init.signal.addEventListener('abort', () => reject(new Error('aborted'))); }));
+    const c2 = createMemoryClient({ baseUrl: 'https://j', token: 't', fetchImpl: slow });
+    const started = Date.now();
+    expect((await c2.recall({ text: 'x' }, { timeoutMs: 50 })).status).toBe(0);
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 });

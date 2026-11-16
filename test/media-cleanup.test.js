@@ -8,6 +8,7 @@ const media = { type: 'file', blobRef: 'upload', name: 'report.pdf' };
 function harness(overrides = {}) {
   const session = { alive: true, agent: 'claude', claudeSessionId: 'provider', journalConvoId: 'conversation', _sessionConfirmed: true };
   const deps = {
+    isCanonicalSession: (s) => s === session && s.alive,
     fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('bytes') })),
     buildSavedBlocks: vi.fn(async () => ({ blocks, cleanup: vi.fn() })),
     injectBlocks: vi.fn(() => true), injectText: vi.fn(() => true),
@@ -41,6 +42,27 @@ describe('saved attachment cleanup on delivery', () => {
     if (busy) {
       expect(h.deps.queueMedia.mock.calls[0][1].cleanup).toBe(cleanup);
     } else expect(h.deps.injectBlocks).toHaveBeenCalled();
+  });
+
+  it('removes the saved file when the session is replaced while it is being built', async () => {
+    const cleanup = vi.fn();
+    let h;
+    h = harness({ buildSavedBlocks: async () => { h.session.alive = false; return { blocks, cleanup }; } });
+    await h.route(h.session, media);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(h.deps.injectBlocks).not.toHaveBeenCalled();
+    expect(h.deps.queueMedia).not.toHaveBeenCalled();
+  });
+
+  it('removes the parts a batch gathered when the session is replaced before it finalizes', async () => {
+    vi.useFakeTimers();
+    const cleanup = vi.fn();
+    const h = harness({ buildSavedBlocks: async () => ({ blocks, cleanup }), batchQuietMs: 100 });
+    await h.route(h.session, { ...media, batch: { id: 'batch', index: 1, total: 2 } });
+    h.session.alive = false;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(h.deps.injectBlocks).not.toHaveBeenCalled();
   });
 
   it('cleans a duplicate batch frame and an undeliverable partial batch', async () => {

@@ -49,12 +49,12 @@ describe('compactCommandFor', () => {
 describe('/compact-self handler', () => {
   it('parks mid-turn, notifies, and records the time', async () => {
     const { handler, session, calls } = harness({ session: { coordinator: true } });
-    const res = await handler({ roomId: '!room:x', reason: 'context at 31%', focus: 'spawn on elm to check' });
+    const res = await handler({ roomId: '!room:x', reason: 'context at 31%', focus: 'spawn on box-a to check' });
     expect(res).toEqual({ status: 200, body: { ok: true, parked: true } });
     expect(calls[0][0]).toBe('park');
     expect(calls[0][1]).toMatchObject({ action: 'compact', self: true, reason: 'context at 31%' });
     expect(calls[0][1].command).toContain(COORDINATOR_INSTRUCTIONS);
-    expect(calls[0][1].command).toMatch(/Also keep: spawn on elm to check$/);
+    expect(calls[0][1].command).toMatch(/Also keep: spawn on box-a to check$/);
     expect(calls[1]).toEqual(['notify', '🗜️ Compacting this session once this turn finishes — context at 31%.']);
     expect(session._lastSelfCompactAt).toBe(1_000_000);
   });
@@ -139,7 +139,7 @@ describe('compact_self wiring', () => {
     expect(src).toMatch(/import \{ createSelfCompactHandler \} from '\.\/lib\/self-compact\.js'/);
     expect(src).toMatch(/url\.pathname === '\/compact-self'[\s\S]{0,80}respondAgentChatRoute\(res, data, selfCompactHandler/);
     expect(src).toMatch(/_deferredControls = \{ \.\.\.\(session\._deferredControls \|\| \{\}\), compact: \{ kind: 'compact', params, id: randomUUID\(\) \} \}/);
-    expect(src).toMatch(/journalRouteTextToSession\(current, step\.command \|\| '\/compact', \{ keepRestartBudget: !!step\.command \}\)/);
+    expect(src).toMatch(/journalRouteTextToSession\(current, step\.command \|\| '\/compact', \{ bridgeOrigin: true, keepRestartBudget: !!step\.command \}\)/);
     expect(src).toMatch(/if \(!keepRestartBudget\) session\._agentRestartCount = 0;/);
     expect(src).toMatch(/compactSelf: \(d\) => selfCompactHandler\(d\)/);
     // The cooldown crosses a crash restart and a recreate, like the restart budget.

@@ -3,7 +3,7 @@ import { rateLimit } from 'express-rate-limit';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
-import { generateSignedUrl, verifyToken, readPageToken } from '../lib/viewer-tokens.js';
+import { generateSignedUrl, verifyToken, scopeFromToken, readPageToken } from '../lib/viewer-tokens.js';
 import { formatSecretContextHtml, secretConversationUrl } from '../lib/secret-context.js';
 import { viewerApiKey, VIEWER_KEY_HEADER_NAME } from '../lib/api-auth.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
@@ -322,7 +322,8 @@ app.get('/view', async (req, res) => {
   if (!token) return res.status(400).send('Missing token');
 
   const data = verifyToken(token);
-  if (!data) return res.status(403).send('Invalid or expired token');
+  // Page and download tokens are minted for their own routes only.
+  if (!data || data.dl === true || data.page === true) return res.status(403).send('Invalid or expired token');
 
   try {
     // Serve-time boundary (lib/file-link-guard.js): fd-pinned symlink,
@@ -330,7 +331,7 @@ app.get('/view', async (req, res) => {
     // without a workdir still get everything but containment. Every
     // rejection — denied, missing, oversize — is a uniform 404 so the
     // response leaks nothing about why.
-    const { content, realPath } = await validateAndOpen(data.path, { workdir: data.workdir });
+    const { content, realPath } = await validateAndOpen(data.path, scopeFromToken(data));
     res.type('html').send(renderHtml(path.basename(realPath), content.toString('utf-8')));
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
@@ -362,7 +363,7 @@ app.get('/download', downloadLimiter, async (req, res) => {
 
   try {
     const { content, realPath } = await validateAndOpen(data.path, {
-      workdir: data.workdir,
+      ...scopeFromToken(data),
       maxBytes: MAX_DOWNLOAD_BYTES,
     });
     // Keep the header a plain quoted ASCII token: strip anything that could
@@ -405,7 +406,7 @@ app.get('/page', pageLimiter, async (req, res) => {
   try {
     if (!isPageFile(data.path)) throw new FileLinkDenied('not-html');
     const { content } = await validateAndOpen(data.path, {
-      workdir: data.workdir,
+      ...scopeFromToken(data),
       maxBytes: MAX_PAGE_BYTES,
     });
     res.set(PAGE_HEADERS);

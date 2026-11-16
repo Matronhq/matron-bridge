@@ -4,6 +4,8 @@ import {
   parseShowFileUploadTimeoutMs,
   shareAgentMedia,
 } from '../lib/show-file.js';
+import { DEDUP_MAX_BYTES } from '../lib/show-file.js';
+import { createMediaDedupLedger } from '../lib/media-dedup-ledger.js';
 
 class MockFileLinkDenied extends Error {
   constructor(reason) {
@@ -224,5 +226,90 @@ describe('parseShowFileUploadTimeoutMs', () => {
 
     expect(parseShowFileUploadTimeoutMs('45000', warn)).toBe(45000);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('shareAgentMedia retry dedup', () => {
+  const run = (deps, overrides = {}) => share(deps, { token: 'tok-1', ...overrides });
+
+  it('records the first publish and returns the same media_id on a retry without uploading again', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    const first = makeDeps();
+    const r1 = await run({ ...first, dedupLedger });
+    expect(r1).toMatchObject({ ok: true, media_id: 'media-123' });
+    expect(r1.deduped).toBeUndefined();
+
+    const second = makeDeps();
+    const r2 = await run({ ...second, dedupLedger });
+    expect(r2).toMatchObject({ ok: true, media_id: 'media-123', kind: 'image', sha256: 'sha-abc', deduped: true });
+    // Neither a second stored blob nor a second bubble.
+    expect(second.uploadMedia).not.toHaveBeenCalled();
+    expect(second.publish).not.toHaveBeenCalled();
+  });
+
+  it('does not dedup when the caption, content, or session token differs', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    await run({ ...makeDeps(), dedupLedger });
+
+    for (const [overrides, content] of [
+      [{ caption: 'new caption' }, undefined],
+      [{}, Buffer.from('different bytes')],
+      [{ token: 'tok-2' }, undefined],
+    ]) {
+      const deps = makeDeps(content ? { content } : {});
+      const r = await run({ ...deps, dedupLedger }, overrides);
+      expect(r.deduped).toBeUndefined();
+      expect(deps.uploadMedia).toHaveBeenCalledOnce();
+      expect(deps.publish).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('reports when the earlier publish happened', async () => {
+    let t = 5000;
+    const dedupLedger = createMediaDedupLedger({ now: () => t });
+    await run({ ...makeDeps(), dedupLedger });
+    t = 9000;
+    const r = await run({ ...makeDeps(), dedupLedger });
+    expect(r).toMatchObject({ deduped: true, deduped_at: 5000 });
+  });
+
+  it('skips dedup (and the hash) for files over the size cap', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    const big = Buffer.alloc(DEDUP_MAX_BYTES + 1);
+    await run({ ...makeDeps({ content: big }), dedupLedger });
+    const again = makeDeps({ content: big });
+    const r = await run({ ...again, dedupLedger });
+    expect(r.deduped).toBeUndefined();
+    expect(again.uploadMedia).toHaveBeenCalledOnce();
+    expect(dedupLedger.size).toBe(0);
+  });
+
+  it('treats an empty and a missing caption as the same publish', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    await run({ ...makeDeps(), dedupLedger }, { caption: '' });
+    const r = await run({ ...makeDeps(), dedupLedger }, { caption: undefined });
+    expect(r.deduped).toBe(true);
+  });
+
+  it('does not record a failed upload, so the retry uploads again', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    const failing = makeDeps();
+    failing.uploadMedia.mockResolvedValue(null);
+    expect(await run({ ...failing, dedupLedger })).toEqual({ denied: 'upload-failed' });
+    const retry = makeDeps();
+    const r = await run({ ...retry, dedupLedger });
+    expect(r.deduped).toBeUndefined();
+    expect(retry.publish).toHaveBeenCalledOnce();
+  });
+
+  it('fails open: a broken ledger warns and the publish proceeds', async () => {
+    const dedupLedger = { get: () => { throw new Error('boom'); }, set: () => { throw new Error('boom'); } };
+    const warn = vi.fn();
+    const deps = makeDeps();
+    const r = await run({ ...deps, dedupLedger, warn });
+    expect(r).toMatchObject({ ok: true });
+    expect(r.deduped).toBeUndefined();
+    expect(deps.publish).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalled();
   });
 });

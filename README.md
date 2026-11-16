@@ -252,6 +252,12 @@ undone within five minutes; use `-StopOnly`, which disables the task.
 `deploy.ps1`) hands itself to a one-shot Scheduled Task a few seconds out,
 because Task Scheduler would otherwise stop it along with the bridge.
 
+**Import preflight:** `MATRON_BRIDGE_PREFLIGHT=module node index.js` loads
+`index.js`'s whole static import graph (native bindings included) and exits 0
+before it reads `.env` or starts anything. `deploy.sh`, `deploy.ps1` and the
+self-restart check below all use it. Startup code added to `index.js` must stay
+below that early exit.
+
 **Self-restart onto new code (every platform):** a deploy that finds a live
 session (`deploy.sh --dry-run`, a fleet updater script) leaves the
 new code on disk and the old process running. The bridge notices by itself:
@@ -319,6 +325,12 @@ the viewer's environment turns it off.
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
+| `MATRON_APPROVAL_KEYS_FILE` | Path of the pinned approval keys file. Set, the box verifies the user's signed approval itself before it starts a session, joins a chat or takes a file (see "Approval keys"). The file must not be owned by the bridge's user, writable by group or others, or a symlink | _(unset: off)_ |
+| `MATRON_APPROVAL_MAX_AGE_MS` | An upper bound on how old a signed approval may be, for every kind of request | _(per kind: 5 minutes to 24 hours)_ |
+| `MATRON_APPROVAL_JOURNAL_HOST` | The journal's public host as signed approvals name it, when it differs from the host in `JOURNAL_WS_URL` | host of `JOURNAL_WS_URL` |
+| `MATRON_STEP_UP_ALL` | `1` marks every question this box files, and every comment with buttons, as step-up: the tap needs the user's device signature | off |
+| `MATRON_LOCKED` | `1` puts the box in locked mode: outside input is taken only during a signed unlock window. Needs `MATRON_APPROVAL_KEYS_FILE`; the bridge refuses to start without it | off |
+| `MATRON_UNLOCK_MAX_MINUTES` | The longest unlock window a locked box grants | `120` |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset. Scripts run outside a session can list sessions (`POST /sessions`) with `curl -H @"${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"`, an owner-only file the bridge rewrites at each start | on |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
@@ -328,8 +340,8 @@ the viewer's environment turns it off.
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
-| `BRIDGE_TOOL_FILTER` | Set to `1` to hide Coordinator-only `ask-user` MCP tools from confirmed Claude worker sessions, in print and interactive modes. Unknown roles keep the full list. | off |
-| `BRIDGE_TOOL_ROLE` | Set per Claude session by the bridge when filtering is enabled: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
+| `BRIDGE_TOOL_FILTER` | Coordinator-only `ask-user` MCP tools are hidden from every session that is known not to be the Coordinator (Claude print and interactive, and Codex app-server sessions), which keeps each session's tool definitions about a quarter smaller. Set to `0` to give every session every tool. A session whose role is not known yet keeps the full list. | on |
+| `BRIDGE_TOOL_ROLE` | Set per session by the bridge unless filtering is off: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
@@ -445,9 +457,11 @@ Bridge sessions on the same journal server can chat with each other. An agent ro
 Every session gets these MCP tools via `ask-user.js`:
 
 - `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
+- `agent_sessions` — list the user's sessions with state and an `is_self` flag
 - `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
 - `agent_chat_accept` / `agent_chat_refuse` — answer an inbound request that still needs one (a same-bridge invite, or a join request into a room you own); an approved invite from another box has already joined the agent, so accept is a no-op there and refuse mutes the room
 - `agent_chat_join` — ask to join an existing room by id
+- `agent_chat_invite` — as the room owner, invite a session on another box into a joined room
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
 - `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
 - `agent_chat_leave` — step out of a room of three or more that someone else started, once your part is done (a room of two cannot be left)
@@ -456,12 +470,97 @@ The user's consent card is the gate: once an invite is approved, the target brid
 
 A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
 
+### Rooms with another person, and managed Claude Code settings
+
+A turn started by another person (a room with their agent, or their comment on a shared item) runs behind a PreToolUse hook the bridge passes each Claude session in `--settings` (`hooks/foreign-gate.*`). Claude Code's managed settings can stop that hook from running:
+
+- with `disableAllHooks: true`, no hook runs, so the bridge does not take turns from another person on that machine;
+- with `allowManagedHooksOnly: true`, only managed hooks run. Install the gate as one, for every tool:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "node $HOME/matron-bridge/hooks/foreign-gate-managed.mjs --port 9802" }] }
+    ]
+  }
+}
+```
+
+Use the bridge's real path and its `MATRON_BRIDGE_API_PORT`. The bridge reads the file-based managed settings (`managed-settings.json` and its `managed-settings.d/` drop-ins); a policy set only through a macOS configuration profile or the Windows registry is not seen. An interactive session also needs the bridge's own Stop hook to end such a turn, so where only managed hooks run, interactive sessions don't take turns from another person; print sessions do, behind the managed gate. The hook names the session by the session id Claude Code gives it, so it needs no per-session settings. Until the managed settings list it, the bridge refuses turns from another person and says so in the conversation. Where the bridge's own hooks do run, the managed hook stands aside, so one call is never checked twice.
+
+## Approval keys
+
+The journal lets a user enrol *approval keys*: key pairs held in a phone's or a Mac's secure hardware, which sign a short statement naming exactly what is being approved (see "Approval keys (step-up)" in the journal's protocol doc). The bridge takes part in three ways. Every one of them is off unless you turn it on, and a box with none of the settings below behaves exactly as before.
+
+### Step-up questions
+
+`item_create` and `item_comment` take `step_up: true` and an optional `subject`. A step-up question's buttons can only be tapped with Face ID or Touch ID; a typed reply never satisfies it. `subject` is a flat object of short strings (at most 12 keys) that the user is shown verbatim and signs, for example `{"op":"drop_table","table":"orders"}`. When the user's account has no approval key the journal files an ordinary question and the tool result says that `step_up` was ignored.
+
+`MATRON_STEP_UP_ALL=1` marks every question this box files, and every comment with buttons, as step-up.
+
+A tap the journal accepted with a signature reaches the agent as `tapped "Approve" (signed with the user's device key 7734f909)`, and `item_get` shows the same on that comment.
+
+### The approval gate
+
+Set `MATRON_APPROVAL_KEYS_FILE` to a file of pinned keys and the bridge stops taking the journal's word for the user's approval. It then refuses, with `approval_required`:
+
+- a session start, whether an approved spawn from another agent or a client's own New Chat, unless it carries a statement signed by a pinned key over this box's name, the working directory and the hash of the task;
+- an inbound chat invite or join request, unless it carries one over the room, the device and the hash of the justification;
+- a file transfer, unless it carries one over the transfer's id, size and SHA-256 (the downloaded bytes must then match that hash before the file is released);
+- another person's talk request, always;
+- Coordinator session control that starts or redirects work (`carry_on`, `set_model`, a routine's fire). `compact` and an alert still go through, except on a locked box with no unlock window open;
+- the typed `/start` and `/workdir` commands: a session is started from New Chat in the app, which signs the start. Messages to a conversation that already exists, and so resuming it, are ordinary chat and are not gated (locked mode covers those).
+
+The bridge builds what the statement must say from what it is about to do, not from what the request claims, checks the signature against the pinned keys, requires the statement to be recent (five minutes for a tap or an unlock, ten for a direct start, thirty for a spawn, a day for an invite or a transfer; `MATRON_APPROVAL_MAX_AGE_MS` lowers all of them) and refuses a statement it has seen before. Sub-sessions, restarts and resumes of sessions already on the box need no new approval. On such a box a signed tap is also checked locally, against the item, the button and the question the agent is shown, and reads `…, verified on this box` or `signature NOT verified on this box: <reason>`.
+
+The keys file:
+
+```json
+{ "keys": [ { "key_id": "<64 hex characters>", "public_key": "<base64url>", "name": "phone" } ] }
+```
+
+- It must be owned by root (or any user other than the one the bridge runs as), must not be writable by its group or by everyone, and must not be a symlink. Agents run as the bridge's user, and a file that user could write would let an agent pin a key of its own. The bridge refuses to start when the rule is broken, and it re-checks the rule and re-reads the file on every approval, so a change takes effect without a restart and a loosened file is refused at once.
+- To produce it: on a signed-in machine, `GET /approval-keys` on the journal lists the account's keys with their `key_id` and `public_key`, and its `journal` field is the host a statement names. Copy the entries for the devices you trust, and compare each `key_id` with the fingerprint that device itself shows (compare the whole id where the device shows it; the short fingerprint is its first 8 characters). An entry whose `public_key` does not hash to its `key_id` is ignored. Never let a box fetch its keys from the journal by itself.
+- Install it with your configuration management, for example `install -o root -g root -m 0644 approval-keys.json /etc/matron/approval-keys.json`.
+
+A statement names the journal by its public host. When the bridge dials the journal by another address, set `MATRON_APPROVAL_JOURNAL_HOST` to that public host.
+
+Limits worth knowing: spent statements, an open unlock window and a lockdown are remembered in files in the bridge user's home, so an agent on the box could delete or edit them; a deleted ledger lets a statement be replayed after the next bridge restart, within its freshness window. Keep the keys file's parent directories unwritable by the bridge's user too. An approval is spent when it is checked, so a start that then fails needs a new one. If the box is renamed in the journal while connected, approvals are refused as `mismatch` until the bridge reconnects.
+
+### Locked mode
+
+`MATRON_LOCKED=1` (which needs the keys file) makes the box take instructions from outside only during an unlock window:
+
+- The user unlocks the box from an app with a statement over `{op:'unlock_box', box:<this box's name>, minutes:'<n>'}`, sent as the `unlock` request. `MATRON_UNLOCK_MAX_MINUTES` caps `n` (default 120). `lock` ends the window early and needs no signature. A bridge restart neither reopens nor extends a window.
+- During a window the bridge accepts the user's messages, files, voice notes, replies and commands only from the device that signed the unlock (the journal stamps each user event with the sending device's key), and room messages from other sessions.
+- Outside a window those are dropped, not queued, and wake no session: the user gets `This box is locked. Unlock it to send instructions.` in the conversation, and another session is told in the room that the box is locked. A signed tap on a step-up question that verifies against the pinned keys is delivered either way, once: the statement is spent, and must be under thirty minutes old.
+- Turns already running continue, and a session's own reminders still fire. Locked mode does not defend against an agent already on the box.
+
+### Lockdown
+
+A genuine app never sends a bad signature. Three approvals within ten minutes that are forged or malformed (a bad signature or a malformed statement) put a box with a keys file into lockdown: it refuses every request that needs an approval, valid or not, for thirty minutes, then an hour, doubling up to a day, closes any unlock window, and files a notice (label `box-lockdown`). The only early way out is a statement over `{op:'clear_lockdown', box:<this box's name>}`, sent as the `clear_lockdown` request. Refusals an honest app can cause (a stale statement, a mismatch, a missing approval, a key the user enrolled but this box does not pin) never count. Anyone who can send requests to the box can trip a lockdown again after it is cleared; it fails towards refusing work, never towards allowing it.
+
+### What an app sees
+
+- **The box's state.** A box with a keys file reports `locked: {on, until, lockdown_until}` on `hello` and `box_status`, and again whenever it changes or a window or lockdown runs out. `on`: the box is in locked mode with no window open; `until`: the end of the open unlock window (ms), else `null`; `lockdown_until`: the end of a lockdown (ms), else `null`. Locked: `{on:true, until:null, lockdown_until:null}`. Unlocked for a while: `{on:false, until:<end>, lockdown_until:null}`. Locked box in lockdown: `{on:true, until:null, lockdown_until:<end>}`; a box that is not in locked mode, in lockdown: `{on:false, until:null, lockdown_until:<end>}`. A box without a keys file sends no `locked` key.
+- **`unlock`, `lock`, `clear_lockdown`** (agent requests; `unlock` and `clear_lockdown` take `params: {approval}`). Success: `result: {locked: {on, until, lockdown_until}}`, the state as it now is. Failure: `error: {code, detail?}` with `code` one of `approval_required` (no approval sent), `approval_invalid` (`detail` is the reason: `bad_statement`, `unknown_key`, `signature`, `mismatch`, `stale`, `nonce_reused`, `keys_file`, `identity_unknown`, `nonce_ledger`, `check_failed`), `bad_minutes` (not a whole number from 1 to the cap), `lockdown` (an unlock during a lockdown), `not_locked` (an unlock on a box that is not in locked mode). A box with no keys file does not have these requests (`unknown_method`).
+- **A refused start.** `error: {code:'approval_required'}` when the request carried no approval, `{code:'approval_invalid', detail:<reason>}` otherwise (the reasons above, and `talk_request`), `{code:'lockdown'}` during a lockdown, and `{code:'account_locked'}` under the account lock. A refused invite is answered `accept: false` with the reason `approval_required: <reason>` (or `account_locked`), and a refused transfer is reported failed with the same text.
+- **A dropped message.** The conversation gets `🔒 This box is locked. Unlock it to send instructions.`; a peer's room gets `<box> is locked; ask the user to unlock it` (at most once in ten minutes per room).
+- **The lockdown notice.** A notice item titled `<box> locked down: invalid approval signatures`, with the label `box-lockdown` and `Box: <box>` as the first line of its body, filed in the box's own bridge conversation.
+
+### Account lock
+
+The journal can lock a whole account (its `panic` broadcast, sent to every box of the account and repeated in the answer to each connect while it lasts). A locked bridge interrupts its running turns and starts no new one from any source: the user's messages, other sessions' room messages, reminders, routines and session control are all refused, as are session starts, chat invites and file transfers. Each affected conversation gets one line: `This account is locked. Sessions are stopped until it is cleared.` Reminders that fall due meanwhile are kept and delivered after the clear.
+
+Only the journal clears the lock; nothing a client, an agent or a signed approval sends to the bridge does. The state is kept on disk, so a bridge that restarts while it cannot reach the journal stays locked until its next connect says otherwise. This needs no setting and no keys file.
+
 ## Repository instructions (MATRON.md)
 
 CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a repository, so instructions there about the tracker, rooms or missions confuse a run outside Matron, which has none of those tools. A repository puts such instructions in a `MATRON.md` instead, and the bridge adds it to the instructions of Matron sessions only.
 
 - **Which files.** Every `MATRON.md` from the repository root (the nearest ancestor of the workdir holding `.git`, so a worktree counts) down to the session's workdir, root first. Outside a repository, only the workdir's own `MATRON.md`. A `MATRON.md` in a subdirectory applies only to sessions whose workdir is inside it; nested files are not loaded on first touch the way Claude Code loads a nested CLAUDE.md.
-- **Where it goes.** In the system prompt the bridge already builds (`--append-system-prompt` for Claude, developer instructions for Codex), after the bridge's own instructions, the Coordinator brief and the notices block, and before the user's memories. Its heading tells the agent that it adds to CLAUDE.md and AGENTS.md and wins over them in a Matron session, and that the user's memories and the bridge's rules on sensitive data and on other people's turns win over it. It is trusted like CLAUDE.md: whatever branch is checked out supplies it.
+- **Where it goes.** In the system prompt the bridge already builds (`--append-system-prompt-file` for Claude, developer instructions for Codex), after the bridge's own instructions, the Coordinator brief and the notices block, and before the user's memories. Its heading tells the agent that it adds to CLAUDE.md and AGENTS.md and wins over them in a Matron session, and that the user's memories and the bridge's rules on sensitive data and on other people's turns win over it. It is trusted like CLAUDE.md: whatever branch is checked out supplies it.
 - **When.** Read afresh at every spawn: start, resume, `/workdir`, `/restart`, `restart_session`, a crash respawn and a bridge restart. An edit reaches a running session at its next restart; a `cd` inside a session changes nothing.
 - **Size.** At most 24 KB in total. Anything past that is cut off, with a line in the prompt saying so and a warning in the bridge log.
 - **Seeing it.** The start, resume, workdir and restart messages and `/status` list the files a session loaded, e.g. `MATRON.md: MATRON.md (3.1 KB)`.

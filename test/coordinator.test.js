@@ -13,6 +13,7 @@ import {
   isModelExplicit,
   planCoordinatorTransition,
   decideCoordinatorEvent,
+  coordinatorNeedsAssigning,
   withCoordinatorModel,
   recreateSpawnModel,
   COORDINATOR_MODEL,
@@ -336,12 +337,12 @@ describe('MATRON.md block plumbing', () => {
 describe('renderMemoryBlock', () => {
   const m = (name, description = `Rule ${name}.`, type = 'feedback', scope) => ({ id: `me_${name}`, name, type, description, ...(scope ? { scope } : {}) });
   it('lists name (type, scope): description per memory, sorted by name, and says which scopes are listed', () => {
-    const out = renderMemoryBlock({ known: true, memories: [m('b-two'), m('a-one', 'Never use elm.', 'user')] });
+    const out = renderMemoryBlock({ known: true, memories: [m('b-two'), m('a-one', 'Never use box-a.', 'user')] });
     expect(out.startsWith('## Your memories\n\n')).toBe(true);
     expect(out).toContain('memory_save');
     expect(out).toContain('Listed here: the global memories only (this session has no repo).\n');
     expect(out).not.toContain('left out');
-    expect(out.endsWith('\n- a-one (user, global): Never use elm.\n- b-two (feedback, global): Rule b-two.')).toBe(true);
+    expect(out.endsWith('\n- a-one (user, global): Never use box-a.\n- b-two (feedback, global): Rule b-two.')).toBe(true);
   });
   it('an ordinary session gets global and its repo, and is told what was left out and how to see it', () => {
     const memories = [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('app-rule', 'Train.', 'project', 'repo:acme-app'), m('infra-rule', 'Infra.', 'project', 'repo:acme-infra'), m('g-rule'), m('odd', 'Odd.', 'feedback', 'team:ops')];
@@ -361,6 +362,28 @@ describe('renderMemoryBlock', () => {
     expect(out).toContain('You are the Coordinator, so every memory is listed with its scope');
     expect(out).not.toContain('left out');
     expect(out.endsWith('\n- app-rule (project, repo:acme-app): Train.\n- c-rule (feedback, coordinator): Compact.\n- g-rule (feedback, global): Rule g-rule.')).toBe(true);
+  });
+  it('on-demand memories are named under their topic, after the always ones; the rest keep the full line', () => {
+    const od = (name, topic, scope) => ({ ...m(name, `Detail of ${name}.`, 'feedback', scope), tier: 'on_demand', ...(topic ? { topic } : {}) });
+    const memories = [m('a-always'), { ...m('b-always'), tier: 'always' }, od('ship-labels', 'shipping'), od('ship-courier', 'shipping'), od('lone'), od('apex-links', 'links'), od('elsewhere', 'shipping', 'repo:other')];
+    const out = renderMemoryBlock({ known: true, memories }, { repo: 'acme-app' });
+    expect(out).toContain('\n- a-always (feedback, global): Rule a-always.\n- b-always (feedback, global): Rule b-always.\n\n### On demand: named only\n\n');
+    expect(out).toContain('read the memory with memory_get before you act, or ask memory_recall');
+    expect(out.endsWith('\n- links: apex-links\n- shipping: ship-courier, ship-labels\n- other: lone')).toBe(true);
+    expect(out).not.toContain('Detail of');
+    expect(out).not.toContain('elsewhere');
+  });
+  it('no on-demand memories, no on-demand section', () => {
+    expect(renderMemoryBlock({ known: true, memories: [m('a'), { ...m('b'), tier: 'always' }] })).not.toContain('On demand');
+  });
+  it('the on-demand index stays inside the cap with many always memories', () => {
+    const memories = [];
+    for (let i = 0; i < 2000; i += 1) memories.push(m(`rule-${String(i).padStart(4, '0')}`, 'x'.repeat(150)));
+    for (let i = 0; i < 50; i += 1) memories.push({ ...m(`od-${i}`), tier: 'on_demand', topic: `topic ${i % 7}` });
+    const out = renderMemoryBlock({ known: true, memories });
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(MEMORY_BLOCK_MAX_BYTES);
+    expect(out).toContain('### On demand: named only');
+    expect(out).toContain('- topic 0: ');
   });
   it('known and empty says there are none; unknown says to call memory_list and never claims none', () => {
     expect(renderMemoryBlock({ known: true, memories: [] })).toMatch(/You have no memories yet\.$/);
@@ -639,5 +662,23 @@ describe('recreateSpawnModel (final review #1)', () => {
   it('Codex keeps its explicit null and ignores any pending model', () => {
     expect(recreateSpawnModel({ agent: 'codex', currentModel: null, pendingModel: 'opus[1m]' })).toBeNull();
     expect(recreateSpawnModel({ agent: 'codex', currentModel: 'gpt-5' })).toBe('gpt-5');
+  });
+});
+
+describe('coordinatorNeedsAssigning', () => {
+  const truth = { fetched: true, known: true, convoId: 'a' };
+  it('a live session the journal names, spawned without the role, gets it', () => {
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: false })).toBe(true);
+  });
+  it('nothing when the answer was not fetched, the role is unknown, or nobody holds it', () => {
+    expect(coordinatorNeedsAssigning({ truth: { ...truth, fetched: false }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: { fetched: false, known: false, convoId: null }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: { ...truth, convoId: null }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: null, live: true, sessionCoordinator: false })).toBe(false);
+  });
+  it('nothing for a session that is not running, already has the role, or has a role change queued', () => {
+    expect(coordinatorNeedsAssigning({ truth, live: false, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: true })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: false, pendingRole: 'assigned' })).toBe(false);
   });
 });

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
+import { createAgentRooms } from '../lib/agent-rooms.js';
 import { createAgentSpawnHandlers } from '../lib/agent-spawn.js';
 
 // Fake publisher + recording rooms/notifyParent, modeled on agent-chat.test.js's
@@ -13,12 +14,12 @@ function mk(overrides = {}) {
     sendRoomOp: overrides.sendRoomOp ?? ((frame) => { sent.push(frame); return true; }),
   };
   const roomsCalls = [];
-  const rooms = {
+  const rooms = overrides.rooms ?? {
     record: (roomId, fields) => { roomsCalls.push({ roomId, fields }); },
     isActive: () => true,
     calls: roomsCalls,
   };
-  const sessions = new Map([['sess-1', { roomId: 'sess-1' }]]);
+  const sessions = overrides.sessions ?? new Map([['sess-1', { roomId: 'sess-1' }]]);
   const notifyParent = vi.fn((args) => notices.push(args));
   const handlers = createAgentSpawnHandlers({
     sessions,
@@ -45,7 +46,7 @@ describe('createAgentSpawnHandlers', () => {
       expect(sent).toHaveLength(1);
       expect(sent[0].op).toBe('spawn_targets');
       expect(typeof sent[0].request_id).toBe('string');
-      const boxesPayload = [{ device_id: 2, name: 'elm', online: true, folders: [], activity: { live_sessions: 0, last_hour: [] } }];
+      const boxesPayload = [{ device_id: 2, name: 'box-a', online: true, folders: [], activity: { live_sessions: 0, last_hour: [] } }];
       handlers.onSpawnFrame({ kind: 'spawn', event: 'targets', request_id: sent[0].request_id, boxes: boxesPayload });
       const res = await p;
       expect(res).toEqual({ status: 200, body: { boxes: boxesPayload } });
@@ -417,8 +418,8 @@ describe('createAgentSpawnHandlers', () => {
     // Coordinator answered the card — the parent must not hear "the user".
     it('decided_by coordinator — declined and started name the Coordinator and its reason, one-lined', async () => {
       const ctx = await armStarted();
-      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined', decided_by: 'coordinator', reason: 'elm is a last-resort box\nuse box-2' });
-      expect(ctx.notices[0].text).toMatch(/declined on the user's behalf \(decided by the user's Coordinator: elm is a last-resort box ⏎ use box-2\)\./);
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined', decided_by: 'coordinator', reason: 'box-a is a last-resort box\nuse box-2' });
+      expect(ctx.notices[0].text).toMatch(/declined on the user's behalf \(decided by the user's Coordinator: box-a is a last-resort box ⏎ use box-2\)\./);
       expect(ctx.notices[0].text).not.toMatch(/the user declined/);
       const ctx2 = await armStarted();
       ctx2.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', decided_by: 'coordinator', reason: 'follows the box rules' });
@@ -701,4 +702,31 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     expect(block).toMatch(/topic: z\.string\(\)\.max\(200\)\.optional\(\)/);
     expect(block).toMatch(/link: z\.boolean\(\)\.optional\(\)/);
   });
+});
+
+describe('spawn room local bindings', () => {
+  it.each(['local', 'remote', 'stale', 'owner', 'invited', 'parent', 'paired'])(
+    'keeps both live local ends only for a target-side guest binding: %s', async (kind) => {
+      const rooms = createAgentRooms();
+      const sessions = new Map([
+        ['sess-1', { roomId: 'sess-1' }],
+        ['child', { roomId: 'child' }],
+      ]);
+      if (kind !== 'remote') rooms.record('channel', {
+        role: kind === 'owner' ? 'owner' : 'guest',
+        state: kind === 'invited' ? 'invited' : 'joined',
+        sessionRoomId: kind === 'parent' ? 'sess-1' : 'child',
+        ...(kind === 'paired' ? { guestSessionRoomId: 'other', guestState: 'joined' } : {}),
+      });
+      if (kind === 'stale') sessions.delete('child');
+      const { handlers, sent, notices } = mk({ rooms, sessions });
+      const pending = handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'Review the changes' });
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'spawn' });
+      await pending;
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'spawn', outcome: 'started', room_id: 'channel', child_convo_id: 'conversation' });
+      expect(rooms.bindingFor('channel', 'sess-1')).toEqual({ role: 'owner', state: 'joined', binding: 'primary' });
+      expect(rooms.get('channel').guestSessionRoomId).toBe(kind === 'local' ? 'child' : kind === 'paired' ? 'other' : null);
+      if (kind === 'local') expect(rooms.bindingFor('channel', 'child')).toEqual({ role: 'guest', state: 'joined', binding: 'guest' });
+      expect(notices).toHaveLength(1);
+    });
 });
