@@ -1422,7 +1422,7 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath, workdir) {
+function generateFileLink(filePath, workdir, pinnedRoots = null) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   // Normalize BEFORE gating and signing: a relative session.workdir (or
   // target) would otherwise resolve against the wrong process cwd in the
@@ -1438,7 +1438,23 @@ function generateFileLink(filePath, workdir) {
     return null;
   }
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
+  // Sign the workdir's pinned identity, not just its pathname, so a workdir
+  // renamed and replaced after the link is minted is rejected at serve time.
+  // Prefer the root pinned at session creation; otherwise pin now (a failure to
+  // resolve means no link, the caller renders plain text).
+  let roots;
+  if (absWorkdir) {
+    try {
+      const pinned = pinnedRoots?.roots?.[0] || pinAllowedRootsSync([absWorkdir]).roots[0];
+      roots = [{ realPath: pinned.realPath, dev: pinned.dev, ino: pinned.ino }];
+    } catch (err) {
+      console.log(`file-link denied (${err.reason || 'bad-workdir'}): ${absTarget}`);
+      return null;
+    }
+  }
+  const payload = Buffer.from(JSON.stringify(roots
+    ? { path: absTarget, exp, workdir: absWorkdir, roots }
+    : { path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
@@ -2056,7 +2072,7 @@ function buildEditDiffPayload(session, toolName, input, label) {
   return {
     file_path: absPath,
     display_path: input.file_path,
-    viewer_url: generateFileLink(absPath, session.workdir),
+    viewer_url: generateFileLink(absPath, session.workdir, session.showFilePinnedRoots),
     tool: toolName,
     label: label || null,
     diff: result.diff,
