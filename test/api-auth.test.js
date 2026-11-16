@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApiAuth, apiAuthRefusal, viewerApiKey, isViewerRoute, namedSessionRoom, NAMES_CONFLICT, operatorHeaderPath } from '../lib/api-auth.js';
+import { createApiAuth, apiAuthRefusal, isOperatorRoute, viewerApiKey, isViewerRoute, namedSessionRoom, NAMES_CONFLICT, operatorHeaderPath } from '../lib/api-auth.js';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'api-auth-'));
@@ -143,5 +143,34 @@ describe('operator token file ownership', () => {
       expect(second.removeOperatorFile(file)).toBe(true);
       expect(fs.existsSync(file)).toBe(false);
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+});
+
+describe('/restart routes', () => {
+  const routes = [['POST', '/restart'], ['GET', '/restart'], ['DELETE', '/restart']];
+  it('opens them to the operator token and nothing else on the operator list', () => {
+    for (const [method, pathname] of routes) {
+      expect(isOperatorRoute(method, pathname)).toBe(true);
+      expect(apiAuthRefusal({ caller: { kind: 'operator' }, method, pathname })).toBe(null);
+    }
+    expect(isOperatorRoute('PUT', '/restart')).toBe(false);
+    expect(isOperatorRoute('GET', '/sessions')).toBe(false);
+  });
+  it('refuses a session token and the viewer key', () => {
+    for (const [method, pathname] of routes) {
+      expect(apiAuthRefusal({ caller: { kind: 'viewer' }, method, pathname }).status).toBe(403);
+      expect(apiAuthRefusal({ caller: { kind: 'session', roomId: 'room-a' }, method, pathname })).not.toBe(null);
+      expect(apiAuthRefusal({ caller: null, method, pathname }).status).toBe(401);
+    }
+  });
+  it('refuses a real session token and viewer key end to end', () => {
+    const auth = createApiAuth({ viewerKey: viewerApiKey('secret') });
+    auth.ensure('room-a');
+    const session = auth.caller({ 'x-matron-session-token': auth.tokenFor('room-a') });
+    const viewer = auth.caller({ 'x-matron-viewer-key': viewerApiKey('secret') });
+    for (const [method, pathname] of routes) {
+      expect(apiAuthRefusal({ caller: session, method, pathname, namedRoomId: null }).status).toBe(403);
+      expect(apiAuthRefusal({ caller: viewer, method, pathname }).status).toBe(403);
+    }
   });
 });

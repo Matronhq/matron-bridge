@@ -288,6 +288,24 @@ viewer signs its calls to the bridge cannot leave secret forms and one-time
 links failing until the machine reboots. `MATRON_CODE_UPDATE_RESTART=0` in
 the viewer's environment turns it off.
 
+### Asking for a bridge restart
+
+A bridge restart can also be requested without any code change, for example
+to pick up a new `.env`. It goes through the same watcher, so it waits for
+the same holds, runs the same preflight, warns every 30 minutes and exits 75.
+The routes take the operator token only (a session token or the viewer key
+is refused), and answer 409 when the watcher is not running:
+
+```sh
+H=${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header
+curl -s -H @"$H" http://127.0.0.1:9802/restart            # dry run: who holds it, and why
+curl -s -H @"$H" -X POST -d '{"reason":"new .env"}' http://127.0.0.1:9802/restart
+curl -s -H @"$H" -X DELETE http://127.0.0.1:9802/restart   # cancel
+```
+
+`./deploy.sh --when-quiet` does the pull, install and preflight, then sends
+that POST instead of restarting at once.
+
 ## Config (.env)
 
 | Variable | Description | Default |

@@ -271,6 +271,7 @@ import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
+import { bridgeRestartResponse } from './lib/bridge-restart.js';
 import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
 import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './lib/header-files.js';
 import { launchWithClaudePromptFile } from './lib/claude-prompt-file.js';
@@ -11366,6 +11367,14 @@ function startAutoResumeSweep() {
   return timer;
 }
 
+// RESTART GATE (dry-run call site): the reason an advisory restart gate would
+// hold a bridge restart right now, or null. There is no gate in this tree, so
+// it is always null; when one exists, report its current verdict here by
+// calling the gate's own function (not by running its command again).
+async function restartGateHoldReason() {
+  return null;
+}
+
 // The live sessions that hold a restart back right now: mid-turn, a live
 // background work child, or a running subagent. Background work and subagents
 // use the idle reaper's age cap, a running turn never does. One process-table
@@ -11404,6 +11413,7 @@ function sessionsHoldingRestart() {
 // flushed) with a non-zero exit so every supervisor relaunches the bridge;
 // an idle session resumes with its history on its next turn, an
 // interrupted one gets a carry-on card at boot (publishRestartCarryOnCards).
+let codeUpdateWatcher = null;
 function startCodeUpdateWatcher() {
   if (!CODE_UPDATE_RESTART) {
     console.log('[code-update] self-restart onto new code: OFF (MATRON_CODE_UPDATE_RESTART)');
@@ -11415,7 +11425,7 @@ function startCodeUpdateWatcher() {
     console.log(`[code-update] self-restart onto new code: OFF (no HEAD reflog under ${__dirname})`);
     return null;
   }
-  const watcher = createCodeUpdateWatcher({
+  const watcher = codeUpdateWatcher = createCodeUpdateWatcher({
     readHead: () => readHeadReflog(gitDir),
     // Share the idle reaper's age cap for background work, while a running
     // turn always holds the update unless forcing is explicitly enabled.
@@ -14006,6 +14016,31 @@ const apiServer = createServer(async (req, res) => {
     }
     res.writeHead(result.status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result.body));
+    return;
+  }
+
+  // /restart (GET dry run, POST ask, DELETE cancel): a bridge restart on
+  // demand, operator token only (isOperatorRoute). No body to speak of, so
+  // it is read here rather than after the generic POST-only check.
+  if (url.pathname === '/restart') {
+    if (refuseApiCall(null)) { req.resume(); return; }
+    let raw = '';
+    req.on('data', chunk => { if (raw.length < 4096) raw += chunk; });
+    req.on('end', async () => {
+      let data = null;
+      try { data = raw.trim() ? JSON.parse(raw) : null; } catch { /* no reason given */ }
+      const r = await bridgeRestartResponse({
+        method: req.method,
+        body: data,
+        watcher: codeUpdateWatcher,
+        holds: sessionsHoldingRestart,
+        gateHold: restartGateHoldReason,
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(r.body));
+      // Do not wait for the next poll when nothing holds the restart.
+      if (req.method === 'POST' && r.status === 202) codeUpdateWatcher?.tick().catch(() => {});
+    });
     return;
   }
 
