@@ -49,6 +49,7 @@ import { createTimelineClient } from './lib/timeline-client.js';
 import { createTimelineHandlers } from './lib/timeline-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
+import { memoryRecallEntry } from './lib/memory-recall-hook.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
 import { formatProposalOutcome } from './lib/memory-format.js';
 import { createUserDefaultsLookup, defaultDeclinedText, defaultOfferFor, defaultSavedText, effectiveDefaultEffort, effectiveDefaultModel } from './lib/user-defaults.js';
@@ -3652,6 +3653,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
         { matcher: 'Bash', hooks: [ivHook('matron-bash-tee')] },
       ],
+      // The user's on-demand memories that bear on each message
+      // (lib/memory-recall-hook.js).
+      UserPromptSubmit: [memoryRecallEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, apiHeaderFile: apiHeaderFileFor(roomId) })],
       Stop: [{
         hooks: [ivHook('stop-notify', { timeout: 10 })],
       }],
@@ -14546,11 +14550,12 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The four memory_* tool routes; same one-matcher allowlist shape.
-      const memoryRoute = url.pathname.match(/^\/memory\/(save|list|get|delete)$/);
+      // The memory_* tool routes and the memory-recall hook's (recall-turn);
+      // same one-matcher allowlist shape.
+      const memoryRoute = url.pathname.match(/^\/memory\/(save|list|get|delete|recall|recall-turn)$/);
       if (memoryRoute) {
         const name = memoryRoute[1];
-        await respondAgentChatRoute(res, data, memoryHandlers[name],
+        await respondAgentChatRoute(res, data, name === 'recall-turn' ? memoryHandlers.recallTurn : memoryHandlers[name],
           (status, b) => debug(`memory/${name} ${status} ${b.error || (b.memory ? b.memory.name : `${(b.memories || []).length} memories`)}`));
         return;
       }
