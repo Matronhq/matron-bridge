@@ -256,7 +256,11 @@ echo "Use port 4001 here." > "$MATRON_WORKTREE_NOTICE_FILE"
     const s = setup('#!/bin/sh\necho staged\n');
     let seen;
     const spawnFn = (cmd, args, opts) => {
-      seen = { cmd, args, opts, mode: fs.statSync(cmd).mode & 0o777, dir: fs.statSync(path.dirname(cmd)).mode & 0o777, body: fs.readFileSync(cmd, 'utf-8') };
+      const fd = fs.openSync(cmd, 'r');
+      const st = fs.fstatSync(fd);
+      const body = fs.readFileSync(fd, 'utf-8');
+      fs.closeSync(fd);
+      seen = { cmd, args, opts, mode: st.mode & 0o777, dir: fs.statSync(path.dirname(cmd)).mode & 0o777, body };
       return spawn('true', [], opts);
     };
     const res = await run(s, { spawnFn });
