@@ -468,6 +468,19 @@ describe('restart gate', () => {
     expect(h2.state.warn.join('\n')).toMatch(/timed out after 5000ms/);
   });
 
+  it('re-checks work after the gate answers: a turn that started meanwhile holds the restart', async () => {
+    const state = {};
+    let release;
+    const slow = () => new Promise(r => { release = () => r({ hold: false }); });
+    const h = harness({ head: landed, gate: gateOf(state, slow) });
+    const p = h.watcher.tick();
+    await Promise.resolve();
+    h.state.busy = 1;
+    release();
+    expect((await p).action).toBe('waiting');
+    expect(h.state.restarts).toEqual([]);
+  });
+
   it('never asks the gate for a forced restart', async () => {
     const state = {};
     const h = harness({ head: { sha: NEW, at: T0 - 10_000 }, busy: 1, settleMs: 10_000, forceAfterMs: 20_000, gate: gateOf(state, { hold: true, reason: 'x' }) });
@@ -506,5 +519,21 @@ describe('createCommandGate', () => {
     expect(await r(Object.assign(new Error('spawn check ENOENT'), { code: 'ENOENT' }))).toEqual({ hold: false, error: 'exit ENOENT' });
     const thrower = vi.fn(() => { throw new Error('bad'); });
     expect(await createCommandGate('check', { exec: thrower })()).toEqual({ hold: false, error: 'bad' });
+  });
+});
+
+describe('createCommandGate with a real child', () => {
+  it('settles on its own deadline when the hook ignores SIGTERM', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const script = path.join(dir, 'hook.js');
+    fs.writeFileSync(script, "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);");
+    try {
+      const gate = createCommandGate(`${process.execPath} ${script}`, { timeoutMs: 200 });
+      const started = Date.now();
+      expect(await gate()).toEqual({ hold: false, error: 'timed out after 200ms' });
+      expect(Date.now() - started).toBeLessThan(3000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
