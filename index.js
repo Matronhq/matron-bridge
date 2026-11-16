@@ -74,7 +74,7 @@ import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue, unwrapScreenUrls, newUrlsAgainst, dropCutUrls, isCutOf } from './lib/prompt-detector.js';
 import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, showsSignInScreen, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
@@ -4346,21 +4346,6 @@ function maybeResolveInteractivePrompt(session, userText) {
   return false;
 }
 
-// Iteratively rejoin URLs that claude wrapped at terminal width. We only
-// merge a `\n` into a URL when the next line begins with characters that
-// can only be URL continuation (no spaces, only URL-safe chars), so prose
-// that happens to follow a URL stays on its own line.
-function unwrapUrls(text) {
-  const URL_HEAD = /(https?:\/\/[A-Za-z0-9=&/%+\-._~?#:@!*'(),;$]+)\n(?!https?:\/\/)([A-Za-z0-9=&/%+\-._~?#]+)/g;
-  let prev;
-  let out = text;
-  do {
-    prev = out;
-    out = out.replace(URL_HEAD, '$1$2');
-  } while (out !== prev);
-  return out;
-}
-
 // Surface free-text TUI output (e.g. the /login OAuth URL screen, "press
 // enter to continue" notices) to the user. Triggered by the prompt-detector's
 // `screen-update` event whenever the screen settles with URLs or input
@@ -4377,17 +4362,26 @@ function handleInteractiveScreenUpdate(session, update) {
   session.surfacedUrls = session.surfacedUrls || new Set();
   // Un-wrap URLs that claude broke across lines at terminal width so
   // the parsed URL set is correct (`...redir\nect_uri=...` → joined).
-  const unwrappedScreen = unwrapUrls(
-    screen.split('\n').map(l => l.trim()).join('\n')
-  );
-  // Build a clean cue-specific message instead of dumping the raw
-  // screen. If the formatter can't make sense of the cue, skip rather
-  // than spam a screen-dump full of status chrome.
-  const allUrls = extractUrls(unwrappedScreen);
-  const newUrls = allUrls.filter(u => !session.surfacedUrls.has(u));
+  const unwrappedScreen = unwrapScreenUrls(screen);
+  const allUrls = dropCutUrls(extractUrls(unwrappedScreen));
+  // Newness is judged on the unwrapped URLs: the detector's are cut at the
+  // wrap, and a wrapped OAuth URL's first line is identical on every sign-in
+  // attempt, so a retry's fresh link read as already sent and never reached
+  // the user.
+  // A mid-repaint capture can cut a URL short: a cut of a link already sent
+  // is not new, but a fuller URL extending a cut that was sent IS (the cut
+  // was unusable), and it replaces the cut. Two sign-in attempts differ
+  // inside the query (state, challenge), never by a prefix.
+  const seen = [...session.surfacedUrls];
+  const newUrls = newUrlsAgainst(seen, allUrls);
   if (newUrls.length === 0 && !hasInputCue) return;
-  for (const u of newUrls) session.surfacedUrls.add(u);
-  // A retry may repaint an older OAuth link above its fresh link.
+  for (const u of newUrls) {
+    for (const v of seen) if (isCutOf(v, u)) session.surfacedUrls.delete(v);
+    session.surfacedUrls.add(u);
+  }
+  // Fresh URLs lead: the sign-in card picks the first OAuth link, and a
+  // stale one still in the capture buffer (a retry's earlier link) must not
+  // be sent in place of the fresh one just marked surfaced.
   const orderedUrls = [...newUrls, ...allUrls.filter(u => !newUrls.includes(u))];
   const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0 });
   // Auto-Enter decision is independent of message formatting: an

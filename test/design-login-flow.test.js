@@ -378,7 +378,6 @@ describe('Design login lifecycle', async () => {
     const { formatTuiCueMessage } = await import('../lib/tui-cue-message.js');
     const update = runInNewContext(`(${functionSource('handleInteractiveScreenUpdate')})`, {
       ...prompt, formatTuiCueMessage,
-      unwrapUrls: runInNewContext(`(${functionSource('unwrapUrls')})`),
       console: { log() {} }, journalSessionState() {}, journalActivity() {},
     });
     const send = vi.fn();
