@@ -236,7 +236,7 @@ import { createTitleSummary } from './lib/title-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, boxVitals, boxVitalsDue, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
@@ -375,6 +375,14 @@ if (isRootOutsideSandbox()) {
 // behaviour, or 0 to disable the reaper entirely).
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
+// Host CPU/RAM on box_status: sampled every HOST_VITALS_SAMPLE_MS (CPU is the
+// busy share over that whole interval), sent when either reading has moved by
+// HOST_VITALS_DELTA_PCT points since the last send, and at least every
+// HOST_VITALS_HEARTBEAT_MS (clients treat a reading over a minute old as stale).
+const HOST_VITALS_SAMPLE_MS = Math.max(5000, parseInt(process.env.HOST_VITALS_SAMPLE_MS || '10000', 10) || 10000);
+const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '8', 10);
+const HOST_VITALS_HEARTBEAT_MS = parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '45000', 10);
+let lastBoxVitalsSent = null; // { cpu_pct, ram_pct, at } of the last send that went out
 // Pre-reap handoff (lib/pre-reap-handoff.js): shortly before the reap, while
 // the prompt cache is still warm, an idle session is asked to refresh its
 // mission status and is compacted when its context is large. Off when the
@@ -1296,10 +1304,12 @@ function publishBoxStatus(reason) {
   let limits = null;
   let disk = null;
   let accountEmail = null;
+  let vitals = null;
   try { activity = buildActivity({ sessions, persisted: loadPersistedSessions() }); } catch { /* best-effort */ }
   try { limits = buildLimits(usageLimitsCache); } catch { /* best-effort */ }
   try { disk = buildDisk({ path: DEFAULT_WORKDIR }); } catch { /* best-effort */ }
   try { accountEmail = getAccountEmail(); } catch { /* best-effort */ }
+  try { vitals = boxVitals(); } catch { /* best-effort */ }
   // What a start with no explicit choice runs as here, so agent_boxes and
   // the spawn consent card can say so (null model/effort: the agent's own
   // default).
@@ -1310,17 +1320,32 @@ function publishBoxStatus(reason) {
       ? { agent, model: codexDefaultModelNow(), effort: codexDefaultEffortNow(), source }
       : { agent, model: defaultModelNow(), effort: defaultEffortNow(), source };
   } catch { /* best-effort */ }
-  if (!activity && !limits && !disk && !accountEmail && !defaults) return false;
+  if (!activity && !limits && !disk && !accountEmail && !vitals && !defaults) return false;
   const sent = journalPublisher.sendRoomOp({
     op: 'box_status',
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
     ...(disk ? { disk } : {}),
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
+    ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
+  if (sent && vitals) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: Date.now() };
+  return sent;
+}
+
+// A box_status carrying only `vitals`: the journal merges it into the box's
+// stored report, so this small frame never replaces the usage and activity
+// blocks. Called after each CPU sample; sends only when boxVitalsDue.
+function publishBoxVitals() {
+  if (!JOURNAL_ENABLED) return false;
+  const vitals = boxVitals();
+  const now = Date.now();
+  if (!boxVitalsDue(lastBoxVitalsSent, vitals, now, { deltaPct: HOST_VITALS_DELTA_PCT, heartbeatMs: HOST_VITALS_HEARTBEAT_MS })) return false;
+  const sent = journalPublisher.sendRoomOp({ op: 'box_status', vitals });
+  if (sent) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: now };
   return sent;
 }
 
@@ -16106,7 +16131,7 @@ async function main() {
   // process open. cpu_pct appears once the first interval has a valid diff.
   // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
   // journal frames, so there's nothing to sample for when journal mode is off.
-  if (JOURNAL_ENABLED) startCpuSampler();
+  if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS, publishBoxVitals);
   // Retention: the relocated codex-viz sink tree lives outside Claude Code's
   // pruned project dirs, so its unredacted JSONL would accumulate forever.
   // Best-effort age-based sweep at boot (never throws).
