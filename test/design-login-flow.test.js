@@ -274,6 +274,15 @@ describe('sign-in card needs an OAuth URL', async () => {
     const screen = `Paste code here if prompted >\n${oauth}`;
     expect(formatTuiCueMessage(screen, [oauth], { hasNewUrls: false })).toBe(null);
   });
+  it('an old OAuth URL repainted beside a new unrelated link is not a new sign-in', () => {
+    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
+    const pr = 'https://example.test/pr/17';
+    const screen = `Paste code here if prompted >\n${oauth}\nMerged as ${pr}`;
+    expect(formatTuiCueMessage(screen, [pr, oauth], { hasNewUrls: true, newUrls: [pr] })).toBe(null);
+    // The same screen with the OAuth URL itself new still gets the card.
+    const msg = formatTuiCueMessage(screen, [oauth, pr], { hasNewUrls: true, newUrls: [oauth, pr] });
+    expect(msg.parts.map(p => p.plain)).toContain(oauth);
+  });
   it('a live sign-in screen still gets the card with its OAuth URL', () => {
     const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
     const screen = `Browser didn't open? Use the url below\n${oauth}\nPaste code here if prompted >`;

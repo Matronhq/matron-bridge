@@ -4561,7 +4561,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // stale one still in the capture buffer (a retry's earlier link) must not
   // be sent in place of the fresh one just marked surfaced.
   const orderedUrls = [...newUrls, ...allUrls.filter(u => !newUrls.includes(u))];
-  const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0 });
+  const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0, newUrls });
   // Auto-Enter decision is independent of message formatting: an
   // acknowledgment screen the formatter can't summarise must STILL be
   // acknowledged, or claude sits blocked on a keystroke the user can't see.
