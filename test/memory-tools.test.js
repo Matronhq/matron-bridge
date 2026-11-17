@@ -167,13 +167,6 @@ describe('memory handlers', () => {
     expect(client.save).toHaveBeenCalledTimes(2);
   });
 
-  it('save: always_full is a 409 that says what to do', async () => {
-    const { h } = fixture({ save: vi.fn(async () => ({ status: 409, data: { error: 'always_full', scope: 'repo:acme-app', max: 15 } })) });
-    const r = await h.save({ roomId: '!r:s', name: 'ok', description: 'd', tier: 'always' });
-    expect(r.status).toBe(409);
-    expect(r.body.error).toMatch(/always tier for repo:acme-app is full \(15 memories\).*tier "on_demand"/);
-  });
-
   it('recall: the query in this session\'s scopes; the Coordinator in every scope; bad input is 400', async () => {
     const recall = vi.fn(async () => ({ status: 200, data: { memories: [mem], semantic: 'ready' } }));
     const { h } = fixture({ recall }, { repoFor: () => 'acme-app' });

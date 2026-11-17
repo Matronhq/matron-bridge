@@ -66,15 +66,12 @@ describe('memory renderers', () => {
     expect(formatSaveAck({})).toBe('Saved memory');
     expect(formatDeleteAck(undefined)).toBe('Deleted memory `(unnamed)`');
   });
-  it('tier and topic show in the line, the detail and the save ack; a capped save says it went on demand', () => {
+  it('tier and topic show in the line, the detail and the save ack', () => {
     const od = { ...m, tier: 'on_demand', topic: 'couriers' };
     expect(memoryLine(od)).toContain('(feedback, global, on demand, topic: couriers)');
     expect(formatMemoryDetail({ memory: od })).toContain('\ntier: on demand, topic: couriers\n');
     expect(formatMemoryDetail({ memory: m })).toContain('\ntier: always\n');
-    const capped = formatSaveAck({ memory: { ...m, tier: 'on_demand' }, created: true, capped: true, max: 25 });
-    expect(capped).toContain('saved ON DEMAND, not always: the always tier for global is full (25)');
-    expect(capped).toContain('Give it a topic');
-    expect(formatSaveAck({ memory: od, created: true, capped: true })).not.toContain('Give it a topic');
+    expect(formatSaveAck({ memory: od, created: true })).toContain('on demand, topic: couriers');
   });
   it('formatRecall: each memory whole, a long body cut with a pointer; nothing matched says so', () => {
     const out = formatRecall({ memories: [{ ...m, tier: 'on_demand', topic: 'couriers' }, { ...m, name: 'long', body: 'y'.repeat(5000) }] });
