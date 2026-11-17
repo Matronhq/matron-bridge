@@ -16,7 +16,7 @@ describe('session convo_upsert reports the repo', () => {
 
   it('adds it to both establishing upserts', () => {
     const publish = index.slice(index.indexOf('function journalPublish('), index.indexOf('function journalPublish(') + 2000);
-    expect(publish).toMatch(/upsertConvo\(convoId, \{ title: session\._journalTitleHint, \.\.\.journalRepoField\(session\) \}\)/);
+    expect(publish).toMatch(/upsertConvo\(convoId, \{ title: session\._journalTitleHint, agentKind: session\.agent, \.\.\.journalRepoField\(session\) \}\)/);
     expect(publish).toMatch(/payload = \{ \.\.\.payload, \.\.\.journalRepoField\(session\) \}/);
     const flush = index.slice(index.indexOf('function journalFlushForSession('), index.indexOf('function journalFlushForSession(') + 800);
     expect(flush).toMatch(/upsertConvo\(convoId, \{ title: session\._journalTitleHint, \.\.\.journalRepoField\(session\) \}\)/);

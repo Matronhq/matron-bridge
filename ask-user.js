@@ -386,7 +386,7 @@ server.tool(
 
 server.tool(
   'agent_sessions',
-  "List this user's 30 most recent agent sessions: conversation id, title, state and is_self. Use the is_self row to find this session's own conversation id.",
+  "List this user's 30 most recent agent sessions: conversation id, title, state, agent kind and is_self. Use the is_self row to find this session's own conversation id.",
   {},
   async () => {
     try {
