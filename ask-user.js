@@ -12,7 +12,7 @@ import { formatUsageHistory } from './lib/usage-history-tool.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings, withStepUpNote } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { formatSearchAll } from './lib/search-format.js';
-import { missionIdemKey } from './lib/missions-idem.js';
+import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatRecall } from './lib/memory-format.js';
 import { formatReminderLine, REMINDER_ID_STRING } from './lib/reminder-tools.js';
@@ -1332,11 +1332,20 @@ server.tool(
 // is testable without a journal). Never isError: a tool result that reads as
 // a sentence keeps the model working instead of retrying blindly.
 async function callItems(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  // item_create and item_comment carry an idempotency key the model never sees:
+  // a harness-retried call would otherwise duplicate the item/comment and
+  // re-upload its attachment blob. The key is derived from the call (op, room,
+  // content, plus the item id for comments) inside a ten-minute bucket, so a
+  // retry replays the existing row. See lib/missions-idem.js.
+  if (name === 'create' || name === 'comment') {
+    payload.idem_key = itemIdemKey({ op: `item_${name}`, roomId: ROOM_ID, args: args || {} });
+  }
   try {
     const res = await bridgeFetch(`${BRIDGE_API}/items/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return { content: [{ type: 'text', text: `item_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
