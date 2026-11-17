@@ -79,7 +79,12 @@ describe('code-update self-restart wiring', () => {
   it('at boot: takes the stamp, resumes only its own interruptions by itself, cards the rest', () => {
     const boot = index.slice(index.indexOf('function publishRestartCarryOnCards()'), index.indexOf('async function main()'));
     // Taken (and removed) before the early return, so it can never outlive the boot it was meant for.
-    expect(boot).toMatch(/const stamp = takeSelfRestartStamp\(SELF_RESTART_STAMP_FILE\);\n\s*if \(!stale\.length\) return;/);
+    expect(boot).toMatch(/const stamp = takeSelfRestartStamp\(SELF_RESTART_STAMP_FILE\);/);
+    expect(boot.indexOf('takeSelfRestartStamp(')).toBeLessThan(boot.indexOf('if (!stale.length) return;'));
+    // Resume notes are picked (and deleted) before the auto/card split, so a noted chat gets one first turn only.
+    expect(boot.indexOf('takeNoteDeliveries(')).toBeGreaterThan(-1);
+    expect(boot.indexOf('takeNoteDeliveries(')).toBeLessThan(boot.indexOf('selectAutoCarryOn('));
+    expect(boot.indexOf('stale = noteResult.stale;')).toBeLessThan(boot.indexOf('selectAutoCarryOn('));
     expect(boot).toMatch(/selectAutoCarryOn\(stale, stamp, \{ enabled: CODE_UPDATE_AUTO_CARRY_ON \}\)/);
     // Same two gates as a card: a persisted session to resume, and a convo id a resume can address.
     // A turn another person started never carries on by itself; it gets a card that names them.
