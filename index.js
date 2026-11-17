@@ -3704,7 +3704,7 @@ function finishCodexTurn(session, {
   // carry-on card. Teardown leaves the marker standing; a genuine end clears
   // it. A deliberate !stop clears it explicitly at its own call site, before
   // killSession runs, so that case does not rely on this branch.
-  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   maybeSummarizeAtTurnEnd(session);
@@ -4211,7 +4211,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.turnCount++;
     session.busy = false;
     // Authoritative iv-mode turn-end seam.
-    inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+    inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
     maybeSummarizeAtTurnEnd(session);
@@ -5917,7 +5917,7 @@ function handleClaudeEvent(session, event) {
         foreignSessions.end(session);
         endTurn(session);
         // Authoritative print-mode turn-end seam.
-        inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+        inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
         clearPendingInterrupt(session);
         // Print-mode's turn-end (this `case 'result':` block is its equivalent
         // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
@@ -6143,7 +6143,7 @@ function handleClaudeEvent(session, event) {
             // This branch IS the turn-end for a print-mode session at a manual
             // compact boundary (the iv branch above delegates to onTurnEnd,
             // which clears the marker there).
-            inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+            inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
             endTurn(session);
             clearPendingInterrupt(session);
           }
@@ -6899,7 +6899,7 @@ function releaseStaleSteerHold(session, why = 'steered message never started a t
   session.busy = false;
   foreignSessions.end(session);
   endTurn(session);
-  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
   clearPendingInterrupt(session);
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
@@ -16087,6 +16087,43 @@ function sessionWorkHold(session, last, now, table) {
   });
 }
 
+// Whether work outlives the turn that just ended: a live background child or a
+// running subagent, by the same rule that holds a restart or the idle reaper
+// (sessionWorkHold, with the turn itself left out: it is the thing that just
+// ended). The marker then stays, as a background marker, so a restart that
+// kills the work leaves a card. An unreadable process table falls back to the
+// in-memory subagent count, as sessionsHoldingRestart does.
+function sessionHasBackgroundWork(session, table = readProcessTable()) {
+  try {
+    const now = Date.now();
+    const hold = table.unreadable
+      ? workHold({ subagentCount: session.subagentConvos?.runningCount() ?? 0, idleSince: now, now })
+      : sessionWorkHold(Object.create(session, { busy: { value: false } }), now, now, table);
+    return !!hold;
+  } catch {
+    // A failed observation must not erase the evidence that work was running.
+    return true;
+  }
+}
+
+// Keeps background markers honest while no turn runs: refreshed while the
+// work is still there (so a job that outlives the carry-on window still gets
+// its card), dropped once it is gone. The process table is read once per tick,
+// and only when some session has such a marker.
+function startBackgroundMarkerMaintenance() {
+  setInterval(() => {
+    let table;
+    for (const session of sessions.values()) {
+      if (!session.alive || session._autoStopped || session.busy) continue;
+      const convoId = journalConvoIdFor(session);
+      if (!inflightMarker.isBackground(convoId)) continue;
+      table ??= readProcessTable();
+      if (sessionHasBackgroundWork(session, table)) inflightMarker.refreshBackground(convoId);
+      else inflightMarker.clearBackground(convoId);
+    }
+  }, SESSION_IDLE_CHECK_MS).unref();
+}
+
 // --- Pre-reap handoff (lib/pre-reap-handoff.js) ---
 //
 // Fired from the reaper tick above at PRE_REAP_HANDOFF.idleMs of idleness.
@@ -16335,7 +16372,9 @@ function publishRestartCarryOnCards() {
   // A turn another person started never carries on by itself: it would run
   // as the user's own turn with that person's request still in it. It gets
   // the card below, which says whose turn it was.
-  const autoResumable = auto.filter(rec => !rec.foreignPerson && resumable.has(rec.convoId) && isResumeConvoId(rec.convoId));
+  const autoResumable = auto.filter(rec => !rec.foreignPerson && resumable.has(rec.convoId) && isResumeConvoId(rec.convoId))
+    // Background work is not a turn to carry on: it gets the card.
+    .filter(rec => rec.kind !== 'background');
   if (autoResumable.length) {
     try { console.log(`[code-update] ${autoResumable.length} chat(s) cut off by the self-restart onto ${String(stamp.sha || '').slice(0, 7)} carry on by themselves in ${CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS}ms`); } catch { /* logging must never throw */ }
     setTimeout(() => {
@@ -16371,7 +16410,9 @@ function publishRestartCarryOnCards() {
     }
     const question = rec.foreignPerson
       ? `⚠️ The bridge restarted during a turn ${peerField(rec.foreignPerson, PEER_NAME_MAX)} started in this chat — interrupted ${formatInterruptedAgo(rec.ageMs)}. Carry on runs as your own turn, with their request still in it.`
-      : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
+      : rec.kind === 'background'
+        ? `⚠️ The bridge restarted while this chat had background work running — interrupted ${formatInterruptedAgo(rec.ageMs)}. The background work stopped where it was.`
+        : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
     const published = journalPublishCardForConvo(rec.convoId, {
       question,
       options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
@@ -16401,6 +16442,8 @@ async function main() {
 
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
   console.log(`Default workdir: ${DEFAULT_WORKDIR}`);
+  // Independent of the idle reaper: background markers must stay fresh either way.
+  startBackgroundMarkerMaintenance();
   if (SESSION_IDLE_TIMEOUT_MS > 0) {
     console.log(`Session idle timeout: ${SESSION_IDLE_TIMEOUT_MS}ms (check every ${SESSION_IDLE_CHECK_MS}ms)`);
     startIdleReaper();
