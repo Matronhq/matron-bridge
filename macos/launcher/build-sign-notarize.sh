@@ -117,7 +117,7 @@ if [ "$notarize" = 1 ]; then
   xcrun stapler validate "$app"
   # Zip again so the published zip carries the stapled ticket.
   make_zip
-  spctl --assess --type execute --verbose=2 "$app"
+  /usr/sbin/spctl --assess --type execute --verbose=2 "$app"
 fi
 
 echo

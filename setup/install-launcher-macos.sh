@@ -90,7 +90,7 @@ fi
 if [ "$allow_unnotarized" = 1 ]; then
   echo "Skipping the Gatekeeper check (--allow-unnotarized)."
 else
-  spctl --assess --type execute "$new" 2>/dev/null ||
+  /usr/sbin/spctl --assess --type execute "$new" 2>/dev/null ||
     die "Gatekeeper rejects the app (not notarised?). Use a notarised build, or --allow-unnotarized for a local test build."
 fi
 
