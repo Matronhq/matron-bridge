@@ -12378,7 +12378,7 @@ function deliverRoomFrameTo(room, frame) {
   }
   if (!body) return;
   let session = sessions.get(room.sessionRoomId);
-  const live = !!(session && session.alive);
+  let live = !!(session && session.alive);
   // The user's copy of the peer's message. The agent-facing injection below
   // passes skipJournalMirror (the message is durable in the room convo), so
   // without this the session conversation shows the agent's REPLY to a peer
@@ -12404,7 +12404,14 @@ function deliverRoomFrameTo(room, frame) {
   // Runs BEFORE this message's own notice so the journal reads in the order
   // things happened: any ⏳ from an earlier batch is closed by its 📨 above
   // the 💬 line for the message that arrived after it.
-  if (live) maybeFlushRoomDelivery(session);
+  if (live) {
+    maybeFlushRoomDelivery(session);
+    // The flush can run a parked command that replaces or ends the session.
+    // Re-read it so the rest of this delivery targets the session that exists
+    // now, not the one that was just retired.
+    session = sessions.get(room.sessionRoomId);
+    live = !!(session && session.alive);
+  }
   const echoFrom = roomEchoLabel(sender, from);
   const roomTitle = room.title || room.topic || null;
   // Mute gate (2026-08-19). agent_chat_mute replaced agent_chat_leave as the
@@ -12795,7 +12802,13 @@ function journalInjectInviteRequest(frame) {
   // helper flips the binding only once the journal has let the answer stand;
   // otherwise the room stays pending and the agent gets the accept/refuse
   // ask below, whose agent_chat_accept retries the answer properly.
-  if (!isJoin && !frame.local) {
+  //
+  // Only an ADDRESSED request auto-joins. An unaddressed one (a peer bridge
+  // that predates target_convo_id) was routed here by a guess among live
+  // sessions (lib/invite-target.js); auto-joining would bind a room into a
+  // conversation it was never meant for with the user's notice suppressed, so
+  // the guessed session keeps the explicit accept/refuse ask.
+  if (!isJoin && !frame.local && addressed) {
     deliverAutoJoinedRequest(session, frame, room, { addressed })
       .catch((e) => { try { console.warn(`[agent-invites] joined-room delivery for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
     return;
