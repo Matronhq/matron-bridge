@@ -93,7 +93,7 @@ describe('takeNoteDeliveries', () => {
     const stamp = { bootId: 'b1' };
     const stale = [{ convoId: 'c1', bootId: 'b1', ageMs: 5 }, { convoId: 'c2', bootId: 'b1', ageMs: 5 }];
     const r = takeNoteDeliveries({ store, stale, resumable, now: () => NOW });
-    expect(r.deliveries).toEqual([{ convoId: 'c1', text: 'finish the deploy check', ageMs: 10 * MIN }]);
+    expect(r.deliveries).toEqual([{ convoId: 'c1', text: 'finish the deploy check', ageMs: 10 * MIN, interrupted: true }]);
     const { auto, card } = selectAutoCarryOn(r.stale, stamp, { enabled: true });
     const firstTurns = [...r.deliveries.map(d => d.convoId), ...auto.map(a => a.convoId), ...card.map(c => c.convoId)];
     expect(firstTurns.filter(id => id === 'c1')).toHaveLength(1);
@@ -112,6 +112,7 @@ describe('takeNoteDeliveries', () => {
     const store = setup([['c3', 'idle note']]);
     const r = takeNoteDeliveries({ store, stale: [], resumable, now: () => NOW });
     expect(r.deliveries.map(d => d.convoId)).toEqual(['c3']);
+    expect(r.deliveries[0].interrupted).toBe(false);
   });
 
   it('deletes the notes before returning them', () => {
@@ -162,5 +163,10 @@ describe('restartNoteTurnText', () => {
     expect(t).toContain('The bridge restarted');
     expect(t).toContain('10 min');
     expect(t).toContain('<line>');
+    expect(t).not.toContain('cut your turn off');
+  });
+
+  it('says a turn was cut off when the chat was interrupted', () => {
+    expect(restartNoteTurnText('line', 10 * MIN, undefined, true)).toContain('It cut your turn off mid-way');
   });
 });

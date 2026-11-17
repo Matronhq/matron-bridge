@@ -16013,7 +16013,7 @@ function publishRestartCarryOnCards() {
     setTimeout(() => {
       for (const note of noteResult.deliveries) {
         void carryOnConvo(note.convoId, null, null,
-          restartNoteTurnText(note.text, note.ageMs, frameSafeBody),
+          restartNoteTurnText(note.text, note.ageMs, frameSafeBody, note.interrupted),
           '🔄 The bridge restarted — resuming this chat with the note you left for it.',
           { causes: [carryOnCause()] });
       }
