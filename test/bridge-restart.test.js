@@ -172,6 +172,34 @@ describe('requested bridge restart (watcher)', () => {
     expect(state.preflights).toBe(2);
   });
 
+  it('a tick during a held gate call after a cancel does not break the gated tick', async () => {
+    let release;
+    const { state, watcher } = withGate(onBoot, () => new Promise((resolve) => { release = () => resolve({ hold: true, reason: 'busy' }); }));
+    watcher.request({ reason: 'x' });
+    const t = watcher.tick();
+    for (let i = 0; i < 5 && !release; i++) await Promise.resolve();
+    watcher.cancelRequest();
+    expect((await watcher.tick()).action).toBe('none');
+    release();
+    expect((await t).action).toBe('none');
+    expect(watcher.gateHoldReason).toBeNull();
+    expect(state.restarts).toHaveLength(0);
+  });
+
+  it('an update whose HEAD goes back to boot during a held gate call ends cleanly', async () => {
+    let release;
+    const { state, watcher } = withGate({ sha: NEW, at: T0 - 60 * 60_000 }, () => new Promise((resolve) => { release = () => resolve({ hold: true, reason: 'busy' }); }));
+    const t = watcher.tick();
+    for (let i = 0; i < 5 && !release; i++) await Promise.resolve();
+    state.head = onBoot;
+    expect((await watcher.tick()).action).toBe('none');
+    release();
+    await expect(t).resolves.toMatchObject({ action: 'waiting' });
+    expect((await watcher.tick()).action).toBe('none');
+    expect(watcher.gateHoldReason).toBeNull();
+    expect(state.restarts).toHaveLength(0);
+  });
+
   it('keeps a failed preflight pending and reports it', async () => {
     const { state, watcher } = harness({ head: onBoot, preflightOk: false });
     watcher.request({ reason: 'x' });
