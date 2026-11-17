@@ -4,10 +4,9 @@
 #
 #   bash setup/install-launcher-macos.sh <Matron-Bridge-x.y.z.zip | Matron Bridge.app> [options]
 #
-# --team-id <id>         the Apple team the app must be signed by. Without it,
-#                        an update must come from the same team as the app
-#                        already installed, and a first install shows the team
-#                        it found.
+# --team-id <id>         the Apple team the app must be signed by. Required
+#                        for a first install. An update without it must come
+#                        from the same team as the app already installed.
 # --dest <dir>           where to install (default $HOME/Applications)
 # --allow-unnotarized    skip the Gatekeeper check, for a local test build
 #
@@ -79,7 +78,12 @@ expected="$team_id"
 if [ -z "$expected" ] && [ -d "$installed" ]; then
   expected="$(team_of "$installed")"
 fi
-if [ -n "$expected" ] && [ "$new_team" != "$expected" ]; then
+if [ -z "$expected" ]; then
+  # Gatekeeper trusts every Developer ID team, so on a first install only an
+  # explicit team stops an app signed by someone else from being accepted.
+  die "first install: pass --team-id with the team you expect. This app is signed by team '${new_team:-none: ad hoc}'; check that it is yours."
+fi
+if [ "$new_team" != "$expected" ]; then
   die "the app is signed by team '${new_team:-none}', expected '$expected'. Permission grants are tied to the team, so a different team would lose them."
 fi
 

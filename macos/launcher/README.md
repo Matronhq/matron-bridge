@@ -83,7 +83,7 @@ The output is `macos/launcher/build/Matron Bridge.app` and
 ## Installing and switching the service over
 
 ```sh
-bash setup/install-launcher-macos.sh macos/launcher/build/Matron-Bridge-1.0.0.zip
+bash setup/install-launcher-macos.sh macos/launcher/build/Matron-Bridge-1.0.0.zip --team-id <team id>
 bash setup/service.sh
 open -a "$HOME/Applications/Matron Bridge.app" --args --request-permissions
 ```
@@ -92,9 +92,17 @@ Then, in System Settings ▸ Privacy & Security, switch on **Matron Bridge**
 under Accessibility and Screen Recording, and remove the old `node` (or
 `matron-bridge`) rows.
 
+The team ID is the 10-character code in brackets after the signing
+certificate's name, also shown as `TeamIdentifier` by
+`codesign -dv "Matron Bridge.app"`. A first
+install needs it, because Gatekeeper accepts an app signed by any Developer
+ID team; updates may leave it out and must then match the installed app.
+
 The installer checks the app's signature, bundle identifier and Gatekeeper
 verdict, and that its team matches `--team-id` or the app already installed,
-before it swaps the new app in by rename. `setup/service.sh` uses the app
+before it swaps the new app in by rename. Between the two renames there is a
+moment with no app at the path; a bridge starting in that moment fails and
+launchd's KeepAlive starts it again. `setup/service.sh` uses the app
 only when it is installed at `$HOME/Applications/Matron Bridge.app` (or
 `MATRON_LAUNCHER_APP`) and its signature verifies; otherwise it writes the
 plain node service as before. `MATRON_LAUNCHER=0` opts out. Only the bridge
