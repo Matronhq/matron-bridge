@@ -187,6 +187,7 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { loadBridgePlugins } from './lib/bridge-plugins.js';
 import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
@@ -1319,10 +1320,17 @@ function publishBoxStatus(reason) {
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
     ...(defaults ? { defaults } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
+    ...pluginsReport(),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
   return sent;
 }
+
+// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
+// Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
+const bridgePlugins = await loadBridgePlugins({
+  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
+});
 
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
@@ -1340,7 +1348,7 @@ const journalPublisher = createJournalPublisher({
   onPanic: (panic, { hello }) => (hello ? accountLock.onHello(panic) : accountLock.onFrame(panic)),
   // The box's lock, said on every hello: a hello without it reads as "not
   // locked". A box without approval keys sends nothing.
-  helloExtras: () => (boxLock ? { locked: boxLock.report() } : null),
+  helloExtras: () => ({ ...(boxLock ? { locked: boxLock.report() } : {}), ...pluginsReport() }),
   // The user's settings: hello_ok's (or GET /settings when it carries none)
   // and every pushed change.
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
@@ -1754,7 +1762,11 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
+const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
+
+
 const journalRpcHandler = createRpcRequestHandler({
+  plugins: bridgePlugins,
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
   // The !stop teardown for the unsupported_mode orphan: kill, drop from the
