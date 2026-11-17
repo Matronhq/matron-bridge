@@ -6263,6 +6263,9 @@ function handleClaudeEvent(session, event) {
               }
             }
           }
+          if (block.type === 'tool_result' && session.foreignTurn) {
+            foreignSessions.onToolResult(session, block).catch(() => {});
+          }
           if (block.type === 'tool_result' && block.is_error) {
             debug(`Auto tool_result: tool_use_id=${block.tool_use_id}, content=${JSON.stringify(block.content).slice(0, 100)}`);
           }
