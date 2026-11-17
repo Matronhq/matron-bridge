@@ -65,7 +65,9 @@ import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron
 import { createWorktreeLedger } from './lib/worktree-ledger.js';
 import { createConsentStore } from './lib/worktree-setup.js';
 import { createSetupFlow } from './lib/worktree-setup-flow.js';
+import { createSizeCache } from './lib/worktree-size.js';
 import { createWorktreeService, WorktreeRemovedError } from './lib/worktree-service.js';
+import { createCleanupService, discardQuestion, verifyDiscardTap } from './lib/worktree-cleanup-service.js';
 import { extractWorktreeFlag, worktreeHeaderLine, worktreeNoticeBlock } from './lib/worktree.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
@@ -1334,6 +1336,9 @@ function publishBoxStatus(reason) {
       ? { agent, model: codexDefaultModelNow(), effort: codexDefaultEffortNow(), source }
       : { agent, model: defaultModelNow(), effort: defaultEffortNow(), source };
   } catch { /* best-effort */ }
+  // Count and (cached) size of the worktrees this box made; omitted when none.
+  let worktreeSummary = null;
+  try { worktreeSummary = worktreeCleanup.summary(); } catch { /* best-effort */ }
   if (!activity && !limits && !disk && !accountEmail && !vitals && !defaults) return false;
   const sent = journalPublisher.sendRoomOp({
     op: 'box_status',
@@ -1343,6 +1348,7 @@ function publishBoxStatus(reason) {
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
     ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
+    ...(worktreeSummary ? { worktrees: worktreeSummary } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
     ...pluginsReport(),
   });
@@ -1601,6 +1607,27 @@ const worktreeService = createWorktreeService({
   ledger: worktreeLedger,
   setup: worktreeSetup,
 });
+// Clean-up on archive/delete, and the picker view with cached sizes.
+const worktreeCleanup = createCleanupService({
+  ledger: worktreeLedger,
+  sizes: createSizeCache(),
+  // Discarding work that exists nowhere else needs a signed tap on a
+  // question this bridge files for exactly that worktree.
+  stepUp: {
+    file: async (args) => {
+      const res = await itemsClient.create({ ...discardQuestion(args), awaiting: 'user' });
+      return res?.status >= 200 && res.status < 300 && res.data?.step_up_ignored !== true ? (res.data?.item?.id ?? null) : null;
+    },
+    verify: async (itemId, subject) => {
+      const res = await itemsClient.getAsStored(itemId);
+      if (res?.status !== 200) return false;
+      return verifyDiscardTap(res.data, subject, {
+        check: tapVerifier ? (data, tap) => tapVerifier.forThread(data, tap) : null,
+      });
+    },
+    consume: (itemId) => itemsClient.close(itemId, { resolution: 'answered', comment: 'Discarded.' }),
+  },
+});
 
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   recentFolders.touch(workdir, Date.now());
@@ -1832,6 +1859,18 @@ const journalRpcHandler = createRpcRequestHandler({
   },
   listPersistedSessions: () => Object.values(loadPersistedSessions()),
   listRememberedFolders: () => recentFolders.list(),
+  describeWorktrees: () => worktreeCleanup.describe(),
+  worktreeCleanup: (args) => worktreeCleanup.cleanup(args),
+  worktreeInUse: (wtPath) => {
+    const base = wtPath.replace(/\\/g, '/');
+    return [...sessions.values()].some((sess) => {
+      const dir = typeof sess?.workdir === 'string' ? sess.workdir.replace(/\\/g, '/') : '';
+      return sess?.alive && (dir === base || dir.startsWith(`${base}/`));
+    });
+  },
+  fileWorktreeNotice: ({ title, body, convoId }) => {
+    Promise.resolve(itemsClient.create({ kind: 'notice', title, body, labels: ['worktree'], convo_id: convoId || JOURNAL_CONTROL_CONVO_ID })).catch(() => {});
+  },
   defaultWorkdir: DEFAULT_WORKDIR,
   // Gates model selection (the `model` param and the picker's
   // model_options) — an RPC start mints a fresh convo, so this box default
