@@ -16460,9 +16460,18 @@ async function main() {
   // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
   // journal frames, so there's nothing to sample for when journal mode is off.
   if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS, publishBoxVitals);
-  // box_status heartbeat: publishBoxStatus is a no-op while disconnected
+  // box_status heartbeat, Codex boxes only: it exists so the Codex quota lines
+  // (account-scoped, no session to trigger them) do not go stale on an idle
+  // box. A Claude-only box has no Codex lines to refresh and keeps its
+  // turn-driven publishes. publishBoxStatus is a no-op while disconnected
   // (sendRoomOp refuses), so this only reports while connected.
-  _boxStatusRepublishHandle = setInterval(() => publishBoxStatus('heartbeat'), BOX_STATUS_REPUBLISH_MS);
+  _boxStatusRepublishHandle = setInterval(() => {
+    if (!codexSpawnable()) return;
+    // Throttled, and republishes on its own when new lines land; the publish
+    // below carries whatever is cached so the heartbeat itself stays cheap.
+    refreshCodexLimits();
+    publishBoxStatus('heartbeat');
+  }, BOX_STATUS_REPUBLISH_MS);
   if (typeof _boxStatusRepublishHandle.unref === 'function') _boxStatusRepublishHandle.unref();
   // Retention: the relocated codex-viz sink tree lives outside Claude Code's
   // pruned project dirs, so its unredacted JSONL would accumulate forever.
