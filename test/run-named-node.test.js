@@ -194,8 +194,14 @@ exec '${fakeNode}' "$@"
     for (const dir of [path.join(prefix, 'lib'), path.join(tmp, 'lib-alias')]) {
       const res = run(['matron-test', 'a.js'], { NODE_BIN: brewNode, MATRON_NAMED_NODE_DIR: dir });
       expect(res.status).toBe(0);
-      expect(fs.lstatSync(lib).isFile()).toBe(true);
-      expect(fs.readFileSync(lib, 'utf8')).toBe('lib');
+      // O_NOFOLLOW fails on a symlink, so this reads the library only if it
+      // is still a regular file, with no separate stat beforehand.
+      const fd = fs.openSync(lib, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        expect(fs.readFileSync(fd, 'utf8')).toBe('lib');
+      } finally {
+        fs.closeSync(fd);
+      }
     }
   });
 
