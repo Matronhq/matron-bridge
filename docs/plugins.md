@@ -20,6 +20,9 @@ going) a plugin whose file:
   others, unless that directory is sticky and owned by root (like `/tmp`), or
   that is owned by someone other than root or the bridge's user.
 
+A plugin whose import or `register()` has not finished after 10 seconds is
+logged and skipped the same way; the bridge keeps starting.
+
 Symlinks are followed and the checks apply to the resolved file, which is also
 the file that gets imported.
 

@@ -94,6 +94,18 @@ describe('loadBridgePlugins', () => {
     expect(warnings[0]).toMatch(/gone\.mjs/);
   });
 
+  it.skipIf(!posix)('skips a plugin whose import or register() hangs and still loads the next', async () => {
+    const dir = path.join(home, 'plugins');
+    const slowImport = writePlugin(dir, 'slow-import.mjs', 'await new Promise(() => {});\nexport default () => ({ name: \'si\', handlers: {} });\n');
+    const slowRegister = writePlugin(dir, 'slow-register.mjs', 'export default () => new Promise(() => {});\n');
+    const ok = writePlugin(dir, 'ok.mjs', okSrc('aa'));
+    const plugins = await load([slowImport, slowRegister, ok], { timeoutMs: 100 });
+    expect(plugins.map((p) => p.name)).toEqual(['aa']);
+    expect(warnings.length).toBe(2);
+    expect(warnings[0]).toMatch(/slow-import\.mjs.*import timed out/);
+    expect(warnings[1]).toMatch(/slow-register\.mjs.*register\(\) timed out/);
+  });
+
   it.skipIf(!posix)('refuses a method without the x_<plugin>_ prefix', async () => {
     const file = writePlugin(path.join(home, 'plugins'), 'bad.mjs',
       "export default () => ({ name: 'demo', handlers: { start: () => ({}) } });\n");
