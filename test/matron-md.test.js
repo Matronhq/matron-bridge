@@ -320,7 +320,7 @@ describe('repoInstructionsPointer (a workdir outside any repository)', () => {
 });
 
 describe('repoInstructionsPointer containment and scan limit', () => {
-  it('does not name an instruction file that is a symlink out of its repository', () => {
+  it.skipIf(process.platform === 'win32')('does not name an instruction file that is a symlink out of its repository', () => {
     fs.mkdirSync(path.join(tmp, 'work/alpha/.git'), { recursive: true });
     write('outside.md', 'secret');
     fs.symlinkSync(path.join(tmp, 'outside.md'), path.join(tmp, 'work/alpha/MATRON.md'));
