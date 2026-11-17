@@ -287,9 +287,9 @@ timeout counts as safe (logged). A hold expires after the work-hold age cap
 `MATRON_RESTART_GATE_ON_ERROR=hold` the other-exit-code, spawn-failure and
 timeout cases hold too, with the error as the reason, instead of counting as
 safe. With either setting on, nothing but the gate ends a hold, so a hold
-that goes on for two hours (ten minutes when the gate itself is failing) is
-reported once as a notice in the bridge's own chat, along with how to get past
-it. A forced restart (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) never asks the
+that goes on for 30 minutes (`MATRON_RESTART_GATE_NOTICE_AFTER_MS`, a gate
+that keeps failing included) is reported once as a notice in the bridge's own
+chat, along with how to get past it. A forced restart (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) never asks the
 gate, and neither does `POST /restart` with `{"force": true}` (sessions with
 work in flight still hold it). Unset, nothing changes. Sessions between turns resume with their history on their next turn,
 as with any restart. The exit code is 75, non-zero on purpose: launchd only
@@ -379,6 +379,7 @@ that POST instead of restarting at once.
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MATRON_RESTART_GATE_CMD` | Advisory hook for the self-restart onto new code (see above): a command, split on whitespace, run with a 5 s timeout once no session holds work, in its own process group (a timeout kills the whole group) and with a minimal environment: `PATH`, `HOME` and any `MATRON_RESTART_GATE_*` variables, not the bridge's tokens. Exit 0 = restart, exit 1 = hold (first stdout line is the reason shown in the waiting warning). By default anything else, or a timeout, counts as safe and a hold expires after eight hours; see the two settings below. Never consulted for a forced restart or a `POST /restart` made with `{"force": true}` | _(unset: no gate)_ |
 | `MATRON_RESTART_GATE_MAX_HOLD_MS` | How long a gate hold lasts before the restart goes ahead anyway. `0` = a hold never lapses, so the gate is authoritative. Digits only; anything else (`0s`, `8h`, `0.5`) is ignored and the eight hours apply, as before | _(unset: 8 h)_ |
+| `MATRON_RESTART_GATE_NOTICE_AFTER_MS` | With the gate made authoritative (the two settings below), how long a hold lasts before one notice about it goes to the bridge's own chat, with how to get past it (`POST /restart` with `{"force": true}`). Digits only, at least 1 | _(unset: 30 min)_ |
 | `MATRON_RESTART_GATE_ON_ERROR` | `hold`: a gate that errors, times out or cannot start holds the restart (reason `gate error: ...`, warned once per distinct error) instead of counting as safe. Any other value: advisory, as before | _(unset: errors count as safe)_ |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |

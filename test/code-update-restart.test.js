@@ -538,6 +538,15 @@ describe('restart gate', () => {
     expect((await busy.watcher.tick()).action).toBe('waiting');
   });
 
+  it('logs a forced request, and says nothing about force otherwise', () => {
+    const f = harness({ head: landed });
+    f.watcher.request({ reason: 'x', force: true });
+    expect(f.state.log.join('\n')).toMatch(/force: the restart gate is skipped/);
+    const n = harness({ head: landed });
+    n.watcher.request({ reason: 'x' });
+    expect(n.state.log.join('\n')).not.toMatch(/force/);
+  });
+
   it('a request without force is still held by the gate', async () => {
     const h = harness({ head: landed, gate: gateOf({}, { hold: true, reason: 'backup' }), gateMaxMs: 0 });
     h.watcher.request({ reason: 'x' });
@@ -545,25 +554,25 @@ describe('restart gate', () => {
     expect((await h.watcher.tick()).action).toBe('waiting');
   });
 
-  it('notifies once when an authoritative hold goes on long, sooner when the gate itself fails', async () => {
+  it('notifies once when an authoritative hold goes on long, and when the gate itself keeps failing', async () => {
     const notes = [];
     const h = harness({ head: landed, gate: gateOf({}, { hold: true, reason: 'backup' }), gateMaxMs: 0, notify: (m) => notes.push(m) });
     await h.watcher.tick();
-    h.state.now = T0 + 2 * 3600_000 - 1;
+    h.state.now = T0 + 30 * 60_000 - 1;
     await h.watcher.tick();
     expect(notes).toHaveLength(0);
-    h.state.now = T0 + 2 * 3600_000;
+    h.state.now = T0 + 30 * 60_000;
     await h.watcher.tick();
     h.state.now = T0 + 3 * 3600_000;
     await h.watcher.tick();
     expect(notes).toHaveLength(1);
-    expect(notes[0]).toMatch(/held by the restart gate for 120 min \(backup\)/);
+    expect(notes[0]).toMatch(/held by the restart gate for 30 min \(backup\)/);
     expect(notes[0]).toMatch(/"force": true/);
 
     const errNotes = [];
     const e = harness({ head: landed, gate: gateOf({}, { hold: false, error: 'spawn /nope ENOENT' }), gateMaxMs: 0, gateOnError: 'hold', notify: (m) => errNotes.push(m) });
     await e.watcher.tick();
-    e.state.now = T0 + 10 * 60_000;
+    e.state.now = T0 + 30 * 60_000;
     await e.watcher.tick();
     expect(errNotes).toHaveLength(1);
     expect(errNotes[0]).toMatch(/gate error: spawn \/nope ENOENT/);
@@ -576,6 +585,11 @@ describe('restart gate', () => {
     h.state.now = T0 + 3 * 3600_000;
     await h.watcher.tick();
     expect(notes).toHaveLength(0);
+    const c = harness({ head: landed, gate: gateOf({}, { hold: true, reason: 'backup' }), gateMaxMs: 0, gateNoticeAfterMs: 5 * 60_000, notify: (m) => notes.push(m) });
+    await c.watcher.tick();
+    c.state.now = T0 + 5 * 60_000;
+    await c.watcher.tick();
+    expect(notes).toHaveLength(1);
     const t = harness({ head: landed, gate: gateOf({}, { hold: true, reason: 'backup' }), gateMaxMs: 0, notify: () => { throw new Error('x'); } });
     await t.watcher.tick();
     t.state.now = T0 + 3 * 3600_000;

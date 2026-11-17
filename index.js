@@ -11673,7 +11673,11 @@ function startCodeUpdateWatcher() {
     gateMaxMs: /^\d+$/.test(String(process.env.MATRON_RESTART_GATE_MAX_HOLD_MS ?? '').trim())
       ? parseCodeUpdateMsOrOff(String(process.env.MATRON_RESTART_GATE_MAX_HOLD_MS).trim(), undefined)
       : undefined,
-    // A long hold under the opt-in modes is reported to the bridge's own chat.
+    // A long hold under the opt-in modes is reported to the bridge's own chat
+    // after MATRON_RESTART_GATE_NOTICE_AFTER_MS (digits only; default 30 min).
+    gateNoticeAfterMs: /^[1-9]\d*$/.test(String(process.env.MATRON_RESTART_GATE_NOTICE_AFTER_MS ?? '').trim())
+      ? Number(String(process.env.MATRON_RESTART_GATE_NOTICE_AFTER_MS).trim())
+      : undefined,
     notify: (text) => { try { journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, `⚠️ ${text}`); } catch { /* a notice must never break the watcher */ } },
     gateOnError: String(process.env.MATRON_RESTART_GATE_ON_ERROR || '').trim().toLowerCase() === 'hold' ? 'hold' : 'safe',
     restart: (info) => {
