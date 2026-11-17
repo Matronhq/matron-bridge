@@ -145,7 +145,7 @@ import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
-  createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
+  createCodeUpdateWatcher, createCommandGate, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
   autoCarryOnEnabled as codeUpdateAutoCarryOnEnabled, writeSelfRestartStamp, takeSelfRestartStamp, selectAutoCarryOn,
   AUTO_CARRY_ON_TEXT as CODE_UPDATE_AUTO_CARRY_ON_TEXT, AUTO_CARRY_ON_DELAY_MS as CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
@@ -194,6 +194,7 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { loadBridgePlugins } from './lib/bridge-plugins.js';
 import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
@@ -243,7 +244,7 @@ import { createTitleSummary } from './lib/title-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, boxVitals, boxVitalsDue, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
@@ -382,6 +383,19 @@ if (isRootOutsideSandbox()) {
 // behaviour, or 0 to disable the reaper entirely).
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
+// Host CPU/RAM on box_status: sampled every HOST_VITALS_SAMPLE_MS (CPU is the
+// busy share over that whole interval), sent when either reading has moved by
+// HOST_VITALS_DELTA_PCT points since the last send, and at least every
+// HOST_VITALS_HEARTBEAT_MS (the web client greys out a reading older than 60 s,
+// see HOST_VITALS_STALE_MS in matron-web). The heartbeat is only checked after
+// a sample, so the sample interval is capped at the heartbeat.
+const HOST_VITALS_HEARTBEAT_MS = Math.max(5000, parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '45000', 10) || 45000);
+const HOST_VITALS_SAMPLE_MS = Math.min(
+  HOST_VITALS_HEARTBEAT_MS,
+  Math.max(5000, parseInt(process.env.HOST_VITALS_SAMPLE_MS || '10000', 10) || 10000),
+);
+const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '8', 10);
+let lastBoxVitalsSent = null; // { cpu_pct, ram_pct, at } of the last send that went out
 // Pre-reap handoff (lib/pre-reap-handoff.js): shortly before the reap, while
 // the prompt cache is still warm, an idle session is asked to refresh its
 // mission status and is compacted when its context is large. Off when the
@@ -1303,10 +1317,12 @@ function publishBoxStatus(reason) {
   let limits = null;
   let disk = null;
   let accountEmail = null;
+  let vitals = null;
   try { activity = buildActivity({ sessions, persisted: loadPersistedSessions() }); } catch { /* best-effort */ }
   try { limits = buildLimits(usageLimitsCache); } catch { /* best-effort */ }
   try { disk = buildDisk({ path: DEFAULT_WORKDIR }); } catch { /* best-effort */ }
   try { accountEmail = getAccountEmail(); } catch { /* best-effort */ }
+  try { vitals = boxVitals(); } catch { /* best-effort */ }
   // What a start with no explicit choice runs as here, so agent_boxes and
   // the spawn consent card can say so (null model/effort: the agent's own
   // default).
@@ -1320,20 +1336,42 @@ function publishBoxStatus(reason) {
   // Count and (cached) size of the worktrees this box made; omitted when none.
   let worktreeSummary = null;
   try { worktreeSummary = worktreeCleanup.summary(); } catch { /* best-effort */ }
-  if (!activity && !limits && !disk && !accountEmail && !defaults) return false;
+  if (!activity && !limits && !disk && !accountEmail && !vitals && !defaults) return false;
   const sent = journalPublisher.sendRoomOp({
     op: 'box_status',
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
     ...(disk ? { disk } : {}),
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
+    ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
     ...(worktreeSummary ? { worktrees: worktreeSummary } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
+    ...pluginsReport(),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
+  if (sent && vitals) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: Date.now() };
   return sent;
 }
+
+// A box_status carrying only `vitals`: the journal merges it into the box's
+// stored report, so this small frame never replaces the usage and activity
+// blocks. Called after each CPU sample; sends only when boxVitalsDue.
+function publishBoxVitals() {
+  if (!JOURNAL_ENABLED) return false;
+  const vitals = boxVitals();
+  const now = Date.now();
+  if (!boxVitalsDue(lastBoxVitalsSent, vitals, now, { deltaPct: HOST_VITALS_DELTA_PCT, heartbeatMs: HOST_VITALS_HEARTBEAT_MS })) return false;
+  const sent = journalPublisher.sendRoomOp({ op: 'box_status', vitals });
+  if (sent) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: now };
+  return sent;
+}
+
+// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
+// Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
+const bridgePlugins = await loadBridgePlugins({
+  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
+});
 
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
@@ -1351,7 +1389,7 @@ const journalPublisher = createJournalPublisher({
   onPanic: (panic, { hello }) => (hello ? accountLock.onHello(panic) : accountLock.onFrame(panic)),
   // The box's lock, said on every hello: a hello without it reads as "not
   // locked". A box without approval keys sends nothing.
-  helloExtras: () => (boxLock ? { locked: boxLock.report() } : null),
+  helloExtras: () => ({ ...(boxLock ? { locked: boxLock.report() } : {}), ...pluginsReport() }),
   // The user's settings: hello_ok's (or GET /settings when it carries none)
   // and every pushed change.
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
@@ -1800,7 +1838,11 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
+const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
+
+
 const journalRpcHandler = createRpcRequestHandler({
+  plugins: bridgePlugins,
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
   // The !stop teardown for the unsupported_mode orphan: kill, drop from the
@@ -11549,6 +11591,34 @@ function startAutoResumeSweep() {
   return timer;
 }
 
+// The live sessions that hold a restart back right now: mid-turn, a live
+// background work child, or a running subagent. Background work and subagents
+// use the idle reaper's age cap, a running turn never does. One process-table
+// read per call, shared by every live session. `unreadable` reports a failed
+// `ps`: the verdict then rests on in-memory signals alone.
+function sessionsHoldingRestart() {
+  const live = [...sessions.values()].filter(s => s.alive);
+  if (!live.length) return { holders: [], unreadable: false };
+  const table = readProcessTable();
+  const now = Date.now();
+  const holders = [];
+  for (const s of live) {
+    const last = handoffIdleSince(s);
+    // A quiet tool call can outlast the age cap without ending its turn.
+    // Subagent tracking is in memory, so it survives a failed ps read.
+    const hold = s.busy
+      ? { reason: 'turn in progress' }
+      : table.unreadable
+        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
+        : sessionWorkHold(s, last, now, table);
+    if (hold) {
+      holders.push({ session: s, reason: hold.reason });
+      debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
+    }
+  }
+  return { holders, unreadable: !!table.unreadable };
+}
+
 // Restart onto new code by itself — lib/code-update-restart.js has the
 // policy and the why. A rollout that found a live session here left the
 // new code on disk and the old process running; this is the "next natural
@@ -11574,29 +11644,12 @@ function startCodeUpdateWatcher() {
     readHead: () => readHeadReflog(gitDir),
     // Share the idle reaper's age cap for background work, while a running
     // turn always holds the update unless forcing is explicitly enabled.
-    busySessions: () => {
-      const live = [...sessions.values()].filter(s => s.alive);
-      if (!live.length) return 0;
-      const table = readProcessTable();
-      const now = Date.now();
-      let n = 0;
-      for (const s of live) {
-        const last = handoffIdleSince(s);
-        // A quiet tool call can outlast the age cap without ending its turn.
-        // Subagent tracking is in memory, so it survives a failed ps read.
-        const hold = s.busy
-          ? { reason: 'turn in progress' }
-          : table.unreadable
-            ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
-            : sessionWorkHold(s, last, now, table);
-        if (hold) {
-          n++;
-          debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
-        }
-      }
-      return n;
-    },
+    busySessions: () => sessionsHoldingRestart().holders.length,
     preflight: () => defaultPreflight(__dirname),
+    // Optional advisory hook; unset = no gate. Never consulted for a forced
+    // restart, and never by restart_session or the other operator restarts,
+    // which do not go through this watcher.
+    gate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
@@ -16313,7 +16366,7 @@ async function main() {
   // process open. cpu_pct appears once the first interval has a valid diff.
   // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
   // journal frames, so there's nothing to sample for when journal mode is off.
-  if (JOURNAL_ENABLED) startCpuSampler();
+  if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS, publishBoxVitals);
   // Retention: the relocated codex-viz sink tree lives outside Claude Code's
   // pruned project dirs, so its unredacted JSONL would accumulate forever.
   // Best-effort age-based sweep at boot (never throws).
