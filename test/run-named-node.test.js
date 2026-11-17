@@ -182,6 +182,23 @@ exec '${fakeNode}' "$@"
     expect(() => fs.lstatSync(path.join(binDir, 'libnode.115.dylib'))).toThrow();
   });
 
+  it('leaves libnode alone when the copy directory is the one holding it', () => {
+    const prefix = path.join(tmp, 'prefix');
+    fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(prefix, 'lib'));
+    const brewNode = path.join(prefix, 'bin', 'node');
+    writeExecutable(brewNode, FAKE_NODE);
+    const lib = path.join(prefix, 'lib', 'libnode.127.dylib');
+    fs.writeFileSync(lib, 'lib');
+    fs.symlinkSync(path.join(prefix, 'lib'), path.join(tmp, 'lib-alias'));
+    for (const dir of [path.join(prefix, 'lib'), path.join(tmp, 'lib-alias')]) {
+      const res = run(['matron-test', 'a.js'], { NODE_BIN: brewNode, MATRON_NAMED_NODE_DIR: dir });
+      expect(res.status).toBe(0);
+      expect(fs.lstatSync(lib).isFile()).toBe(true);
+      expect(fs.readFileSync(lib, 'utf8')).toBe('lib');
+    }
+  });
+
   it('makes no links for a node without a shared libnode', () => {
     run(['matron-test', 'a.js']);
     expect(fs.readdirSync(binDir).filter((f) => f.startsWith('libnode'))).toEqual([]);

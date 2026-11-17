@@ -136,18 +136,20 @@ fi
 # cannot find it and dies at load time ("Library not loaded:
 # @rpath/libnode.NNN.dylib"). So every libnode*.dylib beside node or in its
 # ../lib is symlinked next to the copy, where @rpath looks first. Links left
-# behind by an older node point nowhere and are removed.
+# behind by an older node point nowhere and are removed afterwards; the
+# current node's links are in place by then, so a launcher running at the
+# same time never sees one of its own links removed.
 realdir=${real%/*}
-for link in "$dir"/libnode*.dylib; do
-  if [ -L "$link" ] && [ ! -e "$link" ]; then
-    rm -f "$link" 2>/dev/null
-  fi
-done
 for libdir in "$realdir/../lib" "$realdir"; do
   libdir=$(cd "$libdir" 2>/dev/null && pwd -P) || continue
   for lib in "$libdir"/libnode*.dylib; do
     [ -f "$lib" ] || continue
     link=$dir/${lib##*/}
+    # The copy directory may be node's own (or an alias of it): never
+    # replace a library with a link to itself.
+    if [ "$lib" -ef "$link" ] && [ ! -L "$link" ]; then
+      continue
+    fi
     if [ -L "$link" ] && [ "$(readlink "$link")" = "$lib" ]; then
       continue
     fi
@@ -161,6 +163,11 @@ for libdir in "$realdir/../lib" "$realdir"; do
       exec "$node" "$@"
     fi
   done
+done
+for link in "$dir"/libnode*.dylib; do
+  if [ -L "$link" ] && [ ! -e "$link" ]; then
+    rm -f "$link" 2>/dev/null
+  fi
 done
 
 MATRON_REAL_NODE=$real
