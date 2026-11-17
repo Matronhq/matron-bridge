@@ -157,6 +157,30 @@ describe('resume note delivery', () => {
     expect(t.discards).toEqual([]);
   });
 
+  it('halted() cancels the pending retries and ignores an attempt in flight, without stop()', async () => {
+    let down = false;
+    const t = setup({ a: [false, true] });
+    const c = clock();
+    const calls = [];
+    const cards = [];
+    const discards = [];
+    const delivery = createNoteDelivery({
+      deliver: async (n) => { calls.push(n.attempt); return false; },
+      recover: (n) => { cards.push(n.convoId); return true; },
+      discard: (e) => discards.push(e),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, halted: () => down, now: c.now,
+    });
+    delivery.start([note('a')], []);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    expect(calls).toEqual([1]);
+    down = true;
+    await c.advance(10 * NOTE_RETRY_MS);
+    expect(calls).toEqual([1]);
+    expect(cards).toEqual([]);
+    expect(discards).toEqual([]);
+    expect(t.calls).toEqual([]);
+  });
+
   it('stop() during a delivery in flight: its result is ignored (no card, no removal)', async () => {
     const c = clock();
     const cards = [];
@@ -288,17 +312,17 @@ describe('resume note delivery wiring', () => {
     expect(fn).toMatch(/causes: \[carryOnCause\(\)\]/);
     expect(fn).toMatch(/return false;/);
   });
-  it('refuses to deliver while shutting down, and stops the retries first thing at shutdown', () => {
+  it('refuses to deliver while shutting down, and the delivery is told the bridge is going down', () => {
     const fn = index.slice(index.indexOf('async function deliverRestartNote'), index.indexOf('function publishNoteRecoveryCard'));
     expect(fn).toMatch(/if \(shuttingDown\) return false;/);
     const shutdown = index.slice(index.indexOf('async function gracefulShutdown'));
-    expect(shutdown.indexOf('restartNoteDelivery?.stop()')).toBeGreaterThan(-1);
-    expect(shutdown.indexOf('restartNoteDelivery?.stop()')).toBeLessThan(shutdown.indexOf('killSession(session)'));
+    expect(index).toMatch(/halted: \(\) => shuttingDown,/);
+    expect(shutdown).not.toMatch(/restartNoteDelivery/);
   });
   it('posts the resuming notice on the first attempt only', () => {
     const fn = index.slice(index.indexOf('async function deliverRestartNote'), index.indexOf('function publishNoteRecoveryCard'));
     expect(fn).toMatch(/note\.attempt > 1 \? ''/);
-    expect(index).toMatch(/if \(noticeConvoId && noticeText\) journalPublishNotice/);
+    expect(index).toMatch(/if \(!JOURNAL_ENABLED \|\| !convoId \|\| !body\) return;/);
   });
   it('reports whether the recovery card was published', () => {
     const fn = index.slice(index.indexOf('function publishNoteRecoveryCard'), index.indexOf('function publishNoteRecoveryCard') + 700);

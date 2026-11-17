@@ -9786,7 +9786,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // `silent` marks a line that is only a record (see timerCardPayload): the
 // journal and the apps show it and tell nobody.
 function journalPublishNotice(convoId, body, notice = null, { silent = false } = {}) {
-  if (!JOURNAL_ENABLED || !convoId) return;
+  // An empty body is no notice (a retried resume note's later attempts ask for none).
+  if (!JOURNAL_ENABLED || !convoId || !body) return;
   try {
     journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}), ...(silent ? { silent: true } : {}) });
   } catch (e) {
@@ -11000,8 +11001,7 @@ function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
   if (existing && existing.alive) return null;
   if (existing) sessions.delete(roomId);
   console.log(`[journal-input] auto-resuming reaped session in ${roomId}`);
-  // An empty notice text means no notice (a retried resume note's later attempts).
-  if (noticeConvoId && noticeText) journalPublishNotice(noticeConvoId, noticeText);
+  if (noticeConvoId) journalPublishNotice(noticeConvoId, noticeText);
   return resumePersistedSession(roomId, prev, { skipJournalMirror: !!noticeConvoId });
 }
 
@@ -16360,6 +16360,9 @@ function publishRestartCarryOnCards() {
     discard: (entries) => restartNotes.discard(entries),
     log: (m) => { try { console.warn(m); } catch { /* logging must never throw */ } },
     firstDelayMs: CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
+    // Going down: no retry may start, card or remove anything; the notes that
+    // were not dealt with stay on disk for the next boot.
+    halted: () => shuttingDown,
   });
   restartNoteDelivery.start(noteResult.deliveries, taken);
   if (!stale.length) return;
@@ -16519,9 +16522,6 @@ async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
     // will see for this box until it wakes again. Sent before the sessions
     // are killed so `activity` still describes what was running.
     publishBoxStatus('shutdown');
-    // No resume-note retry may start or card anything from here on: the notes
-    // that were not dealt with stay on disk for the next boot.
-    restartNoteDelivery?.stop();
     stopCpuSampler();
     for (const [, session] of sessions) {
       killSession(session);
