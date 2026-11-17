@@ -11000,7 +11000,8 @@ function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
   if (existing && existing.alive) return null;
   if (existing) sessions.delete(roomId);
   console.log(`[journal-input] auto-resuming reaped session in ${roomId}`);
-  if (noticeConvoId) journalPublishNotice(noticeConvoId, noticeText);
+  // An empty notice text means no notice (a retried resume note's later attempts).
+  if (noticeConvoId && noticeText) journalPublishNotice(noticeConvoId, noticeText);
   return resumePersistedSession(roomId, prev, { skipJournalMirror: !!noticeConvoId });
 }
 
@@ -16282,10 +16283,15 @@ function startIdleReaper() {
 // carry-on cause as the other bridge-made turns). Unlike carryOnConvo this
 // reports whether it worked, so lib/restart-note-delivery.js can retry: false
 // when the chat cannot be resumed or the session refused the text.
+let restartNoteDelivery = null;
 async function deliverRestartNote(note) {
+  // Never start or resume a session while the bridge is going down.
+  if (shuttingDown) return false;
   try {
     let target = findSessionByClaudeSessionId(note.convoId);
-    if (!target || !target.alive) target = journalResumeConvo(note.convoId, '🔄 The bridge restarted — resuming this chat with the note you left for it.');
+    // The "resuming" notice only on the first attempt: a retry that has to
+    // resume the chat again must not post it a second and third time.
+    if (!target || !target.alive) target = journalResumeConvo(note.convoId, note.attempt > 1 ? '' : '🔄 The bridge restarted — resuming this chat with the note you left for it.');
     if (!target) return false;
     const result = await journalRouteTextToSession(target,
       restartNoteTurnText(note.text, note.ageMs, frameSafeBody, note.interrupted),
@@ -16348,13 +16354,14 @@ function publishRestartCarryOnCards() {
     log: (m) => { try { console.log(m); } catch { /* logging must never throw */ } },
   });
   stale = noteResult.stale;
-  createNoteDelivery({
+  restartNoteDelivery = createNoteDelivery({
     deliver: deliverRestartNote,
     recover: (note) => publishNoteRecoveryCard(note.convoId),
     discard: (entries) => restartNotes.discard(entries),
     log: (m) => { try { console.warn(m); } catch { /* logging must never throw */ } },
     firstDelayMs: CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
-  }).start(noteResult.deliveries, taken);
+  });
+  restartNoteDelivery.start(noteResult.deliveries, taken);
   if (!stale.length) return;
   // The previous process's self-restart onto new code cut these turns off;
   // with the option on they carry on by themselves (lib/code-update-restart.js
@@ -16512,6 +16519,9 @@ async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
     // will see for this box until it wakes again. Sent before the sessions
     // are killed so `activity` still describes what was running.
     publishBoxStatus('shutdown');
+    // No resume-note retry may start or card anything from here on: the notes
+    // that were not dealt with stay on disk for the next boot.
+    restartNoteDelivery?.stop();
     stopCpuSampler();
     for (const [, session] of sessions) {
       killSession(session);
