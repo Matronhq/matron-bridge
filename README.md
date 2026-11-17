@@ -585,11 +585,14 @@ CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a reposito
 - **Where.** `<repo>/.claude/worktrees/<name>` on a new branch `wt/<name>`, cut from `origin/<default branch>` after a `git fetch`. `.claude/worktrees/` is added to the clone's `.git/info/exclude` (never to a `.gitignore`), and the folder picker (`recent_folders`) leaves worktrees out of its list. The name must make a valid branch name; if the branch or folder is taken, the start is refused and `<name>-2` is suggested. A repository with no `origin` is refused, and git's own error is passed through if the branch is checked out elsewhere. After the session has started, `git submodule update --init` runs when there is a `.gitmodules`, and `git lfs pull` when LFS is configured; both only warn if they fail. Git runs for all of this have no journal credential in their environment and no repository hooks.
 - **What the agent is told.** Every worktree session starts with a fixed notice: it is in worktree `<path>` on `wt/<name>`, and the dev server, public URL, OAuth callbacks and webhooks point at the main checkout, so it should test there or say what it could not test. The start message and `/status` show a `Worktree:` line. No `.env` is linked in.
 - **Resuming.** Resuming a session whose worktree was removed is refused with a message, and the session being replaced is left alone; the folder is never recreated empty.
+- **Setup script.** If the repository has `.matron/worktree-setup`, it can prepare the worktree (install dependencies and so on). It runs inside the worktree with `MATRON_MAIN_CHECKOUT` set to the main checkout, only after you approve that repository's script on a card in the new conversation, and only while it has the approved sha256: a changed script asks again. The real gates are the allowlist (`MATRON_WORKTREE_SETUP_ORIGINS`, empty means none) and the consent card; the fork check only detects an `upstream` remote, so it catches the usual fork setup and nothing more. The bytes you approved are the bytes that run (a private temp copy, never the file on disk), setup is refused on Windows, and it runs in the background after the session has started. It has a 10 minute limit, its output is logged under `~/.matron-bridge-worktree-logs/`, and a failure still starts the session, with a notice. The script can add lines to the agent's notice by writing them to the file named in `MATRON_WORKTREE_NOTICE_FILE`.
 - **Limits.** At most 5 worktrees per repository (`MATRON_WORKTREE_MAX`), and none when the disk has under 10 GB or 10% free.
 
 | Variable | Description | Default |
 |---|---|---|
 | `MATRON_WORKTREE_MAX` | Most worktrees per repository | `5` |
+| `MATRON_WORKTREE_SETUP_ORIGINS` | Comma-separated origins whose `.matron/worktree-setup` may run, as `host/owner/repo` or `host/owner/*`. Empty means none | _(empty)_ |
+| `MATRON_WORKTREE_SETUP_TIMEOUT_MS` | Time limit for the setup script | `600000` (10 minutes) |
 
 ## How it works
 

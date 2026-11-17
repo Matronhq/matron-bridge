@@ -62,6 +62,8 @@ import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, coordinatorNeedsAssigning, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
 import { createWorktreeLedger } from './lib/worktree-ledger.js';
+import { createConsentStore } from './lib/worktree-setup.js';
+import { createSetupFlow } from './lib/worktree-setup-flow.js';
 import { createWorktreeService, WorktreeRemovedError } from './lib/worktree-service.js';
 import { extractWorktreeFlag, worktreeHeaderLine, worktreeNoticeBlock } from './lib/worktree.js';
 import { createServer } from 'http';
@@ -1586,8 +1588,15 @@ recentFolders.seedFrom(Object.values(loadPersistedSessions()).map((rec) => ({
 // Worktree sessions (`/start --worktree <name>`): the record of the worktrees
 // this bridge made.
 const worktreeLedger = createWorktreeLedger({ file: path.join(os.homedir(), '.matron-bridge-worktrees.json') });
+// Approval and running of a repository's worktree setup script.
+const worktreeSetup = createSetupFlow({
+  ledger: worktreeLedger,
+  consent: createConsentStore({ file: path.join(os.homedir(), '.matron-bridge-worktree-consent.json') }),
+  logDir: path.join(os.homedir(), '.matron-bridge-worktree-logs'),
+});
 const worktreeService = createWorktreeService({
   ledger: worktreeLedger,
+  setup: worktreeSetup,
 });
 
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
@@ -8051,6 +8060,26 @@ async function availableCodexThreads(workdir, { cached = false, roomId = '' } = 
   return items;
 }
 
+// The approval card for a worktree's setup script: a tracker question on the
+// new session's conversation. The conversation row can trail the session's
+// start, so a refused create is retried a few times; if it never lands the
+// user is told the script did not run.
+async function fileWorktreeConsentCard(session, started) {
+  const spec = worktreeSetup.consentCard(started.entry, started.plan);
+  const convoId = journalConvoIdFor(session);
+  for (let attempt = 0; attempt < 4 && convoId; attempt++) {
+    try {
+      const res = await itemsClient.create({ ...spec, convo_id: convoId, awaiting: 'user' });
+      const id = res?.data?.item?.id;
+      if (res?.status >= 200 && res.status < 300 && id) {
+        worktreeSetup.rememberCard(started.entry.path, id);
+        return;
+      }
+    } catch { /* retried below */ }
+    await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+  }
+  try { session.sendCallback?.('Could not file the approval card for the worktree setup script, so it did not run.'); } catch { /* best effort */ }
+}
 
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const nativeSession = sessions.get(roomId);
@@ -8186,6 +8215,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const worktreeNote = startedWorktree ? `\n${worktreeHeaderLine(session.worktree)}` : '';
       await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}${worktreeNote}`);
       if (startedWorktree) {
+        if (startedWorktree.plan) void fileWorktreeConsentCard(session, startedWorktree);
         // Submodules, LFS and an approved setup script, after the start.
         startedWorktree.background().then((notes) => {
           if (notes.length) session.sendCallback?.(notes.join('\n'));
@@ -10469,6 +10499,18 @@ function journalOnItem(session, item, ctx) {
   // never an ordinary 📌 turn that would hand the agent an unrestricted turn
   // in the middle of another person's conversation.
   if (foreignSessions.onItemReply(session, item?.payload)) return;
+  // A tap on the approval card of a worktree's setup script: the bridge's
+  // to apply, never a turn for the agent.
+  if (worktreeSetup.isCardReply(item?.payload)) {
+    worktreeSetup.onCardReply(item.payload).then((out) => {
+      if (!out) return;
+      Promise.resolve(itemsClient.close(item.payload.item_id, out.close)).catch(() => {});
+      try { session.sendCallback?.(out.message); } catch { /* best effort */ }
+    }).catch((e) => {
+      try { console.warn(`[worktree] setup approval failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    });
+    return;
+  }
   const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
   if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
     const cmdCtx = journalSessionCommandCtx(session);
