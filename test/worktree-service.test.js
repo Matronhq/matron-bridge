@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { createWorktreeLedger, parseWorktreePath } from '../lib/worktree-ledger.js';
 import { createWorktreeService, WorktreeRemovedError } from '../lib/worktree-service.js';
+import { gitRun } from '../lib/worktree.js';
 import { git, makeRepo, roomyStatfs } from './helpers/worktree-repo.js';
 
 const cleanups = [];
@@ -57,6 +58,23 @@ describe('start', () => {
     expect(h.ledger.get(out.cwd)).toMatchObject({ name: 'fix-1', branch: 'wt/fix-1', root: h.r.repo });
     expect(h.service.info(out.cwd)).toMatchObject({ branch: 'wt/fix-1', path: out.entry.path });
     expect(h.service.noticeBlock(out.cwd)).toMatch(/point at the main checkout/);
+  });
+
+  it('keeps the remote URL out of the ledger file, and the file owner-only', async () => {
+    const h = harness();
+    const url = 'https://alice:example-token@example.com/x.git';
+    // Report a credentialed URL for origin; every other git call is real.
+    const run = async (args, opts) => {
+      const out = await gitRun(args, opts);
+      return args.join(' ') === 'config --get remote.origin.url' ? { ...out, stdout: url } : out;
+    };
+    const svc = createWorktreeService({ ledger: h.ledger, statfs: roomyStatfs, env: {}, run });
+    const out = await svc.start({ workdir: h.r.repo, name: 'secret-check' });
+    expect(out.ok).toBe(true);
+    const file = path.join(h.home, 'worktrees.json');
+    expect(fs.readFileSync(file, 'utf-8')).not.toContain('example-token');
+    expect(h.ledger.get(out.cwd)).not.toHaveProperty('origin');
+    if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o077).toBe(0);
   });
 
   it('is not a worktree session for any other workdir', async () => {

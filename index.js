@@ -2514,6 +2514,19 @@ function shouldAutoRestart(exitCode, session, shuttingDown) {
 // Small seams over the worktree service, so the exit handlers and
 // recreateSession (lifted into sandboxes by some tests) call functions.
 function worktreeRemovedFor(workdir) { return worktreeService.removedFor(workdir); }
+// Like worktreeRemovedFor, but also follows a Claude transcript that moved
+// into a managed worktree (the session changed cwd mid-flight): if that
+// worktree is gone, the resume must be refused rather than started fresh on
+// the same id.
+function worktreeRemovedForResume(workdir, agent, sessionId) {
+  const direct = worktreeRemovedFor(workdir);
+  if (direct || agent !== AGENT_CLAUDE || !sessionId) return direct;
+  try {
+    if (fs.existsSync(transcriptPathFor(workdir, sessionId))) return null;
+    const found = findTranscriptBySessionId(sessionId);
+    return found?.workdir ? worktreeRemovedFor(found.workdir) : null;
+  } catch { return null; }
+}
 function worktreeRemovedMessage(entry) { return new WorktreeRemovedError(entry).message; }
 // An exit handler that would respawn a session into a removed worktree stops
 // instead (the respawn would resume in a different folder): marked like a
@@ -8523,7 +8536,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? resumeExtras
         : resumeState.mcpExtras;
       // A removed bridge-made worktree cannot be resumed (see createSession).
-      const removedWorktree = worktreeService.removedFor(actualWorkdir);
+      const removedWorktree = worktreeRemovedForResume(actualWorkdir, selectedAgent, resumeSessionId);
       if (removedWorktree) {
         await sendReply(new WorktreeRemovedError(removedWorktree).message);
         return;
@@ -13214,10 +13227,16 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   const activeAgent = resolveAgent({ persisted: prev.agent, fallback: ENV_DEFAULT_AGENT });
   const activeState = getPersistedAgentState(prev, activeAgent, history.length);
   const resumeSessionId = activeState.sessionId;
-  const removedWorktree = resumeSessionId ? worktreeService.removedFor(prev.workdir || DEFAULT_WORKDIR) : null;
+  // Checked even without a native session ID: a fresh session has a stable
+  // conversation ID before its first native thread exists.
+  const removedWorktree = worktreeRemovedForResume(prev.workdir || DEFAULT_WORKDIR, activeAgent, resumeSessionId);
   if (removedWorktree) {
-    // Said in the conversation itself; the idle session stays idle.
-    Promise.resolve(sendToRoom(roomId, new WorktreeRemovedError(removedWorktree).message)).catch(() => {});
+    // Said in the conversation itself; the idle session stays idle. The
+    // session was already dropped, so sendToRoom has nowhere to deliver on the
+    // journal path: publish straight to the conversation as well.
+    const msg = new WorktreeRemovedError(removedWorktree).message;
+    journalPublishNotice(prev.journalConvoId || prev.sessionId || roomId, msg);
+    Promise.resolve(sendToRoom(roomId, msg)).catch(() => {});
     return null;
   }
   const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, resumeSessionId, {

@@ -49,8 +49,12 @@ describe('worktree wiring in index.js', () => {
   it('resuming in a removed worktree is refused at every resume entry point', () => {
     // createSession itself never throws for a removed worktree: callers check first.
     expect(block('function createSession(', 'const guarded')).not.toContain('WorktreeRemovedError');
-    expect(block("case '!resume':", "case '!workdir':")).toContain('worktreeService.removedFor(actualWorkdir)');
-    expect(block('function resumePersistedSession(', 'newSession.originRoomId')).toContain('worktreeService.removedFor');
+    expect(block("case '!resume':", "case '!workdir':")).toContain('worktreeRemovedForResume(actualWorkdir');
+    // checked even when the conversation has no native session ID yet, and said through the journal too
+    const idle = block('function resumePersistedSession(', 'newSession.originRoomId');
+    expect(idle).toContain('worktreeRemovedForResume(');
+    expect(idle).not.toMatch(/resumeSessionId \? worktreeRemovedForResume/);
+    expect(idle).toContain('journalPublishNotice(');
     expect(block('function recreateSession(', 'killSession(existing')).toContain('worktreeRemovedFor(existing.workdir)');
     expect(block('function noteWorktreeGone(', '\n}')).toContain('worktreeRemovedFor(session.workdir)');
     // Both exit handlers (print and interactive) stop a respawn into a removed worktree.

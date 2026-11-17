@@ -6,8 +6,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+// Repository-location variables inherited from a hook or shell would point git
+// at the developer's own repository instead of the temp one.
+const REPO_LOCATION_VARS = new Set([
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_PREFIX', 'GIT_NAMESPACE',
+]);
 const ENV = {
-  ...process.env,
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !REPO_LOCATION_VARS.has(k))),
   GIT_AUTHOR_NAME: 'alice', GIT_AUTHOR_EMAIL: 'alice@example.com',
   GIT_COMMITTER_NAME: 'alice', GIT_COMMITTER_EMAIL: 'alice@example.com',
   GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_SYSTEM: os.devNull,

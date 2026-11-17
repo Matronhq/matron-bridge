@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
-  checkDisk, createWorktree, ensureExcluded, extractWorktreeFlag, finishWorktree, gitRun,
+  checkDisk, createWorktree, ensureExcluded, extractWorktreeFlag, finishWorktree, gitEnv, gitRun,
   maxWorktreesPerRepo, validateName, withoutHooks, worktreeHeaderLine, worktreeNoticeBlock,
 } from '../lib/worktree.js';
 import { git, makeRepo, roomyStatfs } from './helpers/worktree-repo.js';
@@ -177,6 +177,15 @@ describe('createWorktree', () => {
     const out = await make(r, 'x', { run });
     expect(out.ok).toBe(false);
     expect(out.error).toContain("'wt/x' is already checked out at '/elsewhere'");
+    // and says how to clear a leftover branch or folder before retrying
+    expect(out.error).toContain('git branch -D wt/x');
+    expect(out.error).toContain('git worktree list');
+  });
+
+  it('gives the git child no repository-location variables, and keeps the prompt/lock guards', () => {
+    const env = gitEnv({ GIT_DIR: '/a', GIT_WORK_TREE: '/b', GIT_INDEX_FILE: '/c', GIT_COMMON_DIR: '/d', PATH: '/bin', GIT_TERMINAL_PROMPT: '1' });
+    for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) expect(env).not.toHaveProperty(k);
+    expect(env).toMatchObject({ PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' });
   });
 });
 
