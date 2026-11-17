@@ -3249,7 +3249,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const matronMd = loadMatronMd(cwd);
+  const matronMd = loadMatronMd(cwd, { agent: 'codex' });
   // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
   const worktreeInfo = worktreeService.info(cwd);
   matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');

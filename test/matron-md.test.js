@@ -7,6 +7,7 @@ import {
   matronMdDirs,
   matronMdFileList,
   matronMdStatusLine,
+  repoInstructionsPointer,
   MATRON_MD_MAX_BYTES,
   MATRON_MD_TRUNCATED,
 } from '../lib/matron-md.js';
@@ -242,5 +243,78 @@ describe('matronMdStatusLine', () => {
     expect(matronMdStatusLine({ files: [], truncated: false })).toBe('');
     expect(matronMdStatusLine(undefined)).toBe('');
     expect(matronMdFileList(null)).toBe('');
+  });
+});
+
+describe('repoInstructionsPointer (a workdir outside any repository)', () => {
+  const repo = (name, files = {}) => {
+    fs.mkdirSync(path.join(tmp, name, '.git'), { recursive: true });
+    for (const [f, text] of Object.entries(files)) write(path.join(name, f), text);
+  };
+
+  it('names each repository directly below that has a MATRON.md, sorted, and does not load the files', () => {
+    repo('beta', { 'MATRON.md': 'BETA RULES' });
+    repo('alpha', { 'MATRON.md': 'ALPHA RULES', 'CLAUDE.md': 'x' });
+    repo('gamma', { 'CLAUDE.md': 'x' });
+    fs.mkdirSync(path.join(tmp, 'plain'));
+    write('plain/MATRON.md', 'not a repo');
+    const text = repoInstructionsPointer(tmp);
+    expect(text).toContain('## Repositories below your working folder');
+    expect(text).toContain('`alpha` (MATRON.md), `beta` (MATRON.md).');
+    expect(text).not.toContain('gamma');
+    expect(text).not.toContain('plain');
+    expect(text).not.toContain('RULES');
+  });
+
+  it('for Codex also names AGENTS.md and CLAUDE.md, which Codex does not read from below its folder', () => {
+    repo('alpha', { 'MATRON.md': 'a', 'CLAUDE.md': 'x' });
+    repo('gamma', { 'AGENTS.md': 'x' });
+    expect(repoInstructionsPointer(tmp, { agent: 'codex' })).toContain('`alpha` (MATRON.md, CLAUDE.md), `gamma` (AGENTS.md).');
+  });
+
+  it('treats a worktree (.git file) below as a repository and skips hidden folders', () => {
+    write('wt/.git', 'gitdir: /elsewhere\n');
+    write('wt/MATRON.md', 'a');
+    repo('.hidden', { 'MATRON.md': 'a' });
+    const text = repoInstructionsPointer(tmp);
+    expect(text).toContain('`wt` (MATRON.md)');
+    expect(text).not.toContain('.hidden');
+  });
+
+  it('is empty inside a repository, and when nothing below has instructions', () => {
+    repo('alpha', { 'MATRON.md': 'a' });
+    expect(repoInstructionsPointer(path.join(tmp, 'alpha'))).toBe('');
+    fs.mkdirSync(path.join(tmp, 'alpha/sub/inner/.git'), { recursive: true });
+    write('alpha/sub/inner/MATRON.md', 'a');
+    expect(repoInstructionsPointer(path.join(tmp, 'alpha/sub'))).toBe('');
+    fs.mkdirSync(path.join(tmp, 'empty'));
+    expect(repoInstructionsPointer(path.join(tmp, 'empty'))).toBe('');
+    expect(repoInstructionsPointer(path.join(tmp, 'missing'))).toBe('');
+  });
+
+  it('names at most 25 repositories and counts the rest', () => {
+    for (let i = 0; i < 30; i++) repo(`r${String(i).padStart(2, '0')}`, { 'MATRON.md': 'a' });
+    const text = repoInstructionsPointer(tmp);
+    expect(text).toContain('`r24` (MATRON.md), and 5 more.');
+    expect(text).not.toContain('`r25`');
+  });
+
+  it('loadMatronMd appends the pointer after the workdir\'s own MATRON.md, without listing it as a loaded file', () => {
+    write('MATRON.md', 'FOLDER RULES');
+    repo('alpha', { 'MATRON.md': 'ALPHA RULES' });
+    const loaded = loadMatronMd(tmp, { log: recordingLog().log });
+    expect(loaded.files.map((f) => f.rel)).toEqual(['MATRON.md']);
+    expect(loaded.block.indexOf('FOLDER RULES')).toBeLessThan(loaded.block.indexOf('## Repositories below your working folder'));
+    expect(loaded.block).not.toContain('ALPHA RULES');
+    const bare = loadMatronMd(path.join(tmp, 'alpha'), { log: recordingLog().log });
+    expect(bare.block).not.toContain('Repositories below');
+  });
+
+  it('loadMatronMd gives only the pointer when the folder has no MATRON.md of its own', () => {
+    repo('alpha', { 'AGENTS.md': 'a' });
+    expect(loadMatronMd(tmp, { log: recordingLog().log }).block).toBe('');
+    const codex = loadMatronMd(tmp, { agent: 'codex', log: recordingLog().log });
+    expect(codex.block.startsWith('## Repositories below your working folder')).toBe(true);
+    expect(codex.files).toEqual([]);
   });
 });
