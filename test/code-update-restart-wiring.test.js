@@ -27,7 +27,9 @@ describe('code-update self-restart wiring', () => {
   });
 
   it('reads the opt-in authoritative gate settings from the environment', () => {
-    expect(fn).toMatch(/gateMaxMs: parseCodeUpdateMsOrOff\(process\.env\.MATRON_RESTART_GATE_MAX_HOLD_MS, undefined\)/);
+    expect(fn).toMatch(/\/\^\\d\+\$\/\.test\(String\(process\.env\.MATRON_RESTART_GATE_MAX_HOLD_MS/);
+    expect(fn).toMatch(/notify: \(text\) =>/);
+    expect(fn).not.toMatch(/never by restart_session or the other operator restarts, which do not go through this watcher/);
     expect(fn).toMatch(/MATRON_RESTART_GATE_ON_ERROR/);
     expect(fn).toMatch(/=== 'hold' \? 'hold' : 'safe'/);
   });
