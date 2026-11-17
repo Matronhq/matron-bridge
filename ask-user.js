@@ -1334,10 +1334,11 @@ server.tool(
 async function callItems(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   // item_create and item_comment carry an idempotency key the model never sees:
-  // a harness-retried call would otherwise duplicate the item/comment and
-  // re-upload its attachment blob. The key is derived from the call (op, room,
-  // content, plus the item id for comments) inside a ten-minute bucket, so a
-  // retry replays the existing row. See lib/missions-idem.js.
+  // a harness-retried call would otherwise duplicate the item/comment. The key
+  // is derived from the call (op, room, content, plus the item id for
+  // comments) inside a ten-minute bucket, so a retry replays the existing row.
+  // A retry still re-uploads its attachment (the bridge uploads before the
+  // journal call), which can leave an orphaned blob. See lib/missions-idem.js.
   if (name === 'create' || name === 'comment') {
     payload.idem_key = itemIdemKey({ op: `item_${name}`, roomId: ROOM_ID, args: args || {} });
   }
