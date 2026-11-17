@@ -15,7 +15,7 @@ import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatRecall } from './lib/memory-format.js';
-import { formatReminderLine } from './lib/reminder-tools.js';
+import { formatReminderLine, REMINDER_ID_STRING } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
 import {
@@ -1962,6 +1962,8 @@ server.tool(
 server.tool(
   'reminder_cancel',
   "Cancel a pending reminder in this conversation by its number, or 'all' of them.",
-  { id: z.union([z.number().int(), z.literal('all')]).describe("Reminder number from reminder_list / the create result, or 'all'") },
+  // The string branch takes "261" / "#261" too: some MCP clients send the
+  // integer as a string, which a bare integer | 'all' union rejected.
+  { id: z.union([z.number().int(), z.literal('all'), z.string().regex(REMINDER_ID_STRING)]).describe("Reminder number from reminder_list / the create result, or 'all'") },
   async (args) => callReminders('cancel', args, (d) => `Cancelled ${d.cancelled.length === 1 ? 'reminder' : `${d.cancelled.length} reminders`}: ${d.cancelled.map(formatReminderLine).join('; ')}`),
 );
