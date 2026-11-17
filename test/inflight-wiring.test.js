@@ -251,54 +251,112 @@ describe('background work markers in the bridge', () => {
     expect(stale.map(r => [r.convoId, r.kind])).toEqual([['child', 'background'], ['subagent', 'background']]);
   });
 
-  it('every turn-end seam passes the work check to the marker', () => {
+  it('every turn-end seam goes through the non-blocking work check', () => {
     const ends = src.match(/inflightMarker\.noteTurnEnd\(journalConvoIdFor\(session\)[^;]*;/g) || [];
-    const withWork = ends.filter(e => e.includes('{ hasWork: sessionHasBackgroundWork(session) }'));
-    expect(withWork).toHaveLength(5);
+    expect(src.match(/dropBackgroundMarkerWhenNoWork\(session\);/g)).toHaveLength(5);
+    expect(ends.filter(e => e.includes('{ hasWork: true }'))).toHaveLength(5);
     // The others are teardown or unstick paths that deliberately clear the marker.
-    expect(ends.length - withWork.length).toBeGreaterThan(0);
+    expect(ends.length).toBeGreaterThan(5);
   });
 
-  it('sweeps background markers: refresh while work runs, drop when it is gone, skip when none', () => {
+  const flush = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
+
+  it('a turn end keeps the marker, then drops it when the non-blocking check finds no work', async () => {
+    let data = {};
+    const marker = createInflightMarker({ load: () => data, save: (d) => { data = JSON.parse(JSON.stringify(d)); }, now: () => 1000, bootId: 'b1' });
+    marker.noteTurnStart('alice', 'room-a');
+    marker.noteTurnStart('bob', 'room-b');
+    const tables = { alice: Object.assign([], { unreadable: false }), bob: [{ pid: 11, ppid: 10, args: 'sleep 3600' }] };
+    const fns = hasWorkFns({ inflightMarker: marker, shuttingDown: false, journalConvoIdFor: (s) => s.id, readProcessTableAsync: async () => tables.current });
+    const drop = load(['dropBackgroundMarkerWhenNoWork'], { ...fns, inflightMarker: marker, shuttingDown: false, journalConvoIdFor: (s) => s.id, readProcessTableAsync: async () => tables.current }).dropBackgroundMarkerWhenNoWork;
+    const end = (session) => { marker.noteTurnEnd(session.id, { hasWork: true }); drop(session); };
+    tables.current = tables.alice;
+    end({ id: 'alice', pid: 10 });
+    expect(data.alice.kind).toBe('background');
+    await flush();
+    expect(data.alice).toBeUndefined();
+    tables.current = tables.bob;
+    end({ id: 'bob', pid: 10 });
+    await flush();
+    expect(data.bob.kind).toBe('background');
+  });
+
+  it('a turn end does not read the process table synchronously', () => {
+    const body = src.slice(src.indexOf('function dropBackgroundMarkerWhenNoWork'), src.indexOf('function startBackgroundMarkerMaintenance'));
+    expect(body).toMatch(/readProcessTableAsync\(\)/);
+    expect(body).not.toMatch(/readProcessTable\(\)/);
+    const sweep = src.slice(src.indexOf('function startBackgroundMarkerMaintenance'), src.indexOf('// --- Pre-reap handoff'));
+    expect(sweep).not.toMatch(/readProcessTable\(\)/);
+    expect(src.slice(src.indexOf('function sessionHasBackgroundWork'), src.indexOf('function dropBackgroundMarkerWhenNoWork'))).not.toMatch(/execFileSync|readProcessTable\(/);
+  });
+
+  function sweepHarness({ ids, sessions, hasWork = () => true, shuttingDown = false }) {
     let tick;
     const refreshBackground = vi.fn();
     const clearBackground = vi.fn();
-    const isBackground = vi.fn((id) => id !== 'plain');
-    const readProcessTable = vi.fn(() => []);
-    const hasWork = new Map([['busy-one', true], ['gone', false]]);
-    const sessions = new Map([
-      ['r1', { alive: true, id: 'busy-one' }],
-      ['r2', { alive: true, id: 'gone' }],
-      ['r3', { alive: true, id: 'plain' }],
-      ['r4', { alive: true, busy: true, id: 'busy-one' }],
-      ['r5', { alive: false, id: 'busy-one' }],
-    ]);
+    const readProcessTableAsync = vi.fn(async () => []);
     const { startBackgroundMarkerMaintenance } = load(['startBackgroundMarkerMaintenance'], {
       setInterval: (fn) => { tick = fn; return { unref() {} }; },
-      sessions, SESSION_IDLE_CHECK_MS: 1000, readProcessTable,
-      journalConvoIdFor: (s) => s.id,
-      sessionHasBackgroundWork: (s) => hasWork.get(s.id),
-      inflightMarker: { isBackground, refreshBackground, clearBackground },
+      sessions: new Map(sessions.map((s, i) => [`r${i}`, s])), SESSION_IDLE_CHECK_MS: 1000, readProcessTableAsync,
+      journalConvoIdFor: (s) => s.id, handoffIdleSince: () => 0, shuttingDown,
+      sessionHasBackgroundWork: (s) => hasWork(s),
+      inflightMarker: { backgroundIds: () => ids, refreshBackground, clearBackground },
     });
     startBackgroundMarkerMaintenance();
-    tick();
-    expect(refreshBackground.mock.calls).toEqual([['busy-one']]);
-    expect(clearBackground.mock.calls).toEqual([['gone']]);
-    expect(readProcessTable).toHaveBeenCalledTimes(1);
+    return { tick: async () => { await tick(); }, refreshBackground, clearBackground, readProcessTableAsync };
+  }
+
+  it('sweeps background markers: refresh while work runs, drop when it is gone', async () => {
+    const h = sweepHarness({
+      ids: ['busy-one', 'gone', 'mid-turn'],
+      sessions: [{ alive: true, id: 'busy-one' }, { alive: true, id: 'gone' }, { alive: true, busy: true, id: 'mid-turn' }],
+      hasWork: (s) => s.id === 'busy-one',
+    });
+    await h.tick();
+    expect(h.refreshBackground.mock.calls).toEqual([['busy-one']]);
+    expect(h.clearBackground.mock.calls).toEqual([['gone']]);
+    expect(h.readProcessTableAsync).toHaveBeenCalledTimes(1);
   });
 
-  it('does not read the process table when no session has a background marker', () => {
-    let tick;
-    const readProcessTable = vi.fn(() => []);
-    const { startBackgroundMarkerMaintenance } = load(['startBackgroundMarkerMaintenance'], {
-      setInterval: (fn) => { tick = fn; return { unref() {} }; },
-      sessions: new Map([['r1', { alive: true, id: 'a' }]]), SESSION_IDLE_CHECK_MS: 1000, readProcessTable,
-      journalConvoIdFor: (s) => s.id, sessionHasBackgroundWork: () => true,
-      inflightMarker: { isBackground: () => false, refreshBackground() {}, clearBackground() {} },
+  it('drops the marker of a conversation with no live session: reaped, killed, archived or exited', async () => {
+    const h = sweepHarness({
+      ids: ['reaped', 'dead', 'archived', 'live'],
+      sessions: [{ alive: true, _autoStopped: true, id: 'reaped' }, { alive: false, id: 'dead' }, { alive: true, id: 'live' }],
+      hasWork: () => true,
     });
-    startBackgroundMarkerMaintenance();
-    tick();
-    expect(readProcessTable).not.toHaveBeenCalled();
+    await h.tick();
+    expect(h.clearBackground.mock.calls.map(c => c[0]).sort()).toEqual(['archived', 'dead', 'reaped']);
+    expect(h.refreshBackground.mock.calls).toEqual([['live']]);
+  });
+
+  it('does nothing, and reads no process table, when there is no background marker', async () => {
+    const h = sweepHarness({ ids: [], sessions: [{ alive: true, id: 'a' }] });
+    await h.tick();
+    expect(h.readProcessTableAsync).not.toHaveBeenCalled();
+    expect(h.clearBackground).not.toHaveBeenCalled();
+  });
+
+  it('leaves the markers alone while the bridge is shutting down: the killed sessions are the ones whose cards a restart keeps', async () => {
+    const h = sweepHarness({ ids: ['a'], sessions: [], shuttingDown: true });
+    await h.tick();
+    expect(h.clearBackground).not.toHaveBeenCalled();
+    expect(h.readProcessTableAsync).not.toHaveBeenCalled();
+  });
+
+  it('judges the sweep by the session\'s real idle time, so the eight-hour cap applies', () => {
+    const body = src.slice(src.indexOf('function startBackgroundMarkerMaintenance'), src.indexOf('// --- Pre-reap handoff'));
+    expect(body).toMatch(/sessionHasBackgroundWork\(session, table, handoffIdleSince\(session\)\)/);
+    const { sessionHasBackgroundWork } = hasWorkFns();
+    const child = Object.assign([], [{ pid: 11, ppid: 10, args: 'sleep 3600' }]);
+    const now = Date.now();
+    expect(sessionHasBackgroundWork({ pid: 10 }, child, now - 60_000)).toBe(true);
+    expect(sessionHasBackgroundWork({ pid: 10 }, child, now - 9 * 3600_000)).toBe(false);
+  });
+
+  it('reaping an idle session drops its background marker before the kill', () => {
+    const body = src.slice(src.indexOf('session._autoStopped = true;'), src.indexOf('session._autoStopped = true;') + 400);
+    expect(body.indexOf('inflightMarker.clearBackground(journalConvoIdFor(session))')).toBeGreaterThan(-1);
+    expect(body.indexOf('inflightMarker.clearBackground')).toBeLessThan(body.indexOf('killSession(session'));
   });
 
   it('starts the sweep at boot whether or not the idle reaper is on', () => {

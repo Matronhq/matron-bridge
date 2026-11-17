@@ -108,6 +108,14 @@ describe('takeNoteDeliveries', () => {
     expect(r.stale).toEqual(stale);
   });
 
+  it('a conversation whose marker was background work is not described as cut off mid-turn', () => {
+    const store = setup([['c1', 'finish the deploy check'], ['c2', 'other']]);
+    const stale = [{ convoId: 'c1', kind: 'background', bootId: 'b1', ageMs: 5 }, { convoId: 'c2', kind: 'turn', bootId: 'b1', ageMs: 5 }];
+    const r = takeNoteDeliveries({ store, stale, resumable, now: () => NOW });
+    expect(r.deliveries.map(d => [d.convoId, d.interrupted])).toEqual([['c1', false], ['c2', true]]);
+    expect(r.stale).toEqual([]);
+  });
+
   it('delivers a note even when no turn was interrupted', () => {
     const store = setup([['c3', 'idle note']]);
     const r = takeNoteDeliveries({ store, stale: [], resumable, now: () => NOW });

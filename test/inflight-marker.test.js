@@ -297,16 +297,16 @@ describe('background work markers', () => {
   });
 });
 
-describe('isBackground', () => {
-  it('is true only for a usable background marker', () => {
+describe('backgroundIds', () => {
+  it('lists only usable background markers', () => {
     const { marker } = harness();
+    expect(marker.backgroundIds()).toEqual([]);
     marker.noteTurnStart('alice', 'room-a');
-    expect(marker.isBackground('alice')).toBe(false);
+    marker.noteTurnStart('bob', 'room-b');
+    expect(marker.backgroundIds()).toEqual([]);
     marker.noteTurnEnd('alice', { hasWork: true });
-    expect(marker.isBackground('alice')).toBe(true);
+    expect(marker.backgroundIds()).toEqual(['alice']);
     marker.clearBackground('alice');
-    expect(marker.isBackground('alice')).toBe(false);
-    expect(marker.isBackground('missing')).toBe(false);
-    expect(marker.isBackground(null)).toBe(false);
+    expect(marker.backgroundIds()).toEqual([]);
   });
 });

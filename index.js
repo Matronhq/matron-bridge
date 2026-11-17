@@ -3704,7 +3704,8 @@ function finishCodexTurn(session, {
   // carry-on card. Teardown leaves the marker standing; a genuine end clears
   // it. A deliberate !stop clears it explicitly at its own call site, before
   // killSession runs, so that case does not rely on this branch.
-  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+  if (!discardOutput) dropBackgroundMarkerWhenNoWork(session);
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   maybeSummarizeAtTurnEnd(session);
@@ -4211,7 +4212,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.turnCount++;
     session.busy = false;
     // Authoritative iv-mode turn-end seam.
-    inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+    inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+    dropBackgroundMarkerWhenNoWork(session);
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
     maybeSummarizeAtTurnEnd(session);
@@ -5917,7 +5919,8 @@ function handleClaudeEvent(session, event) {
         foreignSessions.end(session);
         endTurn(session);
         // Authoritative print-mode turn-end seam.
-        inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+        inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+        dropBackgroundMarkerWhenNoWork(session);
         clearPendingInterrupt(session);
         // Print-mode's turn-end (this `case 'result':` block is its equivalent
         // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
@@ -6143,7 +6146,8 @@ function handleClaudeEvent(session, event) {
             // This branch IS the turn-end for a print-mode session at a manual
             // compact boundary (the iv branch above delegates to onTurnEnd,
             // which clears the marker there).
-            inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+            inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+            dropBackgroundMarkerWhenNoWork(session);
             endTurn(session);
             clearPendingInterrupt(session);
           }
@@ -6899,7 +6903,8 @@ function releaseStaleSteerHold(session, why = 'steered message never started a t
   session.busy = false;
   foreignSessions.end(session);
   endTurn(session);
-  inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+  dropBackgroundMarkerWhenNoWork(session);
   clearPendingInterrupt(session);
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
@@ -16087,18 +16092,43 @@ function sessionWorkHold(session, last, now, table) {
   });
 }
 
+// `ps` without blocking the event loop: the turn-end seams and the sweep below
+// run on the hot path, and a synchronous read (up to 5 s) would stall every
+// session. Same command and parse as readProcessTable; a failure resolves to
+// the same unreadable empty table, never rejects.
+function readProcessTableAsync() {
+  return new Promise((resolve) => {
+    try {
+      const { file, args: ptArgs } = processTableCommand();
+      const timeout = process.platform === 'win32' ? 15000 : 5000;
+      execFile(file, ptArgs, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }, (err, stdout) => {
+        if (err) {
+          debug(`readProcessTableAsync failed: ${err.message}`);
+          resolve(Object.assign([], { unreadable: true }));
+          return;
+        }
+        try { resolve(parseProcessTable(stdout)); } catch { resolve(Object.assign([], { unreadable: true })); }
+      });
+    } catch (e) {
+      debug(`readProcessTableAsync failed: ${e.message}`);
+      resolve(Object.assign([], { unreadable: true }));
+    }
+  });
+}
+
 // Whether work outlives the turn that just ended: a live background child or a
 // running subagent, by the same rule that holds a restart or the idle reaper
 // (sessionWorkHold, with the turn itself left out: it is the thing that just
-// ended). The marker then stays, as a background marker, so a restart that
-// kills the work leaves a card. An unreadable process table falls back to the
-// in-memory subagent count, as sessionsHoldingRestart does.
-function sessionHasBackgroundWork(session, table = readProcessTable()) {
+// ended). An unreadable process table falls back to the in-memory subagent
+// count, as sessionsHoldingRestart does.
+// `idleSince` is the session's last activity (default: now, at a turn end), so
+// the sweep applies the same eight-hour cap as the reaper and the update restart.
+function sessionHasBackgroundWork(session, table, idleSince = Date.now()) {
   try {
     const now = Date.now();
     const hold = table.unreadable
-      ? workHold({ subagentCount: session.subagentConvos?.runningCount() ?? 0, idleSince: now, now })
-      : sessionWorkHold(Object.create(session, { busy: { value: false } }), now, now, table);
+      ? workHold({ subagentCount: session.subagentConvos?.runningCount() ?? 0, idleSince, now })
+      : sessionWorkHold(Object.create(session, { busy: { value: false } }), idleSince, now, table);
     return !!hold;
   } catch {
     // A failed observation must not erase the evidence that work was running.
@@ -16106,19 +16136,44 @@ function sessionHasBackgroundWork(session, table = readProcessTable()) {
   }
 }
 
-// Keeps background markers honest while no turn runs: refreshed while the
-// work is still there (so a job that outlives the carry-on window still gets
-// its card), dropped once it is gone. The process table is read once per tick,
-// and only when some session has such a marker.
+// The second half of a turn end. The marker was just kept as a background
+// marker (inflightMarker.noteTurnEnd with hasWork: true, so nothing is lost if
+// the check is slow); this checks without blocking whether anything outlives
+// the turn and drops the marker when nothing does. clearBackground only touches
+// a background marker, so a turn that has already started again is left alone.
+function dropBackgroundMarkerWhenNoWork(session) {
+  const convoId = journalConvoIdFor(session);
+  void readProcessTableAsync().then((table) => {
+    if (shuttingDown) return;
+    if (!sessionHasBackgroundWork(session, table)) inflightMarker.clearBackground(convoId);
+  });
+}
+
+// Keeps background markers honest while no turn runs. A marker is refreshed
+// while its work is still there (so a job longer than the carry-on window
+// still gets its card) and dropped once the work is gone, and also when the
+// conversation has no live session any more: reaped, killed, archived or
+// exited, the work it stood for is gone with it, and a card after a later
+// restart would be for something the restart never touched. The process table
+// is read (asynchronously) once per tick, and only when a background marker
+// exists. Not while shutting down: the sessions the SIGTERM path kills are
+// exactly the ones whose cards the restart must keep.
 function startBackgroundMarkerMaintenance() {
-  setInterval(() => {
-    let table;
+  setInterval(async () => {
+    if (shuttingDown) return;
+    const ids = inflightMarker.backgroundIds();
+    if (!ids.length) return;
+    const live = new Map();
     for (const session of sessions.values()) {
-      if (!session.alive || session._autoStopped || session.busy) continue;
-      const convoId = journalConvoIdFor(session);
-      if (!inflightMarker.isBackground(convoId)) continue;
-      table ??= readProcessTable();
-      if (sessionHasBackgroundWork(session, table)) inflightMarker.refreshBackground(convoId);
+      if (session.alive && !session._autoStopped) live.set(journalConvoIdFor(session), session);
+    }
+    const table = await readProcessTableAsync();
+    if (shuttingDown) return;
+    for (const convoId of ids) {
+      const session = live.get(convoId);
+      if (!session) { inflightMarker.clearBackground(convoId); continue; }
+      if (session.busy) continue;
+      if (sessionHasBackgroundWork(session, table, handoffIdleSince(session))) inflightMarker.refreshBackground(convoId);
       else inflightMarker.clearBackground(convoId);
     }
   }, SESSION_IDLE_CHECK_MS).unref();
@@ -16288,6 +16343,8 @@ function startIdleReaper() {
       const idleHours = Math.round((now - last) / 3600000);
       debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
       session._autoStopped = true;
+      // The child dies with the session: no background-work card for it.
+      inflightMarker.clearBackground(journalConvoIdFor(session));
       killSession(session, 'SIGTERM');
       // Claude's persistent child close handler performs this cleanup. An
       // idle Codex logical session normally has no child between turns, so
