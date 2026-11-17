@@ -379,6 +379,7 @@ describe('duplicate_of', () => {
         update: async (id, body) => { updates.push([id, body]); return { status: 200, data: {} }; },
       },
       journalConvoIdFor: (s) => `convo-${s.roomId}`,
+      trackerBase: () => 'https://chat.example/u/bob',
       sendText: () => true,
       publishNotice: () => {},
       isOccupied: () => false,
@@ -414,13 +415,13 @@ describe('duplicate_of', () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]).toMatchObject({ id: 'it_open', key: 'foreign-dup-it_1', as_convo_id: 'convo-sess-a' });
     expect(comments[0].actions).toBeUndefined();
-    expect(comments[0].body).toContain("**Moved here from the notice [#201 From alice's agent: PRs to review](matron://item/201), closed as the same as this item.**");
+    expect(comments[0].body).toContain("**Moved here from the notice [#201 From alice's agent: PRs to review](https://chat.example/u/bob/201), closed as the same as this item.**");
     expect(comments[0].body).toContain('> Sixty of them.');
     expect(comments[0].body).toContain('> By Friday [x](https://example.com/t.png) ‹b>now‹/b>');
     expect(comments[0].body).not.toMatch(/!\[|<b>/);
     expect(closed).toHaveLength(1);
     expect(closed[0]).toMatchObject({ id: 'it_1', resolution: 'cancelled', as_convo_id: 'convo-sess-a' });
-    expect(closed[0].comment).toBe("Your agent judged this the same as [#42 Review backlog](matron://item/42) and moved it there; reopen this if it isn't.");
+    expect(closed[0].comment).toBe("Your agent judged this the same as [#42 Review backlog](https://chat.example/u/bob/42) and moved it there; reopen this if it isn't.");
     expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
     fs.end(s);
     await tick();
