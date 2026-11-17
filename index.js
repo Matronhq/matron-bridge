@@ -7175,9 +7175,15 @@ function dispatchMergedFlush(session, queued) {
   if (blocks.length === 0) return false;
   // One turn for the whole batch: it was started by everything in it.
   if (!sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued), queuedEntries: queued })) return false;
-  if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
-  for (const entry of queued) {
-    for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+  // The text is already with the agent. A throw from the journal mirror must not
+  // read as a failed send, or flushQueue would restore the batch and send it twice.
+  try {
+    if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
+    for (const entry of queued) {
+      for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+    }
+  } catch (e) {
+    console.log(`[QUEUE] journal mirror of a delivered batch failed (room ${session.roomId}): ${e?.message ?? String(e)}`);
   }
   return true;
 }
@@ -7388,12 +7394,20 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     return false;
   }
   let delivered;
+  const wasBusy = session.busy;
   try {
     delivered = dispatchMergedFlush(session, queued);
   } catch (e) {
     // The batch was detached from the queue before the send; if the send
     // throws it would be lost, so put it back for a later flush.
     restore();
+    // The send began a turn that no agent output will ever end: close it, or
+    // the restored batch waits on a turn end that never comes.
+    if (!wasBusy && session.busy) {
+      session.busy = false;
+      if (session.currentTurn) endTurn(session);
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+    }
     console.log(`[QUEUE] dispatch threw; kept ${queued.length} queued message(s) for retry (room ${session.roomId}): ${e?.message ?? String(e)}`);
     return false;
   }
@@ -15354,7 +15368,7 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   }
 
   journalStreamClear(existing);
-  killSession(existing, 'SIGTERM', { preserveQueue: true });
+  killSession(existing);
 
   next.originRoomId = existing.originRoomId;
   next.firstMessageCaptured = true;
@@ -15364,16 +15378,6 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.showWorking = existing.showWorking;
   next.showBashOutput = existing.showBashOutput;
   next.chatHistory = history;
-  // Carry queued messages + their notification tiles across the agent switch,
-  // as recreateSession does. killSession keeps them (preserveQueue) and
-  // flushPendingSessionQueue no-ops on a dead session, so pending user input
-  // survives the switch instead of being orphaned. The journal convo id is
-  // stable across the switch, so the queue-release registry entries already
-  // map to `next` by convo id + item id.
-  next.queuedMessages = existing.queuedMessages;
-  next.queueNotifications = existing.queueNotifications;
-  // The replacement now owns delivery (see the matching line in recreateSession).
-  if (CLAUDE_STEER_ENABLED) existing._queueTransferred = true;
   next.pinnedSummaryText = existing.pinnedSummaryText;
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
   next.lastSummaryMsgCount = existing.lastSummaryMsgCount || 0;

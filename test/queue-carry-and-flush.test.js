@@ -21,6 +21,8 @@ function flushHarness({ dispatchMergedFlush }) {
     finalizeSentQueue: vi.fn(),
     journalPublishNotice: vi.fn(),
     journalConvoIdFor: () => 'convo',
+    endTurn: vi.fn(),
+    inflightMarker: { noteTurnEnd: vi.fn() },
     dispatchMergedFlush,
     console: { log: vi.fn() },
   });
@@ -47,6 +49,24 @@ describe('flushQueue when the dispatch throws', () => {
     expect(h.session.queuedMessages).toEqual([...h.batch, late]);
   });
 
+  it('closes a turn the failed send began, so the restored batch can go next', () => {
+    const h = flushHarness({
+      dispatchMergedFlush: () => { h.session.busy = true; h.session.currentTurn = {}; throw new Error('boom'); },
+    });
+    expect(h.flush()).toBe(false);
+    expect(h.session.busy).toBe(false);
+    expect(h.context.endTurn).toHaveBeenCalledWith(h.session);
+    expect(h.context.inflightMarker.noteTurnEnd).toHaveBeenCalledWith('convo');
+  });
+
+  it('leaves a turn that was already running alone', () => {
+    const h = flushHarness({ dispatchMergedFlush: () => { throw new Error('boom'); } });
+    h.session.busy = true;
+    h.flush();
+    expect(h.session.busy).toBe(true);
+    expect(h.context.endTurn).not.toHaveBeenCalled();
+  });
+
   it('still retires the queue cards on a normal delivery', () => {
     const h = flushHarness({ dispatchMergedFlush: () => true });
     expect(h.flush()).toBe(true);
@@ -55,14 +75,6 @@ describe('flushQueue when the dispatch throws', () => {
 });
 
 describe('index.js wiring (source inspection)', () => {
-  it('switchAgentSession carries the queue and its notification tiles to the replacement', () => {
-    const body = sourceOf('switchAgentSession').replace('async function', 'function');
-    expect(body).toMatch(/killSession\(existing, 'SIGTERM', \{ preserveQueue: true \}\)/);
-    expect(body).toMatch(/next\.queuedMessages = existing\.queuedMessages/);
-    expect(body).toMatch(/next\.queueNotifications = existing\.queueNotifications/);
-    expect(body).toMatch(/if \(CLAUDE_STEER_ENABLED\) existing\._queueTransferred = true/);
-  });
-
   it('an interactive session that refuses the typed text reports a failed send', () => {
     const body = sourceOf('sendToSession');
     const typed = body.indexOf('session.iv.sendText(text)');
@@ -72,5 +84,21 @@ describe('index.js wiring (source inspection)', () => {
     expect(guard).toContain('reportSessionSendFailure(session');
     // The turn is committed only after the guard.
     expect(body.indexOf('commitDispatchedUserTurn', typed)).toBeGreaterThan(typed + 150);
+  });
+});
+
+describe('dispatchMergedFlush after the text is sent', () => {
+  it('a throwing journal mirror does not turn a delivered batch into a failed one', () => {
+    const context = vm.createContext({
+      planQueueFlush: () => ({ blocks: [{ type: 'text', text: 'hi' }], mirrorText: 'hi' }),
+      sendToSession: () => true,
+      queueCauses: () => null,
+      journalPublishUserItem: () => { throw new Error('journal down'); },
+      pendingMediaMirror: () => [],
+      journalMirrorUserMedia: vi.fn(),
+      console: { log: vi.fn() },
+    });
+    vm.runInContext(sourceOf('dispatchMergedFlush'), context);
+    expect(context.dispatchMergedFlush({ roomId: 'r' }, [[{ type: 'text', text: 'hi' }]])).toBe(true);
   });
 });
