@@ -3429,13 +3429,17 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     if (session.alive) void refreshCodexMetadata(session);
     session.proc = codex.transport === 'app-server' ? codex.child : null;
     if (session._codexTurnFinished) return;
-    if (!session.alive) {
+    if (shuttingDown || !session.alive) {
       // killSession normally performs this synchronously so a replacement
       // session cannot inherit running/thinking state. Keep an exit-side
       // fallback for any future path that marks the session dead directly.
+      // A child that exits because the bridge is shutting down is not a
+      // failed turn: no error card, and the queue is not flushed into a
+      // process that is about to go away.
       finishCodexTurn(session, {
         usage: session._codexCompletedUsage,
         discardOutput: true,
+        preserveQueue: shuttingDown,
       });
       return;
     }
@@ -10612,6 +10616,7 @@ async function journalOnCoordinator(convoId, { role }) {
   if (role === 'assigned') await memoryLookup.refresh({ force: true });
   // Looked up after the await: the session may have been reaped or respawned
   // while the journal answered.
+  if (shuttingDown) return;
   const session = findSessionByClaudeSessionId(convoId);
   const live = !!(session && session.alive);
   const verdict = decideCoordinatorEvent({
@@ -16131,7 +16136,7 @@ async function runPreReapHandoff(session, now, idleSince) {
   // After the awaits: still the live session for the room, and the mark
   // still ours (another turn meanwhile — a user message, a room message, a
   // reminder — cleared it, see noteTurnStart).
-  if (sessions.get(roomId) !== session || !session.alive || session._autoStopped || !session._preReapHandoff) return;
+  if (shuttingDown || sessions.get(roomId) !== session || !session.alive || session._autoStopped || !session._preReapHandoff) return;
   if (lookupFailed) {
     debug(`pre-reap handoff for ${roomId}: ${lookupFailed} — retrying next tick`);
     session._preReapHandoff = null;
