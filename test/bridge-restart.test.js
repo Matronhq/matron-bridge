@@ -59,6 +59,50 @@ describe('requested bridge restart (watcher)', () => {
     expect((await watcher.tick()).action).toBe('restart');
   });
 
+  // A preflight the test resolves by hand, to land a POST or DELETE mid-check.
+  function gated(head, outcomes) {
+    const state = { head, busy: 0, now: T0, log: [], warn: [], restarts: [], preflights: 0, release: [] };
+    const watcher = createCodeUpdateWatcher({
+      readHead: () => state.head,
+      busySessions: () => state.busy,
+      preflight: () => new Promise((resolve) => { const ok = outcomes[state.preflights++]; state.release.push(() => resolve(ok ? { ok: true } : { ok: false, error: 'broken tree' })); }),
+      restart: (info) => state.restarts.push(info),
+      now: () => state.now,
+      log: (m) => state.log.push(m),
+      warn: (m) => state.warn.push(m),
+      bootSha: OLD,
+    });
+    return { state, watcher };
+  }
+
+  it('a cancel during the preflight stops the restart it was checking for', async () => {
+    const { state, watcher } = gated(onBoot, [true]);
+    watcher.request({ reason: 'x' });
+    const t = watcher.tick();
+    await Promise.resolve();
+    expect(watcher.cancelRequest()).toBe(true);
+    state.release[0]();
+    expect((await t).action).toBe('superseded');
+    expect((await watcher.tick()).action).toBe('none');
+    expect(state.restarts).toHaveLength(0);
+  });
+
+  it('a repeat request during a failing preflight gets a fresh check', async () => {
+    const { state, watcher } = gated(onBoot, [false, true]);
+    watcher.request({ reason: 'first' });
+    const t = watcher.tick();
+    await Promise.resolve();
+    watcher.request({ reason: 'tree repaired' });
+    state.release[0]();
+    expect((await t).action).toBe('superseded');
+    expect(watcher.requested.error).toBeNull();
+    const t2 = watcher.tick();
+    await Promise.resolve();
+    state.release[1]();
+    expect((await t2).action).toBe('restart');
+    expect(state.preflights).toBe(2);
+  });
+
   it('keeps a failed preflight pending and reports it', async () => {
     const { state, watcher } = harness({ head: onBoot, preflightOk: false });
     watcher.request({ reason: 'x' });

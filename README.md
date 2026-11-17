@@ -292,9 +292,10 @@ the viewer's environment turns it off.
 
 A bridge restart can also be requested without any code change, for example
 to pick up a new `.env`. It goes through the same watcher, so it waits for
-The routes take the operator token only, even with `MATRON_BRIDGE_API_AUTH=off` (a session token or the viewer key
-The routes take the operator token only (a session token or the viewer key
-is refused), and answer 409 when the watcher is not running:
+the same holds, runs the same preflight, warns every 30 minutes and exits 75.
+The routes take the operator token only, even with `MATRON_BRIDGE_API_AUTH=off`
+(a session token or the viewer key is refused), and answer 409 when the
+watcher is not running:
 
 ```sh
 H=${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header
