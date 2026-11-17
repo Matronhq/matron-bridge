@@ -187,6 +187,7 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { loadBridgePlugins } from './lib/bridge-plugins.js';
 import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
@@ -1319,10 +1320,17 @@ function publishBoxStatus(reason) {
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
     ...(defaults ? { defaults } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
+    ...pluginsReport(),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
   return sent;
 }
+
+// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
+// Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
+const bridgePlugins = await loadBridgePlugins({
+  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
+});
 
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
@@ -1340,7 +1348,7 @@ const journalPublisher = createJournalPublisher({
   onPanic: (panic, { hello }) => (hello ? accountLock.onHello(panic) : accountLock.onFrame(panic)),
   // The box's lock, said on every hello: a hello without it reads as "not
   // locked". A box without approval keys sends nothing.
-  helloExtras: () => (boxLock ? { locked: boxLock.report() } : null),
+  helloExtras: () => ({ ...(boxLock ? { locked: boxLock.report() } : {}), ...pluginsReport() }),
   // The user's settings: hello_ok's (or GET /settings when it carries none)
   // and every pushed change.
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
@@ -1754,7 +1762,11 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
+const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
+
+
 const journalRpcHandler = createRpcRequestHandler({
+  plugins: bridgePlugins,
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
   // The !stop teardown for the unsupported_mode orphan: kill, drop from the
@@ -11366,6 +11378,34 @@ function startAutoResumeSweep() {
   return timer;
 }
 
+// The live sessions that hold a restart back right now: mid-turn, a live
+// background work child, or a running subagent. Background work and subagents
+// use the idle reaper's age cap, a running turn never does. One process-table
+// read per call, shared by every live session. `unreadable` reports a failed
+// `ps`: the verdict then rests on in-memory signals alone.
+function sessionsHoldingRestart() {
+  const live = [...sessions.values()].filter(s => s.alive);
+  if (!live.length) return { holders: [], unreadable: false };
+  const table = readProcessTable();
+  const now = Date.now();
+  const holders = [];
+  for (const s of live) {
+    const last = handoffIdleSince(s);
+    // A quiet tool call can outlast the age cap without ending its turn.
+    // Subagent tracking is in memory, so it survives a failed ps read.
+    const hold = s.busy
+      ? { reason: 'turn in progress' }
+      : table.unreadable
+        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
+        : sessionWorkHold(s, last, now, table);
+    if (hold) {
+      holders.push({ session: s, reason: hold.reason });
+      debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
+    }
+  }
+  return { holders, unreadable: !!table.unreadable };
+}
+
 // Restart onto new code by itself — lib/code-update-restart.js has the
 // policy and the why. A rollout that found a live session here left the
 // new code on disk and the old process running; this is the "next natural
@@ -11391,28 +11431,7 @@ function startCodeUpdateWatcher() {
     readHead: () => readHeadReflog(gitDir),
     // Share the idle reaper's age cap for background work, while a running
     // turn always holds the update unless forcing is explicitly enabled.
-    busySessions: () => {
-      const live = [...sessions.values()].filter(s => s.alive);
-      if (!live.length) return 0;
-      const table = readProcessTable();
-      const now = Date.now();
-      let n = 0;
-      for (const s of live) {
-        const last = handoffIdleSince(s);
-        // A quiet tool call can outlast the age cap without ending its turn.
-        // Subagent tracking is in memory, so it survives a failed ps read.
-        const hold = s.busy
-          ? { reason: 'turn in progress' }
-          : table.unreadable
-            ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
-            : sessionWorkHold(s, last, now, table);
-        if (hold) {
-          n++;
-          debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
-        }
-      }
-      return n;
-    },
+    busySessions: () => sessionsHoldingRestart().holders.length,
     preflight: () => defaultPreflight(__dirname),
     // Optional advisory hook; unset = no gate. Never consulted for a forced
     // restart, and never by restart_session or the other operator restarts,

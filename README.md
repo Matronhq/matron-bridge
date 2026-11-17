@@ -339,6 +339,7 @@ the viewer's environment turns it off.
 | `MATRON_STEP_UP_ALL` | `1` marks every question this box files, and every comment with buttons, as step-up: the tap needs the user's device signature | off |
 | `MATRON_LOCKED` | `1` puts the box in locked mode: outside input is taken only during a signed unlock window. Needs `MATRON_APPROVAL_KEYS_FILE`; the bridge refuses to start without it | off |
 | `MATRON_UNLOCK_MAX_MINUTES` | The longest unlock window a locked box grants | `120` |
+| `MATRON_BRIDGE_PLUGINS` | Comma-separated absolute paths of ES modules that add RPC methods (see `docs/plugins.md`). **A plugin runs with full bridge privileges.** Files must be owned by the bridge's user, not group- or world-writable, with no writable or foreign-owned parent directory, and outside the default and session folders. Read at startup only | _(empty: off)_ |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset. Scripts run outside a session can list sessions (`POST /sessions`) with `curl -H @"${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"`, an owner-only file the bridge rewrites at each start | on |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
