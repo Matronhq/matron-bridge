@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { createForeignSessions, REVIEW_PARKED_MAX } from '../lib/foreign-session.js';
 import {
   decideForeignCall, foreignRouteAllowed, noticeItem, reviewTurnFor, reviewTurnText, validateReview, reviewComment,
-  REVIEW_PENDING_LINE, REVIEW_MISSING_COMMENT,
+  REVIEW_PENDING_LINE, REVIEW_MISSING_COMMENT, reviewDuplicateComment,
 } from '../lib/foreign-turn.js';
 
 // After a notice from another person's side is filed, the same session gets
@@ -359,7 +359,7 @@ describe('wiring', () => {
 });
 
 describe('duplicate_of', () => {
-  const open = (extra = {}) => ({ status: 200, data: { item: { id: 'it_open', num: 42, state: 'open', kind: 'task', awaiting: 'agent', ...extra } } });
+  const open = (extra = {}) => ({ status: 200, data: { item: { id: 'it_open', num: 42, title: 'Review backlog', state: 'open', kind: 'task', awaiting: 'agent', private: true, mission_id: 'mi_1', ...extra } } });
   const state = { close: 200, comment: 201 };
   async function setup(getTarget) {
     state.close = 200; state.comment = 201;
@@ -414,17 +414,37 @@ describe('duplicate_of', () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]).toMatchObject({ id: 'it_open', key: 'foreign-dup-it_1', as_convo_id: 'convo-sess-a' });
     expect(comments[0].actions).toBeUndefined();
-    expect(comments[0].body).toContain("**Moved here from a notice (#201), closed as the same as this item:** From alice's agent: PRs to review");
+    expect(comments[0].body).toContain("**Moved here from the notice [#201 From alice's agent: PRs to review](matron://item/201), closed as the same as this item.**");
     expect(comments[0].body).toContain('> Sixty of them.');
     expect(comments[0].body).toContain('> By Friday [x](https://example.com/t.png) ‹b>now‹/b>');
     expect(comments[0].body).not.toMatch(/!\[|<b>/);
     expect(closed).toHaveLength(1);
     expect(closed[0]).toMatchObject({ id: 'it_1', resolution: 'cancelled', as_convo_id: 'convo-sess-a' });
-    expect(closed[0].comment).toBe("Your agent judged this the same as #42 and moved it there; reopen this if it isn't.");
+    expect(closed[0].comment).toBe("Your agent judged this the same as [#42 Review backlog](matron://item/42) and moved it there; reopen this if it isn't.");
     expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
     fs.end(s);
     await tick();
     expect(comments).toHaveLength(1);
+  });
+  it('folds into a private item, or one on no mission, and into nothing else', async () => {
+    for (const extra of [{ private: true, mission_id: 'mi_1' }, { private: false, mission_id: null }, { private: undefined, mission_id: null }]) {
+      const r = await setup(async () => open(extra));
+      expect((await r.fs.postReview(r.s, { duplicate_of: 42 })).status, JSON.stringify(extra)).toBe(200);
+      expect(r.closed).toHaveLength(1);
+    }
+  });
+  it('refuses a target on a mission that is not private, or one whose privacy and mission are unknown; the notice stays open and the review can still be sent', async () => {
+    for (const extra of [{ private: false, mission_id: 'mi_shared' }, { private: undefined, mission_id: 'mi_1' }, { private: undefined, mission_id: undefined }, { private: 'yes', mission_id: 'mi_1' }]) {
+      const r = await setup(async () => open(extra));
+      const out = await r.fs.postReview(r.s, { duplicate_of: 42 });
+      expect(out.status, JSON.stringify(extra)).toBe(409);
+      expect(out.body.error).toMatch(/private item or one on no mission.*buttons instead.*notice stays open/);
+      expect(r.comments).toEqual([]);
+      expect(r.closed).toEqual([]);
+      expect((await r.fs.postReview(r.s, good)).status).toBe(200);
+      expect(r.comments).toHaveLength(1);
+      expect(r.comments[0].id).toBe('it_1');
+    }
   });
   it('hands the target to the user only when it is a question not already waiting on them', async () => {
     let r = await setup(async () => open());
@@ -483,6 +503,10 @@ describe('duplicate_of', () => {
     state.close = 409;
     expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
     expect(closed).toHaveLength(2);
+  });
+  it('links the item in the journal\'s own form when it is known, plain text without a number', () => {
+    expect(reviewDuplicateComment({ num: 42, title: 'A [b] (c)' }, 'https://chat.example/u/bob')).toContain('[#42 A b c](https://chat.example/u/bob/42)');
+    expect(reviewDuplicateComment({ id: 'it_x' })).toContain('same as it_x and');
   });
   it('the review turn and the tool tell the agent about it', () => {
     expect(reviewTurnText(review)).toContain('duplicate_of');
