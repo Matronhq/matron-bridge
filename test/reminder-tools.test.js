@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createReminderHandlers, reminderView, formatReminderLine, REMINDER_TEXT_MAX } from '../lib/reminder-tools.js';
+import { z } from 'zod';
+import { createReminderHandlers, reminderView, formatReminderLine, REMINDER_TEXT_MAX, REMINDER_ID_STRING } from '../lib/reminder-tools.js';
 import { createTimerStore, MIN_TIMER_MS, MAX_TIMER_MS } from '../lib/timer-command.js';
 
 const HOUR = 3_600_000;
@@ -135,6 +136,24 @@ describe('reminder handlers', () => {
     expect((await h.cancel({ roomId: '!r:s', id: 'all' })).body.cancelled.map(x => x.text)).toEqual(['b']);
     expect((await h.cancel({ roomId: '!r:s', id: 'all' })).status).toBe(404);
     expect(store.listForConvo('other')).toHaveLength(1);
+  });
+
+  it('cancel takes the number as a string too, as some MCP clients send it ("261", "#261")', async () => {
+    const { h } = fixture();
+    const a = await h.create({ roomId: '!r:s', text: 'a', in: '1h' });
+    const b = await h.create({ roomId: '!r:s', text: 'b', in: '2h' });
+    expect((await h.cancel({ roomId: '!r:s', id: String(a.body.reminder.id) })).body.cancelled.map(x => x.text)).toEqual(['a']);
+    expect((await h.cancel({ roomId: '!r:s', id: ` #${b.body.reminder.id} ` })).body.cancelled.map(x => x.text)).toEqual(['b']);
+    for (const id of ['', '1.5', '-3', '12abc', 'ALL ', null]) {
+      expect((await h.cancel({ roomId: '!r:s', id })).status, `id ${JSON.stringify(id)}`).toBe(400);
+    }
+  });
+
+  it('the tool schema built from REMINDER_ID_STRING lets the string forms through to the handler', () => {
+    // Mirrors the union in ask-user.js (the wiring test pins it there).
+    const schema = z.union([z.number().int(), z.literal('all'), z.string().regex(REMINDER_ID_STRING)]);
+    for (const id of [261, 'all', '261', '#261', ' 261 ']) expect(schema.safeParse(id).success, `id ${JSON.stringify(id)}`).toBe(true);
+    for (const id of [1.5, '1.5', '-3', 'nope', '']) expect(schema.safeParse(id).success, `id ${JSON.stringify(id)}`).toBe(false);
   });
 });
 
