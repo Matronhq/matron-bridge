@@ -16468,7 +16468,7 @@ function publishRestartCarryOnCards() {
     const question = rec.foreignPerson
       ? `⚠️ The bridge restarted during a turn ${peerField(rec.foreignPerson, PEER_NAME_MAX)} started in this chat — interrupted ${formatInterruptedAgo(rec.ageMs)}. Carry on runs as your own turn, with their request still in it.`
       : rec.kind === 'background'
-        ? `⚠️ The bridge restarted while this chat had background work running — interrupted ${formatInterruptedAgo(rec.ageMs)}. The background work stopped where it was.`
+        ? `⚠️ The bridge restarted while this chat had background work running — interrupted ${formatInterruptedAgo(rec.ageMs)}. The background work stopped where it was.${rec.note ? ` Your note for this chat: "${String(rec.note).replace(/\s+/g, ' ').trim().slice(0, 400)}"` : ''}`
         : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
     const published = journalPublishCardForConvo(rec.convoId, {
       question,

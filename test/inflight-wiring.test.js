@@ -365,6 +365,10 @@ describe('background work markers in the bridge', () => {
     expect(main.indexOf('startBackgroundMarkerMaintenance();')).toBeLessThan(main.indexOf('if (SESSION_IDLE_TIMEOUT_MS > 0)'));
   });
 
+  it('shows the note a background chat had on its card', () => {
+    expect(src).toMatch(/Your note for this chat: "/);
+  });
+
   it('gives background work its own card and never carries it on by itself', () => {
     expect(src).toMatch(/\.filter\(rec => rec\.kind !== 'background'\)/);
     expect(src).toMatch(/rec\.kind === 'background'\s*\? `⚠️ The bridge restarted while this chat had background work running/);
