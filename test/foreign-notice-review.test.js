@@ -359,18 +359,24 @@ describe('wiring', () => {
 });
 
 describe('duplicate_of', () => {
-  const open = (extra = {}) => ({ status: 200, data: { item: { id: 'it_open', num: 42, state: 'open', ...extra } } });
-  async function setup(get) {
+  const open = (extra = {}) => ({ status: 200, data: { item: { id: 'it_open', num: 42, state: 'open', kind: 'task', awaiting: 'agent', ...extra } } });
+  const state = { close: 200, comment: 201 };
+  async function setup(getTarget) {
+    state.close = 200; state.comment = 201;
     const closed = [];
     const comments = [];
+    const updates = [];
     const created = [];
+    const order = [];
     const fs = createForeignSessions({
       sharing: { personRoom: async () => ({ status: 404, data: {} }) },
       items: {
-        get,
+        // The notice is read back as the bridge filed it; anything else is the target.
+        get: async (id) => (id === 'it_1' ? { status: 200, data: { item: { ...created[0], id: 'it_1', num: 201 } } } : getTarget(id)),
         create: async (body) => { created.push(body); return { status: 201, data: { item: { id: 'it_1', num: 201 } } }; },
-        close: async (id, body) => { closed.push({ id, ...body }); return { status: closedStatus.v, data: {} }; },
-        comment: async (id, body) => { comments.push({ id, ...body }); return { status: 201, data: {} }; },
+        close: async (id, body) => { order.push('close'); closed.push({ id, ...body }); return { status: state.close, data: {} }; },
+        comment: async (id, body, opts) => { order.push(`comment:${id}`); comments.push({ id, ...body, key: opts?.idemKey }); return { status: state.comment, data: {} }; },
+        update: async (id, body) => { updates.push([id, body]); return { status: 200, data: {} }; },
       },
       journalConvoIdFor: (s) => `convo-${s.roomId}`,
       sendText: () => true,
@@ -383,12 +389,11 @@ describe('duplicate_of', () => {
     });
     const s = { roomId: 'sess-a', alive: true, foreignTurn: null };
     fs.begin(s, roomTurn);
-    await fs.raiseNotice(s, { title: 'PRs to review', text: 'Sixty of them.' });
+    await fs.raiseNotice(s, { title: 'PRs to review', text: 'Sixty of them.\nBy Friday ![x](https://example.com/t.png) <b>now</b>' });
     fs.end(s);
     fs.drainParked(s);
-    return { fs, s, closed, comments };
+    return { fs, s, closed, comments, updates, order };
   }
-  const closedStatus = { v: 200 };
 
   it('is checked: an item id, a number or #number', () => {
     expect(validateReview({ duplicate_of: 'it_abc' })).toEqual({ ok: true, value: { duplicateOf: 'it_abc' } });
@@ -401,22 +406,50 @@ describe('duplicate_of', () => {
     expect(validateReview({ duplicate_of: 42 }).ok).toBe(true);
     expect(validateReview({}).ok).toBe(false);
   });
-  it('closes the notice with a comment pointing to the open item, and posts no buttons', async () => {
-    closedStatus.v = 200;
-    const { fs, s, closed, comments } = await setup(async () => open());
+  it('copies the notice onto the target, then closes it with a comment the user can check; no buttons', async () => {
+    const { fs, s, closed, comments, order } = await setup(async () => open());
     const out = await fs.postReview(s, { duplicate_of: 42 });
     expect(out.status).toBe(200);
-    expect(comments).toEqual([]);
+    expect(order).toEqual(['comment:it_open', 'close']);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ id: 'it_open', key: 'foreign-dup-it_1', as_convo_id: 'convo-sess-a' });
+    expect(comments[0].actions).toBeUndefined();
+    expect(comments[0].body).toContain("**Moved here from a notice (#201), closed as the same as this item:** From alice's agent: PRs to review");
+    expect(comments[0].body).toContain('> Sixty of them.');
+    expect(comments[0].body).toContain('> By Friday [x](https://example.com/t.png) ‹b>now‹/b>');
+    expect(comments[0].body).not.toMatch(/!\[|<b>/);
     expect(closed).toHaveLength(1);
     expect(closed[0]).toMatchObject({ id: 'it_1', resolution: 'cancelled', as_convo_id: 'convo-sess-a' });
-    expect(closed[0].comment).toMatch(/already covered by #42/);
+    expect(closed[0].comment).toBe("Your agent judged this the same as #42 and moved it there; reopen this if it isn't.");
     expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
     fs.end(s);
     await tick();
-    expect(comments).toEqual([]);
+    expect(comments).toHaveLength(1);
   });
-  it('refuses the notice itself, a closed item, another person\'s item and a missing one; the review may then be sent normally', async () => {
-    closedStatus.v = 200;
+  it('hands the target to the user only when it is a question not already waiting on them', async () => {
+    let r = await setup(async () => open());
+    await r.fs.postReview(r.s, { duplicate_of: 42 });
+    expect(r.updates).toEqual([]);
+    r = await setup(async () => open({ kind: 'question', awaiting: 'agent' }));
+    await r.fs.postReview(r.s, { duplicate_of: 42 });
+    expect(r.updates).toEqual([['it_open', { awaiting: 'user' }]]);
+    r = await setup(async () => open({ kind: 'question', awaiting: 'user' }));
+    await r.fs.postReview(r.s, { duplicate_of: 42 });
+    expect(r.updates).toEqual([]);
+  });
+  it('if the target comment fails the notice stays open, and the agent is told', async () => {
+    const { fs, s, closed, comments, order } = await setup(async () => open());
+    state.comment = 500;
+    const out = await fs.postReview(s, { duplicate_of: 42 });
+    expect(out.status).toBe(502);
+    expect(out.body.error).toMatch(/notice stays open/);
+    expect(closed).toEqual([]);
+    expect(order).toEqual(['comment:it_open']);
+    state.comment = 201;
+    expect((await fs.postReview(s, good)).status).toBe(200);
+    expect(comments.at(-1)).toMatchObject({ id: 'it_1', actions: ['Reply: yes', 'Ask for more detail'] });
+  });
+  it('refuses the notice itself, a closed item, another person\'s item and a missing one, writing nothing; the review may then be sent normally', async () => {
     let reply = { status: 200, data: { item: { id: 'it_1', num: 201, state: 'open' } } };
     const { fs, s, closed, comments } = await setup(async () => reply);
     expect((await fs.postReview(s, { duplicate_of: 201 })).status).toBe(400);
@@ -427,11 +460,11 @@ describe('duplicate_of', () => {
     reply = { status: 404, data: {} };
     expect((await fs.postReview(s, { duplicate_of: 99 })).status).toBe(404);
     expect(closed).toEqual([]);
+    expect(comments).toEqual([]);
     expect((await fs.postReview(s, good)).status).toBe(200);
     expect(comments).toHaveLength(1);
   });
   it('claims the review before the lookup: a parallel review with buttons is refused', async () => {
-    closedStatus.v = 200;
     let release;
     const gate = new Promise((res) => { release = res; });
     const { fs, s, closed, comments } = await setup(async () => { await gate; return open(); });
@@ -439,17 +472,17 @@ describe('duplicate_of', () => {
     expect((await fs.postReview(s, good)).status).toBe(409);
     release();
     expect((await dup).status).toBe(200);
-    expect(comments).toEqual([]);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].id).toBe('it_open');
     expect(closed).toHaveLength(1);
   });
   it('a notice the user already marked seen is not closed twice, and a journal failure may be retried', async () => {
     const { fs, s, closed } = await setup(async () => open());
-    closedStatus.v = 500;
+    state.close = 500;
     expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(502);
-    closedStatus.v = 409;
+    state.close = 409;
     expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
     expect(closed).toHaveLength(2);
-    closedStatus.v = 200;
   });
   it('the review turn and the tool tell the agent about it', () => {
     expect(reviewTurnText(review)).toContain('duplicate_of');
