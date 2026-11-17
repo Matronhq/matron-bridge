@@ -93,5 +93,10 @@ describe('the error line', () => {
   it('drops anything shaped like a credential', () => {
     const line = allowedCallErrorLine('Bash', 'curl failed: Authorization: Bearer abc123 token=hunter2 sk-abcdefghijklmnopqrstuvwxyz0123');
     expect(line).not.toMatch(/abc123|hunter2|sk-abcdef/);
+    expect(allowedCallErrorLine('Bash', 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPx invalid')).not.toMatch(/wJalr|K7MDENG/);
+    expect(allowedCallErrorLine('Bash', 'connect postgres://app:hunter2@db/x refused')).not.toMatch(/hunter2/);
+  });
+  it('carries no image syntax', () => {
+    expect(allowedCallErrorLine('Bash', 'bad ![x](https://example.com/t?u=1)')).not.toContain('![');
   });
 });
