@@ -430,6 +430,18 @@ describe('duplicate_of', () => {
     expect((await fs.postReview(s, good)).status).toBe(200);
     expect(comments).toHaveLength(1);
   });
+  it('claims the review before the lookup: a parallel review with buttons is refused', async () => {
+    closedStatus.v = 200;
+    let release;
+    const gate = new Promise((res) => { release = res; });
+    const { fs, s, closed, comments } = await setup(async () => { await gate; return open(); });
+    const dup = fs.postReview(s, { duplicate_of: 42 });
+    expect((await fs.postReview(s, good)).status).toBe(409);
+    release();
+    expect((await dup).status).toBe(200);
+    expect(comments).toEqual([]);
+    expect(closed).toHaveLength(1);
+  });
   it('a notice the user already marked seen is not closed twice, and a journal failure may be retried', async () => {
     const { fs, s, closed } = await setup(async () => open());
     closedStatus.v = 500;

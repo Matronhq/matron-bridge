@@ -466,7 +466,7 @@ server.tool(
   "Only in the review turn the bridge starts after you filed a foreign_notice: file your review of that notice for your own user, once. Say what the other side is asking, what your user already has on it, and 1 to 4 things your user might do. The bridge posts it under the notice with one button per action; nothing is done until your user taps one, which reaches you as their own turn. If an OPEN item of your user's already covers the notice (the same message can reach you twice, as a comment and in a room), pass only duplicate_of with that item: the bridge closes the notice as a duplicate and points to the item, with no buttons.",
   {
     asking: z.string().max(1000).optional().describe('What is being asked, in a sentence or two, in your own words. Required unless duplicate_of is set'),
-    duplicate_of: z.union([z.string().max(100), z.number().int().min(1)]).optional().describe("Id (it_...) or number of your own user's open item that already covers this notice. The bridge closes the notice and points to that item; leave asking, related and actions out"),
+    duplicate_of: z.union([z.string().min(1).max(100), z.number().int().min(1)]).optional().describe("Id (it_...) or number of your own user's open item that already covers this notice. The bridge closes the notice and points to that item; leave asking, related and actions out"),
     related: z.string().max(2000).optional().describe("Related work of your user's that you found: missions, items, earlier exchanges with this person. Leave out when there is none"),
     actions: z.array(z.object({
       label: z.string().max(40).describe('Button label, e.g. "Reply: yes" or "Ask for more detail"'),
