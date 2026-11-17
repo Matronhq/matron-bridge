@@ -318,3 +318,28 @@ describe('repoInstructionsPointer (a workdir outside any repository)', () => {
     expect(codex.files).toEqual([]);
   });
 });
+
+describe('repoInstructionsPointer containment and scan limit', () => {
+  it('does not name an instruction file that is a symlink out of its repository', () => {
+    fs.mkdirSync(path.join(tmp, 'work/alpha/.git'), { recursive: true });
+    write('outside.md', 'secret');
+    fs.symlinkSync(path.join(tmp, 'outside.md'), path.join(tmp, 'work/alpha/MATRON.md'));
+    fs.mkdirSync(path.join(tmp, 'work/beta/.git'), { recursive: true });
+    write('work/beta/docs/m.md', 'ok');
+    fs.symlinkSync(path.join(tmp, 'work/beta/docs/m.md'), path.join(tmp, 'work/beta/MATRON.md'));
+    const text = repoInstructionsPointer(path.join(tmp, 'work'));
+    expect(text).not.toContain('alpha');
+    expect(text).toContain('`beta` (MATRON.md)');
+  });
+
+  it('says so when the folder holds more entries than were checked', () => {
+    // Every entry is a repository, so the check holds whatever order the
+    // folder lists them in.
+    for (let i = 0; i < 2001; i++) {
+      fs.mkdirSync(path.join(tmp, `r${i}/.git`), { recursive: true });
+      fs.writeFileSync(path.join(tmp, `r${i}/MATRON.md`), 'x');
+    }
+    const text = repoInstructionsPointer(tmp);
+    expect(text).toMatch(/more than 2000 entries, and the rest were not checked/);
+  });
+});
