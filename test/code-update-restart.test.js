@@ -14,6 +14,7 @@ import {
   readHeadReflog,
   defaultPreflight,
   createCommandGate,
+  gateEnv,
   createCodeUpdateWatcher,
   AUTO_CARRY_ON_TEXT,
   autoCarryOnEnabled,
@@ -549,7 +550,63 @@ describe('createCommandGate', () => {
   });
 });
 
+describe('gateEnv', () => {
+  it('keeps PATH, HOME and MATRON_RESTART_GATE_* and drops everything else', () => {
+    expect(gateEnv({
+      PATH: '/bin', HOME: '/home/x', MATRON_RESTART_GATE_FOO: '1', MATRON_RESTART_GATE_CMD: 'check',
+      MATRON_API_TOKEN: 'secret', SECRET: 's', MATRON_BRIDGE_PLUGINS: '/p.mjs',
+    })).toEqual({ PATH: '/bin', HOME: '/home/x', MATRON_RESTART_GATE_FOO: '1', MATRON_RESTART_GATE_CMD: 'check' });
+  });
+
+  it('passes the minimal env and a detached spawn to the exec', async () => {
+    const exec = vi.fn((file, args, opts, cb) => cb(null, '', ''));
+    await createCommandGate('check', { exec, env: { PATH: '/bin', HOME: '/h', TOKEN: 'secret' } })();
+    const opts = exec.mock.calls[0][2];
+    expect(opts.env).toEqual({ PATH: '/bin', HOME: '/h' });
+    expect(opts.detached).toBe(process.platform !== 'win32');
+  });
+});
+
 describe('createCommandGate with a real child', () => {
+  it.skipIf(process.platform === 'win32')('runs the hook without the bridge secrets', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const script = path.join(dir, 'hook.js');
+    fs.writeFileSync(script, "process.stdout.write(Object.keys(process.env).includes('GATE_TEST_SECRET') ? 'leaked' : 'clean'); process.exit(1);");
+    process.env.GATE_TEST_SECRET = 'x';
+    try {
+      expect(await createCommandGate(`${process.execPath} ${script}`)()).toEqual({ hold: true, reason: 'clean' });
+    } finally {
+      delete process.env.GATE_TEST_SECRET;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')("kills the hook's own children on timeout", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const script = path.join(dir, 'hook.js');
+    const pidFile = path.join(dir, 'child.pid');
+    fs.writeFileSync(script, `
+const { spawn } = require('node:child_process');
+const c = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));
+setInterval(() => {}, 1000);
+`);
+    let grandchild;
+    try {
+      const gate = createCommandGate(`${process.execPath} ${script}`, { timeoutMs: 600 });
+      expect(await gate()).toEqual({ hold: false, error: 'timed out after 600ms' });
+      grandchild = Number(fs.readFileSync(pidFile, 'utf8'));
+      let alive = true;
+      for (let i = 0; i < 40 && alive; i++) {
+        try { process.kill(grandchild, 0); await new Promise(r => setTimeout(r, 50)); } catch { alive = false; }
+      }
+      expect(alive).toBe(false);
+    } finally {
+      try { if (grandchild) process.kill(grandchild, 'SIGKILL'); } catch { /* gone */ }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('settles on its own deadline when the hook ignores SIGTERM', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
     const script = path.join(dir, 'hook.js');
