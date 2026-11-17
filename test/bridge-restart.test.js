@@ -103,6 +103,47 @@ describe('requested bridge restart (watcher)', () => {
     expect(state.preflights).toBe(2);
   });
 
+  function withGate(head, gate) {
+    const state = { head, busy: 0, now: T0, log: [], warn: [], restarts: [] };
+    const watcher = createCodeUpdateWatcher({
+      readHead: () => state.head,
+      busySessions: () => state.busy,
+      preflight: async () => ({ ok: true }),
+      restart: (info) => state.restarts.push(info),
+      gate,
+      now: () => state.now,
+      log: (m) => state.log.push(m),
+      warn: (m) => state.warn.push(m),
+      bootSha: OLD,
+    });
+    return { state, watcher };
+  }
+
+  it('reports the gate verdict that holds a requested restart, and clears it when the gate says go', async () => {
+    let verdict = { hold: true, reason: 'deploy in progress' };
+    const { state, watcher } = withGate(onBoot, async () => verdict);
+    expect(watcher.gateHoldReason).toBeNull();
+    watcher.request({ reason: 'x' });
+    expect((await watcher.tick()).action).toBe('waiting');
+    expect(watcher.gateHoldReason).toBe('deploy in progress');
+    verdict = { hold: false };
+    expect((await watcher.tick()).action).toBe('restart');
+    expect(watcher.gateHoldReason).toBeNull();
+    expect(state.restarts).toHaveLength(1);
+  });
+
+  it('a cancel while the gate is being asked stops the requested restart', async () => {
+    let release;
+    const { state, watcher } = withGate(onBoot, () => new Promise((resolve) => { release = () => resolve({ hold: false }); }));
+    watcher.request({ reason: 'x' });
+    const t = watcher.tick();
+    for (let i = 0; i < 5 && !release; i++) await Promise.resolve();
+    expect(watcher.cancelRequest()).toBe(true);
+    release();
+    expect((await t).action).toBe('none');
+    expect(state.restarts).toHaveLength(0);
+  });
+
   it('keeps a failed preflight pending and reports it', async () => {
     const { state, watcher } = harness({ head: onBoot, preflightOk: false });
     watcher.request({ reason: 'x' });
