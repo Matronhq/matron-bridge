@@ -357,3 +357,91 @@ describe('wiring', () => {
     expect(index.slice(route, route + 400)).toContain('foreignSessions.postReview(frSession, data)');
   });
 });
+
+describe('duplicate_of', () => {
+  const open = (extra = {}) => ({ status: 200, data: { item: { id: 'it_open', num: 42, state: 'open', ...extra } } });
+  async function setup(get) {
+    const closed = [];
+    const comments = [];
+    const created = [];
+    const fs = createForeignSessions({
+      sharing: { personRoom: async () => ({ status: 404, data: {} }) },
+      items: {
+        get,
+        create: async (body) => { created.push(body); return { status: 201, data: { item: { id: 'it_1', num: 201 } } }; },
+        close: async (id, body) => { closed.push({ id, ...body }); return { status: closedStatus.v, data: {} }; },
+        comment: async (id, body) => { comments.push({ id, ...body }); return { status: 201, data: {} }; },
+      },
+      journalConvoIdFor: (s) => `convo-${s.roomId}`,
+      sendText: () => true,
+      publishNotice: () => {},
+      isOccupied: () => false,
+      flag: { set: () => {}, clear: () => {} },
+      store: { load: () => ({}), save: () => {} },
+      reviewStore: { load: () => ({}), save: () => {} },
+      log: { warn: () => {} },
+    });
+    const s = { roomId: 'sess-a', alive: true, foreignTurn: null };
+    fs.begin(s, roomTurn);
+    await fs.raiseNotice(s, { title: 'PRs to review', text: 'Sixty of them.' });
+    fs.end(s);
+    fs.drainParked(s);
+    return { fs, s, closed, comments };
+  }
+  const closedStatus = { v: 200 };
+
+  it('is checked: an item id, a number or #number', () => {
+    expect(validateReview({ duplicate_of: 'it_abc' })).toEqual({ ok: true, value: { duplicateOf: 'it_abc' } });
+    expect(validateReview({ duplicate_of: 12 }).value.duplicateOf).toBe(12);
+    expect(validateReview({ duplicate_of: '#12' }).value.duplicateOf).toBe(12);
+    expect(validateReview({ duplicate_of: 'soon' }).ok).toBe(false);
+    expect(validateReview({ duplicate_of: 0 }).ok).toBe(false);
+  });
+  it('needs no asking or actions', () => {
+    expect(validateReview({ duplicate_of: 42 }).ok).toBe(true);
+    expect(validateReview({}).ok).toBe(false);
+  });
+  it('closes the notice with a comment pointing to the open item, and posts no buttons', async () => {
+    closedStatus.v = 200;
+    const { fs, s, closed, comments } = await setup(async () => open());
+    const out = await fs.postReview(s, { duplicate_of: 42 });
+    expect(out.status).toBe(200);
+    expect(comments).toEqual([]);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toMatchObject({ id: 'it_1', resolution: 'cancelled', as_convo_id: 'convo-sess-a' });
+    expect(closed[0].comment).toMatch(/already covered by #42/);
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
+    fs.end(s);
+    await tick();
+    expect(comments).toEqual([]);
+  });
+  it('refuses the notice itself, a closed item, another person\'s item and a missing one; the review may then be sent normally', async () => {
+    closedStatus.v = 200;
+    let reply = { status: 200, data: { item: { id: 'it_1', num: 201, state: 'open' } } };
+    const { fs, s, closed, comments } = await setup(async () => reply);
+    expect((await fs.postReview(s, { duplicate_of: 201 })).status).toBe(400);
+    reply = open({ state: 'closed' });
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
+    reply = open({ owner: { username: 'bob' } });
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(400);
+    reply = { status: 404, data: {} };
+    expect((await fs.postReview(s, { duplicate_of: 99 })).status).toBe(404);
+    expect(closed).toEqual([]);
+    expect((await fs.postReview(s, good)).status).toBe(200);
+    expect(comments).toHaveLength(1);
+  });
+  it('a notice the user already marked seen is not closed twice, and a journal failure may be retried', async () => {
+    const { fs, s, closed } = await setup(async () => open());
+    closedStatus.v = 500;
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(502);
+    closedStatus.v = 409;
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
+    expect(closed).toHaveLength(2);
+    closedStatus.v = 200;
+  });
+  it('the review turn and the tool tell the agent about it', () => {
+    expect(reviewTurnText(review)).toContain('duplicate_of');
+    expect(readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8')).toContain('duplicate_of');
+    expect(readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8')).toContain('duplicate_of');
+  });
+});
