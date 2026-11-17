@@ -109,10 +109,10 @@ describe('a running turn only ever gains causes', () => {
     expect(report).toContain('if (beganTurn) endTurn(session);');
     expect(report.match(/endTurn\(/g)).toHaveLength(1);
     const send = fnBody('function sendToSession(');
-    // The three dispatch failures after the turn starts pass the flag; the
+    // The four dispatch failures after the turn starts pass the flag; the
     // validation rejects before it pass nothing, so they never end a turn.
-    expect(send.match(/\{ restoreJournalState: true, beganTurn(, preserveRunningTurn: steering)? \}/g)).toHaveLength(3);
-    expect(send.match(/reportSessionSendFailure\(/g)).toHaveLength(7);
+    expect(send.match(/\{ restoreJournalState: true, beganTurn(, preserveRunningTurn: steering)? \}/g)).toHaveLength(4);
+    expect(send.match(/reportSessionSendFailure\(/g)).toHaveLength(8);
   });
 
   it('agent output with no turn on the session begins one of unknown origin', () => {
