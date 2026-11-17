@@ -5,7 +5,7 @@ import { createTimerStore, MIN_TIMER_MS, MAX_TIMER_MS } from '../lib/timer-comma
 const HOUR = 3_600_000;
 const NOW = new Date(2026, 8, 17, 10, 0, 0, 0).getTime(); // local 10:00
 
-function fixture({ announce } = {}) {
+function fixture({ announce, restartNotes } = {}) {
   const saves = [];
   const store = createTimerStore({
     load: () => null,
@@ -19,7 +19,7 @@ function fixture({ announce } = {}) {
   const sessions = new Map([['!r:s', session]]);
   const announceFn = announce || vi.fn(async () => {});
   const h = createReminderHandlers({
-    sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, timerStore: store, now: () => NOW, announce: announceFn,
+    sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, timerStore: store, now: () => NOW, announce: announceFn, restartNotes,
   });
   return { h, store, saves, session, announce: announceFn };
 }
@@ -223,5 +223,52 @@ describe('daily repeating reminders (repeat + tz)', () => {
     expect(c.status).toBe(200);
     expect(c.body.cancelled[0]).toMatchObject({ id: a.body.reminder.id, repeat: 'daily' });
     expect(store.listForConvo('c1')).toEqual([]);
+  });
+});
+
+describe('restart_note', () => {
+  const notesStub = () => ({ put: vi.fn() });
+
+  it('holds a note for the calling conversation and arms no timer', async () => {
+    const restartNotes = notesStub();
+    const { h, store, saves } = fixture({ restartNotes });
+    const r = await h.create({ roomId: '!r:s', text: ' resume the migration ', restart_note: true });
+    expect(r.status).toBe(201);
+    expect(restartNotes.put).toHaveBeenCalledWith('c1', ' resume the migration ');
+    expect(store.listForConvo('c1')).toHaveLength(0);
+    expect(saves).toHaveLength(0);
+  });
+
+  it('refuses a time, repeat or hold_awake alongside it', async () => {
+    const restartNotes = notesStub();
+    const { h } = fixture({ restartNotes });
+    for (const extra of [{ in: '2h' }, { at: '09:00' }, { repeat: 'daily' }, { tz: 'Europe/London' }, { hold_awake: true }]) {
+      const r = await h.create({ roomId: '!r:s', text: 'n', restart_note: true, ...extra });
+      expect(r.status).toBe(400);
+    }
+    expect(restartNotes.put).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed write to the agent and says the note was not set', async () => {
+    const restartNotes = { put: () => { throw new Error('ENOSPC'); } };
+    const { h } = fixture({ restartNotes });
+    const r = await h.create({ roomId: '!r:s', text: 'n', restart_note: true });
+    expect(r.status).toBe(500);
+    expect(r.body.error).toMatch(/NOT set/);
+  });
+
+  it('is refused while a restart_session is parked for the session', async () => {
+    const restartNotes = notesStub();
+    const { h, session } = fixture({ restartNotes });
+    session._selfRestartPending = true;
+    const r = await h.create({ roomId: '!r:s', text: 'n', restart_note: true });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/continue_with/);
+    expect(restartNotes.put).not.toHaveBeenCalled();
+  });
+
+  it('is refused for an empty text', async () => {
+    const { h } = fixture({ restartNotes: notesStub() });
+    expect((await h.create({ roomId: '!r:s', text: '  ', restart_note: true })).status).toBe(400);
   });
 });
