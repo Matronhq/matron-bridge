@@ -61,6 +61,9 @@ import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } fro
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, coordinatorNeedsAssigning, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
+import { createWorktreeLedger } from './lib/worktree-ledger.js';
+import { createWorktreeService, WorktreeRemovedError } from './lib/worktree-service.js';
+import { extractWorktreeFlag, worktreeHeaderLine, worktreeNoticeBlock } from './lib/worktree.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -1580,6 +1583,13 @@ recentFolders.seedFrom(Object.values(loadPersistedSessions()).map((rec) => ({
   lastUsed: rec?.lastUsed,
 })));
 
+// Worktree sessions (`/start --worktree <name>`): the record of the worktrees
+// this bridge made.
+const worktreeLedger = createWorktreeLedger({ file: path.join(os.homedir(), '.matron-bridge-worktrees.json') });
+const worktreeService = createWorktreeService({
+  ledger: worktreeLedger,
+});
+
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   recentFolders.touch(workdir, Date.now());
   const data = loadPersistedSessions();
@@ -2543,6 +2553,33 @@ function shouldAutoRestart(exitCode, session, shuttingDown) {
   return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
 }
 
+// Small seams over the worktree service, so the exit handlers and
+// recreateSession (lifted into sandboxes by some tests) call functions.
+function worktreeRemovedFor(workdir) { return worktreeService.removedFor(workdir); }
+// Like worktreeRemovedFor, but also follows a Claude transcript that moved
+// into a managed worktree (the session changed cwd mid-flight): if that
+// worktree is gone, the resume must be refused rather than started fresh on
+// the same id.
+function worktreeRemovedForResume(workdir, agent, sessionId) {
+  const direct = worktreeRemovedFor(workdir);
+  if (direct || agent !== AGENT_CLAUDE || !sessionId) return direct;
+  try {
+    if (fs.existsSync(transcriptPathFor(workdir, sessionId))) return null;
+    const found = findTranscriptBySessionId(sessionId);
+    return found?.workdir ? worktreeRemovedFor(found.workdir) : null;
+  } catch { return null; }
+}
+function worktreeRemovedMessage(entry) { return new WorktreeRemovedError(entry).message; }
+// An exit handler that would respawn a session into a removed worktree stops
+// instead (the respawn would resume in a different folder): marked like a
+// failed resume, with the reason said in the conversation.
+function noteWorktreeGone(session) {
+  const gone = worktreeRemovedFor(session.workdir);
+  if (!gone) return;
+  session._resumeFailed = true;
+  Promise.resolve(sendToRoom(session.roomId, worktreeRemovedMessage(gone))).catch(() => {});
+}
+
 // Crash restarts (lib/crash-recovery.js): the process died on its own and was
 // respawned. Count it, keep a bounded record, flag a burst to the user, and
 // carry a session that died mid-turn on with a turn saying so.
@@ -2593,6 +2630,9 @@ function onCrashRestart(session, restarted, exitCode, signal = null) {
 }
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
+  // A removed bridge-made worktree is refused by the callers that resume or
+  // replace a session, BEFORE they destroy anything; createSession itself
+  // never throws for it.
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
   // ENOENT`, so degrade to a fallback dir here — before any agent branch —
@@ -2642,7 +2682,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       // amnesia — the user can !workdir somewhere real afterwards. (Bugbot,
       // PR #216: without this, a found transcript was still demoted.)
       let usable = fs.existsSync(found.workdir);
-      if (!usable) {
+      // Never recreate a removed worktree as an empty folder.
+      const wasWorktree = !usable && !!worktreeRemovedFor(found.workdir);
+      if (!usable && !wasWorktree) {
         try {
           fs.mkdirSync(found.workdir, { recursive: true });
           usable = true;
@@ -2743,6 +2785,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
   const matronMd = loadMatronMd(cwd);
+  // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
+  const worktreeInfo = worktreeService.info(cwd);
+  matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');
   const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const args = [
     '--print',
@@ -2825,6 +2870,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // The MATRON.md files this spawn read (lib/matron-md.js), for the
     // start, resume and restart messages and /status.
     matronMd: { files: matronMd.files, truncated: matronMd.truncated },
+    // The bridge-made worktree this spawn runs in, or null (lib/worktree-service.js).
+    worktree: worktreeInfo,
     // The spawned session's effective env (shim prepended to PATH when
     // MATRON_CODEX_VIZ=1). The codex-viz activation guard must evaluate the
     // session's PATH, not the bridge's, to see the producer we just deployed.
@@ -2984,6 +3031,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // server's 30-min idle sweep. Runs on every path below, including
     // auto-restart.
     sweepToolStreams(session);
+    noteWorktreeGone(session);
     clearPendingInterrupt(session);
     // Only a restart can retry input the CLI never started.
     const orphanSteers = takeUnstartedSteers(session);
@@ -3190,6 +3238,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     }
   }
   const matronMd = loadMatronMd(cwd);
+  // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
+  const worktreeInfo = worktreeService.info(cwd);
+  matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');
   const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: trackerLinksNow(CODEX_BRIDGE_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
@@ -3225,6 +3276,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // The MATRON.md files this spawn read (lib/matron-md.js), for the
     // start, resume and restart messages and /status.
     matronMd: { files: matronMd.files, truncated: matronMd.truncated },
+    // The bridge-made worktree this spawn runs in, or null (lib/worktree-service.js).
+    worktree: worktreeInfo,
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
@@ -3715,6 +3768,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
   if (ivRootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const matronMd = loadMatronMd(cwd);
+  // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
+  const worktreeInfo = worktreeService.info(cwd);
+  matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');
   const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
@@ -3785,6 +3841,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // The MATRON.md files this spawn read (lib/matron-md.js), for the
     // start, resume and restart messages and /status.
     matronMd: { files: matronMd.files, truncated: matronMd.truncated },
+    // The bridge-made worktree this spawn runs in, or null (lib/worktree-service.js).
+    worktree: worktreeInfo,
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
@@ -3911,6 +3969,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Same orphan-pump sweep as the print-mode close handler above: the
     // process exited on its own without the tool_result seam running.
     sweepToolStreams(session);
+    noteWorktreeGone(session);
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
@@ -7992,6 +8051,7 @@ async function availableCodexThreads(workdir, { cached = false, roomId = '' } = 
   return items;
 }
 
+
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const nativeSession = sessions.get(roomId);
   if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
@@ -8039,7 +8099,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       const startModel = startModelFlag.model;
-      const arg = startModelFlag.rest[0];
+      // --worktree <name>: opt-in, per start. Never remembered for the repo.
+      const worktreeFlag = extractWorktreeFlag(startModelFlag.rest);
+      if (worktreeFlag.error) {
+        await sendReply(worktreeFlag.error);
+        return;
+      }
+      const arg = worktreeFlag.rest[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
       let workdir = DEFAULT_WORKDIR;
@@ -8056,6 +8122,24 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           return;
         }
         workdir = resolved;
+      }
+
+      let startedWorktree = null;
+      if (worktreeFlag.present) {
+        // Everything that can refuse (name, limits, disk, fetch, taken
+        // branch) happens here, before any session exists. The slow rest
+        // (submodules, LFS, an approved setup script) runs after the session
+        // has started.
+        try {
+          startedWorktree = await worktreeService.start({ workdir, name: worktreeFlag.name });
+        } catch (e) {
+          startedWorktree = { ok: false, error: e?.message || String(e) };
+        }
+        if (!startedWorktree.ok) {
+          await sendReply(`Worktree not created: ${startedWorktree.error}`);
+          return;
+        }
+        workdir = startedWorktree.cwd;
       }
 
       // Mint a fresh conversation id for this session
@@ -8099,7 +8183,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const extrasNote = shownStartExtras.length > 0 ? ` (extras: ${shownStartExtras.join(', ')})` : '';
       const permNote = permissionNote(session);
       const startModelNote = startModel ? ` on ${aliasLabel(startModel)}` : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}`);
+      const worktreeNote = startedWorktree ? `\n${worktreeHeaderLine(session.worktree)}` : '';
+      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}${worktreeNote}`);
+      if (startedWorktree) {
+        // Submodules, LFS and an approved setup script, after the start.
+        startedWorktree.background().then((notes) => {
+          if (notes.length) session.sendCallback?.(notes.join('\n'));
+        }).catch((e) => {
+          try { console.warn(`[worktree] background steps failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+        });
+      }
       break;
     }
 
@@ -8484,6 +8577,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
         : resumeState.mcpExtras;
+      // A removed bridge-made worktree cannot be resumed (see createSession).
+      const removedWorktree = worktreeRemovedForResume(actualWorkdir, selectedAgent, resumeSessionId);
+      if (removedWorktree) {
+        await sendReply(new WorktreeRemovedError(removedWorktree).message);
+        return;
+      }
       const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, {
         agent: selectedAgent,
         // An explicit --model overrides what this session last ran on.
@@ -8681,7 +8780,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const busyText = session.busy ? 'yes' : 'no';
 
       const plainStatus =
-        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}${matronMdNote(session)}\nSession ID: ${shortId}\n` +
+        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}${matronMdNote(session)}${session.worktree ? `\n${worktreeHeaderLine(session.worktree)}` : ''}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}${codexDetails}`;
 
       const busyHtml = session.busy
@@ -8692,6 +8791,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<tr><td>State</td><td>${busyHtml}</td></tr>` +
         `<tr><td>Agent</td><td>${escapeHtml(agentLabel(session.agent))}</td></tr>` +
         `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
+        (session.worktree ? `<tr><td>Worktree</td><td><code>${escapeHtml(session.worktree.branch)}</code></td></tr>` : '') +
         (matronMdFileList(session.matronMd) ? `<tr><td>MATRON.md</td><td>${escapeHtml(matronMdFileList(session.matronMd))}</td></tr>` : '') +
         `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
         `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
@@ -8819,6 +8919,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
         `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
+        `/start --worktree <name> [workdir] — Start in a fresh git worktree (.claude/worktrees/<name>, branch wt/<name>); off unless asked\n` +
         `/start --auto [workdir] — Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir\n` +
         `/start --model <alias> [workdir] — Start on a specific Claude model (${VALID_ALIAS_HINT}, or a full claude-* name); also accepted by /restart, /resume, /workdir. Claude only\n` +
         `/stop — Stop the current session\n` +
@@ -8864,6 +8965,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
           ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
+          ['/start --worktree <name> [workdir]', 'Start in a fresh git worktree (branch wt/<name> from origin); never the default'],
           ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
           ['/start --model &lt;alias&gt; [workdir]', `Start on a specific Claude model (${escapeHtml(VALID_ALIAS_HINT)}, or a full <code>claude-*</code> name); also accepted by /restart, /resume, /workdir. Claude only`],
           ['/stop', 'Stop the current session'],
@@ -13178,6 +13280,18 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   const activeAgent = resolveAgent({ persisted: prev.agent, fallback: ENV_DEFAULT_AGENT });
   const activeState = getPersistedAgentState(prev, activeAgent, history.length);
   const resumeSessionId = activeState.sessionId;
+  // Checked even without a native session ID: a fresh session has a stable
+  // conversation ID before its first native thread exists.
+  const removedWorktree = worktreeRemovedForResume(prev.workdir || DEFAULT_WORKDIR, activeAgent, resumeSessionId);
+  if (removedWorktree) {
+    // Said in the conversation itself; the idle session stays idle. The
+    // session was already dropped, so sendToRoom has nowhere to deliver on the
+    // journal path: publish straight to the conversation as well.
+    const msg = new WorktreeRemovedError(removedWorktree).message;
+    journalPublishNotice(prev.journalConvoId || prev.sessionId || roomId, msg);
+    Promise.resolve(sendToRoom(roomId, msg)).catch(() => {});
+    return null;
+  }
   const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, resumeSessionId, {
     agent: activeAgent,
     model: activeState.model,
@@ -15064,6 +15178,12 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
     }
   }
 
+  const removedWorktree = worktreeService.removedFor(existing.workdir);
+  if (removedWorktree) {
+    await sendReply(new WorktreeRemovedError(removedWorktree).message);
+    return null;
+  }
+
   const stableConvoId = journalConvoIdFor(existing) || persisted.journalConvoId || randomUUID();
   const targetOptions = {
     agent: target,
@@ -15519,6 +15639,12 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // Recheck at teardown, including attachments arriving during a reply await.
   if (mediaGateActive(existing)) {
     sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+    return null;
+  }
+  // Refuse before anything is killed: the old session stays as it is.
+  const removedWorktree = worktreeRemovedFor(existing.workdir);
+  if (removedWorktree) {
+    sendReply(worktreeRemovedMessage(removedWorktree));
     return null;
   }
   const sessionId = existing.claudeSessionId;

@@ -403,6 +403,7 @@ bridge's own `ask-user` MCP loads per session; everything else is opt-in.
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
 | `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. Chrome runs with its sandbox on, so on Linux the bridge must run as an unprivileged user (Chrome will not start sandboxed as root) with Xvfb and the Google Chrome package installed; the package's AppArmor profile lets it use the user namespaces Ubuntu otherwise restricts. |
+| `!start --worktree <name> [workdir]` | Start in a fresh git worktree (see "Worktree sessions"). Never the default; plain `!start` and New Chat always use the main checkout |
 | `!start --auto [workdir]` | Claude only: spawn with auto permission mode + Matron permission cards instead of the default `--dangerously-skip-permissions`. Also order-independent and accepted by `!resume`, `!workdir`, and `!restart`; pass `--bypass` instead to return to the default. See Permissions below. |
 | `!stop` | Stop the current session |
 | `!restart [--force] [--browser] [--bypass\|--auto]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser`/`--bypass`/`--auto` are Claude-only) |
@@ -576,6 +577,19 @@ CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a reposito
 - **Seeing it.** The start, resume, workdir and restart messages and `/status` list the files a session loaded, e.g. `MATRON.md: MATRON.md (3.1 KB)`.
 
 **MATRON.md or a memory?** `MATRON.md` is part of the code: reviewed in pull requests, it follows the branch and applies to everyone's Matron sessions in the repository. Use it for how to work on that repository through Matron. A `repo:<name>` memory is one user's own standing rule, changed at once and private to them. Use it for personal preferences and anything about particular machines.
+
+## Worktree sessions
+
+`!start --worktree <name> [workdir]` starts the session in a fresh git worktree, so it can change code without touching your main checkout. It is opt-in per start: nothing else creates one, the choice is not remembered for the repository, and resuming a session never turns it into one.
+
+- **Where.** `<repo>/.claude/worktrees/<name>` on a new branch `wt/<name>`, cut from `origin/<default branch>` after a `git fetch`. `.claude/worktrees/` is added to the clone's `.git/info/exclude` (never to a `.gitignore`), and the folder picker (`recent_folders`) leaves worktrees out of its list. The name must make a valid branch name; if the branch or folder is taken, the start is refused and `<name>-2` is suggested. A repository with no `origin` is refused, and git's own error is passed through if the branch is checked out elsewhere. After the session has started, `git submodule update --init` runs when there is a `.gitmodules`, and `git lfs pull` when LFS is configured; both only warn if they fail. Git runs for all of this have no journal credential in their environment and no repository hooks.
+- **What the agent is told.** Every worktree session starts with a fixed notice: it is in worktree `<path>` on `wt/<name>`, and the dev server, public URL, OAuth callbacks and webhooks point at the main checkout, so it should test there or say what it could not test. The start message and `/status` show a `Worktree:` line. No `.env` is linked in.
+- **Resuming.** Resuming a session whose worktree was removed is refused with a message, and the session being replaced is left alone; the folder is never recreated empty.
+- **Limits.** At most 5 worktrees per repository (`MATRON_WORKTREE_MAX`), and none when the disk has under 10 GB or 10% free.
+
+| Variable | Description | Default |
+|---|---|---|
+| `MATRON_WORKTREE_MAX` | Most worktrees per repository | `5` |
 
 ## How it works
 
