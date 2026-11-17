@@ -14024,6 +14024,14 @@ const apiServer = createServer(async (req, res) => {
   // it is read here rather than after the generic POST-only check.
   if (url.pathname === '/restart') {
     if (refuseApiCall(null)) { req.resume(); return; }
+    // Operator caller only, even with MATRON_BRIDGE_API_AUTH=off: that
+    // setting must not let any local process restart the bridge.
+    if (apiCaller?.kind !== 'operator') {
+      req.resume();
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Only the operator token can ask for a bridge restart' }));
+      return;
+    }
     let raw = '';
     req.on('data', chunk => { if (raw.length < 4096) raw += chunk; });
     req.on('end', async () => {

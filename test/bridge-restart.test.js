@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import { bridgeRestartResponse } from '../lib/bridge-restart.js';
 import { createCodeUpdateWatcher, DEFAULT_WARN_EVERY_MS } from '../lib/code-update-restart.js';
@@ -48,11 +49,11 @@ describe('requested bridge restart (watcher)', () => {
 
   it('waits for holders, warns every 30 minutes, then restarts', async () => {
     const { state, watcher } = harness({ head: onBoot, busy: 1 });
-    watcher.request({ reason: 'x' });
+    watcher.request({ reason: 'new env' });
     expect((await watcher.tick()).action).toBe('waiting');
     state.now += DEFAULT_WARN_EVERY_MS + 1000;
     await watcher.tick();
-    expect(state.warn.join('\n')).toMatch(/still waiting to restart/);
+    expect(state.warn.join('\n')).toMatch(/still waiting to restart onto \w+ \(bridge restart requested: new env\)/);
     expect(state.restarts).toHaveLength(0);
     state.busy = 0;
     expect((await watcher.tick()).action).toBe('restart');
@@ -121,5 +122,16 @@ describe('bridgeRestartResponse', () => {
     expect(del).toEqual({ status: 200, body: { cancelled: true } });
     expect(watcher.requested).toBeNull();
     expect((await bridgeRestartResponse({ method: 'DELETE', watcher, holds })).body.cancelled).toBe(false);
+  });
+});
+
+describe('/restart route wiring', () => {
+  const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const at = index.indexOf("if (url.pathname === '/restart') {");
+  const route = index.slice(at, index.indexOf("if (req.method !== 'POST') {", at));
+
+  it('needs the operator caller even when MATRON_BRIDGE_API_AUTH=off', () => {
+    expect(route).toMatch(/if \(apiCaller\?\.kind !== 'operator'\) \{[\s\S]*?res\.writeHead\(403/);
+    expect(route.indexOf("apiCaller?.kind !== 'operator'")).toBeLessThan(route.indexOf('bridgeRestartResponse('));
   });
 });
