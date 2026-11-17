@@ -11665,6 +11665,10 @@ function startCodeUpdateWatcher() {
     // restart, and never by restart_session or the other operator restarts,
     // which do not go through this watcher.
     gate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
+    // Opt-in: a hold that never lapses (0) and a gate that fails closed.
+    // Unset keeps the advisory behaviour.
+    gateMaxMs: parseCodeUpdateMsOrOff(process.env.MATRON_RESTART_GATE_MAX_HOLD_MS, undefined),
+    gateOnError: String(process.env.MATRON_RESTART_GATE_ON_ERROR || '').trim().toLowerCase() === 'hold' ? 'hold' : 'safe',
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);

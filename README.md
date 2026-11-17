@@ -282,7 +282,11 @@ quiet moment: a command (argv split on whitespace, no shell) run with a
 exit 1 means hold, with the first line of stdout as the reason, which the
 30-minute waiting warning repeats. Any other exit code, a spawn failure or a
 timeout counts as safe (logged). A hold expires after the work-hold age cap
-(eight hours) and the restart then goes ahead, logged; a forced restart
+(eight hours) and the restart then goes ahead, logged, unless
+`MATRON_RESTART_GATE_MAX_HOLD_MS=0` says it never lapses. With
+`MATRON_RESTART_GATE_ON_ERROR=hold` the other-exit-code, spawn-failure and
+timeout cases hold too, with the error as the reason, instead of counting as
+safe; a forced restart
 (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) never asks the gate. Unset, nothing
 changes. Sessions between turns resume with their history on their next turn,
 as with any restart. The exit code is 75, non-zero on purpose: launchd only
@@ -369,6 +373,8 @@ that POST instead of restarting at once.
 | `MATRON_WAKE_TARGETS` | Optional. Comma-separated names of further wake targets, for a box that runs more than one conversation needing a wake. `POST /wake/<name>` wakes target `<name>` (lowercase letters, digits and single dashes, up to 32 characters) with the conversation in `MATRON_WAKE_CONVO_ID_<NAME>` and the text in `MATRON_WAKE_TEXT_<NAME>`, where `<NAME>` is the name upper-cased with dashes as underscores (`chat-2` reads `MATRON_WAKE_CONVO_ID_CHAT_2`). Each target coalesces on its own, and `MATRON_WAKE_TOKEN` guards them all. A listed target missing either variable is off (404) and logged at startup | — |
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MATRON_RESTART_GATE_CMD` | Advisory hook for the self-restart onto new code (see above): a command, split on whitespace, run with a 5 s timeout once no session holds work, in its own process group (a timeout kills the whole group) and with a minimal environment: `PATH`, `HOME` and any `MATRON_RESTART_GATE_*` variables, not the bridge's tokens. Exit 0 = restart, exit 1 = hold (first stdout line is the reason shown in the waiting warning); anything else, or a timeout, counts as safe. A hold expires after eight hours. Never consulted for a forced restart | _(unset: no gate)_ |
+| `MATRON_RESTART_GATE_MAX_HOLD_MS` | How long a gate hold lasts before the restart goes ahead anyway. `0` = a hold never lapses, so the gate is authoritative. Unset or invalid: eight hours, as before | _(unset: 8 h)_ |
+| `MATRON_RESTART_GATE_ON_ERROR` | `hold`: a gate that errors, times out or cannot start holds the restart (reason `gate error: ...`, warned once per distinct error) instead of counting as safe. Any other value: advisory, as before | _(unset: errors count as safe)_ |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `BRIDGE_TOOL_FILTER` | Coordinator-only `ask-user` MCP tools are hidden from every session that is known not to be the Coordinator (Claude print and interactive, and Codex app-server sessions), which keeps each session's tool definitions about a quarter smaller. Set to `0` to give every session every tool. A session whose role is not known yet keeps the full list. | on |

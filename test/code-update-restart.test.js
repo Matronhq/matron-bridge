@@ -469,6 +469,68 @@ describe('restart gate', () => {
     expect(h2.state.warn.join('\n')).toMatch(/timed out after 5000ms/);
   });
 
+  it('gateMaxMs 0: a hold never lapses, even past the default eight hours', async () => {
+    const state = {};
+    const h = harness({ head: landed, gate: gateOf(state, { hold: true, reason: 'backup' }), gateMaxMs: 0 });
+    expect((await h.watcher.tick()).action).toBe('waiting');
+    h.state.now = T0 + 9 * 3600_000;
+    expect(await h.watcher.tick()).toMatchObject({ action: 'waiting', gate: 'backup' });
+    expect(h.state.restarts).toEqual([]);
+    h.state.now = T0 + 9 * 3600_000 + DEFAULT_WARN_EVERY_MS;
+    await h.watcher.tick();
+    expect(h.state.warn.join('\n')).toMatch(/the hold never expires/);
+    expect(h.state.warn.join('\n')).not.toMatch(/restarting anyway/);
+  });
+
+  it('default cap still lapses at eight hours', async () => {
+    const state = {};
+    const h = harness({ head: landed, gate: gateOf(state, { hold: true, reason: 'backup' }) });
+    expect((await h.watcher.tick()).action).toBe('waiting');
+    h.state.now = T0 + 8 * 3600_000 - 1;
+    expect((await h.watcher.tick()).action).toBe('waiting');
+    h.state.now = T0 + 8 * 3600_000;
+    expect((await h.watcher.tick()).action).toBe('restart');
+  });
+
+  it('gateOnError hold: a throw, an exit code, a timeout or a spawn failure hold with the error as reason', async () => {
+    for (const verdict of [
+      () => { throw new Error('boom'); },
+      { hold: false, error: 'exit 2' },
+      { hold: false, error: 'timed out after 5000ms' },
+      { hold: false, error: 'spawn /nope ENOENT' },
+    ]) {
+      const h = harness({ head: landed, gate: gateOf({}, verdict), gateMaxMs: 0, gateOnError: 'hold' });
+      const r = await h.watcher.tick();
+      expect(r.action).toBe('waiting');
+      expect(r.gate).toMatch(/^gate error: /);
+      expect(h.state.restarts).toEqual([]);
+      expect(h.state.warn.join('\n')).toMatch(/holding the restart/);
+    }
+  });
+
+  it('gateOnError hold: a good verdict after an error goes through', async () => {
+    let verdict = { hold: false, error: 'exit 2' };
+    const h = harness({ head: landed, gate: gateOf({}, () => verdict), gateMaxMs: 0, gateOnError: 'hold' });
+    expect((await h.watcher.tick()).action).toBe('waiting');
+    verdict = { hold: false };
+    expect((await h.watcher.tick()).action).toBe('restart');
+  });
+
+  it('gateOnError hold: the same error is warned about once', async () => {
+    const h = harness({ head: landed, gate: gateOf({}, { hold: false, error: 'exit 2' }), gateMaxMs: 0, gateOnError: 'hold' });
+    await h.watcher.tick();
+    h.state.now = T0 + 1000;
+    await h.watcher.tick();
+    expect(h.state.warn.filter(m => /restart gate failed \(exit 2\)/.test(m))).toHaveLength(1);
+  });
+
+  it('gateOnError hold with a real command: a missing gate program holds', async () => {
+    const gate = createCommandGate('/nonexistent/gate-binary');
+    const h = harness({ head: landed, gate, gateMaxMs: 0, gateOnError: 'hold' });
+    expect(await h.watcher.tick()).toMatchObject({ action: 'waiting' });
+    expect(h.state.restarts).toEqual([]);
+  });
+
   it('re-checks work after the gate answers: a turn that started meanwhile holds the restart', async () => {
     const state = {};
     let release;
