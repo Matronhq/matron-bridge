@@ -144,6 +144,34 @@ describe('requested bridge restart (watcher)', () => {
     expect(state.restarts).toHaveLength(0);
   });
 
+  it('drops a preflight result when HEAD moved during the check', async () => {
+    const { state, watcher } = gated(onBoot, [true, true]);
+    watcher.request({ reason: 'x' });
+    const t = watcher.tick();
+    await Promise.resolve();
+    state.head = { sha: NEW, at: T0 - 60 * 60_000 };
+    state.release[0]();
+    expect((await t).action).toBe('superseded');
+    expect(state.restarts).toHaveLength(0);
+    const t2 = watcher.tick();
+    await Promise.resolve();
+    state.release[1]();
+    expect(await t2).toMatchObject({ action: 'restart', sha: NEW });
+    expect(state.preflights).toBe(2);
+  });
+
+  it('a new request after a cancel runs the preflight again on the same HEAD', async () => {
+    const { state, watcher } = harness({ head: onBoot, busy: 1 });
+    watcher.request({ reason: 'first' });
+    expect((await watcher.tick()).action).toBe('waiting');
+    expect(state.preflights).toBe(1);
+    watcher.cancelRequest();
+    watcher.request({ reason: 'again' });
+    state.busy = 0;
+    expect((await watcher.tick()).action).toBe('restart');
+    expect(state.preflights).toBe(2);
+  });
+
   it('keeps a failed preflight pending and reports it', async () => {
     const { state, watcher } = harness({ head: onBoot, preflightOk: false });
     watcher.request({ reason: 'x' });
