@@ -6621,7 +6621,10 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     }
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
-      session.iv.sendText(text);
+      if (session.iv.sendText(text) === false) {
+        return reportSessionSendFailure(session, 'Interactive session could not accept the message.',
+          { restoreJournalState: true, beganTurn });
+      }
       commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (session.resetTimeout) session.resetTimeout();
       return true;
@@ -7384,7 +7387,17 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
     return false;
   }
-  if (!dispatchMergedFlush(session, queued)) {
+  let delivered;
+  try {
+    delivered = dispatchMergedFlush(session, queued);
+  } catch (e) {
+    // The batch was detached from the queue before the send; if the send
+    // throws it would be lost, so put it back for a later flush.
+    restore();
+    console.log(`[QUEUE] dispatch threw; kept ${queued.length} queued message(s) for retry (room ${session.roomId}): ${e?.message ?? String(e)}`);
+    return false;
+  }
+  if (!delivered) {
     // dispatchMergedFlush fails in two distinct situations that must NOT be
     // handled the same way:
     //   1. The session is gone (dead / auto-stopped). There is nothing to
@@ -15341,7 +15354,7 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   }
 
   journalStreamClear(existing);
-  killSession(existing);
+  killSession(existing, 'SIGTERM', { preserveQueue: true });
 
   next.originRoomId = existing.originRoomId;
   next.firstMessageCaptured = true;
@@ -15351,6 +15364,16 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.showWorking = existing.showWorking;
   next.showBashOutput = existing.showBashOutput;
   next.chatHistory = history;
+  // Carry queued messages + their notification tiles across the agent switch,
+  // as recreateSession does. killSession keeps them (preserveQueue) and
+  // flushPendingSessionQueue no-ops on a dead session, so pending user input
+  // survives the switch instead of being orphaned. The journal convo id is
+  // stable across the switch, so the queue-release registry entries already
+  // map to `next` by convo id + item id.
+  next.queuedMessages = existing.queuedMessages;
+  next.queueNotifications = existing.queueNotifications;
+  // The replacement now owns delivery (see the matching line in recreateSession).
+  if (CLAUDE_STEER_ENABLED) existing._queueTransferred = true;
   next.pinnedSummaryText = existing.pinnedSummaryText;
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
   next.lastSummaryMsgCount = existing.lastSummaryMsgCount || 0;
