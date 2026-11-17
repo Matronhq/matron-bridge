@@ -5174,6 +5174,7 @@ function reconcileStrandedSubagents(reason = 'startup') {
   const repairFrames = strandedRepairFrames(entries, stranded);
   let published = 0;
   for (const { childConvoId, parentConvoId } of repairFrames) {
+    const addedAt = entries.find((entry) => entry.childConvoId === childConvoId)?.addedAt;
     try {
       // Publish `done` and drop the store record ONLY on confirmed delivery
       // a capacity-rejected best-effort send or a
@@ -5184,7 +5185,12 @@ function reconcileStrandedSubagents(reason = 'startup') {
       journalPublisher.upsertConvoBestEffort(
         childConvoId,
         { sessionState: 'done', parentConvoId },
-        { onDelivered: () => subagentRunningStore.remove(childConvoId) },
+        { onDelivered: () => {
+          // A child resumed after this repair was queued has a newer record
+          // (add with incarnation: true); the older repair must not erase it.
+          const current = subagentRunningStore.list().find((entry) => entry.childConvoId === childConvoId);
+          if (current && current.addedAt === addedAt) subagentRunningStore.remove(childConvoId);
+        } },
       );
       published += 1;
     } catch (e) {
