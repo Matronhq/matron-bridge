@@ -333,13 +333,30 @@ describe('repoInstructionsPointer containment and scan limit', () => {
   });
 
   it('says so when the folder holds more entries than were checked', () => {
-    // Every entry is a repository, so the check holds whatever order the
-    // folder lists them in.
-    for (let i = 0; i < 2001; i++) {
-      fs.mkdirSync(path.join(tmp, `r${i}/.git`), { recursive: true });
-      fs.writeFileSync(path.join(tmp, `r${i}/MATRON.md`), 'x');
-    }
-    const text = repoInstructionsPointer(tmp);
-    expect(text).toMatch(/more than 2000 entries, and the rest were not checked/);
+    // A fake filesystem: 2001 repositories, each with a MATRON.md, so the
+    // check holds whatever order the folder lists them in, without making
+    // thousands of real folders (slow on some runners).
+    const root = path.join(tmp, 'many');
+    const names = Array.from({ length: 2001 }, (_, i) => `r${i}`);
+    const notFound = (p) => Object.assign(new Error(`ENOENT ${p}`), { code: 'ENOENT' });
+    const kind = (p) => {
+      if (p === root) return 'dir';
+      const rel = path.relative(root, p).split(path.sep);
+      if (rel.length === 1 && names.includes(rel[0])) return 'dir';
+      if (rel.length === 2 && names.includes(rel[0]) && rel[1] === '.git') return 'dir';
+      if (rel.length === 2 && names.includes(rel[0]) && rel[1] === 'MATRON.md') return 'file';
+      return null;
+    };
+    const fsImpl = {
+      readdirSync: (p) => { if (p !== root) throw notFound(p); return names; },
+      realpathSync: (p) => { if (!kind(p)) throw notFound(p); return p; },
+      statSync: (p) => {
+        const k = kind(p);
+        if (!k) throw notFound(p);
+        return { isFile: () => k === 'file', isDirectory: () => k === 'dir' };
+      },
+    };
+    const text = repoInstructionsPointer(root, { fsImpl });
+    expect(text).toContain(', and 1975 more (the folder holds more than 2000 entries, and the rest were not checked)');
   });
 });
