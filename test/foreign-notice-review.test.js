@@ -360,9 +360,9 @@ describe('wiring', () => {
 
 describe('duplicate_of', () => {
   const open = (extra = {}) => ({ status: 200, data: { item: { id: 'it_open', num: 42, title: 'Review backlog', state: 'open', kind: 'task', awaiting: 'agent', private: true, mission_id: 'mi_1', ...extra } } });
-  const state = { close: 200, comment: 201 };
+  const state = { close: 200, comment: 201, hold: null };
   async function setup(getTarget) {
-    state.close = 200; state.comment = 201;
+    state.close = 200; state.comment = 201; state.hold = null;
     const closed = [];
     const comments = [];
     const updates = [];
@@ -375,7 +375,12 @@ describe('duplicate_of', () => {
         get: async (id) => (id === 'it_1' ? { status: 200, data: { item: { ...created[0], id: 'it_1', num: 201 } } } : getTarget(id)),
         create: async (body) => { created.push(body); return { status: 201, data: { item: { id: 'it_1', num: 201 } } }; },
         close: async (id, body) => { order.push('close'); closed.push({ id, ...body }); return { status: state.close, data: {} }; },
-        comment: async (id, body, opts) => { order.push(`comment:${id}`); comments.push({ id, ...body, key: opts?.idemKey }); return { status: state.comment, data: {} }; },
+        comment: async (id, body, opts) => {
+          order.push(`comment:${id}`); comments.push({ id, ...body, key: opts?.idemKey });
+          // state.comment is the target's answer; the notice's own comments always land.
+          if (id === 'it_open' && state.hold) await state.hold;
+          return { status: id === 'it_open' ? state.comment : 201, data: {} };
+        },
         update: async (id, body) => { updates.push([id, body]); return { status: 200, data: {} }; },
       },
       journalConvoIdFor: (s) => `convo-${s.roomId}`,
@@ -484,6 +489,33 @@ describe('duplicate_of', () => {
     expect(comments).toEqual([]);
     expect((await fs.postReview(s, good)).status).toBe(200);
     expect(comments).toHaveLength(1);
+  });
+  it('a turn that ends while the target lookup is out says under the notice that no review came', async () => {
+    let release;
+    const gate = new Promise((res) => { release = res; });
+    const { fs, s, closed, comments } = await setup(async () => { await gate; return { status: 404, data: {} }; });
+    const dup = fs.postReview(s, { duplicate_of: 42 });
+    fs.end(s);
+    release();
+    expect((await dup).status).toBe(409);
+    await tick();
+    expect(closed).toEqual([]);
+    expect(comments).toEqual([expect.objectContaining({ id: 'it_1', body: REVIEW_MISSING_COMMENT })]);
+  });
+  it('a turn that ends while the copy onto the target is out, and fails, says under the notice that no review came', async () => {
+    const { fs, s, closed, comments } = await setup(async () => open());
+    let release;
+    state.hold = new Promise((res) => { release = res; });
+    state.comment = 500;
+    const dup = fs.postReview(s, { duplicate_of: 42 });
+    await tick();
+    fs.end(s);
+    release();
+    expect((await dup).status).toBe(502);
+    await tick();
+    expect(closed).toEqual([]);
+    expect(comments.map((c) => c.id)).toEqual(['it_open', 'it_1']);
+    expect(comments[1].body).toBe(REVIEW_MISSING_COMMENT);
   });
   it('claims the review before the lookup: a parallel review with buttons is refused', async () => {
     let release;
