@@ -32,7 +32,7 @@ describe('usage-limit stall wiring (source inspection)', () => {
     expect(c.slice(c.indexOf('} else if (assistantCtxTokens) {'))).toContain('session._stall = null;');
     expect(c).not.toMatch(/} else \{\s*session\._stall = null;/);
     const rul = body('function refreshUsageLimits(cwd, { force = false } = {}) {', '\nfunction ');
-    expect(rul).toContain('if (!force && Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;');
+    expect(rul).toContain('if (!force && Date.now() - usageLimitsCache.attemptedAt < LIMITS_REFRESH_MS) return null;');
   });
   it('sidechain (subagent) records never reach the assistant case, so they cannot clear a parent stall', () => {
     const fn = body('function handleClaudeEvent(session, event) {', "    case 'assistant': {");

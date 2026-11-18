@@ -289,6 +289,7 @@ import { codexMcpConfig } from './lib/codex-mcp.js';
 import { toolRoleFor } from './lib/tool-roles.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
+import { createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -1270,6 +1271,9 @@ function handleJournalReconnect() {
   // Every hello_ok is a fresh epoch for the journal's copy of this box's
   // status too (a box that just woke reports itself before anyone asks).
   publishBoxStatus('reconnect');
+  // Codex quotas are account-scoped and need no session, so a box that just
+  // woke can report them without waiting for a turn to end (throttled).
+  refreshCodexLimits();
   // A fresh epoch may follow a gap in which the Coordinator moved; the
   // replayed `coordinator` events cover a live bridge, this covers a cursor
   // reset (snapshot_required) that skipped them. The answer also catches a
@@ -1323,7 +1327,7 @@ function publishBoxStatus(reason) {
   let accountEmail = null;
   let vitals = null;
   try { activity = buildActivity({ sessions, persisted: loadPersistedSessions() }); } catch { /* best-effort */ }
-  try { limits = buildLimits(usageLimitsCache); } catch { /* best-effort */ }
+  try { limits = buildLimits(usageLimitsCache, codexLimits.cache); } catch { /* best-effort */ }
   try { disk = buildDisk({ path: DEFAULT_WORKDIR }); } catch { /* best-effort */ }
   try { accountEmail = getAccountEmail(); } catch { /* best-effort */ }
   try { vitals = boxVitals(); } catch { /* best-effort */ }
@@ -1900,7 +1904,7 @@ const journalRpcHandler = createRpcRequestHandler({
   // (throttled, see refreshUsageLimits) but always returns synchronously
   // from whatever usageLimitsCache holds right now.
   getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
-  getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache, codexLimits.cache); },
   // Free space on the default-workdir filesystem — a full box is a bad spawn
   // target however idle it looks. One statfs syscall, answered inline.
   getDisk: () => buildDisk({ path: DEFAULT_WORKDIR }),
@@ -2227,16 +2231,34 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 // out to `claude -p "/usage"` — a local command that costs no API tokens but
 // does boot a claude process, hence the throttle: at most one fetch per
 // LIMITS_REFRESH_MS, refreshed only when turns are actually ending (nothing
-// runs overnight). A failed fetch stamps fetchedAt too, so an outage can't
+// runs overnight). A failed fetch stamps attemptedAt too, so an outage can't
 // turn every turn end into a spawn storm.
+let _boxStatusRepublishHandle = null;
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
 // okAt: the last fetch that actually parsed. fetchedAt also stamps failed
 // fetches (the refresh throttle), so freshness checks read okAt.
-const usageLimitsCache = { lines: null, fetchedAt: 0, okAt: 0, inflight: null };
+// attemptedAt drives the refresh throttle (failed fetches stamp it too);
+// fetchedAt is when the held lines were actually measured, reported as as_of.
+const usageLimitsCache = { lines: null, fetchedAt: 0, attemptedAt: 0, okAt: 0, inflight: null };
 // A refresh that yields no limits is logged once per streak, not only under
 // DEBUG: a box whose /usage never prints them otherwise just shows no limits.
 const usageMissLog = createUsageMissLogger((m) => console.warn(m));
 const codexAccountReader = createCodexAccountReader();
+// Codex quota lines for box_status: the account-scoped `account/rateLimits/read`
+// query via the shared reader, on the Claude cache's LIMITS_REFRESH_MS throttle,
+// only where Codex can run. A failed read keeps the previous lines
+// (lib/box-status.js).
+const codexLimits = createCodexLimitsRefresher({
+  read: () => codexAccountReader.read(DEFAULT_WORKDIR),
+  available: () => detectCodexBinary(),
+  refreshMs: LIMITS_REFRESH_MS,
+  onFresh: () => publishBoxStatus('codex limits refresh'),
+});
+function refreshCodexLimits() {
+  // Same gate as refreshUsageLimits: nothing consumes it without the journal.
+  if (!JOURNAL_ENABLED) return null;
+  return codexLimits.refresh();
+}
 const codexTelemetryReader = new CodexTelemetryReader();
 
 async function refreshCodexMetadata(session, options) {
@@ -2285,14 +2307,17 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
   // The cache exists solely to feed status frames — with the journal
   // disabled nothing consumes it, and each refresh boots a claude process.
   if (!JOURNAL_ENABLED) return null;
+  // Codex lines ride the same triggers on their own throttle (fire-and-forget).
+  refreshCodexLimits();
   if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
-  if (!force && Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
+  if (!force && Date.now() - usageLimitsCache.attemptedAt < LIMITS_REFRESH_MS) return null;
   usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
     .then((raw) => {
       const parsed = parseUsageLimits(raw);
-      usageLimitsCache.fetchedAt = Date.now();
+      usageLimitsCache.attemptedAt = Date.now();
       if (parsed.ok) {
         usageLimitsCache.lines = parsed.lines;
+        usageLimitsCache.fetchedAt = usageLimitsCache.attemptedAt;
         usageLimitsCache.okAt = usageLimitsCache.fetchedAt;
         usageMissLog.ok();
         // Fresh numbers: the journal's copy of this box's status is stale
@@ -2306,7 +2331,7 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
     .catch((e) => {
       debug(`Usage limits refresh failed: ${e.message}`);
       usageMissLog.miss({ error: e });
-      usageLimitsCache.fetchedAt = Date.now();
+      usageLimitsCache.attemptedAt = Date.now();
       return false;
     })
     .finally(() => { usageLimitsCache.inflight = null; });
@@ -16495,6 +16520,19 @@ async function main() {
   // Gated on JOURNAL_ENABLED: the sampler exists only to feed status.vitals on
   // journal frames, so there's nothing to sample for when journal mode is off.
   if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS, publishBoxVitals);
+  // box_status heartbeat, Codex boxes only: it exists so the Codex quota lines
+  // (account-scoped, no session to trigger them) do not go stale on an idle
+  // box. A Claude-only box has no Codex lines to refresh and keeps its
+  // turn-driven publishes. publishBoxStatus is a no-op while disconnected
+  // (sendRoomOp refuses), so this only reports while connected.
+  _boxStatusRepublishHandle = setInterval(() => {
+    if (!codexSpawnable()) return;
+    // Throttled, and republishes on its own when new lines land; the publish
+    // below carries whatever is cached so the heartbeat itself stays cheap.
+    refreshCodexLimits();
+    publishBoxStatus('heartbeat');
+  }, BOX_STATUS_REPUBLISH_MS);
+  if (typeof _boxStatusRepublishHandle.unref === 'function') _boxStatusRepublishHandle.unref();
   // Retention: the relocated codex-viz sink tree lives outside Claude Code's
   // pruned project dirs, so its unredacted JSONL would accumulate forever.
   // Best-effort age-based sweep at boot (never throws).
@@ -16532,6 +16570,7 @@ async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
   if (signal === 'SIGINT') console.log('\nShutting down...');
+  if (_boxStatusRepublishHandle) { clearInterval(_boxStatusRepublishHandle); _boxStatusRepublishHandle = null; }
   // Everything is inside try/finally so a throw from ANY step (sampler, session
   // kill, or the flush) still reaches process.exit(exitCode). Previously stopCpuSampler
   // / killSession ran outside the try, so a throw there rejected the promise the
