@@ -127,7 +127,7 @@ describe('queued attachment cancellation', () => {
       queueRelease: { listLive: () => [{ itemId: 'card::0', promptId: 'card' }], dropItem: vi.fn() },
       convoId: 'conversation', emitRelease: (_convo, _entry, { mutate } = {}) => { mutate?.(); return true; } };
     if (kind === 'magic') await handleBusyQueueMagicWord(session, 'cancel', deps);
-    if (kind === 'tap') resolveQueueReleaseTap('cancel:0', session, deps);
+    if (kind === 'tap') resolveQueueReleaseTap('cancel', session, { ...deps, entry: { prompt_id: 'card', itemIds: ['card::0'] } });
     if (kind === 'item') cancelQueuedItem(session, { itemId: 'card::0', promptId: 'card', ...deps });
     expect(cleanup).toHaveBeenCalledTimes(1);
   });

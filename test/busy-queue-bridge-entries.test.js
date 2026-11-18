@@ -61,7 +61,9 @@ describe('counts on cards and replies ignore bridge-made entries', () => {
     const session = sessionWith([['bridge', 'reminder']]);
     session.queuedMessages.push(userEntry('mine'));
     session.sendButtonMessage = vi.fn(async () => '$card');
-    await notifyQueuedMessage(session, 'mine', { sendReply: vi.fn() });
+    await notifyQueuedMessage(session, 'mine', {
+      sendReply: vi.fn(), queueRelease: { noteQueued: vi.fn() }, convoId: 'c',
+    });
     const [plain] = session.sendButtonMessage.mock.calls[0];
     expect(plain).toBe('📨 Queued (1): mine');
   });
