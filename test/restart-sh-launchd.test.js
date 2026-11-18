@@ -110,7 +110,14 @@ describe.skipIf(process.platform === 'win32')('restart.sh on a launchd install',
     const res = run({ services: '' });
 
     expect(res.log.filter((l) => l.startsWith('launchctl kickstart'))).toEqual([]);
-    expect(res.log).toContain('bridge-started matron-bridge index.js');
+    // The script starts the bridge in the background and (with `sleep`
+    // stubbed) can return before the bridge has recorded its start.
+    const started = 'bridge-started matron-bridge index.js';
+    const readLog = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').split('\n') : []);
+    for (let i = 0; i < 100 && !readLog().includes(started); i++) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+    expect(readLog()).toContain(started);
     expect(res.status).toBe(0);
   });
 });
