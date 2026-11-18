@@ -27,6 +27,7 @@ import { createTransferReceiver } from './lib/transfer-receiver.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createRestartNotes, takeNoteDeliveries, restartNoteTurnText } from './lib/restart-notes.js';
+import { createNoteDelivery } from './lib/restart-note-delivery.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createSearchHandlers } from './lib/search-tools.js';
@@ -9856,7 +9857,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // `silent` marks a line that is only a record (see timerCardPayload): the
 // journal and the apps show it and tell nobody.
 function journalPublishNotice(convoId, body, notice = null, { silent = false } = {}) {
-  if (!JOURNAL_ENABLED || !convoId) return;
+  // An empty body is no notice (a retried resume note's later attempts ask for none).
+  if (!JOURNAL_ENABLED || !convoId || !body) return;
   try {
     journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}), ...(silent ? { silent: true } : {}) });
   } catch (e) {
@@ -16377,6 +16379,40 @@ function startIdleReaper() {
 
 // --- Startup ---
 
+// Hand a resume note to its chat as the first turn after the restart (the same
+// carry-on cause as the other bridge-made turns). Unlike carryOnConvo this
+// reports whether it worked, so lib/restart-note-delivery.js can retry: false
+// when the chat cannot be resumed or the session refused the text.
+let restartNoteDelivery = null;
+async function deliverRestartNote(note) {
+  // Never start or resume a session while the bridge is going down.
+  if (shuttingDown) return false;
+  try {
+    let target = findSessionByClaudeSessionId(note.convoId);
+    // The "resuming" notice only on the first attempt: a retry that has to
+    // resume the chat again must not post it a second and third time.
+    if (!target || !target.alive) target = journalResumeConvo(note.convoId, note.attempt > 1 ? '' : '🔄 The bridge restarted — resuming this chat with the note you left for it.');
+    if (!target) return false;
+    const result = await journalRouteTextToSession(target,
+      restartNoteTurnText(note.text, note.ageMs, frameSafeBody, note.interrupted),
+      { bridgeOrigin: true, causes: [carryOnCause()] });
+    return result !== false;
+  } catch (e) {
+    try { console.warn(`[restart-note] delivery to convo=${note.convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    return false;
+  }
+}
+
+// The note replaced the card its chat would have had; when it cannot be
+// delivered the chat gets one after all.
+function publishNoteRecoveryCard(convoId) {
+  if (!JOURNAL_ENABLED) return false;
+  return journalPublishCardForConvo(convoId, {
+    question: '⚠️ The bridge restarted and could not resume this chat with the note you left for it. Tap to carry on from where it left off.',
+    options: [{ id: `resume-${convoId}`, label: '▶️ Carry on', value: `resume:${convoId}` }],
+  });
+}
+
 // Boot reconciliation for restart carry-on. Every marker still on disk from a
 // previous bridge process is, by construction, a turn that never reached a
 // turn-end seam — the restart killed it (index.js SIGTERM handler kills every
@@ -16409,22 +16445,26 @@ function publishRestartCarryOnCards() {
     .filter(Boolean));
   // Resume notes first, before selectAutoCarryOn: a conversation with a note
   // gets the note as its one bridge-made first turn, in place of both the
-  // automatic carry-on and the card. The notes are deleted before delivery.
+  // automatic carry-on and the card. The notes stay in their file until each
+  // has been delivered (retried) or given a "Carry on" card instead
+  // (lib/restart-note-delivery.js).
+  let taken = [];
   const noteResult = takeNoteDeliveries({
-    store: restartNotes, stale, resumable, isResumeConvoId,
+    store: { take: () => { taken = restartNotes.peek(); return taken; } }, stale, resumable, isResumeConvoId,
     log: (m) => { try { console.log(m); } catch { /* logging must never throw */ } },
   });
   stale = noteResult.stale;
-  if (noteResult.deliveries.length) {
-    setTimeout(() => {
-      for (const note of noteResult.deliveries) {
-        void carryOnConvo(note.convoId, null, null,
-          restartNoteTurnText(note.text, note.ageMs, frameSafeBody, note.interrupted),
-          '🔄 The bridge restarted — resuming this chat with the note you left for it.',
-          { causes: [carryOnCause()] });
-      }
-    }, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS);
-  }
+  restartNoteDelivery = createNoteDelivery({
+    deliver: deliverRestartNote,
+    recover: (note) => publishNoteRecoveryCard(note.convoId),
+    discard: (entries) => restartNotes.discard(entries),
+    log: (m) => { try { console.warn(m); } catch { /* logging must never throw */ } },
+    firstDelayMs: CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
+    // Going down: no retry may start, card or remove anything; the notes that
+    // were not dealt with stay on disk for the next boot.
+    halted: () => shuttingDown,
+  });
+  restartNoteDelivery.start(noteResult.deliveries, taken);
   if (!stale.length) return;
   // The previous process's self-restart onto new code cut these turns off;
   // with the option on they carry on by themselves (lib/code-update-restart.js

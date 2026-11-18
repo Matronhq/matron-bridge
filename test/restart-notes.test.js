@@ -93,7 +93,7 @@ describe('takeNoteDeliveries', () => {
     const stamp = { bootId: 'b1' };
     const stale = [{ convoId: 'c1', bootId: 'b1', ageMs: 5 }, { convoId: 'c2', bootId: 'b1', ageMs: 5 }];
     const r = takeNoteDeliveries({ store, stale, resumable, now: () => NOW });
-    expect(r.deliveries).toEqual([{ convoId: 'c1', text: 'finish the deploy check', ageMs: 10 * MIN, interrupted: true }]);
+    expect(r.deliveries).toEqual([{ convoId: 'c1', text: 'finish the deploy check', writtenAt: NOW - 10 * MIN, ageMs: 10 * MIN, interrupted: true }]);
     const { auto, card } = selectAutoCarryOn(r.stale, stamp, { enabled: true });
     const firstTurns = [...r.deliveries.map(d => d.convoId), ...auto.map(a => a.convoId), ...card.map(c => c.convoId)];
     expect(firstTurns.filter(id => id === 'c1')).toHaveLength(1);
@@ -168,5 +168,59 @@ describe('restartNoteTurnText', () => {
 
   it('says a turn was cut off when the chat was interrupted', () => {
     expect(restartNoteTurnText('line', 10 * MIN, undefined, true)).toContain('It cut your turn off mid-way');
+  });
+});
+
+describe('restart note store: peek and discard', () => {
+  it('peek() reads without removing', () => {
+    const { file } = tmpFile();
+    const store = createRestartNotes({ file, now: () => NOW });
+    store.put('c1', 'hello');
+    expect(store.peek().map(n => n.text)).toEqual(['hello']);
+    expect(store.peek().map(n => n.text)).toEqual(['hello']);
+    expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it('discard() removes only the entries given, so a newer note for another chat stays', () => {
+    const { file } = tmpFile();
+    const store = createRestartNotes({ file, now: () => NOW });
+    store.put('c1', 'one');
+    const taken = store.peek();
+    store.put('c2', 'two');
+    store.discard(taken);
+    expect(store.peek().map(n => n.convoId)).toEqual(['c2']);
+  });
+
+  it('discard() keeps a note that replaced the taken one (different write time)', () => {
+    const { file } = tmpFile();
+    let t = NOW;
+    const store = createRestartNotes({ file, now: () => t });
+    store.put('c1', 'old');
+    const taken = store.peek();
+    t += 1000;
+    store.put('c1', 'new');
+    store.discard(taken);
+    expect(store.peek().map(n => n.text)).toEqual(['new']);
+  });
+
+  it('discard() deletes the file when nothing is left, and is quiet when it is already gone', () => {
+    const { file } = tmpFile();
+    const store = createRestartNotes({ file, now: () => NOW });
+    store.put('c1', 'one');
+    const taken = store.peek();
+    store.discard(taken);
+    expect(fs.existsSync(file)).toBe(false);
+    expect(() => store.discard(taken)).not.toThrow();
+    expect(() => store.discard([])).not.toThrow();
+  });
+
+  it('discard() throws when the file cannot be rewritten', () => {
+    const { file } = tmpFile();
+    createRestartNotes({ file, now: () => NOW }).put('c1', 'one');
+    createRestartNotes({ file, now: () => NOW }).put('c2', 'two');
+    const failing = fsWith({ renameSync: () => { throw new Error('ENOSPC'); } });
+    const store = createRestartNotes({ file, fs: failing, now: () => NOW });
+    expect(() => store.discard([{ convoId: 'c1', writtenAt: NOW }])).toThrow(/ENOSPC/);
+    expect(createRestartNotes({ file }).peek()).toHaveLength(2);
   });
 });
