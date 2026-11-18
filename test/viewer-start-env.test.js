@@ -14,9 +14,15 @@ const SETTINGS = ['HMAC_SECRET', 'MATRON_VIEWER_PORT', 'MATRIX_VIEWER_PORT', 'MA
 
 const children = [];
 const dirs = [];
-afterEach(() => {
-  for (const c of children.splice(0)) c.kill();
-  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+afterEach(async () => {
+  // Wait for each viewer to exit before removing its working directory:
+  // Windows refuses to remove a directory a live process still has as its cwd.
+  await Promise.all(children.splice(0).map((c) => new Promise((resolve) => {
+    if (c.exitCode !== null || c.signalCode !== null) return resolve();
+    c.once('close', resolve);
+    c.kill();
+  })));
+  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 // Run viewer/start.js in a directory holding `dotenv` as its `.env`. Resolves
