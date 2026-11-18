@@ -11693,8 +11693,8 @@ async function restartGateHoldReason() {
 }
 
 // The live sessions that hold a restart back right now: mid-turn, a live
-// background work child, or a running subagent. Background work and subagents
-// use the idle reaper's age cap, a running turn never does. One process-table
+// background work child, a running subagent, or a pending answer. All but a
+// running turn use the idle reaper's age cap. One process-table
 // read per call, shared by every live session. `unreadable` reports a failed
 // `ps`: the verdict then rests on in-memory signals alone.
 function sessionsHoldingRestart() {
@@ -11705,13 +11705,14 @@ function sessionsHoldingRestart() {
   const holders = [];
   for (const s of live) {
     const last = handoffIdleSince(s);
+    const awaitingAnswer = !!(s.pendingInteractivePrompt || s.pendingUnclassifiedPrompt || s.waitingForAnswer);
     // A quiet tool call can outlast the age cap without ending its turn.
     // Subagent tracking is in memory, so it survives a failed ps read.
     const hold = s.busy
       ? { reason: 'turn in progress' }
       : table.unreadable
-        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
-        : sessionWorkHold(s, last, now, table);
+        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now, awaitingAnswer })
+        : sessionWorkHold(s, last, now, table, { awaitingAnswer });
     if (hold) {
       holders.push({ session: s, reason: hold.reason });
       debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
@@ -16193,13 +16194,14 @@ function readProcessTable() {
 // servers — a tool call, a background task — or a running subagent),
 // null when the idle clock
 // should rule. See lib/work-hold.js.
-function sessionWorkHold(session, last, now, table) {
+function sessionWorkHold(session, last, now, table, { awaitingAnswer = false } = {}) {
   return workHold({
     busy: !!session.busy,
     children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
     idleSince: last,
     now,
     subagentCount: session.subagentConvos?.runningCount() ?? 0,
+    awaitingAnswer,
   });
 }
 
