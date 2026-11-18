@@ -1009,7 +1009,6 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       notify,
       formatQueueSummary: (queued) => ({
         plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
-        html: '',
       }),
     });
     expect(notify).toHaveBeenCalledTimes(1);
@@ -1027,7 +1026,7 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
       emitRelease: vi.fn(),
       notify,
-      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+      formatQueueSummary: () => ({ plain: 'x' }),
     });
     expect(notify).not.toHaveBeenCalled();
   });
@@ -1365,7 +1364,6 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
       notify,
       formatQueueSummary: (queued) => ({
         plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
-        html: '',
       }),
     });
     expect(notify).toHaveBeenCalledTimes(1);
@@ -1378,7 +1376,7 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
     tapSendOne(threeSession(), {
       flushQueue: fakeFlushQueue(false),
       notify,
-      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+      formatQueueSummary: () => ({ plain: 'x' }),
     });
     expect(notify).not.toHaveBeenCalled();
   });

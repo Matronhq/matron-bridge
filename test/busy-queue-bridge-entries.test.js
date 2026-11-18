@@ -22,7 +22,7 @@ function sessionWith(entries) {
 
 const deps = () => ({
   sendReply: vi.fn(async () => {}),
-  formatQueueSummary: () => ({ plain: '', html: '' }),
+  formatQueueSummary: () => ({ plain: '' }),
   flushQueue: vi.fn(() => true),
 });
 
@@ -73,7 +73,7 @@ describe('counts on cards and replies ignore bridge-made entries', () => {
     resolveQueueReleaseTap('send_one', session, {
       entry: { prompt_id: 'pr_0', itemIds: ['pr_0::0'] },
       flushQueue: vi.fn(() => true),
-      formatQueueSummary: () => ({ plain: 'x', html: 'x' }),
+      formatQueueSummary: () => ({ plain: 'x' }),
       notify, queueRelease, emitRelease: vi.fn(), convoId: 'c',
     });
     expect(notify.mock.calls[0][0]).toMatch(/the other 1 \w+ stays queued/);
