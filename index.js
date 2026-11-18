@@ -13,6 +13,7 @@ import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
+import { utf8ChunkDecoder } from './lib/utf8-chunks.js';
 import { createShortLinkWriter, shortenViewerUrl, shortLinksEnabled, shortLinksFile } from './lib/short-links.js';
 import { createItemsClient } from './lib/items-client.js';
 import { readApprovalConfig } from './lib/approval-config.js';
@@ -3059,8 +3060,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
 
   // Parse newline-delimited JSON from stdout
+  const decodeStdout = utf8ChunkDecoder();
   proc.stdout.on('data', (chunk) => {
-    session.lineBuf += chunk.toString();
+    session.lineBuf += decodeStdout(chunk);
     const lines = session.lineBuf.split('\n');
     // Keep the last (possibly incomplete) line in the buffer
     session.lineBuf = lines.pop();
@@ -14397,7 +14399,8 @@ const apiServer = createServer(async (req, res) => {
       return;
     }
     let raw = '';
-    req.on('data', chunk => { if (raw.length < 4096) raw += chunk; });
+    const decodeRaw = utf8ChunkDecoder();
+    req.on('data', chunk => { if (raw.length < 4096) raw += decodeRaw(chunk); });
     req.on('end', async () => {
       let data = null;
       try { data = raw.trim() ? JSON.parse(raw) : null; } catch { /* no reason given */ }
@@ -14444,6 +14447,7 @@ const apiServer = createServer(async (req, res) => {
 
   let body = '';
   let bodyBytes = 0;
+  const decodeBody = utf8ChunkDecoder();
   let showFileBodyTooLarge = false;
   req.on('data', chunk => {
     if (showFileBodyTooLarge) return;
@@ -14463,7 +14467,7 @@ const apiServer = createServer(async (req, res) => {
       req.pause();
       return;
     }
-    body += chunk;
+    body += decodeBody(chunk);
   });
   req.on('end', async () => {
     if (showFileBodyTooLarge) return;
