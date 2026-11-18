@@ -68,7 +68,7 @@ describe('work in flight holds the session and the box', () => {
 
   it('decides with the pure helper on the session\'s busy flag and live work children', () => {
     const body = fnBody('sessionWorkHold');
-    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table, MCP_SERVER_SIGNATURES\),\s*idleSince: last,\s*now,\s*subagentCount: session\.subagentConvos\?\.runningCount\(\) \?\? 0,\s*\}\)/);
+    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table, MCP_SERVER_SIGNATURES\),\s*idleSince: last,\s*now,\s*subagentCount: session\.subagentConvos\?\.runningCount\(\) \?\? 0,\s*awaitingAnswer,\s*\}\)/);
   });
 
   it('knows the MCP servers by the merged config claude is spawned with — every extras group, local overlay included', () => {
