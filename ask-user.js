@@ -31,7 +31,11 @@ import { formatTimelineReadAck, formatTimelineWriteAck } from './lib/timeline-to
 import { readApiHeaderFile, explainUnauthorized } from './lib/api-header-file.js';
 import { shouldRegister } from './lib/tool-roles.js';
 
-const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
+// The session's environment carries the port the bridge really listens on
+// (MATRON_BRIDGE_API_PORT); an explicit BRIDGE_API_URL still wins.
+const BRIDGE_API = process.env.BRIDGE_API_URL
+  || (process.env.MATRON_BRIDGE_API_PORT && `http://127.0.0.1:${process.env.MATRON_BRIDGE_API_PORT}`)
+  || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 // This session's loopback API token (lib/api-auth.js), sent on every bridge
 // call. Read per call: the file is written before the session spawns, and a
