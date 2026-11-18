@@ -6640,7 +6640,10 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     }
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
-      session.iv.sendText(text);
+      if (session.iv.sendText(text) === false) {
+        return reportSessionSendFailure(session, 'Interactive session could not accept the message.',
+          { restoreJournalState: true, beganTurn });
+      }
       commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
       if (session.resetTimeout) session.resetTimeout();
       return true;
@@ -7191,9 +7194,15 @@ function dispatchMergedFlush(session, queued) {
   if (blocks.length === 0) return false;
   // One turn for the whole batch: it was started by everything in it.
   if (!sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued), queuedEntries: queued })) return false;
-  if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
-  for (const entry of queued) {
-    for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+  // The text is already with the agent. A throw from the journal mirror must not
+  // read as a failed send, or flushQueue would restore the batch and send it twice.
+  try {
+    if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
+    for (const entry of queued) {
+      for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+    }
+  } catch (e) {
+    console.log(`[QUEUE] journal mirror of a delivered batch failed (room ${session.roomId}): ${e?.message ?? String(e)}`);
   }
   return true;
 }
@@ -7403,7 +7412,25 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
     return false;
   }
-  if (!dispatchMergedFlush(session, queued)) {
+  let delivered;
+  const wasBusy = session.busy;
+  try {
+    delivered = dispatchMergedFlush(session, queued);
+  } catch (e) {
+    // The batch was detached from the queue before the send; if the send
+    // throws it would be lost, so put it back for a later flush.
+    restore();
+    // The send began a turn that no agent output will ever end: close it, or
+    // the restored batch waits on a turn end that never comes.
+    if (!wasBusy && session.busy) {
+      session.busy = false;
+      if (session.currentTurn) endTurn(session);
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+    }
+    console.log(`[QUEUE] dispatch threw; kept ${queued.length} queued message(s) for retry (room ${session.roomId}): ${e?.message ?? String(e)}`);
+    return false;
+  }
+  if (!delivered) {
     // dispatchMergedFlush fails in two distinct situations that must NOT be
     // handled the same way:
     //   1. The session is gone (dead / auto-stopped). There is nothing to
