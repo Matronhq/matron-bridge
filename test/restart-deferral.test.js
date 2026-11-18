@@ -117,11 +117,18 @@ describe('index.js turn-end seams dispatch the deferred command (source inspecti
   };
 
   it('iv-mode onTurnEnd (also the manual-/compact boundary path)', () => {
-    expectDispatchBeforeFlush(seamWindow('session.onTurnEnd = () => {', 'session.requestPlanDecision'));
+    expectDispatchBeforeFlush(seamWindow('session.onTurnEnd = () => {', 'sessions.set(roomId, session);'));
   });
 
   it("print-mode 'result' event", () => {
-    expectDispatchBeforeFlush(seamWindow("case 'result': {", "case 'system':"));
+    // Anchor on the unconditional turn-end dispatch: the window also holds the
+    // fatal path's `if (!session.iv) dispatchDeferredCommand(session)`, which
+    // would satisfy a bare indexOf even with the normal seam removed.
+    const body = seamWindow("case 'result': {", "case 'system':");
+    const dispatch = body.indexOf('if (dispatchDeferredCommand(session)) break;');
+    const flush = body.indexOf('flushPendingSessionQueue(session)', dispatch);
+    expect(dispatch).toBeGreaterThan(-1);
+    expect(flush).toBeGreaterThan(dispatch);
   });
 
   // The fatal "no conversation found" result path breaks out early, before
