@@ -202,6 +202,44 @@ describe('resume note delivery', () => {
   });
 });
 
+describe('resume note delivery at shutdown', () => {
+  it('a send in flight that succeeds after halted() still removes its note', async () => {
+    let down = false;
+    const c = clock();
+    const discards = [];
+    let release;
+    const delivery = createNoteDelivery({
+      deliver: () => new Promise((resolve) => { release = resolve; }),
+      discard: (e) => discards.push(e),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, halted: () => down, now: c.now,
+    });
+    delivery.start([note('a')], []);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    down = true;
+    release(true);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(discards).toHaveLength(1);
+    expect(discards[0][0].convoId).toBe('a');
+  });
+
+  it('a send in flight that succeeds after stop() still removes its note', async () => {
+    const c = clock();
+    const discards = [];
+    let release;
+    const delivery = createNoteDelivery({
+      deliver: () => new Promise((resolve) => { release = resolve; }),
+      discard: (e) => discards.push(e),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now,
+    });
+    delivery.start([note('a')], []);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    delivery.stop();
+    release(true);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(discards).toHaveLength(1);
+  });
+});
+
 describe('resume note delivery against the real note store', () => {
   function tmpStore() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'note-delivery-'));

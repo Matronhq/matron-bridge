@@ -16283,7 +16283,6 @@ function startIdleReaper() {
 // carry-on cause as the other bridge-made turns). Unlike carryOnConvo this
 // reports whether it worked, so lib/restart-note-delivery.js can retry: false
 // when the chat cannot be resumed or the session refused the text.
-let restartNoteDelivery = null;
 async function deliverRestartNote(note) {
   // Never start or resume a session while the bridge is going down.
   if (shuttingDown) return false;
@@ -16354,7 +16353,7 @@ function publishRestartCarryOnCards() {
     log: (m) => { try { console.log(m); } catch { /* logging must never throw */ } },
   });
   stale = noteResult.stale;
-  restartNoteDelivery = createNoteDelivery({
+  const restartNoteDelivery = createNoteDelivery({
     deliver: deliverRestartNote,
     recover: (note) => publishNoteRecoveryCard(note.convoId),
     discard: (entries) => restartNotes.discard(entries),
