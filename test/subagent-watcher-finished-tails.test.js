@@ -161,6 +161,25 @@ describe('SubagentWatcher: tails of finished subagents', () => {
     expect(ctx.texts).toEqual(['first', 'resumed']);
   });
 
+  it('does not stop a tail while its transcript cannot be read', () => {
+    const ctx = mk();
+    const file = attachAgent(ctx);
+    ctx.w.noteAgentFinished('aaa');
+
+    // The file is out of reach for a while (moved, or not readable).
+    fs.renameSync(file, `${file}.away`);
+    vi.advanceTimersByTime(GRACE_MS * 3);
+    expect(ctx.w.tails.has('agent-aaa.jsonl')).toBe(true);
+
+    // Back again, with a line written meanwhile: shown, then the tail stops.
+    fs.appendFileSync(`${file}.away`, line('late'));
+    fs.renameSync(`${file}.away`, file);
+    vi.advanceTimersByTime(GRACE_MS * 2 + 100);
+    expect(ctx.texts).toEqual(['first', 'late']);
+    expect(ctx.w.tails.has('agent-aaa.jsonl')).toBe(false);
+    expect(ctx.w.parked.has('agent-aaa.jsonl')).toBe(true);
+  });
+
   it('a resume announced inside the grace period keeps the tail', () => {
     const ctx = mk();
     attachAgent(ctx);
