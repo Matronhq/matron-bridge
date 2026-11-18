@@ -11,7 +11,7 @@ const ROSTER = {
     { device_id: 7, name: 'box-2' },
   ],
   conversations: [
-    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61, extra: 'dropped' },
+    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex', status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61, extra: 'dropped' },
     { id: 'convo-self', title: 'Local work', session_state: 'running', summary: null, agent_device_id: 1, last_ts: 222, mission_num: 'not a number' },
     { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 },
   ],
@@ -101,12 +101,12 @@ describe('createAgentChatHandlers', () => {
   });
 
   describe('agentSessions', () => {
-    it('lists same-box and cross-box sessions with state, and flags only the caller as self', async () => {
+    it('lists same-box and cross-box sessions with state and kind, and flags only the caller as self', async () => {
       const conversations = [
         // The caller's journal convo id is 'convo-sess', not its session key '!sess'.
-        { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1 },
-        { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1 },
-        { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7 },
+        { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1, agent_kind: 'claude' },
+        { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1, agent_kind: null },
+        { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7, agent_kind: 'codex' },
       ];
       const { handlers } = makeFixture({
         publisher: { fetchRoster: async () => ({ ...ROSTER, conversations }) },
@@ -118,9 +118,9 @@ describe('createAgentChatHandlers', () => {
         status: 200,
         body: {
           sessions: [
-            { convo_id: 'convo-sess', title: 'This session', session_state: 'running', is_self: true },
-            { convo_id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', is_self: false },
-            { convo_id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', is_self: false },
+            { convo_id: 'convo-sess', title: 'This session', session_state: 'running', agent_kind: 'claude', is_self: true },
+            { convo_id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_kind: null, is_self: false },
+            { convo_id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_kind: 'codex', is_self: false },
           ],
           total: 3,
         },
@@ -166,9 +166,9 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.self).toEqual({ device_id: 1, name: 'mac' });
       expect(res.body.agents).toEqual([{ device_id: 7, name: 'box-2' }]);
       expect(res.body.conversations).toEqual([
-        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61 },
-        { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222 },
-        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 },
+        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex', status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61 },
+        { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222, agent_kind: null },
+        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null },
       ]);
     });
 

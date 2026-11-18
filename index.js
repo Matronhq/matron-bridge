@@ -2021,7 +2021,7 @@ function journalPublish(session, method, payload, options) {
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
-        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, ...journalRepoField(session) });
+        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, agentKind: session.agent, ...journalRepoField(session) });
       } else {
         payload = { ...payload, ...journalRepoField(session) };
       }
@@ -2077,7 +2077,16 @@ function journalUpsertConvo(session, opts, options) {
     persistSession(session.roomId, session.claudeSessionId, session.workdir,
       session.originRoomId, { journalTitleHint: opts.title });
   }
-  journalPublish(session, 'upsertConvo', opts, options);
+  // Stamp the backend kind ('claude' | 'codex') on every session-scoped upsert
+  // so clients can mark codex vs claude on top-level conversation rows. A
+  // caller that already supplied agentKind wins. The journal keeps the last
+  // non-null kind, so re-sending it on each state change is harmless.
+  journalPublish(
+    session,
+    'upsertConvo',
+    session.agent && opts.agentKind === undefined ? { ...opts, agentKind: session.agent } : opts,
+    options,
+  );
 }
 
 // opts.incomingHint: the title carried across a restart/resume (see
