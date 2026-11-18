@@ -117,7 +117,7 @@ describe('index.js turn-end seams dispatch the deferred command (source inspecti
   };
 
   it('iv-mode onTurnEnd (also the manual-/compact boundary path)', () => {
-    expectDispatchBeforeFlush(seamWindow('session.onTurnEnd = () => {', 'session.requestPlanDecision'));
+    expectDispatchBeforeFlush(seamWindow('session.onTurnEnd = () => {', 'sessions.set(roomId, session);'));
   });
 
   it("print-mode 'result' event", () => {
