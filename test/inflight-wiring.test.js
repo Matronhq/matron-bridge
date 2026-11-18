@@ -1,5 +1,8 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { runInNewContext } from 'node:vm';
+import { describe, expect, it, vi } from 'vitest';
+import { workHold, liveWorkChildren } from '../lib/work-hold.js';
+import { createInflightMarker } from '../lib/inflight-marker.js';
 
 // Source-text assertions on index.js, same idiom as test/codex-session.test.js's
 // "Codex bridge wiring" block. index.js has no unit-test harness, so the
@@ -181,5 +184,193 @@ describe('restart carry-on turn-boundary wiring', () => {
       + "that id gets noteTurnStart called on it again, resetting startedAt/touchedAt and wrongly "
       + 'refreshing the age window that decides whether the interruption is recent enough to card.',
     ).toBe(true);
+  });
+});
+
+describe('background work markers in the bridge', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+
+  // Run one top-level function of index.js against injected collaborators.
+  function load(names, context) {
+    const body = names.map((name) => {
+      const start = src.indexOf(`function ${name}(`);
+      expect(start, `could not find ${name} in index.js`).toBeGreaterThan(-1);
+      const end = src.indexOf('\n}\n', start);
+      return src.slice(start, end + 3);
+    }).join('\n');
+    return runInNewContext(`${body}\n({ ${names.join(', ')} });`, context);
+  }
+
+  const MCP = [];
+  const hasWorkFns = (extra = {}) => load(['sessionWorkHold', 'sessionHasBackgroundWork'], {
+    workHold, liveWorkChildren, MCP_SERVER_SIGNATURES: MCP, Date,
+    sessionChildPid: (s) => s.pid ?? null,
+    readProcessTable: () => [],
+    ...extra,
+  });
+  const live = (table) => Object.assign([], table);
+
+  it('a turn that ends with a live work child, a running subagent or nothing', () => {
+    const { sessionHasBackgroundWork } = hasWorkFns();
+    const child = live([{ pid: 11, ppid: 10, args: 'sleep 3600' }]);
+    const bare = live([]);
+    // `busy` is still set on some turn-end paths; it must not count as work.
+    expect(sessionHasBackgroundWork({ pid: 10, busy: true }, child)).toBe(true);
+    expect(sessionHasBackgroundWork({ pid: 10, busy: true, subagentConvos: { runningCount: () => 2 } }, bare)).toBe(true);
+    expect(sessionHasBackgroundWork({ pid: 10, busy: true }, bare)).toBe(false);
+  });
+
+  it('on an unreadable process table only running subagents count', () => {
+    const { sessionHasBackgroundWork } = hasWorkFns();
+    const unreadable = Object.assign([], { unreadable: true });
+    expect(sessionHasBackgroundWork({ pid: 10 }, unreadable)).toBe(false);
+    expect(sessionHasBackgroundWork({ pid: 10, subagentConvos: { runningCount: () => 1 } }, unreadable)).toBe(true);
+  });
+
+  it('keeps the evidence when the check itself throws', () => {
+    const { sessionHasBackgroundWork } = hasWorkFns({ sessionChildPid: () => { throw new Error('boom'); } });
+    expect(sessionHasBackgroundWork({}, live([{ pid: 1, ppid: 0, args: 'x' }]))).toBe(true);
+  });
+
+  it('the card appears after a restart only when work outlived the turn', () => {
+    const { sessionHasBackgroundWork } = hasWorkFns();
+    const cases = {
+      child: [{ pid: 10 }, live([{ pid: 11, ppid: 10, args: 'sleep 3600' }])],
+      subagent: [{ pid: 10, subagentConvos: { runningCount: () => 1 } }, live([])],
+      nothing: [{ pid: 10 }, live([])],
+    };
+    let data = {};
+    const save = (d) => { data = JSON.parse(JSON.stringify(d)); };
+    const first = createInflightMarker({ load: () => data, save, now: () => 1_000_000, bootId: 'boot-1' });
+    for (const [convoId, [session, table]] of Object.entries(cases)) {
+      first.noteTurnStart(convoId, `room-${convoId}`);
+      first.noteTurnEnd(convoId, { hasWork: sessionHasBackgroundWork(session, table) });
+    }
+    const next = createInflightMarker({ load: () => data, save, now: () => 1_060_000, bootId: 'boot-2' });
+    const stale = next.takeStale(6 * 3600 * 1000);
+    expect(stale.map(r => [r.convoId, r.kind])).toEqual([['child', 'background'], ['subagent', 'background']]);
+  });
+
+  it('every turn-end seam goes through the non-blocking work check', () => {
+    const ends = src.match(/inflightMarker\.noteTurnEnd\(journalConvoIdFor\(session\)[^;]*;/g) || [];
+    expect(src.match(/dropBackgroundMarkerWhenNoWork\(session\);/g)).toHaveLength(5);
+    expect(ends.filter(e => e.includes('{ hasWork: true }'))).toHaveLength(5);
+    // The others are teardown or unstick paths that deliberately clear the marker.
+    expect(ends.length).toBeGreaterThan(5);
+  });
+
+  const flush = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
+
+  it('a turn end keeps the marker, then drops it when the non-blocking check finds no work', async () => {
+    let data = {};
+    const marker = createInflightMarker({ load: () => data, save: (d) => { data = JSON.parse(JSON.stringify(d)); }, now: () => 1000, bootId: 'b1' });
+    marker.noteTurnStart('alice', 'room-a');
+    marker.noteTurnStart('bob', 'room-b');
+    const tables = { alice: Object.assign([], { unreadable: false }), bob: [{ pid: 11, ppid: 10, args: 'sleep 3600' }] };
+    const fns = hasWorkFns({ inflightMarker: marker, shuttingDown: false, journalConvoIdFor: (s) => s.id, readProcessTableAsync: async () => tables.current });
+    const drop = load(['dropBackgroundMarkerWhenNoWork'], { ...fns, inflightMarker: marker, shuttingDown: false, journalConvoIdFor: (s) => s.id, readProcessTableAsync: async () => tables.current }).dropBackgroundMarkerWhenNoWork;
+    const end = (session) => { marker.noteTurnEnd(session.id, { hasWork: true }); drop(session); };
+    tables.current = tables.alice;
+    end({ id: 'alice', pid: 10 });
+    expect(data.alice.kind).toBe('background');
+    await flush();
+    expect(data.alice).toBeUndefined();
+    tables.current = tables.bob;
+    end({ id: 'bob', pid: 10 });
+    await flush();
+    expect(data.bob.kind).toBe('background');
+  });
+
+  it('a turn end does not read the process table synchronously', () => {
+    const body = src.slice(src.indexOf('function dropBackgroundMarkerWhenNoWork'), src.indexOf('function startBackgroundMarkerMaintenance'));
+    expect(body).toMatch(/readProcessTableAsync\(\)/);
+    expect(body).not.toMatch(/readProcessTable\(\)/);
+    const sweep = src.slice(src.indexOf('function startBackgroundMarkerMaintenance'), src.indexOf('// --- Pre-reap handoff'));
+    expect(sweep).not.toMatch(/readProcessTable\(\)/);
+    expect(src.slice(src.indexOf('function sessionHasBackgroundWork'), src.indexOf('function dropBackgroundMarkerWhenNoWork'))).not.toMatch(/execFileSync|readProcessTable\(/);
+  });
+
+  function sweepHarness({ ids, sessions, hasWork = () => true, shuttingDown = false }) {
+    let tick;
+    const refreshBackground = vi.fn();
+    const clearBackground = vi.fn();
+    const readProcessTableAsync = vi.fn(async () => []);
+    const { startBackgroundMarkerMaintenance } = load(['startBackgroundMarkerMaintenance'], {
+      setInterval: (fn) => { tick = fn; return { unref() {} }; },
+      sessions: new Map(sessions.map((s, i) => [`r${i}`, s])), SESSION_IDLE_CHECK_MS: 1000, readProcessTableAsync,
+      journalConvoIdFor: (s) => s.id, handoffIdleSince: () => 0, shuttingDown,
+      sessionHasBackgroundWork: (s) => hasWork(s),
+      inflightMarker: { backgroundIds: () => ids, refreshBackground, clearBackground },
+    });
+    startBackgroundMarkerMaintenance();
+    return { tick: async () => { await tick(); }, refreshBackground, clearBackground, readProcessTableAsync };
+  }
+
+  it('sweeps background markers: refresh while work runs, drop when it is gone', async () => {
+    const h = sweepHarness({
+      ids: ['busy-one', 'gone', 'mid-turn'],
+      sessions: [{ alive: true, id: 'busy-one' }, { alive: true, id: 'gone' }, { alive: true, busy: true, id: 'mid-turn' }],
+      hasWork: (s) => s.id === 'busy-one',
+    });
+    await h.tick();
+    expect(h.refreshBackground.mock.calls).toEqual([['busy-one']]);
+    expect(h.clearBackground.mock.calls).toEqual([['gone']]);
+    expect(h.readProcessTableAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops the marker of a conversation with no live session: reaped, killed, archived or exited', async () => {
+    const h = sweepHarness({
+      ids: ['reaped', 'dead', 'archived', 'live'],
+      sessions: [{ alive: true, _autoStopped: true, id: 'reaped' }, { alive: false, id: 'dead' }, { alive: true, id: 'live' }],
+      hasWork: () => true,
+    });
+    await h.tick();
+    expect(h.clearBackground.mock.calls.map(c => c[0]).sort()).toEqual(['archived', 'dead', 'reaped']);
+    expect(h.refreshBackground.mock.calls).toEqual([['live']]);
+  });
+
+  it('does nothing, and reads no process table, when there is no background marker', async () => {
+    const h = sweepHarness({ ids: [], sessions: [{ alive: true, id: 'a' }] });
+    await h.tick();
+    expect(h.readProcessTableAsync).not.toHaveBeenCalled();
+    expect(h.clearBackground).not.toHaveBeenCalled();
+  });
+
+  it('leaves the markers alone while the bridge is shutting down: the killed sessions are the ones whose cards a restart keeps', async () => {
+    const h = sweepHarness({ ids: ['a'], sessions: [], shuttingDown: true });
+    await h.tick();
+    expect(h.clearBackground).not.toHaveBeenCalled();
+    expect(h.readProcessTableAsync).not.toHaveBeenCalled();
+  });
+
+  it('judges the sweep by the session\'s real idle time, so the eight-hour cap applies', () => {
+    const body = src.slice(src.indexOf('function startBackgroundMarkerMaintenance'), src.indexOf('// --- Pre-reap handoff'));
+    expect(body).toMatch(/sessionHasBackgroundWork\(session, table, handoffIdleSince\(session\)\)/);
+    const { sessionHasBackgroundWork } = hasWorkFns();
+    const child = Object.assign([], [{ pid: 11, ppid: 10, args: 'sleep 3600' }]);
+    const now = Date.now();
+    expect(sessionHasBackgroundWork({ pid: 10 }, child, now - 60_000)).toBe(true);
+    expect(sessionHasBackgroundWork({ pid: 10 }, child, now - 9 * 3600_000)).toBe(false);
+  });
+
+  it('reaping an idle session drops its background marker before the kill', () => {
+    const body = src.slice(src.indexOf('session._autoStopped = true;'), src.indexOf('session._autoStopped = true;') + 400);
+    expect(body.indexOf('inflightMarker.clearBackground(journalConvoIdFor(session))')).toBeGreaterThan(-1);
+    expect(body.indexOf('inflightMarker.clearBackground')).toBeLessThan(body.indexOf('killSession(session'));
+  });
+
+  it('starts the sweep at boot whether or not the idle reaper is on', () => {
+    const main = src.slice(src.indexOf('async function main()'));
+    expect(main.indexOf('startBackgroundMarkerMaintenance();')).toBeGreaterThan(-1);
+    expect(main.indexOf('startBackgroundMarkerMaintenance();')).toBeLessThan(main.indexOf('if (SESSION_IDLE_TIMEOUT_MS > 0)'));
+  });
+
+  it('shows the note a background chat had on its card', () => {
+    expect(src).toMatch(/Your note for this chat: "/);
+  });
+
+  it('gives background work its own card and never carries it on by itself', () => {
+    expect(src).toMatch(/\.filter\(rec => rec\.kind !== 'background'\)/);
+    expect(src).toMatch(/rec\.kind === 'background'\s*\? `⚠️ The bridge restarted while this chat had background work running/);
   });
 });
