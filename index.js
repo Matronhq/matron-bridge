@@ -207,7 +207,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
-import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap, scopedQueueRelease } from './lib/busy-queue.js';
 import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
@@ -7284,13 +7284,7 @@ function pendingFlushBatch(session) {
 }
 
 function queueReleaseForBatch(session, queued) {
-  const itemIds = queuedReleaseItemIds(session, queued);
-  return {
-    listLive: (convoId) => liveQueuedReleaseEntries(convoId, itemIds),
-    dropItem: (convoId, itemId) => {
-      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-    },
-  };
+  return scopedQueueRelease(journalInputConsumer.queueRelease, queuedReleaseItemIds(session, queued));
 }
 
 // action: 'send' for a batch that went out; 'expired' for one dropped
