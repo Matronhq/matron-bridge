@@ -170,7 +170,8 @@ import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-fo
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
-import { resolveSpawnCwd, attachSpawnErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler, attachStdinErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
+import { respondApiError, guardApiListener, installUnhandledRejectionLogger } from './lib/api-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   extractForceFlag,
@@ -3061,9 +3062,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A write into a dead pipe (EPIPE) surfaces as an 'error' on stdin; with no
   // listener that is fatal to the bridge. Log it; the write's own callback
   // and proc.on('close') handle what was in flight.
-  if (CLAUDE_STEER_ENABLED && proc.stdin && proc.stdin.listenerCount('error') === 0) {
-    proc.stdin.on('error', (err) => console.warn(`[spawn-guard] claude stdin error: ${err?.message || err} (room ${roomId})`));
-  }
+  attachStdinErrorHandler(proc, {
+    log: (msg) => console.warn(`[spawn-guard] ${msg} (room ${roomId})`),
+  });
 
   // Parse newline-delimited JSON from stdout
   const decodeStdout = utf8ChunkDecoder();
@@ -14258,7 +14259,7 @@ const apiServer = createServer(async (req, res) => {
     let raw = '';
     const decodeRaw = utf8ChunkDecoder();
     req.on('data', chunk => { if (raw.length < 4096) raw += decodeRaw(chunk); });
-    req.on('end', async () => {
+    req.on('end', guardApiListener(res, async () => {
       let data = null;
       try { data = raw.trim() ? JSON.parse(raw) : null; } catch { /* no reason given */ }
       const r = await bridgeRestartResponse({
@@ -14272,7 +14273,7 @@ const apiServer = createServer(async (req, res) => {
       res.end(JSON.stringify(r.body));
       // Do not wait for the next poll when nothing holds the restart.
       if (req.method === 'POST' && r.status === 202) codeUpdateWatcher?.tick().catch(() => {});
-    });
+    }));
     return;
   }
 
@@ -14326,7 +14327,7 @@ const apiServer = createServer(async (req, res) => {
     }
     body += decodeBody(chunk);
   });
-  req.on('end', async () => {
+  req.on('end', guardApiListener(res, async () => {
     if (showFileBodyTooLarge) return;
 
     if (url.pathname === '/show-file') {
@@ -14359,9 +14360,16 @@ const apiServer = createServer(async (req, res) => {
       return;
     }
 
+    // Only a body that does not parse is "Invalid JSON"; a route that throws
+    // answers with its own error below.
+    let data;
+    try { data = JSON.parse(body); }
+    catch {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      return;
+    }
     try {
-      const data = JSON.parse(body);
-
       if (refuseApiCall(apiNamedRoom(url, data))) return;
 
       // Foreign turns (lib/foreign-turn.js): the hook's question, answered
@@ -15150,11 +15158,10 @@ const apiServer = createServer(async (req, res) => {
         res.writeHead(404);
         res.end('Not found');
       }
-    } catch (_e) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+    } catch (e) {
+      respondApiError(res, e);
     }
-  });
+  }));
 });
 
 apiServer.listen(API_PORT, '127.0.0.1', () => {
@@ -16577,6 +16584,9 @@ async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   }
 }
 
+// A rejected promise nobody handled would otherwise end the process, and
+// every session with it.
+installUnhandledRejectionLogger(process);
 process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
 process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
 // Windows: Ctrl+Break in a console run. SIGTERM can be listened for but is
