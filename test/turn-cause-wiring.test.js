@@ -149,7 +149,7 @@ describe('a user\'s answer or plan approval carries its causes', () => {
 
   it('approvePlanBuild: both text paths send the causes, the tool_result path takes the seam', () => {
     const build = fnBody('async function approvePlanBuild(');
-    expect(build).toContain('async function approvePlanBuild(session, { sendHtml, causes = null }) {');
+    expect(build).toContain('async function approvePlanBuild(session, { sendReply, causes = null }) {');
     expect(build.match(/just make the changes directly\.', \{ causes \}\);/g)).toHaveLength(2);
     expect(build.match(/sendTextToSession\(/g)).toHaveLength(2);
     const seam = build.indexOf('const beganTurn = beginOrJoinTurn(session, causes);\n    session.busy = true;');
@@ -162,14 +162,14 @@ describe('a user\'s answer or plan approval carries its causes', () => {
     const failure = build.slice(write);
     expect(failure).toMatch(/onError: \(error\) => reportSessionSendFailure\(\n\s*session,\n\s*`Could not send the plan approval to Claude: \$\{error\.message\}`,\n\s*\{ restoreJournalState: true, beganTurn \},\n\s*\),/);
     // The Building notice still follows every path.
-    expect(build.indexOf("notice('success', '▶️ Building...'")).toBeGreaterThan(write);
+    expect(build.indexOf("await sendReply('▶️ Building...');")).toBeGreaterThan(write);
     expect(build).not.toMatch(/mergeIntoTurn\(/);
   });
 
   it('a build typed in the conversation or replied on the plan item reaches approvePlanBuild with its causes', () => {
-    expect(fnBody('async function journalRouteTextToSession(')).toContain('return approvePlanBuild(session, { sendHtml: ctx.sendHtml, causes });');
+    expect(fnBody('async function journalRouteTextToSession(')).toContain('return approvePlanBuild(session, { sendReply: ctx.sendReply, causes });');
     const onItem = fnBody('function journalOnItem(');
     expect(onItem).toContain('const buildCause = itemCause(item?.payload);');
-    expect(onItem).toContain('approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml, causes: buildCause ? [buildCause] : null })');
+    expect(onItem).toContain('approvePlanBuild(session, { sendReply: cmdCtx.sendReply, causes: buildCause ? [buildCause] : null })');
   });
 });

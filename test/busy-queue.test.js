@@ -15,17 +15,11 @@ import { createQueuedReleaseRetry } from '../lib/queued-release-retry.js';
 // Busy-queue magic words, notifications and queue-release taps
 // (lib/busy-queue.js). queuedMessages and queueNotifications must move in
 // lockstep on every path, or later indexed cancels remove the WRONG message.
-// The "full" deps add the sendHtml sink; the journal caller omits it,
-// because journal feedback stays plain text.
 
-// The real formatQueueSummary lives in index.js (it leans on escapeHtml);
-// tests inject a recognizable stand-in so assertions can prove it was fed
-// the flushed queue.
+// The real formatQueueSummary lives in index.js; tests inject a recognizable
+// stand-in so assertions can prove it was fed the flushed queue.
 function fakeSummary(queued) {
-  return {
-    plain: `  1. [${queued.length} entries]`,
-    html: `<ol><li>[${queued.length} entries]</li></ol>`,
-  };
+  return { plain: `  1. [${queued.length} entries]` };
 }
 
 function makeSession(overrides = {}) {
@@ -44,7 +38,6 @@ function makeSession(overrides = {}) {
 function fullDeps(overrides = {}) {
   return {
     sendReply: vi.fn(async () => {}),
-    sendHtml: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
     flushQueue: vi.fn(() => true),
     stripQueueNotificationLinks: vi.fn(),
@@ -62,8 +55,7 @@ function realisticStrip() {
 
 function journalDeps(overrides = {}) {
   // What journalRouteTextToSession passes: a plain reply sink, the shared
-  // queue primitives and the notification-clearing seam. Only sendHtml is
-  // omitted (journal feedback stays plain text).
+  // queue primitives and the notification-clearing seam.
   const deps = {
     sendReply: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
@@ -107,7 +99,7 @@ describe('handleBusyQueueMagicWord — send/interrupt (full seams)', () => {
     const queuedRef = session.queuedMessages;
     const order = [];
     const deps = fullDeps({
-      sendHtml: vi.fn(async () => order.push('summary')),
+      sendReply: vi.fn(async () => order.push('summary')),
       flushQueue: vi.fn(() => {
         order.push('flush');
         return true;
@@ -126,22 +118,19 @@ describe('handleBusyQueueMagicWord — send/interrupt (full seams)', () => {
     expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
   });
 
-  it('sends the exact Matrix summary text (html sink present)', async () => {
+  it('sends the exact summary text', async () => {
     const session = makeSession();
     const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'send', deps);
-    expect(deps.sendHtml).toHaveBeenCalledWith(
-      '⚡ Sending 2 queued messages now:\n  1. [2 entries]',
-      '<b>⚡ Sending 2 queued messages now:</b><ol><li>[2 entries]</li></ol>',
-    );
-    expect(deps.sendReply).not.toHaveBeenCalled();
+    expect(deps.sendReply).toHaveBeenCalledTimes(1);
+    expect(deps.sendReply).toHaveBeenCalledWith('⚡ Sending 2 queued messages now:\n  1. [2 entries]');
   });
 
   it('uses the singular form for one queued message', async () => {
     const session = makeSession({ queuedMessages: [[{ type: 'text', text: 'only' }]] });
     const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'send', deps);
-    expect(deps.sendHtml.mock.calls[0][0]).toMatch(/^⚡ Sending 1 queued message now:/);
+    expect(deps.sendReply.mock.calls[0][0]).toMatch(/^⚡ Sending 1 queued message now:/);
   });
 
   it('replies "no queued messages" when the queue is empty, and never flushes', async () => {
@@ -428,7 +417,7 @@ describe('notifyQueuedMessage', () => {
       sendButtonMessage,
       queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): first' }],
     });
-    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(), htmlEscape: (s) => s, allowSendOne: true });
+    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(), allowSendOne: true });
     expect(sendButtonMessage).toHaveBeenCalledWith(
       '📨 Queued (2): second',
       [
@@ -436,7 +425,7 @@ describe('notifyQueuedMessage', () => {
         { id: 'send_one', label: '⚡ Send just this', value: 'sendone:1' },
         { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
       ],
-      'pick_one', '📨 Queued (2): second', '📨 Queued (2): second',
+      'pick_one',
       {
         question: '📨 Queued (2): second',
         options: [
@@ -487,7 +476,6 @@ describe('notifyQueuedMessage', () => {
     const session = makeSession({ sendButtonMessage, queueNotifications: [] });
     await notifyQueuedMessage(session, 'trunc…', {
       sendReply: vi.fn(),
-      htmlEscape: (s) => s,
       queueRelease: { noteQueued },
       convoId: 'convo-1',
       fullText: 'the full untruncated queued message body',
@@ -750,7 +738,7 @@ describe('notifyQueuedMessage', () => {
     await notifyQueuedMessage(
       makeSession({ sendButtonMessage: solo, queueNotifications: [], queuedMessages: [[{ type: 'text', text: 'only' }]] }),
       'only',
-      { sendReply: vi.fn(), htmlEscape: (s) => s },
+      { sendReply: vi.fn() },
     );
     expect(solo.mock.calls[0][1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
   });
@@ -860,7 +848,6 @@ describe('resolveQueueReleaseTap', () => {
     expect(handled).toBe(true);
     expect(session.queuedMessages).toBeNull();
     expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
-    expect(deps.sendHtml).not.toHaveBeenCalled();
     expect(deps.sendReply).not.toHaveBeenCalled();
     expect(deps.flushQueue).toHaveBeenCalledTimes(1);
     expect(deps.flushQueue.mock.calls[0][1]).toHaveLength(2);
@@ -868,7 +855,7 @@ describe('resolveQueueReleaseTap', () => {
 
   it('interrupt via journal seams: no post-action text line, same flush', () => {
     const session = makeSession();
-    const deps = fullDeps({ sendHtml: null });
+    const deps = journalDeps();
     const handled = resolveQueueReleaseTap('interrupt', session, deps);
     expect(handled).toBe(true);
     expect(deps.sendReply).not.toHaveBeenCalled();
@@ -879,7 +866,6 @@ describe('resolveQueueReleaseTap', () => {
     const session = makeSession({ queuedMessages: null });
     const deps = fullDeps();
     expect(resolveQueueReleaseTap('interrupt', session, deps)).toBe(true);
-    expect(deps.sendHtml).not.toHaveBeenCalled();
     expect(deps.sendReply).not.toHaveBeenCalled();
     expect(deps.flushQueue).not.toHaveBeenCalled();
   });
@@ -1023,7 +1009,6 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       notify,
       formatQueueSummary: (queued) => ({
         plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
-        html: '',
       }),
     });
     expect(notify).toHaveBeenCalledTimes(1);
@@ -1041,7 +1026,7 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
       emitRelease: vi.fn(),
       notify,
-      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+      formatQueueSummary: () => ({ plain: 'x' }),
     });
     expect(notify).not.toHaveBeenCalled();
   });
@@ -1379,7 +1364,6 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
       notify,
       formatQueueSummary: (queued) => ({
         plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
-        html: '',
       }),
     });
     expect(notify).toHaveBeenCalledTimes(1);
@@ -1392,7 +1376,7 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
     tapSendOne(threeSession(), {
       flushQueue: fakeFlushQueue(false),
       notify,
-      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+      formatQueueSummary: () => ({ plain: 'x' }),
     });
     expect(notify).not.toHaveBeenCalled();
   });
@@ -1667,7 +1651,7 @@ describe('notifyQueuedMessage — compact jump tile', () => {
       compactJump: true,
     });
 
-    const payload = session.sendButtonMessage.mock.calls[0][5];
+    const payload = session.sendButtonMessage.mock.calls[0][3];
     expect(payload.actions.map(a => a.label)).toEqual(['⚡ Send now', '✕ Cancel']);
     // Ids and values are untouched, so shipped clients route the card exactly
     // as they always have.
@@ -2089,11 +2073,10 @@ describe('#165 index.js prompt-reply handler — value-shape classification reti
     const body = src.slice(start, end);
     // Only a 'live' queued-release seq is intercepted as a queue action; every
     // other reply — including one whose label is literally `interrupt` /
-    // `cancel:2` — flows through to journalRoutePromptReply and the "answered:"
-    // echo. No value-shape early-return sits between classify and route.
+    // `cancel:2` — flows through to journalRoutePromptReply. No value-shape
+    // early-return sits between classify and route.
     expect(body).toMatch(/queuedRelease\.state === 'live'/);
     expect(body).toMatch(/journalRoutePromptReply\(session, answer, \{ causes \}\)/);
-    expect(body).toMatch(/answered: /);
     expect(body).not.toMatch(/isQueueReleaseTap/);
   });
 });
