@@ -2836,7 +2836,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     }
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
-  // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
+  // Per-room live-bash-output gate. Defaults on; Codex sessions toggle it
+  // with /show_bash (lib/codex-controls.js).
   // showBashOutput is persisted via persistSession on toggle and re-read here at
   // spawn so the hook env stays in sync with the room's setting across restarts.
   // Unset (undefined) means "never toggled" → use the default (on).
@@ -3260,7 +3261,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     }
   });
 
-  session.resetTimeout = () => {}; // no-op, kept for call-site compatibility
 
   // Subagent activity is surfaced on demand: notifyTaskStarted() runs when
   // the parent's stream emits a Task tool_use. The watcher object is cheap
@@ -3508,7 +3508,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     if (CODEX_APP_SERVER) void offerCodexBuild(session);
   });
 
-  session.resetTimeout = () => {};
   sessions.set(roomId, session);
   if (!resumeSessionId && !options.journalConvoId && !persisted?.journalConvoId) {
     persistSession(roomId, session.claudeSessionId, cwd, null);
@@ -3844,7 +3843,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       // confirmation prompt ("Yes / Yes, manually / Refine / Tell Claude
       // what to change") is caught by lib/prompt-detector.js and routed
       // to the user as a numbered question — that's the single approval
-      // round. The hook+/plan-decision flow remains in print-mode only.
+      // round.
       PreToolUse: [
         // The foreign-turn gate (lib/foreign-turn.js), first and on every tool.
         foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
@@ -4232,7 +4231,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
   });
 
-  session.resetTimeout = () => {};
 
   // iv-mode turn-end handler. Print-mode does most of this work in
   // case 'result' inside handleClaudeEvent; the transcript file in iv-mode
@@ -4292,35 +4290,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // composite occupied gate covers waitingForAnswer AND
     // pendingInteractivePrompt, C2).
     if (!queueDispatched) maybeFlushRoomDelivery(session);
-  };
-
-  // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
-  // fires. We post the plan to the chat and stash the tool_use_id so that
-  // the "build" handler in the message loop can call
-  // pendingPlanDecisions.get(toolUseId).resolve(...) when the user replies.
-  session.requestPlanDecision = (toolUseId, planText) => {
-    session.ivPendingPlanToolUseId = toolUseId;
-    session.pendingPlan = planText || '';
-    const preview = (planText || '').length > 500
-      ? (planText || '').slice(0, 500) + '…'
-      : (planText || '');
-    const plainPlan = `--- Plan Ready ---\n\n${preview}\n\nReply "build" to execute, or send feedback.`;
-    if (session.sendHtml) {
-      const htmlPlan =
-        `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(preview)}</blockquote>` +
-        `Reply <code>build</code> to execute, or send feedback.`;
-      session.sendHtml(plainPlan, htmlPlan);
-      // The card's mirror in the tracker (lib/plan-approval-items.js): a
-      // question the user can find and answer from the For you list.
-      void planItems.opened(session, planText || '', { toolUseId });
-    } else if (session.sendCallback) {
-      session.sendCallback(plainPlan);
-      void planItems.opened(session, planText || '', { toolUseId });
-    } else {
-      // No output channel yet — auto-deny so the hook unblocks.
-      const pending = pendingPlanDecisions.get(toolUseId);
-      if (pending) pending.resolve({ decision: 'deny', reason: 'no output channel for session' });
-    }
   };
 
   sessions.set(roomId, session);
@@ -5023,7 +4992,6 @@ function sendAllQuestions(session) {
 // causes: what the answer is (the user's message, lib/turn-cause.js), for
 // the turn it starts or joins — the same as for any other send.
 function submitAnswer(session, answerText, { causes = null } = {}) {
-  const mode = session.waitingForAnswer;
   session.waitingForAnswer = null;
   session.pendingQuestions = null;
   session.currentQuestionIndex = 0;
@@ -5031,55 +4999,10 @@ function submitAnswer(session, answerText, { causes = null } = {}) {
   for (const promptId of session.questionPromptIds || []) session.questionPromptCards?.delete(promptId);
   session.questionPromptIds = [];
 
-  if (mode === 'text-reply') {
-    // AskUserQuestion was auto-rejected — send the answer as a regular user message
-    sendTextToSession(session, answerText, { skipJournalMirror: true, causes });
-  } else {
-    // Normal tool_result flow. This path only applies to print-mode stream-
-    // json input. In iv-mode, user questions are surfaced and answered via the
-    // PromptDetector → buttons/text path (handleInteractivePrompt +
-    // respondToPrompt), so this tool_result branch is unreachable there. Log if
-    // it ever fires under iv-mode so we notice an unexpected code path.
-    if (session.iv) {
-      debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
-      return;
-    }
-    // Not through sendToSession, so the turn seam is taken here: the answer
-    // begins the turn (ended by its result event) or joins the running one.
-    const beganTurn = beginOrJoinTurn(session, causes);
-    session.busy = true;
-    bumpTurnGeneration(session);
-    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
-    journalSessionState(session, 'running');
-    journalActivity(session, 'thinking');
-    session._turnInitSeen = false;
-    const jsonMsg = JSON.stringify({
-      type: 'user',
-      message: {
-        role: 'user',
-        content: [{
-          tool_use_id: mode,
-          type: 'tool_result',
-          content: answerText,
-        }]
-      }
-    }) + '\n';
-    // The answer can be whatever the user typed, so only its size is logged.
-    debug('Sending answer to stdin:', jsonMsg.length, 'bytes');
-    writePromptAnswer(session, jsonMsg, {
-      // This answer goes in via a raw tool_result stdin write (not
-      // sendToSession), so record it only after stdin accepts the chunk.
-      onDelivered: () => {
-        recordUserAnswer(session, answerText);
-        if (session.resetTimeout) session.resetTimeout();
-      },
-      onError: (error) => reportSessionSendFailure(
-        session,
-        `Could not send the prompt answer to Claude: ${error.message}`,
-        { restoreJournalState: true, beganTurn },
-      ),
-    });
-  }
+  // AskUserQuestion is auto-rejected (print sessions disallow the tool), so
+  // the answer goes in as a regular user message. waitingForAnswer is only
+  // ever 'text-reply' or null.
+  sendTextToSession(session, answerText, { skipJournalMirror: true, causes });
 }
 
 function resolveQuestionAnswer(session, text) {
@@ -6683,7 +6606,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
           { restoreJournalState: true, beganTurn });
       }
       commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
-      if (session.resetTimeout) session.resetTimeout();
       return true;
     }
     // Defensive fallback: validation above should make this unreachable, but
@@ -6727,7 +6649,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // The handoff went into stdin with this message; consume it now so another
   // write cannot prepend it again. User history still waits for CLI start.
   else if (preparedHandoff.pending) commitDispatchedUserTurn(session, '', preparedHandoff.pending);
-  if (session.resetTimeout) session.resetTimeout();
   return true;
 }
 
@@ -8978,29 +8899,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
-    case '!show_bash':
-    case '!show_bash_output':
-    case '!bash_output': {
-      const session = sessions.get(roomId);
-      if (!session) {
-        await sendReply('No active session.');
-        break;
-      }
-      if (session.agent === AGENT_CODEX) {
-        await sendReply('Live Bash tee output is a Claude-hook feature and is not available in Codex programmatic mode.');
-        break;
-      }
-      session.showBashOutput = !session.showBashOutput;
-      // Persist so !restart re-reads the value at spawn. Gated like the
-      // pendingPlanDenialId persist at the ExitPlanMode handler — passing a
-      // null sessionId here would clobber an existing persisted sessionId.
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { showBashOutput: session.showBashOutput });
-      }
-      await sendReply(`showBashOutput: ${session.showBashOutput ? 'ON' : 'OFF'} — run !restart to apply`);
-      break;
-    }
-
     case '!sessions': {
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
@@ -10100,7 +9998,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   // mirrors into the journal like every other bridge reply.
   const dispatchedBuild = await dispatchPlanBuild(
     trimmed,
-    !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId),
+    !!(session.pendingPlan || session.pendingPlanDenialId),
     {
       approvePlan: () => {
         const ctx = journalSessionCommandCtx(session);
@@ -10643,7 +10541,7 @@ function journalOnItem(session, item, ctx) {
     });
     return;
   }
-  const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
+  const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId);
   if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
     const cmdCtx = journalSessionCommandCtx(session);
     // The build reply itself is what the approval's turn is for, exactly as
@@ -13360,9 +13258,8 @@ function journalEvictConvoInput(session) {
 
 // Plan approval for the `build` keyword, called from the journal
 // session-text route and a build reply on a plan item (decision gate:
-// dispatchPlanBuild, lib/command-dispatch.js). iv-mode resolves the pending
-// /plan-decision hook with allow; print-mode does the tool_result/denial
-// dance (or falls back to a plain approval message when the denial was
+// dispatchPlanBuild, lib/command-dispatch.js). iv-mode sends the approval
+// as text; print-mode does the tool_result/denial dance (or falls back to a plain approval message when the denial was
 // already answered).
 // `sendHtml` is the caller's reply sink for the final "▶️ Building..."
 // notice — the session ctx's sendToRoom sink, which publishes into the
@@ -13375,7 +13272,7 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
   // The tracker mirror closes as decided, whichever mode settles the plan
   // below (lib/plan-approval-items.js); best-effort, never blocks the build.
-  void planItems.resolved(session, 'build', { toolUseId: session.ivPendingPlanToolUseId || toolUseId || null });
+  void planItems.resolved(session, 'build', { toolUseId: toolUseId || null });
 
   // Check if a tool_result already exists in the session history for this tool_use_id.
   // Claude CLI auto-generates a tool_result for permission denials, so sending another
@@ -13386,31 +13283,14 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
   debug(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
 
   if (session.iv) {
-    // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
-    // it with allow so the hook returns and claude proceeds naturally.
-    // No stdin.write or follow-up text needed — the hook's allow decision
-    // unblocks the original tool call and claude continues its turn.
-    const pending = session.ivPendingPlanToolUseId
-      ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
-      : null;
+    // iv-mode: Claude's own in-TUI plan confirmation was answered through
+    // the prompt detector, so the approval goes in as text.
     session.pendingPlan = null;
     session.pendingPlanDenialId = null;
-    session.ivPendingPlanToolUseId = null;
     if (session.claudeSessionId) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
-    if (pending) {
-      debug(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
-      // The hook unblocks the turn the plan was written in: the approval
-      // joins that turn, never replacing what started it. Only a turn still
-      // on the session: a decision left over from an interrupted turn must
-      // not leave a turn behind that nothing will end (joinHeldTurn).
-      joinHeldTurn(session, causes);
-      pending.resolve({ decision: 'allow', reason: 'approved by user' });
-    } else {
-      debug(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
-      sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.', { causes });
-    }
+    sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.', { causes });
   } else if (!toolUseId || alreadyAnswered) {
     // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
     session.pendingPlan = null;
@@ -13452,14 +13332,11 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
       }
     }) + '\n';
     debug(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
-    // Same delivery as submitAnswer's tool_result: a write stdin refuses
+    // A write stdin refuses
     // (no stdin, a synchronous throw, or a failed write callback) clears
     // busy and the in-flight marker, and ends the turn when this approval
     // began it, so a later send cannot inherit the approval's causes.
     writePromptAnswer(session, jsonMsg, {
-      onDelivered: () => {
-        if (session.resetTimeout) session.resetTimeout();
-      },
       onError: (error) => reportSessionSendFailure(
         session,
         `Could not send the plan approval to Claude: ${error.message}`,
@@ -13641,13 +13518,6 @@ const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, vi
 const permissionRegistry = createPermissionRegistry({
   ttlMs: resolvePermissionTimeoutMs(process.env.PERMISSION_PROMPT_TIMEOUT_MS),
 });
-
-// Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
-// requests waiting for a user decision in interactive mode. The hook script
-// (hooks/exit-plan-decision.sh) holds an HTTP request open against
-// /plan-decision; the bridge resolves it once the user replies.
-// Phase 4 wires the session-side handler that actually surfaces the plan.
-const pendingPlanDecisions = new Map();
 
 // --- Local HTTP API ---
 
@@ -15278,65 +15148,6 @@ const apiServer = createServer(async (req, res) => {
         }
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
-
-      } else if (url.pathname === '/plan-decision') {
-        // PreToolUse hook (hooks/exit-plan-decision.sh) — fires when claude
-        // calls ExitPlanMode. Blocks until the user decides.
-        const { session_id, tool_use_id, plan } = data;
-        if (!tool_use_id) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ decision: 'deny', reason: 'tool_use_id required' }));
-          return;
-        }
-        let target = null;
-        if (session_id) {
-          for (const [, s] of sessions) {
-            if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
-          }
-        }
-        if (!target) {
-          res.writeHead(404);
-          res.end(JSON.stringify({ decision: 'deny', reason: 'unknown session' }));
-          return;
-        }
-        if (typeof target.requestPlanDecision !== 'function') {
-          // Session has no plan-decision handler — this is the print-mode path
-          // (Phase 4 adds the iv-mode handler). Deny so we never silently
-          // execute an unreviewed plan.
-          res.writeHead(503);
-          res.end(JSON.stringify({ decision: 'deny', reason: 'no plan-decision handler for session' }));
-          return;
-        }
-        // Hold the response. Timer caps the wait under curl's 1800s ceiling
-        // in exit-plan-decision.sh so we always reply before curl times out.
-        const PLAN_DECISION_TIMEOUT_MS = 1740 * 1000;
-        const timer = setTimeout(() => {
-          if (!pendingPlanDecisions.has(tool_use_id)) return;
-          pendingPlanDecisions.delete(tool_use_id);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ decision: 'deny', reason: 'timeout waiting for user' }));
-          // The plan is dead: its tracker mirror closes as cancelled
-          // (lib/plan-approval-items.js). The session may have been
-          // replaced meanwhile; whichever holds the room now owns the item.
-          const holder = sessions.get(target.roomId);
-          if (holder) void planItems.resolved(holder, 'timeout', { toolUseId: tool_use_id });
-        }, PLAN_DECISION_TIMEOUT_MS);
-        pendingPlanDecisions.set(tool_use_id, {
-          resolve: ({ decision, reason }) => {
-            clearTimeout(timer);
-            pendingPlanDecisions.delete(tool_use_id);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ decision: decision || 'deny', reason: reason || '' }));
-          },
-          plan,
-        });
-        try {
-          target.requestPlanDecision(tool_use_id, plan);
-        } catch (e) {
-          // If the handler throws, resolve with deny so the hook unblocks.
-          const pending = pendingPlanDecisions.get(tool_use_id);
-          if (pending) pending.resolve({ decision: 'deny', reason: `session handler threw: ${e?.message || e}` });
-        }
 
       } else if (url.pathname === '/sessions') {
         const list = [];
