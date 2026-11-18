@@ -17,7 +17,7 @@ describe('the "Allow once" card in plain words', () => {
     const input = { room_id: 'room-b', message: 'Hi carol,\n\nThe **checklist**:\n1. Freeze\n2. Tag' };
     const it = actionRequestItem({ turn, toolName: 'mcp__ask-user__agent_chat_send', toolInput: input, why: 'bob asked', roomTitle });
     expect(it.title).toBe('Allow once: Send a message in “Release planning” — asked in a room with bob');
-    expect(it.body).toContain('### Send a message in “Release planning”');
+    expect(it.body).toContain('\n**Send a message in “Release planning”**\n');
     expect(it.body).toContain('> Hi carol,\n>\n> The **checklist**:\n> 1. Freeze\n> 2. Tag');
     expect(it.body).toContain('**Room**: “Release planning”');
     expect(it.body).toContain('Tool `mcp__ask-user__agent_chat_send`');
