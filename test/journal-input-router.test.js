@@ -1154,7 +1154,8 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
 
   it('resumes the active provider with its provider-specific native session ID', () => {
     const start = src.indexOf('function resumePersistedSession(');
-    const end = src.indexOf('\n// --- Matrix Message Handler ---', start);
+    const end = src.indexOf('\n// --- Local HTTP API ---', start);
+    expect(end).toBeGreaterThan(start);
     const body = src.slice(start, end);
 
     expect(body).toContain('const resumeSessionId = activeState.sessionId;');

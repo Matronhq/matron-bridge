@@ -47,14 +47,10 @@ const WINDOWS_EXCLUDES = [
   'test/viewer-download.test.js',
   'test/viewer-scope-pinning.test.js',
   'test/viewer-view.test.js',
-  // Coordinator block / RPC handler suites: first Windows run failed on
-  // line-ending or path-separator handling; re-checked once .gitattributes
-  // (eol=lf) is in place.
-  'test/coordinator.test.js',
-  'test/consent-wiring.test.js',
-  'test/missions-wiring.test.js',
-  'test/projects-wiring.test.js',
-  'test/unseen-wiring.test.js',
+  // The spawn RPC handler runs the workdir through path.resolve, which on
+  // Windows turns the fixtures' POSIX workdirs (/home/alice/...) into drive
+  // paths, so the expected spawn workdirs and bad_workdir details no longer
+  // match.
   'test/journal-rpc-handlers.test.js',
   // Real git repositories and sh scripts in a temp dir.
   'test/worktree.test.js',
