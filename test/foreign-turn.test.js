@@ -178,8 +178,9 @@ describe('turn text', () => {
     const it = actionRequestItem({ turn: bare, toolName: 'Bash', toolInput: { command: 'ls ```' }, why: 'list' });
     expect(it.actions).toEqual(['Allow once', 'Decline']);
     expect(it.kind).toBe('question');
-    expect(it.body).toContain(canonicalJson({ command: "ls '''" }));
-    expect(it.body.match(/```/g).length).toBe(2);
+    // Exact, never rewritten: the fence is longer than any backtick run.
+    const fence = '`'.repeat(4);
+    expect(it.body.endsWith(`\n${fence}json collapsed\n${canonicalJson({ command: 'ls ' + '`'.repeat(3) })}\n${fence}`)).toBe(true);
     expect(it.private).toBe(true);
   });
   it('the item shows a long input whole, never cut', () => {
