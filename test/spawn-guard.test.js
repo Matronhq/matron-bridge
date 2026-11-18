@@ -110,8 +110,9 @@ describe('attachStdinErrorHandler', () => {
 
   // The real case: the reading end of the pipe has gone but the bridge has
   // not seen the child exit yet, and it writes one more message. Unguarded,
-  // this write ends the process with "Unhandled 'error' event".
-  it('absorbs the error from a write into a pipe the child has closed', async () => {
+  // this write ends the process with "Unhandled 'error' event". POSIX only:
+  // a Windows pipe does not report the closed reader as EPIPE on this write.
+  it.skipIf(process.platform === 'win32')('absorbs the error from a write into a pipe the child has closed', async () => {
     const { spawn } = await import('node:child_process');
     const child = 'require("fs").closeSync(0); console.log("closed"); setTimeout(() => {}, 10000)';
     const proc = spawn(process.execPath, ['-e', child], { stdio: ['pipe', 'pipe', 'ignore'] });
