@@ -263,21 +263,30 @@ describe('designLoginEndsPhantomTurn', async () => {
   });
 });
 
-describe('sign-in card prefers the OAuth URL', async () => {
+describe('sign-in card needs an OAuth URL', async () => {
   const { formatTuiCueMessage } = await import('../lib/tui-cue-message.js');
-  it('with no OAuth URL, falls back to the first URL like an ordinary /login', () => {
-    const screen = 'Paste code here if prompted >\nhttps://example.test/login-next';
-    const msg = formatTuiCueMessage(screen, ['https://example.test/login-next']);
-    expect(msg.parts.map(p => p.plain)).toContain('https://example.test/login-next');
+  it('a repainted old sign-in screen next to a PR link is not a sign-in', () => {
+    const screen = 'Paste code here if prompted >\nDesign login cancelled.\nMerged as https://example.test/pr/17';
+    expect(formatTuiCueMessage(screen, ['https://example.test/pr/17'])).toBe(null);
   });
   it('a repaint with no new URLs says nothing', () => {
-    const screen = 'Paste code here if prompted >\nhttps://example.test/login-next';
-    expect(formatTuiCueMessage(screen, ['https://example.test/login-next'], { hasNewUrls: false })).toBe(null);
+    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
+    const screen = `Paste code here if prompted >\n${oauth}`;
+    expect(formatTuiCueMessage(screen, [oauth], { hasNewUrls: false })).toBe(null);
+  });
+  it('an old OAuth URL repainted beside a new unrelated link is not a new sign-in', () => {
+    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
+    const pr = 'https://example.test/pr/17';
+    const screen = `Paste code here if prompted >\n${oauth}\nMerged as ${pr}`;
+    expect(formatTuiCueMessage(screen, [pr, oauth], { hasNewUrls: true, newUrls: [pr] })).toBe(null);
+    // The same screen with the OAuth URL itself new still gets the card.
+    const msg = formatTuiCueMessage(screen, [oauth, pr], { hasNewUrls: true, newUrls: [oauth, pr] });
+    expect(msg.parts.map(p => p.plain)).toContain(oauth);
   });
   it('a live sign-in screen still gets the card with its OAuth URL', () => {
-    const oauth = 'https://auth.example.test/oauth/authorize?code=true&state=a';
+    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
     const screen = `Browser didn't open? Use the url below\n${oauth}\nPaste code here if prompted >`;
-    const msg = formatTuiCueMessage(screen, ['https://help.example.test/article', oauth]);
+    const msg = formatTuiCueMessage(screen, ['https://support.claude.com/en/articles/1', oauth]);
     expect(msg.parts.map(p => p.plain)).toContain(oauth);
   });
 });
