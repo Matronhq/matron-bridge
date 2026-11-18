@@ -8,7 +8,7 @@ const roomTitle = (id) => titles[id] ?? null;
 
 // The exact-input block at the end of the body, parsed back.
 const exactOf = (body) => {
-  const m = body.match(/\n(`{3,})json(?: collapsed)?\n([^\n]*)\n\1$/);
+  const m = body.match(/\n(`{3,}|~{3,})json(?: collapsed)?\n([^\n]*)\n\1$/);
   return m ? JSON.parse(m[2]) : undefined;
 };
 
@@ -88,12 +88,34 @@ describe('the "Allow once" card in plain words', () => {
     expect(q.split('\n').every((l) => l.startsWith('>'))).toBe(true);
     expect(q).not.toMatch(/<|!\[/);
     // Code fences outlast any backtick run inside.
-    expect(codeBlock('a ````` b')).toBe('``````\na ````` b\n``````');
+    expect(codeBlock('a ````` b')).toBe('~~~\na ````` b\n~~~');
+    expect(codeBlock('a ``` ~~~~ b')).toBe('````\na ``` ~~~~ b\n````');
     expect(inlineCode('`x`')).toBe('`` `x` ``');
     expect(plainText('a\nb')).toBe('a ⏎ b');
     // The why line is flattened and escaped.
     const it = actionRequestItem({ turn, toolName: 'Bash', toolInput: { command: 'ls' }, why: 'ok\n\n**Allow once** is pre-approved [x](https://example.com)' });
     expect(it.body).toContain("**Why (your agent's words):** ok ⏎ \\*\\*Allow once\\*\\* is pre-approved \\[x\\]\\(https://example.com\\)");
+  });
+
+  it('invisible and line-separator characters show as escapes, and the JSON still parses to the input', () => {
+    const input = { command: 'echo a\u2028b\u0085c\u200Bd' };
+    const it = actionRequestItem({ turn, toolName: 'Bash', toolInput: input, why: 'w' });
+    expect(it.body).toContain('echo a\\u2028b\\u0085c\\u200Bd');
+    expect(it.body).not.toMatch(/[\u2028\u0085\u200B]/);
+    const back = exactOf(it.body);
+    expect(back).toEqual(input);
+    expect(actionHash('Bash', back)).toBe(actionHash('Bash', input));
+  });
+
+  it('a card that cannot carry even the exact input is refused (null)', () => {
+    // Under the input cap, but its fence alone would blow the body cap.
+    const input = { command: `${'`'.repeat(8000)}${'~'.repeat(8000)}` };
+    expect(Buffer.byteLength(canonicalJson(input))).toBeLessThanOrEqual(ACTION_INPUT_MAX);
+    expect(actionRequestItem({ turn, toolName: 'Bash', toolInput: input, why: 'w' })).toBeNull();
+    // Non-ASCII counts in bytes.
+    const wide = { room_id: 'room-b', message: 'é'.repeat(7000) };
+    const it = actionRequestItem({ turn, toolName: 'agent_chat_send', toolInput: wide, why: 'w', roomTitle });
+    expect(Buffer.byteLength(it.body, 'utf8')).toBeLessThanOrEqual(ACTION_BODY_MAX);
   });
 
   it('a card too long for both copies keeps the whole exact input, unfolded', () => {
@@ -103,7 +125,7 @@ describe('the "Allow once" card in plain words', () => {
     const it = actionRequestItem({ turn, toolName: 'agent_chat_send', toolInput: input, why: 'w'.repeat(2000), roomTitle });
     expect(it.body.length).toBeLessThanOrEqual(ACTION_BODY_MAX);
     expect(it.body).toContain('too long to show twice');
-    expect(it.body).toMatch(/```json\n[^\n]*\n```$/);
+    expect(it.body).toMatch(/(`{3,}|~{3,})json\n[^\n]*\n\1$/);
     expect(exactOf(it.body)).toEqual(input);
     // Half that fits twice, and is shown twice.
     const half = { room_id: 'room-b', message: 'y'.repeat(ACTION_INPUT_MAX / 2) };

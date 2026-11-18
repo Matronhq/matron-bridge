@@ -179,7 +179,7 @@ describe('turn text', () => {
     expect(it.actions).toEqual(['Allow once', 'Decline']);
     expect(it.kind).toBe('question');
     // Exact, never rewritten: the fence is longer than any backtick run.
-    const fence = '`'.repeat(4);
+    const fence = '~'.repeat(3);
     expect(it.body.endsWith(`\n${fence}json collapsed\n${canonicalJson({ command: 'ls ' + '`'.repeat(3) })}\n${fence}`)).toBe(true);
     expect(it.private).toBe(true);
   });
