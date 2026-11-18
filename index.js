@@ -253,7 +253,7 @@ import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fabl
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
-import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
+import { armFromStall, dueResumes, dropResumeSlot, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
 import {
   AGENT_CLAUDE,
@@ -11619,6 +11619,9 @@ async function fireAutoResume(roomId, convoId, slot) {
   if (!session || !session.alive) session = convoId ? journalResumeConvo(convoId, '⏳ The usage limit has reset — resuming this session to carry on.') : null;
   if (!session) {
     debug(`auto-resume: ${roomId} could not be resumed`);
+    // Not resumable: drop the slot, or every sweep repeats the notices.
+    const records = loadPersistedSessions();
+    if (dropResumeSlot(records, roomId, slot)) savePersistedSessions(records);
     return;
   }
   // A resume hold, a running turn or an open prompt: not now. The slot
