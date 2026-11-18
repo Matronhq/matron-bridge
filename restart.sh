@@ -56,6 +56,16 @@ if command -v launchctl >/dev/null 2>&1; then
   for candidate in chat.matron.matron-bridge chat.matron.claude-matrix-bridge; do
     LAUNCHD_TARGET="$LAUNCHD_DOMAIN/$candidate"
     if launchctl print "$LAUNCHD_TARGET" >/dev/null 2>&1; then
+      # A copy started outside launchd (by an older version of this script, or
+      # by hand) may still hold the port; the restarted service could not bind
+      # while it does. Stop whatever holds the port other than the service.
+      SERVICE_PID=$(launchctl print "$LAUNCHD_TARGET" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{print $2; exit}')
+      for pid in $(lsof -ti :$PORT 2>/dev/null); do
+        if [ "$pid" != "$SERVICE_PID" ]; then
+          echo "Stopping a bridge copy outside launchd on port $PORT (PID: $pid)"
+          kill "$pid" 2>/dev/null || true
+        fi
+      done
       echo "Restarting launchd service $LAUNCHD_TARGET..."
       # kickstart -k stops the running instance and starts the service again.
       if ! launchctl kickstart -k "$LAUNCHD_TARGET"; then
