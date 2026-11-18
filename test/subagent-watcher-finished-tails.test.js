@@ -141,6 +141,26 @@ describe('SubagentWatcher: tails of finished subagents', () => {
     expect(ctx.texts).toEqual(['first', 'resumed', 'still going']);
   });
 
+  it('a resumed agent keeps its stopped offset when the session directory has moved', () => {
+    const ctx = mk();
+    const file = attachAgent(ctx);
+    ctx.w.noteAgentFinished('aaa');
+    vi.advanceTimersByTime(GRACE_MS + 100);
+    expect(ctx.w.tails.has('agent-aaa.jsonl')).toBe(false);
+
+    // The resumed run writes, then the session changes directory (its
+    // transcripts move with it) before the resume is announced.
+    fs.appendFileSync(file, line('resumed'));
+    const nextWorkdir = `/tmp/subagent-tails-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const nextDir = makeSubagentsDir(nextWorkdir, ctx.w.sessionId, projectRoots, { prefix: '-tmp-subagent-tails-' });
+    fs.renameSync(file, path.join(nextDir, 'agent-aaa.jsonl'));
+    expect(ctx.w.repoint(nextWorkdir)).toBe(true);
+
+    expect(ctx.w.forceAttach('aaa')).toBe(true);
+    vi.advanceTimersByTime(200);
+    expect(ctx.texts).toEqual(['first', 'resumed']);
+  });
+
   it('a resume announced inside the grace period keeps the tail', () => {
     const ctx = mk();
     attachAgent(ctx);
