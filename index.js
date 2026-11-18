@@ -212,7 +212,7 @@ import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
-import { buildPermissionSnapshot } from './lib/permission-eval.js';
+import { sessionPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, slowToolNoticeSummary, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
@@ -2840,7 +2840,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // showBashOutput is persisted via persistSession on toggle and re-read here at
   // spawn so the hook env stays in sync with the room's setting across restarts.
   // Unset (undefined) means "never toggled" → use the default (on).
-  const persistedForRoom = getPersistedSession(roomId);
+  // The entry read at the top of createSession: nothing on the way here
+  // writes the sessions file, so it is still current.
+  const persistedForRoom = persistedMode;
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
   // mcpExtras: explicit caller-supplied value wins (used by /start, /resume,
   // /workdir handlers that parsed user flags); otherwise fall back to whatever
@@ -2980,16 +2982,17 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Spawn-time MCP permission snapshot ({mcpAllow,mcpDeny,mcpAsk} from the
     // session's layered .claude settings), built ONCE here and immutable for the
     // session's life — the POST /permission-request classifier reads it to
-    // decide allow-silent / deny-visible / ask-card. Built for every session
-    // (cheap, fail-closed): only auto-mode sessions ever route MCP calls through
-    // the permission_request tool, but a bypass session simply never consults it.
-    permissionSnapshot: buildPermissionSnapshot({ workdir: cwd }),
+    // decide allow-silent / deny-visible / ask-card. Only gated sessions route
+    // MCP calls through the gate hook and permission_request tool, so a bypass
+    // spawn (effective mode, after the root downgrade) skips the build and
+    // keeps null, which the classifier reads as default-gated.
+    permissionSnapshot: sessionPermissionSnapshot({ bypass: bypassMode, workdir: cwd }),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
-    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
-    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
-    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
+    pendingPlanDenialId: resumeSessionId ? (persistedForRoom?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (persistedForRoom?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (persistedForRoom?.planToolUseId || null) : null,
     sendHtml: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
@@ -3951,9 +3954,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
-    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
-    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
-    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
+    pendingPlanDenialId: resumeSessionId ? (persistedForRoom?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (persistedForRoom?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (persistedForRoom?.planToolUseId || null) : null,
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
@@ -16401,13 +16404,27 @@ function rearmPreReapHandoff(session) {
   if (session && session._preReapHandoff) session._preReapHandoff = null;
 }
 
+// A session the reaper would consider reaping at `now`: live, not already
+// stopped, and idle past the timeout. The walk in startIdleReaper applies
+// the same three checks in the same order.
+function pastIdleTimeout(session, now) {
+  return session.alive && !session._autoStopped
+    && now - handoffIdleSince(session) >= SESSION_IDLE_TIMEOUT_MS;
+}
+
 function startIdleReaper() {
-  setInterval(() => {
+  setInterval(async () => {
     const now = Date.now();
     // Read the process table at most once per tick, and only if some session
     // has actually passed the idle timeout — most ticks never get that far.
+    // Read it before the walk, without blocking the event loop (ps can take
+    // seconds); the walk below then runs synchronously, so no session changes
+    // between its checks and its decision. Two ticks never interleave a walk,
+    // so a slow ps overlapping the next tick is harmless. readProcessTableAsync
+    // never rejects.
     let table = null;
-    const processTable = () => (table ??= readProcessTable());
+    if ([...sessions.values()].some((s) => pastIdleTimeout(s, now))) table = await readProcessTableAsync();
+    const processTable = () => table;
     let held = 0;
     for (const [roomId, session] of sessions) {
       if (!session.alive) continue;
@@ -16431,6 +16448,10 @@ function startIdleReaper() {
       // or a background job the agent started — a colleague's hour-plus rake
       // test was cut off here at the 60-minute mark.
       // Bounded at WORK_HOLD_MAX_MS from the last activity inside workHold.
+      // No table: the session was not past the timeout when the tick began
+      // (nothing makes a session idler while ps runs, so this is a guard
+      // only). The next tick decides it.
+      if (!table) continue;
       const hold = sessionWorkHold(session, last, now, processTable());
       if (hold) {
         held += 1;
