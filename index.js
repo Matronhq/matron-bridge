@@ -99,7 +99,7 @@ import {
   parseDefaultExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
-import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { aliasLabel, crashRestartModel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
 import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
@@ -211,7 +211,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
-import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap, scopedQueueRelease } from './lib/busy-queue.js';
 import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
@@ -257,7 +257,7 @@ import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fabl
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
-import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
+import { armFromStall, dueResumes, dropResumeSlot, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
 import {
   AGENT_CLAUDE,
@@ -4116,7 +4116,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // die).
         const restarted = createSession(roomId, cwd, session.claudeSessionId, {
           agent: session.agent,
-          model: session.currentModel || undefined,
+          model: crashRestartModel(session),
           mcpExtras: session.mcpExtras,
           // Carry the live --bypass/--auto choice for the same reason as
           // mcpExtras: a session that dies before its first persist would
@@ -5064,6 +5064,8 @@ function setupSubagentWatcher(session, workdir, sessionId) {
     getParentModel: () => session.currentModel || session.initData?.model,
     getParentWindow: () => contextWindowForSession(session),
     runningStore: subagentRunningStore,
+    // A finished child's transcript stops being polled after a grace period.
+    onChildFinished: agentId => session.subagentWatcher?.noteAgentFinished(agentId),
     log: console,
   });
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
@@ -6188,7 +6190,7 @@ function handleClaudeEvent(session, event) {
             if (!session.iv) session.slowToolNotices?.toolEnded(block.tool_use_id);
             // A Task tool_result means the subagent it spawned has completed —
             // finish that child convo (no-op for every non-Task tool_result).
-            session.subagentConvos?.noteTaskResult(block.tool_use_id);
+            session.subagentConvos?.noteTaskResult(block.tool_use_id, { failed: block.is_error === true });
             const entry = liveOutputStore.get(block.tool_use_id);
             // Only pay for the blockText join + three regex scans below when
             // something will actually consume the result: either the
@@ -7212,13 +7214,7 @@ function pendingFlushBatch(session) {
 }
 
 function queueReleaseForBatch(session, queued) {
-  const itemIds = queuedReleaseItemIds(session, queued);
-  return {
-    listLive: (convoId) => liveQueuedReleaseEntries(convoId, itemIds),
-    dropItem: (convoId, itemId) => {
-      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-    },
-  };
+  return scopedQueueRelease(journalInputConsumer.queueRelease, queuedReleaseItemIds(session, queued));
 }
 
 // action: 'send' for a batch that went out; 'expired' for one dropped
@@ -11508,6 +11504,9 @@ async function fireAutoResume(roomId, convoId, slot) {
   if (!session || !session.alive) session = convoId ? journalResumeConvo(convoId, '⏳ The usage limit has reset — resuming this session to carry on.') : null;
   if (!session) {
     debug(`auto-resume: ${roomId} could not be resumed`);
+    // Not resumable: drop the slot, or every sweep repeats the notices.
+    const records = loadPersistedSessions();
+    if (dropResumeSlot(records, roomId, slot)) savePersistedSessions(records);
     return;
   }
   // A resume hold, a running turn or an open prompt: not now. The slot

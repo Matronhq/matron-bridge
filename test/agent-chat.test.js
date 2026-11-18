@@ -1221,6 +1221,45 @@ describe('createAgentChatHandlers', () => {
       await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'retry' });
       expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
     });
+
+    // Joining a room the caller is already in must change nothing: record()
+    // merges, so re-recording it as a pending guest would take the caller's
+    // own working binding away.
+    it.each([
+      ['the owner of a joined room', { role: 'owner', state: 'joined' }],
+      ['the owner of a room still waiting for its peer', { role: 'owner', state: 'pending' }],
+      ['a joined guest', { role: 'guest', state: 'joined' }],
+    ])('is a no-op that says so for %s, and leaves the binding alone', async (_who, binding) => {
+      const { handlers, rooms, invites, calls } = makeFixture();
+      rooms.record('room-1', { ...binding, sessionRoomId: '!sess', peerDeviceId: 7 });
+      const before = rooms.get('room-1');
+      calls.length = 0;
+      const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j' });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, room_id: 'room-1' });
+      expect(res.body.note).toMatch(/already in this room/);
+      expect(invites.join).not.toHaveBeenCalled();
+      expect(calls.filter((c) => c.call === 'record')).toEqual([]);
+      expect(rooms.get('room-1')).toEqual(before);
+    });
+
+    it('is a no-op for the joined second session of a same-bridge room', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!other', guestSessionRoomId: '!sess', guestState: 'joined' });
+      const before = rooms.get('room-1');
+      const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j' });
+      expect(res.status).toBe(200);
+      expect(res.body.note).toMatch(/already in this room/);
+      expect(invites.join).not.toHaveBeenCalled();
+      expect(rooms.get('room-1')).toEqual(before);
+    });
+
+    it('puts a prior binding back when the journal rejects the re-join outright', async () => {
+      const { handlers, rooms } = makeFixture({ joinOutcome: { kind: 'error', code: 'forbidden' } });
+      rooms.record('room-1', { role: 'owner', state: 'left', sessionRoomId: '!sess' });
+      await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'retry' });
+      expect(rooms.get('room-1')).toMatchObject({ role: 'owner', state: 'left', sessionRoomId: '!sess' });
+    });
   });
 
   describe('chatInvite', () => {
