@@ -98,7 +98,7 @@ import {
   parseDefaultExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
-import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { aliasLabel, crashRestartModel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
 import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
@@ -4109,7 +4109,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // die).
         const restarted = createSession(roomId, cwd, session.claudeSessionId, {
           agent: session.agent,
-          model: session.currentModel || undefined,
+          model: crashRestartModel(session),
           mcpExtras: session.mcpExtras,
           // Carry the live --bypass/--auto choice for the same reason as
           // mcpExtras: a session that dies before its first persist would
