@@ -11635,6 +11635,7 @@ const foreignSessions = createForeignSessions({
   // managed gate stands in, the turn is not taken (as for Codex).
   gateBlocked: (session) => (session?.codex ? null : foreignGateBlocked(session)),
   trackerBase: () => trackerUrlBaseNow(),
+  roomTitle: (id) => { const r = agentRooms.get(id); return r?.title || r?.topic || null; },
   store: {
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
