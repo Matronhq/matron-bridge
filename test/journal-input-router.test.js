@@ -1151,7 +1151,7 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(body).toMatch(/resumeSleepingSession\(roomId, prev, convoId, noticeText\)/);
 
     // …and the helper threads that flag into the sendToRoom carrying the
-    // notice (the session's own sendCallback/sendHtml stay mirrored). Bound
+    // notice (the session's own sendCallback stays mirrored). Bound
     // the slice at the next surviving section header (Local HTTP API, which
     // now immediately follows resumePersistedSession — the old anchor,
     // `// --- Matrix Message Handler ---`, was deleted in Task 4) so the
@@ -1163,7 +1163,7 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(hEnd).toBeGreaterThan(hStart);
     const hBody = src.slice(hStart, hEnd);
     expect(hBody).toMatch(/skipJournalMirror = false/);
-    expect(hBody).toMatch(/sendToRoom\(roomId, arNotice\.plain, arNotice\.html, \{ skipJournalMirror \}\)/);
+    expect(hBody).toMatch(/sendToRoom\(roomId, `\$\{verb\} [^`]*`, \{ skipJournalMirror \}\)/);
   });
 
   it('resumes the active provider with its provider-specific native session ID', () => {

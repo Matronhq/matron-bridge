@@ -64,7 +64,7 @@ import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
 import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } from './lib/tracker-link-check.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, coordinatorNeedsAssigning, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
-import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
+import { loadMatronMd, matronMdStatusLine } from './lib/matron-md.js';
 import { createWorktreeLedger } from './lib/worktree-ledger.js';
 import { createConsentStore } from './lib/worktree-setup.js';
 import { createSetupFlow } from './lib/worktree-setup-flow.js';
@@ -1022,10 +1022,6 @@ const matronMdNote = (session) => {
   const line = matronMdStatusLine(session?.matronMd);
   return line ? `\n${line}` : '';
 };
-const matronMdNoteHtml = (session) => {
-  const line = matronMdStatusLine(session?.matronMd);
-  return line ? `<br/>${escapeHtml(line)}` : '';
-};
 const noticesBlockNow = ({ coordinator, coordinatorOnly = false }) => trackerLinksNow(renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly }));
 
 // Tracker links in what agents write (lib/tracker-links.js): the journal's
@@ -1821,10 +1817,9 @@ const subagentRunningStore = createSubagentRunningStore({ log: console });
 // convo id — NOT the room key, which is bridge-internal).
 function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = null, effort = null }) {
   const sessionRoomId = newSessionConvoId();
-  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-  const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-  const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-    sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+  const sessionSendButtons = (prompt, buttons, mode, payload) =>
+    sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
   // `agent` is the New Chat switch's pick (validated by the RPC handler);
   // absent means createSession's resolveAgent falls to the box default,
   // exactly as before the switch existed. persistSession's live snapshot
@@ -1839,7 +1834,6 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   });
   session.originRoomId = null;
   session.sendCallback = sessionSendReply;
-  session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
   // Codex has a stable conversation id even before its native thread starts.
   const mintedConvoId = session.agent === AGENT_CODEX && !session.claudeSessionId;
@@ -2549,8 +2543,7 @@ function reportPromptAnswerDeliveryFailure(session, error) {
   const detail = error?.message || String(error || 'unknown error');
   const message = `Could not deliver the prompt answer to Claude: ${detail}`;
   debug(message);
-  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
-  else if (session.sendCallback) session.sendCallback(message);
+  if (session.sendCallback) session.sendCallback(message);
 }
 
 // Mirror a media upload the user just sent into the journal, once it has been
@@ -2606,8 +2599,7 @@ function journalFlushForSession(session) {
 // mirrors into the journal via sessions.get(roomId) and drops the notice for
 // a room with no live entry.
 function postRootBypassWarning(roomId) {
-  const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
-  Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
+  Promise.resolve(sendToRoom(roomId, ROOT_BYPASS_WARNING)).catch(() => {});
 }
 
 // Coordinator role for one spawn (spec 2026-09-23 §2a). createSession is
@@ -2739,9 +2731,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const guarded = resolveSpawnCwd(expandHome(workdir || DEFAULT_WORKDIR), [DEFAULT_WORKDIR, os.homedir()]);
   if (guarded.fellBack) {
     console.warn(`[spawn-guard] workdir ${guarded.missing} no longer exists for ${roomId}; using ${guarded.cwd}`);
-    const wg = notice('warning', `Workdir ${guarded.missing} no longer exists — using ${guarded.cwd} instead. Use !workdir to move the session.`,
-      `Workdir <code>${escapeHtml(String(guarded.missing))}</code> no longer exists — using <code>${escapeHtml(guarded.cwd)}</code> instead. Use <code>!workdir</code> to move the session.`);
-    Promise.resolve(sendToRoom(roomId, wg.plain, wg.html)).catch(() => {});
+    Promise.resolve(sendToRoom(roomId, `Workdir ${guarded.missing} no longer exists — using ${guarded.cwd} instead. Use !workdir to move the session.`)).catch(() => {});
   }
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
@@ -2751,9 +2741,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // to Claude visibly rather than throw: createSession's callers are not
     // wrapped, and a silent switch would be the worse surprise.
     console.warn(`[agent] ${roomId}: the Codex backend is not available on Windows; starting a Claude session instead`);
-    const cw = notice('warning', 'The Codex backend is not available on Windows — starting a Claude session instead.',
-      'The Codex backend is not available on Windows — starting a Claude session instead.');
-    Promise.resolve(sendToRoom(roomId, cw.plain, cw.html)).catch(() => {});
+    Promise.resolve(sendToRoom(roomId, 'The Codex backend is not available on Windows — starting a Claude session instead.')).catch(() => {});
     agent = AGENT_CLAUDE;
     options = { ...options, agent: AGENT_CLAUDE };
   }
@@ -2794,9 +2782,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       }
       if (usable && found.workdir !== workdir) {
         console.warn(`[transcript-relocate] ${roomId}: session ${shortId}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
-        const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
-          `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
-        Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
+        Promise.resolve(sendToRoom(roomId, `Resuming in ${found.workdir} — the session had moved there.`)).catch(() => {});
         workdir = found.workdir;
       }
     } else if (found) {
@@ -2916,10 +2902,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Auto mode needs Opus 4.6+/Sonnet 4.6+/Fable-class models; Haiku-class
   // sessions fall back to `default` permission mode and prompt for far more.
   if (!bypassMode && printModel && /haiku/i.test(printModel)) {
-    const hw = notice('warning',
-      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to run without permission gating instead.`,
-      `Model <code>${escapeHtml(printModel)}</code> doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use <code>--bypass</code> to run without permission gating instead.`);
-    Promise.resolve(sendToRoom(roomId, hw.plain, hw.html)).catch(() => {});
+    Promise.resolve(sendToRoom(roomId,
+      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to run without permission gating instead.`)).catch(() => {});
   }
   args.push(...identity.cliArgs);
 
@@ -2998,7 +2982,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pendingPlanDenialId: resumeSessionId ? (persistedForRoom?.pendingPlanDenialId || null) : null,
     planItemId: resumeSessionId ? (persistedForRoom?.planItemId || null) : null,
     planToolUseId: resumeSessionId ? (persistedForRoom?.planToolUseId || null) : null,
-    sendHtml: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
     alive: true,
@@ -3108,7 +3091,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       if (!session.alive || typeof session.sendCallback !== 'function') return;
       const text = renderSlowToolNotice({ toolName, elapsedMs, reminder });
       const meta = noticeMeta('slow_tool', text, { summary: slowToolNoticeSummary({ toolName, elapsedMs, reminder }) });
-      if (!sendKindNotice(session, 'slow_tool', text, markdownToHtml(text), meta)) session.sendCallback(text);
+      if (!sendKindNotice(session, 'slow_tool', text, meta)) session.sendCallback(text);
     },
     log: debug,
   });
@@ -3200,7 +3183,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         );
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
-        restarted.sendHtml = session.sendHtml;
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
@@ -3241,12 +3223,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
         onCrashRestart(session, restarted, exitCode, proc.signalCode);
-        if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
-        } else if (restarted.sendCallback) {
+        if (restarted.sendCallback) {
           restarted.sendCallback(
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
           );
@@ -3255,10 +3232,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
         // session up in the map, so a notice sent after sessions.delete()
         // is silently dropped (same fix as the iv-mode close handler).
-        if (session.sendHtml) {
-          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
-          session.sendHtml(n.plain, n.html);
-        } else if (session.sendCallback) {
+        if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
         sessions.delete(roomId);
@@ -3304,10 +3278,8 @@ function reportInteractiveFallback(session, error, persisted) {
     persistSession(session.roomId, session.claudeSessionId, session.workdir,
       session.originRoomId || persisted.originRoomId || null, { interactiveMode: false });
   }
-  const n = notice('warning',
-    `Couldn't start interactive mode on this bridge (${reason}). The chat carries on in print mode; anything that needed interactive mode, such as /effort or /login, was not applied.`,
-    `Couldn't start interactive mode on this bridge (<code>${escapeHtml(reason)}</code>). The chat carries on in print mode; anything that needed interactive mode, such as <code>/effort</code> or <code>/login</code>, was not applied.`);
-  Promise.resolve(sendToRoom(session.roomId, n.plain, n.html)).catch(() => {});
+  Promise.resolve(sendToRoom(session.roomId,
+    `Couldn't start interactive mode on this bridge (${reason}). The chat carries on in print mode; anything that needed interactive mode, such as /effort or /login, was not applied.`)).catch(() => {});
 }
 
 // --- Codex programmatic sessions ---
@@ -3390,7 +3362,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     pendingPlanDenialId: null,
     planItemId: null,
     planToolUseId: null,
-    sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
     showBashOutput: CODEX_APP_SERVER && persisted?.showBashOutput !== false,
@@ -3432,8 +3403,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     publisher: journalPublisher, convoIdFor: journalConvoIdFor, runningStore: subagentRunningStore,
     stream: journalStream, activity: journalActivity, status: journalStatus,
     notice: (s, message) => journalPublishNotice(journalConvoIdFor(s), message),
-    publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
-      payload.question, escapeHtml(payload.question), payload) ?? false,
+    publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode, payload) ?? false,
     submitAsyncAnswer: submitCodexAsyncAnswer,
     onLoginComplete: s => {
       void refreshCodexMetadata(s, { force: true });
@@ -3660,9 +3630,7 @@ function flushPendingSessionQueue(session) {
     deferredBy: batchDeferralReason(queued),
     summary: formatQueueSummary(queued),
   });
-  if (session.sendHtml) {
-    session.sendHtml(notice.plain, notice.html);
-  } else if (session.sendCallback) {
+  if (session.sendCallback) {
     session.sendCallback(notice.plain);
   }
   const sent = flushQueue(session, queued, releaseSnapshot);
@@ -3704,7 +3672,7 @@ function dispatchDeferredCommand(session) {
   if (!session.alive || sessions.get(session.roomId) !== session) return false;
   const ctx = journalSessionCommandCtx(session);
   session._replayingDeferred = true;
-  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml).finally(() => {
+  handleCommand(session.roomId, text, ctx.sendReply).finally(() => {
     session._replayingDeferred = false;
   }).catch((err) => {
     // The command failed, so nothing is pending any more. For a self-restart
@@ -3766,8 +3734,7 @@ function finishCodexTurn(session, {
   journalStatus(session);
   if (!discardOutput && error && session.alive) {
     const message = `⚠️ ${error}`;
-    if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
-    else if (session.sendCallback) session.sendCallback(message);
+    if (session.sendCallback) session.sendCallback(message);
   }
 
   if (!preserveQueue && !session._codexSteerPending && !session._codexUncertainSteer) {
@@ -3961,7 +3928,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pendingPlanDenialId: resumeSessionId ? (persistedForRoom?.pendingPlanDenialId || null) : null,
     planItemId: resumeSessionId ? (persistedForRoom?.planItemId || null) : null,
     planToolUseId: resumeSessionId ? (persistedForRoom?.planToolUseId || null) : null,
-    sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
@@ -4129,7 +4095,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
-        restarted.sendHtml = session.sendHtml;
         restarted.sendButtonMessage = session.sendButtonMessage;
         // Account-flow state must survive the TUI's own exit: /logout makes
         // claude quit, this branch respawns it (resumed, now logged out), and
@@ -4197,12 +4162,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // and dropped (Bugbot, PR #162).
         enterResumeHold(restarted);
         onCrashRestart(session, restarted, exitCode);
-        if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
-        } else if (restarted.sendCallback) {
+        if (restarted.sendCallback) {
           restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
@@ -4222,12 +4182,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           if (session._accountFlowReturnToPrint) {
             persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
           }
-          const n = notice('info', '👋 Logged out. Send /login when you\'re ready to sign back in.', '👋 Logged out. Send <code>/login</code> when you\'re ready to sign back in.');
-          if (session.sendHtml) session.sendHtml(n.plain, n.html);
-          else if (session.sendCallback) session.sendCallback(n.plain);
-        } else if (session.sendHtml) {
-          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
-          session.sendHtml(n.plain, n.html);
+          if (session.sendCallback) session.sendCallback('👋 Logged out. Send /login when you\'re ready to sign back in.');
         } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
@@ -4247,7 +4202,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // A turn another person started ends here (iv-mode's turn-end seam).
     foreignSessions.end(session);
     endTurn(session);
-    debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
+    debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}`);
     // Flush the accumulated assistant text to the chat.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
       flushResponse(session);
@@ -4313,7 +4268,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
 // Surface a detected TUI prompt to the user as a multiple-choice question.
 async function handleInteractivePrompt(session, prompt) {
-  if (!session.sendHtml && !session.sendCallback) return;
+  if (!session.sendCallback) return;
   // Surface claude's explanatory prose (rendered above the menu) BEFORE the
   // question, so the user has the reasoning when choosing. In iv-mode that
   // prose only reaches the transcript after the answer, but it's on the live
@@ -4337,8 +4292,7 @@ async function handleInteractivePrompt(session, prompt) {
         // Self-clear so a stale capture can't suppress an unrelated later message.
         session.suppressPreambleTimer = setTimeout(() => { session._suppressPreambleText = null; }, 600_000);
         if (typeof session.suppressPreambleTimer.unref === 'function') session.suppressPreambleTimer.unref();
-        if (session.sendHtml) session.sendHtml(preamble, markdownToHtml(preamble));
-        else session.sendCallback(preamble);
+        session.sendCallback(preamble);
       }
     } catch (e) { debug('extractPreamble failed:', e?.message); }
   }
@@ -4350,23 +4304,6 @@ async function handleInteractivePrompt(session, prompt) {
   if (session.sendButtonMessage) {
     const b = promptButtons(prompt);
     if (b) {
-      // Include each option's description (when the detector captured one, e.g.
-      // AskUserQuestion menus) so the user has the per-option detail before
-      // choosing — the buttons themselves only carry the short label.
-      const descOf = (i) => (prompt.options && prompt.options[i] && prompt.options[i].description) || '';
-      const plain = ['Claude is asking:', prompt.question || '', '',
-        ...b.buttons.map((bt, i) => {
-          const d = descOf(i);
-          return `${i + 1}. ${bt.label}${d ? `\n    ${d}` : ''}`;
-        })].filter(Boolean).join('\n');
-      const anyDesc = b.buttons.some((_, i) => descOf(i));
-      const htmlOpts = b.buttons.map((bt, i) => {
-        const d = descOf(i);
-        return `<b>${i + 1}. ${escapeHtml(bt.label)}</b>${d ? `<br/><i>${escapeHtml(d)}</i>` : ''}`;
-      }).join(anyDesc ? '<br/>' : ' · ');
-      const html = `<b>🟡 Claude is asking:</b>` +
-        (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
-        `<br/><br/>${htmlOpts}`;
       // If a newer prompt superseded this one while we were composing, bail —
       // don't post buttons for a stale prompt against the current TUI menu.
       if (session.pendingInteractivePrompt !== prompt) return;
@@ -4375,7 +4312,7 @@ async function handleInteractivePrompt(session, prompt) {
       // this room to publish to.
       // Fall through to the text rendering below in the null case so the
       // prompt is never silently dropped while the TUI waits for an answer.
-      const sent = await session.sendButtonMessage(promptCardQuestion(prompt, b.buttons), b.buttons, b.mode, plain, html);
+      const sent = await session.sendButtonMessage(promptCardQuestion(prompt, b.buttons), b.buttons, b.mode);
       if (sent != null) return;
     }
   }
@@ -4404,25 +4341,7 @@ async function handleInteractivePrompt(session, prompt) {
     '',
     helpPlain,
   ].filter(Boolean).join('\n');
-  if (session.sendHtml) {
-    const htmlOptions = prompt.options.map((opt, i) =>
-      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}` +
-      (opt.description ? `<br/>&nbsp;&nbsp;&nbsp;&nbsp;<i>${escapeHtml(opt.description)}</i>` : '')
-    ).join('<br/>');
-    const helpHtml =
-      `Reply with the option number (1–${prompt.options.length})` +
-      (prompt.kind === 'yes-no' ? ' or <code>y</code> / <code>n</code>' : '') +
-      (ftLabel ? `, or send any other text to <i>${escapeHtml(ftLabel)}</i>` : '') +
-      '.';
-    const html =
-      `<b>🟡 Claude is asking:</b><br/>` +
-      (prompt.question ? `<i>${escapeHtml(prompt.question)}</i><br/><br/>` : '') +
-      htmlOptions +
-      `<br/><br/>${helpHtml}`;
-    session.sendHtml(plain, html);
-  } else {
-    session.sendCallback(plain);
-  }
+  session.sendCallback(plain);
 }
 
 // If the session has a pending TUI prompt and the user's message looks like
@@ -4439,9 +4358,7 @@ function maybeResolveInteractivePrompt(session, userText) {
   const ack = (label, { numberPrefix = '', note = '' } = {}) => {
     const tail = note ? ` ${note}` : '';
     const plain = `→ Sent "${numberPrefix}${label}" to Claude${tail}`;
-    const html = `<i>→ Sent <b>${escapeHtml(numberPrefix + label)}</b> to Claude${escapeHtml(tail)}</i>`;
-    if (session.sendHtml) session.sendHtml(plain, html);
-    else if (session.sendCallback) session.sendCallback(plain);
+    if (session.sendCallback) session.sendCallback(plain);
   };
 
   // Select the free-text slot ("Tell Claude what to change" / "Type something"),
@@ -4603,8 +4520,7 @@ function handleInteractiveScreenUpdate(session, update) {
     const parts = message.parts || [message];
     console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue in ${parts.length} message(s) (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
     for (const part of parts) {
-      if (session.sendHtml) session.sendHtml(part.plain, part.html);
-      else if (session.sendCallback) session.sendCallback(part.plain);
+      if (session.sendCallback) session.sendCallback(part.plain);
     }
   }
   // A free-text TUI cue means claude is waiting on the user just like a
@@ -4662,12 +4578,11 @@ function handleInteractiveScreenUpdate(session, update) {
         const current = sessions.get(roomId);
         if (!shouldRunAccountFlowReturn(current)) return;
         const sendReply = current.sendCallback || (() => {});
-        const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
         // applyModeSwitch announces the outcome either way — the switch on
         // success, refusalAnnouncement on refusal — and returns the
         // replacement session only when the switch actually happened.
         const switched = applyModeSwitch(roomId, current, false, {
-          sendReply, sendHtml,
+          sendReply,
           announcement: '✅ Logged in successfully — back to normal mode.',
           refusalAnnouncement: 'Login finished, but I couldn\'t switch back to non-interactive mode automatically — type /mode print when ready.',
         });
@@ -4681,8 +4596,7 @@ function handleInteractiveScreenUpdate(session, update) {
       return;
     }
     const note = '↵ (auto-pressed Enter to continue)';
-    if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
-    else if (session.sendCallback) session.sendCallback(note);
+    if (session.sendCallback) session.sendCallback(note);
   }
 }
 
@@ -4693,7 +4607,7 @@ function handleInteractiveScreenUpdate(session, update) {
 // later bare number/letter reply is sent as raw keystrokes (see the message
 // handler) to drive the open menu. Detector-side dedup prevents repeats.
 function handleUnclassifiedPrompt(session, { screen }) {
-  if (!session.sendHtml && !session.sendCallback) return;
+  if (!session.sendCallback) return;
   // Clean the raw screen: drop blank lines, keep the tail (the menu sits at the
   // bottom), and cap length so we don't dump the whole terminal.
   const cleaned = String(screen || '')
@@ -4705,11 +4619,7 @@ function handleUnclassifiedPrompt(session, { screen }) {
     .slice(0, 1500);
   if (!cleaned) return;
   const plain = `⚠️ Claude is waiting for input I couldn't turn into buttons. Reply with the option number shown (or send !esc to cancel):\n\n${cleaned}`;
-  const html =
-    `<b>⚠️ Claude is waiting for input I couldn't parse into buttons.</b><br/>` +
-    `Reply with the option number shown (or send <code>!esc</code> to cancel):<br/><pre>${escapeHtml(cleaned)}</pre>`;
-  if (session.sendHtml) session.sendHtml(plain, html);
-  else session.sendCallback(plain);
+  session.sendCallback(plain);
   session.pendingUnclassifiedPrompt = true;
   // Unconditional (dedupes internally) — see the matching iv-prompt handler.
   journalSessionState(session, 'waiting');
@@ -4834,7 +4744,6 @@ function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) 
     const current = sessions.get(roomId);
     if (!ownsDesignLoginFinish(current, flow)) return;
     const sendReply = current.sendCallback || (() => {});
-    const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     if (!shouldRunAccountFlowReturn(current)) {
       current._designLoginFlow = null;
       sendReply(designLoginOutcomeMessage(outcome, { returning: false }));
@@ -4846,7 +4755,7 @@ function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) 
     }
     current._designLoginFlow = null;
     const switched = applyModeSwitch(roomId, current, false, {
-      sendReply, sendHtml,
+      sendReply,
       announcement: designLoginOutcomeMessage(outcome),
       refusalAnnouncement: `${designLoginOutcomeMessage(outcome, { returning: false })} I couldn't switch back to non-interactive mode automatically — type /mode print when ready.`,
     });
@@ -4915,40 +4824,6 @@ function formatQuestion(q, index, total) {
   return msg;
 }
 
-function formatQuestionHtml(q, index, total) {
-  // HTML rendering collapses raw "\n" to a single space, so options
-  // separated only by newlines render as a run-on wall. Use explicit <br>
-  // for line breaks and a blank line
-  // (double <br>) between options so A/B/C are visually separated. An option
-  // whose label is tagged "(Recommended)" gets a ⭐ marker.
-  let msg = '';
-  const prefix = total > 1 ? `❓ Question ${index + 1}/${total}` : '❓';
-
-  if (q.header) {
-    msg += `${prefix} — <b>${escapeHtml(q.header)}</b><br><br>`;
-  } else {
-    msg += `${prefix}<br><br>`;
-  }
-
-  msg += escapeHtml(q.question);
-
-  if (q.options && q.options.length > 0) {
-    q.options.forEach((opt, i) => {
-      const letter = String.fromCharCode(65 + i);
-      const label = typeof opt.label === 'string' ? opt.label : typeof opt === 'string' ? opt : String(opt.label ?? opt);
-      const desc = opt.description || '';
-      const marker = /\(recommended\)/i.test(label) ? '⭐ ' : '';
-      msg += `<br><br>${marker}<b>${letter}.</b> ${escapeHtml(label)}`;
-      if (desc) {
-        msg += `<br><i>${escapeHtml(desc)}</i>`;
-      }
-    });
-    msg += `<br><br>Reply with a letter (A, B, C…) or number (1, 2, 3…), or type a custom answer.`;
-  }
-
-  return msg;
-}
-
 function sendAllQuestions(session) {
   const questions = session.pendingQuestions;
   if (!questions || questions.length === 0) return;
@@ -4958,9 +4833,6 @@ function sendAllQuestions(session) {
 
   for (let i = 0; i < total; i++) {
     const q = questions[i];
-    const plainText = formatQuestion(q, i, total);
-    const html = formatQuestionHtml(q, i, total);
-
     if (q.options && q.options.length > 0 && session.sendButtonMessage) {
       // Build button array from options
       const buttons = q.options.map((opt, idx) => {
@@ -4983,13 +4855,11 @@ function sendAllQuestions(session) {
       const promptId = randomUUID();
       (session.questionPromptIds ||= []).push(promptId);
       (session.questionPromptCards ||= new Map()).set(promptId, { seq: null, superseded: false });
-      session.sendButtonMessage(prompt, buttons, mode, plainText, html, {
+      session.sendButtonMessage(prompt, buttons, mode, {
         question: prompt, options: buttons, mode, prompt_id: promptId,
       });
-    } else if (session.sendHtml) {
-      session.sendHtml(plainText, html);
     } else if (session.sendCallback) {
-      session.sendCallback(plainText);
+      session.sendCallback(formatQuestion(q, i, total));
     }
   }
 }
@@ -5593,11 +5463,10 @@ function handleClaudeEvent(session, event) {
         } else {
           // Collect tool indicator
           let indicator = `🔧 ${toolName}`;
-          let indicatorHtml = null;
           let isKeyEvent = false;
           // Set when sendLiveOutputEvent has been invoked — the live-output
-          // message already carries the command in its body/formatted_body
-          // fallback, so we skip the duplicate `🔧 <cmd>` indicator below.
+          // activity already carries the command, so we skip the duplicate
+          // `🔧 <cmd>` indicator below.
           let liveOutputSent = false;
 
           if (toolName === 'Bash' && input.command) {
@@ -5617,7 +5486,6 @@ function handleClaudeEvent(session, event) {
               ? displayCommand.slice(0, 100) + '…'
               : displayCommand;
             indicator = `🔧 \`${cmd}\``;
-            indicatorHtml = `🔧 <code>${escapeHtml(cmd)}</code>`;
             isKeyEvent = true;
 
             if (session.showBashOutput) {
@@ -5670,15 +5538,12 @@ function handleClaudeEvent(session, event) {
               // fallback is effectively dead unless a future failure path is
               // added there, kept as the safety net it always was.
               const fallbackPlain = indicator;
-              const fallbackHtml = indicatorHtml;
               sendLiveOutputEvent(session, {
                 tool_use_id: liveToolUseId,
                 command: displayCommand,
               }).then(ok => {
                 if (ok) return;
-                if (session.sendHtml && fallbackHtml) {
-                  session.sendHtml(fallbackPlain, fallbackHtml);
-                } else if (session.sendCallback) {
+                if (session.sendCallback) {
                   session.sendCallback(fallbackPlain);
                 }
               });
@@ -5686,7 +5551,6 @@ function handleClaudeEvent(session, event) {
             }
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
-            indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
           } else if ((toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit')
                      && input.file_path) {
             // Journal-only: a structured `diff` event
@@ -5699,18 +5563,14 @@ function handleClaudeEvent(session, event) {
             publishEditDiff(session, toolName, input, null);
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
-            indicatorHtml = `🔍 <code>${escapeHtml(input.pattern)}</code>`;
           } else if (toolName === 'WebSearch' && input.query) {
             indicator = `🌐 ${input.query}`;
-            indicatorHtml = `🌐 <i>${escapeHtml(input.query)}</i>`;
             isKeyEvent = true;
           } else if (toolName === 'WebFetch' && input.url) {
             indicator = `🌐 ${input.url}`;
-            indicatorHtml = `🌐 <a href="${escapeHtml(input.url)}">${escapeHtml(input.url)}</a>`;
           } else if (toolName === 'Task' || toolName === 'Agent') {
             const desc = (input.description || input.prompt || '').slice(0, 80);
             indicator = `🔀 Subtask: ${desc}`;
-            indicatorHtml = `🔀 Subtask: <i>${escapeHtml(desc)}</i>`;
             isKeyEvent = true;
             // Trigger the subagent watcher's discovery burst — the new
             // agent-<id>.jsonl file appears within ~100ms of this event — and
@@ -5726,11 +5586,6 @@ function handleClaudeEvent(session, event) {
               return `${icon} ${t.content || t.text || ''}`;
             }).join('\n');
             indicator = `📋 Todos:\n${todos}`;
-            const todosHtml = (input.todos || []).map(t => {
-              const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
-              return `<li>${icon} ${escapeHtml(t.content || t.text || '')}</li>`;
-            }).join('');
-            indicatorHtml = `📋 <b>Todos:</b><ul>${todosHtml}</ul>`;
             isKeyEvent = true;
           }
 
@@ -5739,9 +5594,7 @@ function handleClaudeEvent(session, event) {
           // `🔧 <command>` indicator.
           if (!liveOutputSent) {
             session.toolCalls.push(indicator);
-            if (isKeyEvent && session.sendHtml && indicatorHtml) {
-              session.sendHtml(indicator, indicatorHtml);
-            } else if (isKeyEvent && session.sendCallback) {
+            if (isKeyEvent && session.sendCallback) {
               session.sendCallback(indicator);
             }
           }
@@ -5931,14 +5784,7 @@ function handleClaudeEvent(session, event) {
           : planText;
 
         const plainPlan = `--- Plan Ready ---\n\n${planPreview}\n\nReply "build" to execute, or send feedback.`;
-        if (session.sendHtml) {
-          const htmlPlan =
-            `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(planPreview)}</blockquote>` +
-            `Reply <code>build</code> to execute, or send feedback.`;
-          session.sendHtml(plainPlan, htmlPlan);
-        } else {
-          session.sendCallback(plainPlan);
-        }
+        session.sendCallback(plainPlan);
         // The card's mirror in the tracker (lib/plan-approval-items.js).
         void planItems.opened(session, planText, { toolUseId: planDenial.tool_use_id });
       }
@@ -5984,10 +5830,7 @@ function handleClaudeEvent(session, event) {
         const COMPACT_COOLDOWN_MS = 60_000;
         if (!session.lastCompactCompleteNotify || (now - session.lastCompactCompleteNotify) > COMPACT_COOLDOWN_MS) {
           session.lastCompactCompleteNotify = now;
-          if (session.sendHtml) {
-            const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
-            session.sendHtml(n.plain, n.html);
-          } else if (session.sendCallback) {
+          if (session.sendCallback) {
             session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
           }
         } else {
@@ -6108,10 +5951,7 @@ function handleClaudeEvent(session, event) {
           const pendingNow = Date.now();
           session._lastManualCompactConfirm = pendingNow;
           session.lastCompactCompleteNotify = pendingNow;
-          if (session.sendHtml) {
-            const n = notice('success', doneText);
-            session.sendHtml(n.plain, n.html);
-          } else if (session.sendCallback) {
+          if (session.sendCallback) {
             session.sendCallback(doneText);
           }
           // onTurnEnd clears busy + typing and flushes any queued messages.
@@ -6158,10 +5998,7 @@ function handleClaudeEvent(session, event) {
           if (!session._lastManualCompactConfirm || (now - session._lastManualCompactConfirm) > DUP_BOUNDARY_MS) {
             session._lastManualCompactConfirm = now;
             session.lastCompactCompleteNotify = now;
-            if (session.sendHtml) {
-              const n = notice('success', doneText);
-              session.sendHtml(n.plain, n.html);
-            } else if (session.sendCallback) {
+            if (session.sendCallback) {
               session.sendCallback(doneText);
             }
           }
@@ -6375,8 +6212,7 @@ function reportSessionSendFailure(session, message, { restoreJournalState = fals
   // Callers use false to decide whether dispatch-dependent work (history,
   // media mirroring, naming) may run. Surface the specific failure here
   // because the journal-only input path has no transport-level fallback.
-  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
-  else if (session.sendCallback) session.sendCallback(message);
+  if (session.sendCallback) session.sendCallback(message);
   return false;
 }
 
@@ -6715,7 +6551,6 @@ function requeueSteeredMessages(session, entries) {
     // this still finds it.
     Promise.resolve(notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
-      htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText: text,
@@ -7138,10 +6973,7 @@ function formatQueueSummary(queued) {
     }
   }
   const plain = lines.map(l => `  ${l.index}. ${l.text}`).join('\n');
-  const html = lines.map(l =>
-    `<li>${escapeHtml(l.text)}</li>`
-  ).join('');
-  return { plain, html: `<ol>${html}</ol>` };
+  return { plain };
 }
 
 // Merge/grouping rules live in lib/queue-flush.js (pure, unit-tested):
@@ -7456,18 +7288,6 @@ function splitMessage(text) {
   return chunks;
 }
 
-// --- Markdown to HTML ---
-
-function escapeHtml(text) {
-  // &quot; matters because escapeHtml output is interpolated into HTML
-  // attributes (href="...") as well as element content.
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function color(text, hex) {
-  return `<font color="${hex}">${text}</font>`;
-}
-
 function formatDuration(ms) {
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
@@ -7479,156 +7299,20 @@ function formatDuration(ms) {
   return rm ? `${h}h ${rm}m` : `${h}h`;
 }
 
-const NOTICE_COLORS = {
-  success: '#3fb950',
-  error: '#f85149',
-  warning: '#f0883e',
-  info: '#58a6ff',
-};
-
-function notice(type, plainText, htmlContent) {
-  const hex = NOTICE_COLORS[type] || NOTICE_COLORS.info;
-  return {
-    plain: plainText,
-    html: `${color('▌', hex)} ${htmlContent || escapeHtml(plainText)}`,
-  };
-}
-
 // A bridge line in the session's chat, tagged payload.notice = {kind, icon,
 // summary} (lib/system-notice.js) so a client can recognise it without
-// matching the wording. Same delivery as session.sendHtml (sendToRoom), plus
-// the tag. Returns false when the session has no room to send through, so
-// the caller keeps its existing untagged path.
-function sendKindNotice(session, kind, plain, html, meta = noticeMeta(kind, plain)) {
+// matching the wording. Same delivery as session.sendCallback (sendToRoom),
+// plus the tag. Returns false when the session has no room to send through,
+// so the caller keeps its existing untagged path.
+function sendKindNotice(session, kind, plain, meta = noticeMeta(kind, plain)) {
   if (!meta || !session?.roomId) return false;
   try {
-    Promise.resolve(sendToRoom(session.roomId, plain, html, { notice: meta }))
+    Promise.resolve(sendToRoom(session.roomId, plain, { notice: meta }))
       .catch((e) => { try { debug(`sendKindNotice(${kind}) failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
     return true;
   } catch {
     return false;
   }
-}
-
-function markdownToHtml(text) {
-  let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
-
-  // Convert list markers to placeholders BEFORE backtick split so inline code in list items works
-  processed = processed.replace(/^([-*])\s+/gm, '‹li›');
-  processed = processed.replace(/^(\d+)\.\s+/gm, '‹li›');
-
-  const parts = processed.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
-
-  // Phase 1: Process each part (inline formatting for text, code wrapping for code)
-  let html = parts.map((part, i) => {
-    if (i % 2 === 1) {
-      if (part.startsWith('```')) {
-        const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
-        const lineCount = inner.split('\n').length;
-        if (lineCount > 15) {
-          return `<details><summary>Code (${lineCount} lines)</summary><pre><code>${escapeHtml(inner)}</code></pre></details>`;
-        }
-        return `<pre><code>${escapeHtml(inner)}</code></pre>`;
-      }
-      return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
-    }
-
-    let html = escapeHtml(part);
-
-    html = html.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');
-    html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
-    html = html.replace(/__(.+?)__/g, '<b>$1</b>');
-    html = html.replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, '<i>$1</i>');
-    html = html.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
-    html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
-
-    // Markdown links: [text](url)
-    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
-
-    // Linkify remaining bare URLs (not already inside tags). The text is
-    // already escapeHtml'd, so a quote right after a URL appears as
-    // &quot;/&#39; — stop the match at those entities or they get absorbed
-    // into the href. (&lt;/&gt; are deliberately NOT terminators: a literal
-    // > inside a URL has always been absorbed as &gt; and decodes back to >
-    // when the client parses the attribute, so stopping there would change
-    // currently-correct rendering.)
-    html = html.replace(/(?<!href="|">)(https?:\/\/(?:(?!&quot;|&#39;)[^\s<>"'])+)/g, '<a href="$1">$1</a>');
-
-    // Horizontal rules
-    html = html.replace(/^-{3,}$/gm, '<hr/>');
-
-    // Blockquotes: consecutive > lines
-    html = html.replace(/(^&gt;\s?.+(\n|$))+/gm, (match) => {
-      const inner = match.replace(/^&gt;\s?/gm, '').trim();
-      return `<blockquote>${inner}</blockquote>`;
-    });
-
-    return html;
-  }).join('');
-
-  // Phase 2: Block-level processing on joined HTML (so inline code within lists/tables works)
-  html = html.replace(/‹b›‹code›/g, '<b><code>');
-  html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
-
-  // List items (markers were converted to ‹li› before backtick split)
-  html = html.replace(/^‹li›(.+)$/gm, '<li>$1</li>');
-
-  // Tables: consecutive lines starting with | — render as <pre><code> for cross-client compatibility
-  html = html.replace(/(?:^|\n)((?:\|[^\n]+\|\n?)+)/g, (match, tableBlock) => {
-    return '<pre><code>' + padTable(tableBlock).replace(/\n/g, '&#10;') + '</code></pre>';
-  });
-
-  // Wrap consecutive <li> in <ul>
-  html = html.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, (match) => {
-    return `<ul>${match}</ul>`;
-  });
-
-  // Protect newlines inside <pre> blocks before converting to <br/>
-  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
-    return '<pre><code>' + inner.replace(/\n/g, '&#10;') + '</code></pre>';
-  });
-  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
-    return '<pre>' + inner.replace(/\n/g, '&#10;') + '</pre>';
-  });
-
-  // Convert newlines to <br/> (but not before/after block elements)
-  html = html.replace(/\n/g, '<br/>');
-
-  // Restore newlines in <pre> blocks
-  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
-    return '<pre><code>' + inner.replace(/&#10;/g, '\n') + '</code></pre>';
-  });
-  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
-    return '<pre>' + inner.replace(/&#10;/g, '\n') + '</pre>';
-  });
-
-  // Clean up excessive <br/> around block elements
-  html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
-  html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)<br\/>/g, '$1');
-
-  return html;
-}
-
-// Pad pipe table columns to equal widths
-function padTable(tableText) {
-  const rows = tableText.trim().split('\n');
-  const parsed = rows.map(r => r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim()));
-  const colCount = Math.max(...parsed.map(r => r.length));
-  const widths = Array(colCount).fill(0);
-  for (const row of parsed) {
-    // Skip separator rows for width calculation
-    if (/^[\s\-:]+$/.test(row.join(''))) continue;
-    for (let i = 0; i < row.length; i++) {
-      widths[i] = Math.max(widths[i], (row[i] || '').length);
-    }
-  }
-  return rows.map(r => {
-    const cells = r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
-    if (/^[\s\-:]+$/.test(cells.join(''))) {
-      return '| ' + widths.map(w => '-'.repeat(w)).join(' | ') + ' |';
-    }
-    return '| ' + cells.map((c, i) => (c || '').padEnd(widths[i] || 0)).join(' | ') + ' |';
-  }).join('\n');
 }
 
 // Journal bodies are raw markdown: Matron clients render GFM themselves
@@ -7662,7 +7346,7 @@ function deduplicateFilename(dir, filename) {
 // exactly the re-publish loop the return path must avoid (the journal
 // already has the user's own row for that content), so with the flag set
 // sendToRoom publishes nothing.
-async function sendToRoom(roomId, text, html, { skipJournalMirror = false, notice = null } = {}) {
+async function sendToRoom(roomId, text, { skipJournalMirror = false, notice = null } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
   // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
   // no active session (control-room chatter) are silently skipped.
@@ -7848,12 +7532,9 @@ function sweepToolStreams(session) {
   }
 }
 
-// fallbackBody/fallbackHtml are retired plain/HTML fallback text.
-// Still accepted because ~11 call sites pass them positionally through the
-// session.sendButtonMessage closures; the journal publishes structured
-// prompts and ignores them. Retiring the whole fallback-text plumbing is a
-// tracked follow-up.
-async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _fallbackHtml, payload = null) {
+// Publishes a prompt card: `payload` when the caller built a structured one,
+// otherwise the classic { question, options, mode } shape.
+async function sendButtonMessage(roomId, prompt, buttons, mode, payload = null) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const journalSession = sessions.get(roomId);
   if (journalSession) {
@@ -8136,7 +7817,7 @@ async function fileWorktreeConsentCard(session, started) {
   try { session.sendCallback?.('Could not file the approval card for the worktree setup script, so it did not run.'); } catch { /* best effort */ }
 }
 
-async function handleCommand(roomId, text, sendReply, sendHtml) {
+async function handleCommand(roomId, text, sendReply) {
   const nativeSession = sessions.get(roomId);
   if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
   const parts = text.split(/\s+/);
@@ -8224,10 +7905,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+      const sessionSendButtons = (prompt, buttons, mode, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
 
       const session = createSession(sessionRoomId, workdir, undefined, {
         agent: selectedAgent, mcpExtras,
@@ -8236,7 +7916,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
-      session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
       // The requested model IS this session's model from the first turn — the
       // spawn already carries --model, so say so rather than waiting for the
@@ -8383,7 +8062,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         // being forced into auto mode by the coercion.
         bypass: restartBypass != null ? restartBypass
           : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
-      }, { sendReply, sendHtml });
+      }, { sendReply });
       // Refused at teardown (an attachment arrived during the reply await):
       // recreateSession already said so; don't announce a restart.
       if (!restarted) return;
@@ -8403,7 +8082,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const restartedLine = `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`;
       // Tagged for the apps (the summary is its first line); a restart with
       // no live replacement session keeps the plain reply.
-      if (!restarted || !sendKindNotice(restarted, 'restart', restartedLine, markdownToHtml(restartedLine))) await sendReply(restartedLine);
+      if (!restarted || !sendKindNotice(restarted, 'restart', restartedLine)) await sendReply(restartedLine);
       break;
     }
 
@@ -8449,7 +8128,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         }
         // No arg — show sessions list inline
         const flag = resumeAgentFlags.agent ? ` --${resumeAgentFlags.agent}` : '';
-        await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml);
+        await handleCommand(roomId, `!sessions${flag}`, sendReply);
         return;
       }
 
@@ -8632,10 +8311,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
           : `Resumed ${shortId}`,
         titleMarkerFor({ _journalTitleHint: resumedHint }));
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+      const sessionSendButtons = (prompt, buttons, mode, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
 
       // Inherit the resumed session's previously persisted extras unless the
       // user is explicitly overriding via the command line; this lets a
@@ -8688,7 +8366,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       session._llmTitleEarned = resumedTitleEarned;
       session.lastRosterText = resumePersisted?.lastRosterText || '';
       session.sendCallback = sessionSendReply;
-      session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
       session._agentSessions = inheritedAgentSessions;
       // The model this session just spawned with IS its current model — the
@@ -8739,13 +8416,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const resumeModelLine = resumeModelFlag.model ? `\nModel: ${aliasLabel(resumeModelFlag.model)}` : '';
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
       const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${matronMdNote(session)}${resumeModelLine}${resumePermNote}\n\nSend any message to continue.`;
-      const resumeHtml =
-        `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(session.workdir)}</code>${matronMdNoteHtml(session)}` +
-        `${resumeModelFlag.model ? `<br/>Model: <code>${escapeHtml(aliasLabel(resumeModelFlag.model))}</code>` : ''}` +
-        `${escapeHtml(resumePermNote)}<br/><br/>` +
-        `<i>Send any message to continue.</i>`;
-      await sessionSendHtml(resumePlain, resumeHtml);
+      await sessionSendReply(resumePlain);
       break;
     }
 
@@ -8797,10 +8468,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+      const sessionSendButtons = (prompt, buttons, mode, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
 
       const session = createSession(sessionRoomId, resolved, undefined, {
         agent: selectedAgent, mcpExtras: workdirExtras,
@@ -8809,7 +8479,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
-      session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
       // Same rule as !start: set currentModel before persisting (the live
       // snapshot reads it) and pass model through the explicit `extra`.
@@ -8823,13 +8492,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const workdirModelLine = workdirModel ? `\nModel: ${aliasLabel(workdirModel)}` : '';
       await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}${workdirModelLine}`);
       const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${matronMdNote(session)}${workdirModelLine}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
-      const wdHtml =
-        `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(resolved)}</code>${matronMdNoteHtml(session)}` +
-        `${workdirModel ? `<br/>Model: <code>${escapeHtml(aliasLabel(workdirModel))}</code>` : ''}` +
-        `${escapeHtml(workdirPermNote)}<br/><br/>` +
-        `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
-      await sessionSendHtml(wdPlain, wdHtml);
+      await sessionSendReply(wdPlain);
       break;
     }
 
@@ -8858,24 +8521,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}${matronMdNote(session)}${session.worktree ? `\n${worktreeHeaderLine(session.worktree)}` : ''}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}${codexDetails}`;
 
-      const busyHtml = session.busy
-        ? color('● busy', '#f0883e')
-        : color('● idle', '#3fb950');
-      const htmlStatus =
-        `<b>Session Status</b><table>` +
-        `<tr><td>State</td><td>${busyHtml}</td></tr>` +
-        `<tr><td>Agent</td><td>${escapeHtml(agentLabel(session.agent))}</td></tr>` +
-        `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
-        (session.worktree ? `<tr><td>Worktree</td><td><code>${escapeHtml(session.worktree.branch)}</code></td></tr>` : '') +
-        (matronMdFileList(session.matronMd) ? `<tr><td>MATRON.md</td><td>${escapeHtml(matronMdFileList(session.matronMd))}</td></tr>` : '') +
-        `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
-        `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
-        `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
-        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>`) +
-        `</table>` + escapeHtml(codexDetails).replace(/\n/g, '<br/>');
-
-      await sendHtml(plainStatus, htmlStatus);
+      await sendReply(plainStatus);
       break;
     }
 
@@ -8937,7 +8583,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
 
       const activeId = currentSession?.claudeSessionId;
 
-      // Plain text fallback
       const plainList = items.map((s, i) => {
         const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
         const shortId = s.sessionId.slice(0, 8);
@@ -8946,22 +8591,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         return `${i + 1}. ${shortId} ${date}${active}${desc}`;
       }).join('\n');
 
-      // HTML formatted version
-      const htmlRows = items.map((s, _i) => {
-        const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
-        const shortId = s.sessionId.slice(0, 8);
-        const active = s.sessionId === activeId ? ' ⚡' : '';
-        const desc = s.summary
-          ? `<br/><span style="color:gray">${escapeHtml(s.summary)}</span>`
-          : '';
-        return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
-      }).join('\n');
-
       const agentFlag = `--${selectedAgent}`;
       const plainText = `${agentLabel(selectedAgent)} sessions for ${workdir}:\n\n${plainList}\n\nUse /resume ${agentFlag} <number> or /resume ${agentFlag} <id> to resume.`;
-      const html = `<b>${escapeHtml(agentLabel(selectedAgent))} sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume ${agentFlag} &lt;number&gt;</code> or <code>/resume ${agentFlag} &lt;id&gt;</code> to resume.</i>`;
-
-      await sendHtml(plainText, html);
+      await sendReply(plainText);
       break;
     }
 
@@ -9007,56 +8639,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         `Send any other text to chat with the selected coding agent.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
-      const cmdGroup = (title, cmds) => {
-        const items = cmds.map(([c, d]) => `<li><code>${c}</code> — ${d}</li>`).join('');
-        return `<b>${title}</b><ul>${items}</ul>`;
-      };
-
-      const htmlHelp =
-        cmdGroup('Sessions', [
-          ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
-          ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
-          ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
-          ['/start --worktree <name> [workdir]', 'Start in a fresh git worktree (branch wt/<name> from origin); never the default'],
-          ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
-          ['/start --model &lt;alias&gt; [workdir]', `Start on a specific Claude model (${escapeHtml(VALID_ALIAS_HINT)}, or a full <code>claude-*</code> name); also accepted by /restart, /resume, /workdir. Claude only`],
-          ['/stop', 'Stop the current session'],
-          ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)'],
-          ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
-          ['/sessions [--claude|--codex]', 'List past sessions for an agent'],
-          ['/workdir [--claude|--codex] &lt;path&gt;', 'Start a session in a different directory'],
-        ]) +
-        cmdGroup('Info', [
-          ['/status', 'Show current session info'],
-          ['/agent', 'Show the current coding agent'],
-          ['/switch &lt;claude|codex&gt;', 'Hand this conversation to the other coding agent'],
-          ['/working', 'Toggle tool call visibility'],
-          ['/mcp', 'Show MCP server status'],
-          ['/model', 'Show current model'],
-          ['/effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
-          ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
-          ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
-          ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
-          ['/design-login', 'Authorize Claude Design access (auto-switches to interactive mode)'],
-          ['/cost', 'Show session cost'],
-          ['/usage', 'Show token usage'],
-          ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
-          ['/timer &lt;duration|time&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
-          ['/tools', 'List available tools'],
-          ['/sleep', 'Stop this machine now, with a confirmation button (needs <code>MATRON_SLEEP_COMMAND</code>)'],
-          ['/permissions', 'List session-allowed tools; <code>/permissions revoke &lt;name&gt;</code> (or <code>all</code>) removes a grant'],
-          ['/help', 'Show this help message'],
-        ]) +
-        `<b>Tips</b><ul>` +
-        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new session</li>` +
-        `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
-        `<li>Messages are queued automatically while the agent is working</li>` +
-        `<li>Send <code>interrupt</code> to force interrupt</li>` +
-        `<li><code>!esc</code> — cancel the current turn without killing the session</li>` +
-        `<li>You can send photos and documents (PDFs, images, text files)</li>` +
-        `</ul>`;
-
-      await sendHtml(plainHelp, htmlHelp);
+      await sendReply(plainHelp);
       break;
     }
 
@@ -9118,17 +8701,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
                        s.status === 'needs-auth' ? '🟡' : '⚪';
           return `${icon} ${s.name} — ${s.status}`;
         }).join('\n');
-        const statusDot = (st) => {
-          const clr = st === 'connected' ? '#3fb950' :
-                      st === 'failed' ? '#f85149' :
-                      st === 'needs-auth' ? '#f0883e' : '#8b949e';
-          return color('●', clr);
-        };
-        const htmlRows = servers.map(s =>
-          `<tr><td>${statusDot(s.status)}</td><td><code>${escapeHtml(s.name)}</code></td><td>${escapeHtml(s.status)}</td></tr>`
-        ).join('');
-        const htmlMcp = `<b>MCP Servers</b><table>${htmlRows}</table>`;
-        await sendHtml(`MCP Servers (live):\n\n${plainList}`, htmlMcp);
+        await sendReply(`MCP Servers (live):\n\n${plainList}`);
       } else {
         // No initData.mcp_servers. In iv-mode there is no system/init event, so
         // live server status is never exposed — fall back to the bridge's
@@ -9175,7 +8748,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         // `--no-offer`: a switch someone else asked for (the Coordinator's
         // session_set_model) parked mid-turn — no "for new chats too?" card.
         const offer = !implicit && !parts.slice(2).includes('--no-offer');
-        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit, offer });
+        applyModelSwitch(roomId, session, arg, { sendReply, explicit: !implicit, offer });
         break;
       }
       const current = session.currentModel || session.initData?.model || null;
@@ -9194,29 +8767,19 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         if (session.sendButtonMessage) {
           session.sendButtonMessage(codexModelCardQuestion(options, metadata), options.modelOptions.map((o, i) => ({
             id: `codex-model-${i}`, label: o.label, value: `model:${o.value}`,
-          })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+          })), 'pick_one');
         } else await sendReply(plain);
       } else if (session.iv) {
         // A live TUI means switching works. Prefer buttons, but fall back to a
         // typed-command hint when no button channel is wired (e.g. some
         // auto-started sessions) — never claim "needs interactive mode" here.
         if (session.sendButtonMessage) {
-          const buttons = modelButtons();
-          const plain = `${currentLine}${extra}\n\nTap a model to switch, or type /model <name>.`;
-          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-          const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
-            `<br/><br/>Tap a model to switch, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
-          session.sendButtonMessage(`${currentLine}${extra}`, buttons, 'pick_one', plain, html);
+          session.sendButtonMessage(`${currentLine}${extra}`, modelButtons(), 'pick_one');
         } else {
           await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
         }
       } else if (session.sendButtonMessage) {
-        const buttons = modelButtons();
-        const plain = `${currentLine}${extra}\n\nTap a model to switch (restarts to apply), or type /model <name>.`;
-        const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-        const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
-          `<br/><br/>Tap a model to switch (restarts to apply), or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
-        session.sendButtonMessage(`${currentLine}${extra}`, buttons, 'pick_one', plain, html);
+        session.sendButtonMessage(`${currentLine}${extra}`, modelButtons(), 'pick_one');
       } else {
         await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (restarts to apply). Options: ${VALID_ALIAS_HINT}.`);
       }
@@ -9238,11 +8801,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       if (!arg) {
         const line = `Mode: ${modeLabel(currentInteractive)}`;
         if (session.sendButtonMessage) {
-          const buttons = modeButtons(currentInteractive);
-          const plain = `${line}\n\nTap to switch, or type /mode interactive | /mode print.`;
-          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-          const html = `<b>🔀 ${escapeHtml(line)}</b><br/><br/>Tap to switch, or type <code>/mode interactive</code> | <code>/mode print</code>.<br/>${htmlButtons}`;
-          session.sendButtonMessage(line, buttons, 'pick_one', plain, html);
+          session.sendButtonMessage(line, modeButtons(currentInteractive), 'pick_one');
         } else {
           await sendReply(`${line}\n\nType /mode interactive or /mode print to switch.`);
         }
@@ -9254,7 +8813,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         break;
       }
       const wantInteractive = target === 'interactive';
-      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
+      applyModeSwitch(roomId, session, wantInteractive, { sendReply });
       break;
     }
 
@@ -9362,7 +8921,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       // applyModeSwitch sends planModeSwitch's own message instead and
       // nothing is parked.
       const next = applyModeSwitch(roomId, session, true, {
-        sendReply, sendHtml,
+        sendReply,
         announcement: isDesign
           ? 'Signing in to Claude Design — switching to interactive mode to complete…'
           : cmdWord === 'logout'
@@ -9402,7 +8961,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
           if (session.sendButtonMessage) {
             session.sendButtonMessage(codexEffortCardQuestion(options), options.effortLevels.map((o, i) => ({
               id: `codex-effort-${i}`, label: o.label, value: `effort:${o.value}`,
-            })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+            })), 'pick_one');
           } else await sendReply(plain);
         }
         break;
@@ -9411,7 +8970,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       if (arg) {
         // A person's /effort: once it commits, offer it for new chats too.
         noteEffortDefaultOffer(roomId, arg);
-        if (!session.iv) applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml });
+        if (!session.iv) applyPrintEffortSwitch(roomId, session, arg, { sendReply });
         else if (switchEffortAndTrack(session, arg, sendReply)
                  && session._effortFlowReturnToPrint === normalizeEffortArg(arg)) {
           // The re-parked half of an /effort-from-print flow, replayed after
@@ -9427,11 +8986,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       // `/effort <level>` inline — no picker).
       if (session.iv) {
         if (session.sendButtonMessage) {
-          const buttons = effortButtons();
-          const plain = `Effort level\n\nTap a level to set it, or type /effort <level>.`;
-          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-          const html = `<b>🎚️ Effort level</b><br/><br/>Tap a level to set it for this session, or type <code>/effort &lt;level&gt;</code>.<br/>${htmlButtons}`;
-          session.sendButtonMessage('Effort level', buttons, 'pick_one', plain, html);
+          session.sendButtonMessage('Effort level', effortButtons(), 'pick_one');
         } else {
           await sendReply(`Type /effort <level> to set the effort level. Options: ${VALID_EFFORT_HINT}.`);
         }
@@ -9452,14 +9007,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         break;
       }
       const cost = session.totalUsage.cost_usd;
-      const costClr = cost < 0.5 ? '#3fb950' : cost < 2 ? '#f0883e' : '#f85149';
-      const plainCost = `Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`;
-      const htmlCost =
-        `<b>Session Cost</b><table>` +
-        `<tr><td>Cost</td><td>${color('$' + cost.toFixed(4), costClr)}</td></tr>` +
-        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        `</table>`;
-      await sendHtml(plainCost, htmlCost);
+      await sendReply(`Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`);
       break;
     }
 
@@ -9481,11 +9029,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
           (u.reasoning_tokens != null ? `Reasoning: ${u.reasoning_tokens.toLocaleString()} (included in output)\n` : '') +
           `Total: ${(u.input_tokens + u.output_tokens).toLocaleString()}\n` +
           `Bridge turns: ${session.turnCount}${context}`;
-        await sendHtml(plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+        await sendReply(plain);
         break;
       }
       const u = session.totalUsage;
-      const uCostClr = u.cost_usd < 0.5 ? '#3fb950' : u.cost_usd < 2 ? '#f0883e' : '#f85149';
       const plainUsage =
         `Token usage (cumulative):\n\n` +
         `Input: ${u.input_tokens.toLocaleString()}\n` +
@@ -9494,16 +9041,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         (session.agent === AGENT_CODEX ? '' : `Cache create: ${u.cache_create.toLocaleString()}\n`) +
         `Turns: ${session.turnCount}` +
         (session.agent === AGENT_CODEX ? '' : `\nCost: $${u.cost_usd.toFixed(4)}`);
-      const htmlUsage =
-        `<b>Token Usage</b><table>` +
-        `<tr><td>Input</td><td>${u.input_tokens.toLocaleString()}</td></tr>` +
-        `<tr><td>Output</td><td>${u.output_tokens.toLocaleString()}</td></tr>` +
-        `<tr><td>Cache read</td><td>${u.cache_read.toLocaleString()}</td></tr>` +
-        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>`) +
-        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>`) +
-        `</table>`;
-      await sendHtml(plainUsage, htmlUsage);
+      await sendReply(plainUsage);
       break;
     }
 
@@ -9519,15 +9057,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
             ? await refreshCodexMetadata(active, { force: true })
             : await codexAccountReader.read(DEFAULT_WORKDIR, { force: true });
           const fallback = metadata.limitsError || 'No Codex subscription limits were returned for this account. API-key accounts may not have subscription limits.';
-          const { plain, html } = formatLimits({ ok: metadata.limits.length > 0, lines: metadata.limits }, fallback);
-          await sendHtml(plain, html);
+          const { plain } = formatLimits({ ok: metadata.limits.length > 0, lines: metadata.limits }, fallback);
+          await sendReply(plain);
           break;
         }
         const cwd = active?.workdir || DEFAULT_WORKDIR;
         const raw = await fetchUsageLimitsText(cwd);
         const parsed = parseUsageLimits(raw);
-        const { plain, html } = formatLimits(parsed, raw);
-        await sendHtml(plain, html);
+        const { plain } = formatLimits(parsed, raw);
+        await sendReply(plain);
       } catch (e) {
         await sendReply(`Couldn't fetch usage limits: ${e.message}`);
       }
@@ -9578,7 +9116,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
           await session.sendButtonMessage(
             summary,
             [timerSendNowButton(record.id), timerCancelButton(record.id)],
-            'pick_one', summary, escapeHtml(summary), timerCardPayload(record, summary));
+            'pick_one', timerCardPayload(record, summary));
         } else {
           await sendReply(`${summary} /timer lists, /timer cancel ${record.id} cancels.`);
         }
@@ -9638,7 +9176,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       for (const [, s] of sessions) if (s.alive && s.busy) busyCount++;
       const card = sleepCardText({ wakeHint, busyCount });
       await session.sendButtonMessage(
-        card, sleepButtons(), 'pick_one', card, escapeHtml(card));
+        card, sleepButtons(), 'pick_one');
       break;
     }
 
@@ -9663,7 +9201,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const mcpTools = tools.filter(t => t.startsWith('mcp__'));
       const builtIn = tools.filter(t => !t.startsWith('mcp__'));
 
-      // Plain text
       let plainMsg = `Built-in tools (${builtIn.length}):\n${builtIn.join(', ')}\n\n`;
       const grouped = {};
       for (const t of mcpTools) {
@@ -9679,18 +9216,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         }
       }
 
-      // HTML
-      let htmlMsg = `<b>Built-in tools (${builtIn.length})</b><br/>` +
-        builtIn.map(t => `<code>${escapeHtml(t)}</code>`).join(', ');
-      if (mcpTools.length > 0) {
-        for (const [server, serverTools] of Object.entries(grouped)) {
-          htmlMsg += `<details><summary><b>${escapeHtml(server)}</b> (${serverTools.length})</summary>` +
-            serverTools.map(t => `<code>${escapeHtml(t)}</code>`).join(', ') +
-            `</details>`;
-        }
-      }
-
-      await sendHtml(plainMsg, htmlMsg);
+      await sendReply(plainMsg);
       break;
     }
 
@@ -9730,10 +9256,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const plain = `Session-allowed tools (${grants.length}) — cleared on restart:\n` +
         grants.map(t => `  ${t}`).join('\n') +
         `\n\nRevoke with /permissions revoke <name> (or /permissions revoke all).`;
-      const html = `<b>Session-allowed tools (${grants.length})</b> — cleared on restart<ul>` +
-        grants.map(t => `<li><code>${escapeHtml(t)}</code></li>`).join('') +
-        `</ul>Revoke with <code>/permissions revoke &lt;name&gt;</code> (or <code>/permissions revoke all</code>).`;
-      await sendHtml(plain, html);
+      await sendReply(plain);
       break;
     }
 
@@ -9812,25 +9335,12 @@ function formatInterruptedAgo(ageMs) {
   return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
 }
 
-// Echo something into a session's room WITHOUT re-mirroring it into the
-// journal (sendToRoom's default behavior publishes a from:'assistant'
-// text event for everything it sends — see its own comment — which for an
-// echo of content the journal already has would be exactly the re-publish
-// loop this return path exists to avoid). With the journal as the only
-// output this publishes nothing. Fire-and-forget: failures here must never
-// affect journal-side processing.
-function journalEchoToRoom(session, plain, html) {
-  if (!session || !session.roomId) return;
-  sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
-}
-
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
 // replies go through the NORMAL sendToRoom for the session's room id,
 // which publishes them into the session's journal convo.
 function journalSessionCommandCtx(session) {
   return {
-    sendReply: (reply) => sendToRoom(session.roomId, reply, markdownToHtml(reply)),
-    sendHtml: (plainText, html) => sendToRoom(session.roomId, plainText, html),
+    sendReply: (reply) => sendToRoom(session.roomId, reply),
   };
 }
 
@@ -9919,7 +9429,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     flushCursor: () => journalPublisher.flushCursor(),
     runBridgeCommand: (normalizedCommand) => {
       const ctx = journalSessionCommandCtx(session);
-      return handleCommand(session.roomId, normalizedCommand, ctx.sendReply, ctx.sendHtml);
+      return handleCommand(session.roomId, normalizedCommand, ctx.sendReply);
     },
     // Safety net for JOURNAL_UNAVAILABLE_COMMANDS (currently empty — see
     // that constant's comment in lib/command-dispatch.js for the mapping):
@@ -9982,7 +9492,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   // checked after prompt/menu/question resolution, before rescue keystrokes
   // and busy-queueing. With no pending plan, `build` falls through and routes
   // to Claude as ordinary text. The "▶️ Building..."
-  // notice goes through the session ctx's sendHtml (sendToRoom), which
+  // notice goes through the session ctx's sendReply (sendToRoom), which
   // mirrors into the journal like every other bridge reply.
   const dispatchedBuild = await dispatchPlanBuild(
     trimmed,
@@ -9990,7 +9500,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     {
       approvePlan: () => {
         const ctx = journalSessionCommandCtx(session);
-        return approvePlanBuild(session, { sendHtml: ctx.sendHtml, causes });
+        return approvePlanBuild(session, { sendReply: ctx.sendReply, causes });
       },
     },
   );
@@ -10115,7 +9625,6 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     const preview = trimmed.length > 40 ? trimmed.slice(0, 37) + '…' : trimmed;
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
-      htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText: trimmed,
@@ -10249,11 +9758,10 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
 }
 
 // Adapts journalRouteTextToSession to the router's routeTextToSession(session,
-// body, {username}) interface: echoes the incoming message (a no-op publish,
-// see journalEchoToRoom), then routes it in.
-function journalOnText(session, body, { username, seq, convoId }) {
+// body, {seq, convoId}) interface and routes the message in. The journal
+// already holds the user's own row, so nothing is echoed back.
+function journalOnText(session, body, { seq, convoId }) {
   rearmPreReapHandoff(session);
-  journalEchoToRoom(session, `📱 ${username} (Matron): ${body}`, `📱 <b>${escapeHtml(username)} (Matron):</b> ${escapeHtml(body)}`);
   // journalRouteTextToSession is async (command dispatch awaits
   // handleCommand) — not awaited here, matching the router's fire-and-forget
   // contract for routeTextToSession, but errors must still be caught so a
@@ -10364,9 +9872,7 @@ const journalMediaRouter = createJournalMediaRouter({
   mirrorText: (session, text) => journalPublishUserItem(session, 'publishText', { body: text, from: 'user' }),
   queueMedia: (session, entry) => journalQueueMedia(session, entry),
   isCanonicalSession: (session) => !!session?.alive && sessions.get(session.roomId) === session,
-  echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
-  escapeHtml,
   log: console,
 });
 
@@ -10404,7 +9910,6 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
   try {
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
-      htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText,
@@ -10535,7 +10040,7 @@ function journalOnItem(session, item, ctx) {
     // The build reply itself is what the approval's turn is for, exactly as
     // for any other reply on an item (lib/items-turn.js).
     const buildCause = itemCause(item?.payload);
-    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml, causes: buildCause ? [buildCause] : null }).catch((e) => {
+    approvePlanBuild(session, { sendReply: cmdCtx.sendReply, causes: buildCause ? [buildCause] : null }).catch((e) => {
       try { console.warn(`[plan-items] build from item reply failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
     });
     return;
@@ -10754,7 +10259,6 @@ function postEditedQueueCard(session, { index, text }) {
   const preview = text.length > 40 ? text.slice(0, 37) + '…' : text;
   return notifyQueuedMessage(session, preview, {
     sendReply: ctx.sendReply,
-    htmlEscape: escapeHtml,
     queueRelease: journalInputConsumer.queueRelease,
     convoId: journalConvoIdFor(session),
     fullText: text,
@@ -10766,8 +10270,8 @@ function postEditedQueueCard(session, { index, text }) {
 }
 
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
-// {target_seq, choice, text}, {username}) interface.
-function journalOnPromptReply(session, answer, { username, seq, convoId: replyConvoId }) {
+// {target_seq, choice, text}, {seq, convoId}) interface.
+function journalOnPromptReply(session, answer, { seq, convoId: replyConvoId }) {
   rearmPreReapHandoff(session);
   // Command-replay guard: a prompt answer has side effects (keystrokes into
   // the TUI / a tool_result write), so an ungraceful crash inside the
@@ -10874,7 +10378,6 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
       confirmSleep: confirmSleepFromButton,
       cancelSleep: cancelSleepFromButton,
       sendReply: ctx.sendReply,
-      sendHtml: ctx.sendHtml,
     });
     return;
   }
@@ -10893,9 +10396,7 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
   if (label == null) {
     console.warn(`[journal-input] prompt_reply with no resolvable pending prompt for convo=${journalConvoIdFor(session)}`);
     journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
-    return;
   }
-  journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
 }
 
 function journalIsControlConvo(convoId) {
@@ -10935,19 +10436,15 @@ async function journalHandleControlCommand(body) {
   const { cmd, normalizedText } = decision;
 
   if (cmd === 'help') {
-    // handleCommand's '!help' calls sendHtml(plain, html) — intercept so we
-    // can append the Matron-specific note to the SAME real help text
-    // instead of re-deriving/duplicating it.
-    await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
+    // handleCommand's '!help' sends the help text as its one reply —
+    // intercept it so we can append the Matron-specific note to the SAME
+    // real help text instead of re-deriving/duplicating it.
+    await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText,
       (plainText) => reply(plainText + JOURNAL_CONTROL_HELP_NOTE));
     return;
   }
 
-  // Every other command: plain-text reply sink for both sendReply and
-  // sendHtml (the control convo has no HTML rendering — same choice
-  // journalPublishNotice/journalEchoToRoom's callers make elsewhere).
-  await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
-    (plainText) => reply(plainText));
+  await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply);
 }
 
 // The default resume announcement, in the voice of the path that produced
@@ -11268,7 +10765,7 @@ async function announceAgentReminder(session, record) {
     await session.sendButtonMessage(
       summary,
       [timerSendNowButton(record.id), timerCancelButton(record.id)],
-      'pick_one', summary, escapeHtml(summary), timerCardPayload(record, summary));
+      'pick_one', timerCardPayload(record, summary));
   } else {
     journalPublishNotice(journalConvoIdFor(session), summary, null, { silent: true });
   }
@@ -11381,8 +10878,7 @@ function cancelSleepFromButton(session, sendReply) {
 // same flow a typed /login runs, replies included. Skips the picker alive
 // gate so the !login handler's own "no active session" reply speaks instead.
 function startLoginFromButton(session, sendReply) {
-  const ctx = journalSessionCommandCtx(session);
-  return handleCommand(session.roomId, '!login', sendReply, ctx.sendHtml);
+  return handleCommand(session.roomId, '!login', sendReply);
 }
 
 // The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
@@ -11706,7 +11202,7 @@ function recoverBadModel(session) {
   }
   const ctx = journalSessionCommandCtx(session);
   const switched = !controlOccupied(session)
-    && applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+    && applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, explicit: false });
   if (!switched) {
     // Refused (a resume hold, a busy turn, a TUI not ready): the one
     // recovery is NOT spent. Retry through the sweep in a minute — the
@@ -11757,7 +11253,7 @@ function switchFableStall(session, { retry = 0, prior = undefined } = {}) {
   const when = fb.resetsAt ? ` (Fable resets ${new Date(fb.resetsAt).toUTCString().replace(/:\d\d GMT$/, ' UTC')})` : '';
   const ctx = journalSessionCommandCtx(session);
   const switched = !controlOccupied(session)
-    && applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+    && applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, explicit: false });
   if (!switched) {
     // Refused (a resume hold, a busy turn, a TUI not ready): try again in a
     // minute, a few times, then fall back to waiting for the reset.
@@ -11795,14 +11291,13 @@ function boxLabelForControl() {
 }
 
 function postControlNotice(session, text, kind = null) {
-  const n = notice('info', text);
-  // A tagged notice takes sendHtml's own path (sendToRoom), with the tag.
+  // A tagged notice takes sendCallback's own path (sendToRoom), with the tag.
   const meta = kind ? noticeMeta(kind, text) : null;
-  if (meta && session?.roomId && typeof session.sendHtml === 'function' && sessions.get(session.roomId) === session) {
-    try { sendToRoom(session.roomId, n.plain, n.html, { notice: meta }); return; } catch { /* fall through */ }
+  if (meta && session?.roomId && typeof session.sendCallback === 'function' && sessions.get(session.roomId) === session) {
+    try { sendToRoom(session.roomId, text, { notice: meta }); return; } catch { /* fall through */ }
   }
-  if (session && typeof session.sendHtml === 'function') {
-    try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
+  if (session && typeof session.sendCallback === 'function') {
+    try { session.sendCallback(text); return; } catch { /* fall through */ }
   }
   journalPublishNotice(journalConvoIdFor(session), text, meta);
 }
@@ -11906,7 +11401,7 @@ async function applyControlSteps(session, steps) {
       if (!next) return { ok: false, error: { code: 'unsupported', detail: 'the agent switch was refused' } };
       current = next;
     } else if (step.op === 'set_model') {
-      if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true })) {
+      if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, explicit: true })) {
         return { ok: false, error: { code: 'unsupported', detail: 'the model switch was refused' } };
       }
       if (current.iv) current._controlTypedAt = Date.now();
@@ -11955,7 +11450,7 @@ async function applyControlEffort(session, level, ctx) {
   }
   if (session.busy) return refused('the session is mid-turn');
   persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { claudeEffort: level });
-  const next = recreateSession(session.roomId, { effort: level }, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml });
+  const next = recreateSession(session.roomId, { effort: level }, { sendReply: ctx.sendReply });
   if (!next) return refused('the session could not restart');
   ctx.sendReply(`Restarted on effort ${level}.`);
   return { ok: true };
@@ -13251,13 +12746,13 @@ function journalEvictConvoInput(session) {
 // dispatchPlanBuild, lib/command-dispatch.js). iv-mode sends the approval
 // as text; print-mode does the tool_result/denial dance (or falls back to a plain approval message when the denial was
 // already answered).
-// `sendHtml` is the caller's reply sink for the final "▶️ Building..."
+// `sendReply` is the caller's reply sink for the final "▶️ Building..."
 // notice — the session ctx's sendToRoom sink, which publishes into the
 // journal.
 // `causes` is the approval itself (the user's message or item reply,
 // lib/turn-cause.js): every path below either starts a turn with it or adds
 // it to the one the plan is waiting in.
-async function approvePlanBuild(session, { sendHtml, causes = null }) {
+async function approvePlanBuild(session, { sendReply, causes = null }) {
   const toolUseId = session.pendingPlanDenialId;
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
   // The tracker mirror closes as decided, whichever mode settles the plan
@@ -13334,8 +12829,7 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
       ),
     });
   }
-  const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
-  await sendHtml(buildNotice.plain, buildNotice.html);
+  await sendReply('▶️ Building...');
 }
 
 // Respawn a persisted session into its room: recreate the process with
@@ -13347,12 +12841,11 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
 // this directly.
 //
 // skipJournalMirror applies to that notice only (the session's own
-// sendCallback/sendHtml stay mirrored as usual): the journal resume path
+// sendCallback stays mirrored as usual): the journal resume path
 // posts its own richer "Session was idle" notice first, and without the
 // skip Matron users would see both.
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
-  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
-  const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
+  const sendReply = (reply) => sendToRoom(roomId, reply);
   const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
   // A legacy record with no agent ran as the env default; the live box
   // default is for new sessions only.
@@ -13389,15 +12882,13 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   if (typeof prev.llmTitleEarned === 'boolean') newSession._llmTitleEarned = prev.llmTitleEarned;
   newSession.lastRosterText = prev.lastRosterText || '';
   newSession.sendCallback = sendReply;
-  newSession.sendHtml = sendHtmlFn;
-  newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
+  newSession.sendButtonMessage = (prompt, buttons, mode, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, payload);
   hydrateAgentState(newSession, prev);
 
   const shortId = resumeSessionId ? resumeSessionId.slice(0, 8) : 'new';
   const verb = resumeSessionId ? 'Auto-resuming' : 'Restoring';
-  const arNotice = notice('info', `${verb} ${agentLabel(newSession.agent)} session ${shortId}…`, `${verb} ${escapeHtml(agentLabel(newSession.agent))} session <code>${shortId}</code>…`);
-  Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
+  Promise.resolve(sendToRoom(roomId, `${verb} ${agentLabel(newSession.agent)} session ${shortId}…`, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
   // than the paste→Enter window, so an immediate type-in is silently dropped.
@@ -13458,11 +12949,10 @@ const secretRequests = createSecretRequests({
   items: itemsClient,
   generateLink: (secretId, { label, context, convoId, roomId, multiline, ttlMs }) =>
     generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context, convoId }),
-  notifyChat: (record, { plain, html }) => {
+  notifyChat: (record, { plain }) => {
     const session = record.roomId ? sessions.get(record.roomId) : null;
     if (!session) return;
-    if (html && session.sendHtml) session.sendHtml(plain, html);
-    else if (session.sendCallback) session.sendCallback(plain);
+    if (session.sendCallback) session.sendCallback(plain);
   },
   // LIVE sessions only. A killed-but-still-mapped session would take the
   // inject branch, fail it (sendToSession refuses on !alive) and dead-end in
@@ -14031,9 +13521,7 @@ const selfRestartHandler = createSelfRestartHandler({
     dispatchDeferredCommand(session);
   },
   notify: (session, text) => {
-    const n = notice('info', text);
-    if (session.sendHtml) session.sendHtml(n.plain, n.html);
-    else if (session.sendCallback) session.sendCallback(text);
+    if (session.sendCallback) session.sendCallback(text);
   },
 });
 
@@ -14560,7 +14048,7 @@ const apiServer = createServer(async (req, res) => {
         const card = renderPermissionCard({ toolName, input });
         const { buttons: permBtns, mode: permMode } = permissionButtons(permRequestId, toolName);
         try {
-          await sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
+          await sendButtonMessage(roomId, card.plain, permBtns, permMode);
         } catch (err) {
           // Card never reached the user — withdraw the request and answer
           // non-OK so the tool denies immediately instead of polling for five
@@ -14915,13 +14403,8 @@ const apiServer = createServer(async (req, res) => {
         const activeSession = target.session;
 
         const verb = download === true ? 'Download' : 'View';
-        const linkKind = oneTime !== false ? 'one-time link' : 'link';
-        if (activeSession && activeSession.sendHtml) {
-          const plain = `🔐 Secure data: ${label} — ${verb}: ${link}`;
-          const html = `🔐 Secure data: <b>${escapeHtml(label)}</b> — <a href="${link}">${verb}</a> (${linkKind}, expires at ${new Date(expiresAt).toISOString()})`;
-          activeSession.sendHtml(plain, html);
-        } else if (activeSession && activeSession.sendCallback) {
-          activeSession.sendCallback(`🔐 Secure data: ${label} — ${link} (${linkKind}, expires at ${new Date(expiresAt).toISOString()})`);
+        if (activeSession && activeSession.sendCallback) {
+          activeSession.sendCallback(`🔐 Secure data: ${label} — ${verb}: ${link}`);
         }
 
         // Schedule cleanup after expiry
@@ -14989,9 +14472,7 @@ const apiServer = createServer(async (req, res) => {
             deferredBy: batchDeferralReason(queued),
             summary: formatQueueSummary(queued),
           });
-          if (session.sendHtml) {
-            session.sendHtml(notice.plain, notice.html);
-          } else if (session.sendCallback) {
+          if (session.sendCallback) {
             session.sendCallback(notice.plain);
           }
           sent = flushQueue(session, queued, releaseSnapshot);
@@ -15076,7 +14557,7 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, text, markdownToHtml(text)).then(() => {
+        sendToRoom(roomId, text).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
@@ -15099,10 +14580,7 @@ const apiServer = createServer(async (req, res) => {
           const COMPACT_COOLDOWN_MS = 60_000;
           if (!target.lastCompactStartNotify || (now - target.lastCompactStartNotify) > COMPACT_COOLDOWN_MS) {
             target.lastCompactStartNotify = now;
-            if (target.sendHtml) {
-              const n = notice('info', '🗜️ Compacting context — summarizing conversation history…');
-              target.sendHtml(n.plain, n.html);
-            } else if (target.sendCallback) {
+            if (target.sendCallback) {
               target.sendCallback('🗜️ Compacting context — summarizing conversation history…');
             }
           } else {
@@ -15262,7 +14740,6 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.originRoomId = existing.originRoomId;
   next.firstMessageCaptured = true;
   next.sendCallback = existing.sendCallback;
-  next.sendHtml = existing.sendHtml;
   next.sendButtonMessage = existing.sendButtonMessage;
   next.showWorking = existing.showWorking;
   next.showBashOutput = existing.showBashOutput;
@@ -15402,10 +14879,9 @@ function scheduleEffortFlowReturn(session, delayMs, attempt = 0) {
       return;
     }
     const sendReply = current.sendCallback || (() => {});
-    const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     const applied = trackedEffort(current) === level;
     const switched = applyModeSwitch(roomId, current, false, {
-      sendReply, sendHtml,
+      sendReply,
       announcement: applied
         ? `✅ Effort set to ${effortLabel(level)} — back to normal mode.`
         : `Effort change to ${effortLabel(level)} didn't go through — back to normal mode, effort unchanged.`,
@@ -15503,7 +14979,7 @@ function scheduleEffortSettle(session) {
 // assignment may change it again.
 // offer:true (a person's !model or picker tap) follows an applied switch
 // with the "use it for new chats too?" card (offerDefault).
-function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true, offer = false }) {
+function applyModelSwitch(roomId, session, arg, { sendReply, explicit = true, offer = false }) {
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
@@ -15595,7 +15071,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
   bringAutoResumeForward(session);
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
     { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
-  const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
+  const next = recreateSession(roomId, { model: decision.normalized }, { sendReply });
   if (next) next.currentModel = decision.normalized;
   if (next && offer) offerDefault(roomId, 'model', decision.normalized);
   return true;
@@ -15608,7 +15084,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
 // (scheduleEffortFlowReturn). Mid-turn it parks `!effort <level>` on the
 // deferred-command stash instead, replayed at turn end before the queue
 // flushes.
-function applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+function applyPrintEffortSwitch(roomId, session, arg, { sendReply }) {
   const decision = planPrintEffortSwitch(session, arg);
   if (decision.defer) {
     const previousParked = session._deferredCommandText;
@@ -15624,7 +15100,7 @@ function applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     sendReply(decision.message);
     return false;
   }
-  const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml, announcement: decision.message });
+  const next = applyModeSwitch(roomId, session, true, { sendReply, announcement: decision.message });
   if (!next) return false;
   next._postReadySlashCommand = `/effort ${decision.normalized}`;
   next._effortFlowReturnToPrint = decision.normalized;
@@ -15635,7 +15111,7 @@ function applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml }) {
 // planModeSwitch, then persist the choice and restart the session in the new
 // mode (same session id, history preserved). Used by the !mode command and the
 // mode: toggle button.
-function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml, announcement, refusalAnnouncement }) {
+function applyModeSwitch(roomId, session, wantInteractive, { sendReply, announcement, refusalAnnouncement }) {
   if (session.agent === AGENT_CODEX) {
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
@@ -15665,7 +15141,7 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
   // Return the replacement session so callers can park follow-up work on it
   // (the /login-from-print flow tags _postReadySlashCommand).
-  const next = recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
+  const next = recreateSession(roomId, { interactive: wantInteractive }, { sendReply });
   // The interactive spawn failed and createSession fell back to print (it has
   // already told the room why). Nothing may be parked on a print session: a
   // parked slash would never be typed, and an /effort return-to-print mark
@@ -15680,7 +15156,7 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
 // new createSession options. Carries user-visible state (queue, per-room
 // toggles, chat history) across the swap. Returns the new session, or null if
 // the room has no live session. Shared by /restart, /model (print) and /mode.
-function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
+function recreateSession(roomId, overrides, { sendReply }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
   // Recheck at teardown, including attachments arriving during a reply await.
@@ -15755,9 +15231,8 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     ...overrides,
   });
   next.sendCallback = sendReply;
-  next.sendHtml = sendHtml;
-  next.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
+  next.sendButtonMessage = (prompt, buttons, mode, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, payload);
   next.originRoomId = originRoomId;
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;

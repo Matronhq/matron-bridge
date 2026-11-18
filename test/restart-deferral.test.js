@@ -92,7 +92,7 @@ describe('index.js dispatchDeferredCommand (source inspection)', () => {
 
   it('replays through handleCommand with the journal command ctx', () => {
     expect(body).toMatch(/journalSessionCommandCtx\(session\)/);
-    expect(body).toMatch(/handleCommand\(session\.roomId, text, ctx\.sendReply, ctx\.sendHtml\)/);
+    expect(body).toMatch(/handleCommand\(session\.roomId, text, ctx\.sendReply\)/);
   });
 });
 
