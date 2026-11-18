@@ -180,6 +180,28 @@ describe('SubagentWatcher: tails of finished subagents', () => {
     expect(ctx.w.parked.has('agent-aaa.jsonl')).toBe(true);
   });
 
+  it('an agent that finishes while its resume is still waiting for the transcript is stopped once attached', () => {
+    const ctx = mk();
+    const file = attachAgent(ctx);
+    ctx.w.noteAgentFinished('aaa');
+    vi.advanceTimersByTime(GRACE_MS + 100);
+    expect(ctx.w.tails.has('agent-aaa.jsonl')).toBe(false);
+
+    // Resumed while the transcript is out of reach: the attach is retried.
+    fs.renameSync(file, `${file}.away`);
+    expect(ctx.w.forceAttach('aaa')).toBe(false);
+    // It finishes again before the retry succeeds.
+    ctx.w.noteAgentFinished('aaa');
+    fs.appendFileSync(`${file}.away`, line('resumed'));
+    fs.renameSync(`${file}.away`, file);
+    ctx.w._retryPendingForceAttach();
+    expect(ctx.w.tails.has('agent-aaa.jsonl')).toBe(true);
+
+    vi.advanceTimersByTime(GRACE_MS * 2 + 100);
+    expect(ctx.texts).toEqual(['first', 'resumed']);
+    expect(ctx.w.tails.has('agent-aaa.jsonl')).toBe(false);
+  });
+
   it('a resume announced inside the grace period keeps the tail', () => {
     const ctx = mk();
     attachAgent(ctx);
