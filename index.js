@@ -180,6 +180,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
+import { stopSessionAndConfirm } from './lib/stop-command.js';
 import { sendPrintInterrupt, applyInterruptAck } from './lib/print-interrupt.js';
 import {
   checkFileLink,
@@ -8371,12 +8372,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // path has no busy = false for print/iv), so it is invisible to a
       // `session.busy = false` grep.
       inflightMarker.noteTurnEnd(journalConvoIdFor(session));
-      killSession(session);
-      sessions.delete(roomId);
-      journalSessionState(session, 'done');
-      journalActivity(session, 'idle');
-      journalEvictConvoInput(session);
-      await sendReply('Session stopped.');
+      await stopSessionAndConfirm({
+        sessions,
+        roomId,
+        kill: () => killSession(session),
+        settle: () => {
+          journalSessionState(session, 'done');
+          journalActivity(session, 'idle');
+          journalEvictConvoInput(session);
+        },
+        sendReply,
+      });
       break;
     }
 
