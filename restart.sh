@@ -7,9 +7,10 @@ cd "$(dirname "$0")"
 PORT=9802
 
 # This script is the bounce for manual installs and for launchd, where it hands
-# the restart to launchd (see below). Under systemd it is actively harmful: it kills the unit's process, systemd respawns it at
-# RestartSec=5, and the nohup instance started below grabs the port first — so
-# the surviving bridge is unsupervised and systemd's respawn fails to bind.
+# the restart to launchd (see below). Under systemd it is actively harmful: it
+# kills the unit's process, systemd respawns it at RestartSec=5, and the nohup
+# instance started below grabs the port first — so the surviving bridge is
+# unsupervised and systemd's respawn fails to bind.
 #
 # Refuse whenever systemd owns the unit's lifecycle, not just while it is
 # `active`: during the RestartSec hold-off after a crash the state is
