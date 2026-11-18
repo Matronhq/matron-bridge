@@ -13666,7 +13666,6 @@ const agentChatHandlers = createAgentChatHandlers({
     from_device_id: journalPublisher.identity()?.deviceId ?? -1,
   }),
   routeLocalRoomMessage,
-  notifyRoomPeer: (roomId, sessionKey, text) => journalNotifyRoomEvent(roomId, text, { sessionKey }),
   // Mute seams (2026-08-19). agent_chat_mute is loud on purpose: a member
   // going quiet looks like a bug from the other side, so the other LOCAL
   // member's own chat is told in plain text…
@@ -14637,12 +14636,6 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-chat-invite') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatInvite,
           (status, b) => debug(`agent-chat-invite ${status} ${data?.room_id} ${b.status || b.error || ''}`));
-        return;
-      }
-
-      if (url.pathname === '/agent-chat-leave') {
-        await respondAgentChatRoute(res, data, agentChatHandlers.chatLeave,
-          (status, b) => debug(`agent-chat-leave ${status} ${data?.room_id} ${b.error || 'ok'}`));
         return;
       }
 

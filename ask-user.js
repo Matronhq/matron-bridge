@@ -1189,9 +1189,8 @@ server.tool(
 // carry on, and a finished third member otherwise had only a mute to stop
 // being woken by their traffic, which then told every sender for days that
 // their messages no longer reached it. The bridge refuses every other case
-// (lib/agent-chat.js leaveRoom). The /agent-chat-leave route and chatLeave
-// internals are the bridge's own teardown, not this tool: since 2026-09-21 no
-// teardown calls them except the lazy cleanup of a conversation that can no
+// (lib/agent-chat.js leaveRoom). Session teardown never leaves a room; the
+// one bridge-side leave is the lazy cleanup of a conversation that can no
 // longer be resumed (index.js orphanRoomBinding).
 
 server.tool(
