@@ -7,6 +7,7 @@ import { generateSignedUrl, verifyToken, scopeFromToken, readPageToken } from '.
 import { formatSecretContextHtml, secretConversationUrl } from '../lib/secret-context.js';
 import { viewerApiKey, VIEWER_KEY_HEADER_NAME } from '../lib/api-auth.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
+import { createShortLinkReader, shortLinksFile } from '../lib/short-links.js';
 export { generateSignedUrl, verifyToken };
 
 // Port resolution with a legacy-name fallback: the Matrix→Matron rename left
@@ -23,10 +24,27 @@ export function resolveViewerPort(env = process.env, warn = console.warn) {
   return 9803;
 }
 
+// Express's `trust proxy`, from MATRON_VIEWER_TRUST_PROXY. Off by default: the
+// client address is then the socket's, and an X-Forwarded-For header cannot
+// change it. Behind a tunnel or reverse proxy that would make every visitor
+// the proxy's address and every rate limit one shared budget, so a proxied
+// deployment names the proxy it trusts: `loopback` for a tunnel daemon or
+// proxy on this host (cloudflared, nginx), a hop count, or a comma-separated
+// list of addresses or subnets. The rate limiters key on req.ip, which is
+// then the client address the trusted proxy forwarded.
+export function resolveTrustProxy(env = process.env) {
+  const raw = String(env.MATRON_VIEWER_TRUST_PROXY ?? '').trim();
+  if (['', 'off', 'false', 'no', '0'].includes(raw.toLowerCase())) return false;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (['on', 'true', 'yes'].includes(raw.toLowerCase())) return true;
+  return raw;
+}
+
 const PORT = resolveViewerPort();
 const SECRET = process.env.HMAC_SECRET;
 
 const app = express();
+app.set('trust proxy', resolveTrustProxy());
 // App-wide urlencoded parsing keeps body-parser's 100 KB default — /sensitive
 // /reveal accepts urlencoded bodies too, and nothing about a secure-input form
 // should widen ITS ceiling. Only POST /secret gets the bigger parser, mounted
@@ -666,6 +684,37 @@ app.use('/plugin', express.static(PLUGIN_DIR, {
     }
   },
 }));
+
+// Short links (lib/short-links.js): /l/<code>, minted by the bridge for page,
+// sensitive-data and secret-request links. The code is looked up in the store
+// the bridge writes, and the request is then dispatched, in this process, to
+// the route the code was minted for with its token, exactly as if the long
+// link had been opened. Nothing is redirected, so the long token never
+// reaches the address bar, the history or a Referer; every check on the token
+// (signature, expiry, route flag, the bridge's one-time consumption) and the
+// route's own rate limit apply unchanged. The secret form and the sensitive
+// shell carry the token in their page body as they always have; a code and
+// its token grant exactly the same access, so that body tells the code's
+// holder nothing new. An unknown, malformed, expired or pruned code gets the
+// expired-token answer, so a reply never tells whether a code ever existed.
+// Lookups have their own budget on top of the route's: it is the one a code
+// guesser spends.
+const shortLinks = createShortLinkReader({ file: shortLinksFile() });
+const shortLinkLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.SHORT_LINK_RATE_LIMIT || '120', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+app.get('/l/:code', shortLinkLimiter, (req, res, next) => {
+  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+  const entry = shortLinks.resolve(req.params.code);
+  if (!entry) return res.status(403).send('Invalid or expired token');
+  req.url = `/${entry.route}?token=${encodeURIComponent(entry.token)}`;
+  return app.router.handle(req, res, next);
+});
 
 app.get('/health', (req, res) => res.send('ok'));
 
