@@ -134,6 +134,7 @@ import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerSt
 import { formatRepeat } from './lib/daily-repeat.js';
 import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
+import { promptCardQuestion, codexModelCardQuestion, codexEffortCardQuestion } from './lib/button-card-text.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher, routeWorkflowStreamEvent } from './lib/subagent-watcher.js';
@@ -4373,7 +4374,6 @@ async function handleInteractivePrompt(session, prompt) {
   if (session.sendButtonMessage) {
     const b = promptButtons(prompt);
     if (b) {
-      const header = prompt.question || 'Claude is asking';
       // Include each option's description (when the detector captured one, e.g.
       // AskUserQuestion menus) so the user has the per-option detail before
       // choosing — the buttons themselves only carry the short label.
@@ -4399,7 +4399,7 @@ async function handleInteractivePrompt(session, prompt) {
       // this room to publish to.
       // Fall through to the text rendering below in the null case so the
       // prompt is never silently dropped while the TUI waits for an answer.
-      const sent = await session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
+      const sent = await session.sendButtonMessage(promptCardQuestion(prompt, b.buttons), b.buttons, b.mode, plain, html);
       if (sent != null) return;
     }
   }
@@ -9301,7 +9301,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           options.modelOptions.map(o => `${o.label}: /model ${o.value}`).join('\n') +
           (metadata.modelsError ? `\n\n${metadata.modelsError}\nYou can still type /model <model-id>.` : '');
         if (session.sendButtonMessage) {
-          session.sendButtonMessage('Codex model', options.modelOptions.map((o, i) => ({
+          session.sendButtonMessage(codexModelCardQuestion(options, metadata), options.modelOptions.map((o, i) => ({
             id: `codex-model-${i}`, label: o.label, value: `model:${o.value}`,
           })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
         } else await sendReply(plain);
@@ -9315,7 +9315,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
           const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
             `<br/><br/>Tap a model to switch, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
-          session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
+          session.sendButtonMessage(`${currentLine}${extra}`, buttons, 'pick_one', plain, html);
         } else {
           await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
         }
@@ -9325,7 +9325,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
         const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
           `<br/><br/>Tap a model to switch (restarts to apply), or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
-        session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
+        session.sendButtonMessage(`${currentLine}${extra}`, buttons, 'pick_one', plain, html);
       } else {
         await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (restarts to apply). Options: ${VALID_ALIAS_HINT}.`);
       }
@@ -9509,7 +9509,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           const plain = `Codex effort: ${options.effort || 'config default'}\n\n` +
             options.effortLevels.map(o => `/effort ${o.value}`).join('\n');
           if (session.sendButtonMessage) {
-            session.sendButtonMessage('Codex effort', options.effortLevels.map((o, i) => ({
+            session.sendButtonMessage(codexEffortCardQuestion(options), options.effortLevels.map((o, i) => ({
               id: `codex-effort-${i}`, label: o.label, value: `effort:${o.value}`,
             })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
           } else await sendReply(plain);
