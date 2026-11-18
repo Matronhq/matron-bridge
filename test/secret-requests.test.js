@@ -729,6 +729,22 @@ describe('orphaned secret files', () => {
     expect(h.removed).toEqual(['/tmp/secrets/3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt']);
   });
 
+  it('sweeps its own files when the lister returns Windows paths', async () => {
+    const dir = 'C:\\Users\\alice\\.secrets\\';
+    const h = makeHarness({
+      startAt: 10_000_000,
+      fileTtlMs: 3600_000,
+      listSecretFiles: () => [
+        { path: `${dir}11111111-1111-4111-8111-111111111111.txt`, mtimeMs: 1 },
+        { path: `${dir}aws-prod.txt`, mtimeMs: 1 },
+        { path: `${dir}33333333-3333-4333-8333-333333333333.txt`, mtimeMs: 10_000_000 - 600_000 },
+      ],
+    });
+    h.store.init();
+    expect(h.removed).toEqual([`${dir}11111111-1111-4111-8111-111111111111.txt`]);
+    expect(h.scheduler.only().delay).toBe(3600_000 - 600_000);
+  });
+
   it('isOwnSecretFileName accepts exactly <uuid>.txt', () => {
     expect(isOwnSecretFileName('3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt')).toBe(true);
     expect(isOwnSecretFileName('3F2504E0-4F89-11D3-9A0C-0305E82C3301.txt')).toBe(true);
