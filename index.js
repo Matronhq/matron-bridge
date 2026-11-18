@@ -11733,10 +11733,25 @@ function startCodeUpdateWatcher() {
     // turn always holds the update unless forcing is explicitly enabled.
     busySessions: () => sessionsHoldingRestart().holders.length,
     preflight: () => defaultPreflight(__dirname),
-    // Optional advisory hook; unset = no gate. Never consulted for a forced
-    // restart, and never by restart_session or the other operator restarts,
-    // which do not go through this watcher.
+    // Optional hook; unset = no gate. Never consulted for a forced restart.
+    // POST /restart and deploy.sh --when-quiet go through this watcher and
+    // are held by the gate like an update; POST /restart with { "force": true }
+    // skips it. restart_session and the other operator restarts do not go
+    // through this watcher.
     gate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
+    // Opt-in: a hold that never lapses (0) and a gate that fails closed.
+    // Unset keeps the advisory behaviour. Digits only: "0s" or "8h" would
+    // otherwise parse as 0 (never lapse) or 8 ms.
+    gateMaxMs: /^\d+$/.test(String(process.env.MATRON_RESTART_GATE_MAX_HOLD_MS ?? '').trim())
+      ? parseCodeUpdateMsOrOff(String(process.env.MATRON_RESTART_GATE_MAX_HOLD_MS).trim(), undefined)
+      : undefined,
+    // A long hold under the opt-in modes is reported to the bridge's own chat
+    // after MATRON_RESTART_GATE_NOTICE_AFTER_MS (digits only; default 30 min).
+    gateNoticeAfterMs: /^[1-9]\d*$/.test(String(process.env.MATRON_RESTART_GATE_NOTICE_AFTER_MS ?? '').trim())
+      ? Number(String(process.env.MATRON_RESTART_GATE_NOTICE_AFTER_MS).trim())
+      : undefined,
+    notify: (text) => { try { journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, `⚠️ ${text}`); } catch { /* a notice must never break the watcher */ } },
+    gateOnError: String(process.env.MATRON_RESTART_GATE_ON_ERROR || '').trim().toLowerCase() === 'hold' ? 'hold' : 'safe',
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
