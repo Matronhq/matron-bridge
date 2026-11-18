@@ -279,12 +279,14 @@ preflight the deploy scripts run, and then exits for the supervisor to
 relaunch it at the first poll where no session has work in flight: a turn
 running, a background job (shell, monitor) still alive under the session's
 agent process, a subagent running, or a session waiting for a person's answer.
-A running turn always holds the update. Background jobs, subagents and
-pending answers share the idle reaper's eight-hour cap from the session's
-last activity, so a stuck background job cannot
-defer updates forever. If the process table cannot be read, running turns,
-subagents and pending answers still hold the update, with the cap applying
-to subagents and pending answers. While waiting,
+A running turn always holds the update. Input queued for delivery (queued
+messages, the resume outbox, or waiting for input readiness) also holds the
+restart. Background jobs, subagents, pending answers and queued input share the
+idle reaper's eight-hour cap from the session's last activity, so a stuck
+background job cannot defer updates forever. If the process table cannot be
+read, running turns, subagents, pending answers and queued input still hold the
+update, with the cap applying to subagents, pending answers and queued input.
+While waiting,
 the bridge logs a warning every 30 minutes. A box that would rather force
 the restart after a while sets
 `MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
