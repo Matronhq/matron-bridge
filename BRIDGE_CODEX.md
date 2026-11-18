@@ -28,9 +28,10 @@ Use the Matron `ask-user` MCP server:
 
 - `request_secret` opens a secure input form. It does not block: it files a question in the user's tracker (their For you list), posts the link in chat, and returns a request number immediately. The user has 24 hours, and the submission arrives as a turn naming the local file to read — do not poll. Use `multiline: true` for PEM keys, certificates and JSON key files. The 24 h link sits in the item body, so anyone who can read the tracker can submit before the user does; it dies on the first submission or at expiry. Always supply `context`: a non-secret explanation of the related task (with a link when available), why the credential is needed, and the exact permissions/resource scope, or why scope is not applicable. Requests are often read outside the conversation, so this explanation appears on the tracker card, chat notice and secure form. Use plain text up to 2,000 characters; any task URLs are shown literally. The bridge adds the originating conversation link from session state, separately from your unverified explanation. A new request requires a journal conversation; do not supply a substitute source URL. Existing pending requests remain usable.
 - `share_sensitive_data` shares sensitive output through a secure one-time viewer link.
-- `redact_message` removes accidentally posted sensitive data from a bridge message.
 - `send_attachment` delivers an ordinary file to the conversation, or an explicitly selected agent chat room (see "Agent chat" for files sent to another session).
 - `share_html_page` returns a signed link (7 days by default, up to 30) that renders one self-contained `.html` file from the workdir as a sandboxed web page — for reports and demo packs the user should open in a browser rather than download.
+
+You cannot remove a message once it is in the chat. If you post a secret by mistake, tell the user at once so they can rotate it.
 
 If the secure viewer is unconfigured, explain that it needs `HMAC_SECRET` and a public `VIEWER_BASE_URL`; never substitute plaintext chat. If tools are disabled in Plan mode, wait for the user to leave Plan mode before requesting a secret.
 

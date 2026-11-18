@@ -183,6 +183,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
+import { stopSessionAndConfirm } from './lib/stop-command.js';
 import { sendPrintInterrupt, applyInterruptAck } from './lib/print-interrupt.js';
 import {
   checkFileLink,
@@ -3703,7 +3704,7 @@ function dispatchDeferredCommand(session) {
   if (!session.alive || sessions.get(session.roomId) !== session) return false;
   const ctx = journalSessionCommandCtx(session);
   session._replayingDeferred = true;
-  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).finally(() => {
+  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml).finally(() => {
     session._replayingDeferred = false;
   }).catch((err) => {
     // The command failed, so nothing is pending any more. For a self-restart
@@ -8139,7 +8140,7 @@ async function fileWorktreeConsentCard(session, started) {
   try { session.sendCallback?.('Could not file the approval card for the worktree setup script, so it did not run.'); } catch { /* best effort */ }
 }
 
-async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
+async function handleCommand(roomId, text, sendReply, sendHtml) {
   const nativeSession = sessions.get(roomId);
   if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
   const parts = text.split(/\s+/);
@@ -8155,11 +8156,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
   switch (cmd) {
     case '!start': {
-      if (!sender) {
-        await sendReply('Cannot determine sender. Please try again.');
-        return;
-      }
-
       const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass, KNOWN_MCP_EXTRAS);
       const agentFlags = extractAgentFlag(afterMcp);
@@ -8298,12 +8294,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // path has no busy = false for print/iv), so it is invisible to a
       // `session.busy = false` grep.
       inflightMarker.noteTurnEnd(journalConvoIdFor(session));
-      killSession(session);
-      sessions.delete(roomId);
-      journalSessionState(session, 'done');
-      journalActivity(session, 'idle');
-      journalEvictConvoInput(session);
-      await sendReply('Session stopped.');
+      await stopSessionAndConfirm({
+        sessions,
+        roomId,
+        kill: () => killSession(session),
+        settle: () => {
+          journalSessionState(session, 'done');
+          journalActivity(session, 'idle');
+          journalEvictConvoInput(session);
+        },
+        sendReply,
+      });
       break;
     }
 
@@ -8411,11 +8412,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     }
 
     case '!resume': {
-      if (!sender) {
-        await sendReply('Cannot determine sender. Please try again.');
-        return;
-      }
-
       const { bypass: resumeBypass, rest: resumeAfterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(resumeAfterBypass, KNOWN_MCP_EXTRAS);
       const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
@@ -8457,7 +8453,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
         // No arg — show sessions list inline
         const flag = resumeAgentFlags.agent ? ` --${resumeAgentFlags.agent}` : '';
-        await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml, sender);
+        await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml);
         return;
       }
 
@@ -8758,11 +8754,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     }
 
     case '!workdir': {
-      if (!sender) {
-        await sendReply('Cannot determine sender. Please try again.');
-        return;
-      }
-
       const { bypass: workdirBypass, rest: workdirAfterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(workdirAfterBypass, KNOWN_MCP_EXTRAS);
       const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
@@ -9839,16 +9830,11 @@ function journalEchoToRoom(session, plain, html) {
 
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
 // replies go through the NORMAL sendToRoom for the session's room id,
-// which publishes them into the session's journal convo. `sender` is who
-// a command like !start/!resume/!workdir invites into any NEW room it
-// creates; the bridge is single-user, so ALLOWED_USER_IDS[0] is the only
-// sane choice — the same assumption journalHandleControlCommand's
-// control-convo dispatch makes below.
+// which publishes them into the session's journal convo.
 function journalSessionCommandCtx(session) {
   return {
     sendReply: (reply) => sendToRoom(session.roomId, reply, markdownToHtml(reply)),
     sendHtml: (plainText, html) => sendToRoom(session.roomId, plainText, html),
-    sender: ALLOWED_USER_IDS[0],
   };
 }
 
@@ -9937,7 +9923,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     flushCursor: () => journalPublisher.flushCursor(),
     runBridgeCommand: (normalizedCommand) => {
       const ctx = journalSessionCommandCtx(session);
-      return handleCommand(session.roomId, normalizedCommand, ctx.sendReply, ctx.sendHtml, ctx.sender);
+      return handleCommand(session.roomId, normalizedCommand, ctx.sendReply, ctx.sendHtml);
     },
     // Safety net for JOURNAL_UNAVAILABLE_COMMANDS (currently empty — see
     // that constant's comment in lib/command-dispatch.js for the mapping):
@@ -10951,14 +10937,13 @@ async function journalHandleControlCommand(body) {
   }
 
   const { cmd, normalizedText } = decision;
-  const sender = ALLOWED_USER_IDS[0];
 
   if (cmd === 'help') {
     // handleCommand's '!help' calls sendHtml(plain, html) — intercept so we
     // can append the Matron-specific note to the SAME real help text
     // instead of re-deriving/duplicating it.
     await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
-      (plainText) => reply(plainText + JOURNAL_CONTROL_HELP_NOTE), sender);
+      (plainText) => reply(plainText + JOURNAL_CONTROL_HELP_NOTE));
     return;
   }
 
@@ -10966,7 +10951,7 @@ async function journalHandleControlCommand(body) {
   // sendHtml (the control convo has no HTML rendering — same choice
   // journalPublishNotice/journalEchoToRoom's callers make elsewhere).
   await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
-    (plainText) => reply(plainText), sender);
+    (plainText) => reply(plainText));
 }
 
 // The default resume announcement, in the voice of the path that produced
@@ -11401,7 +11386,7 @@ function cancelSleepFromButton(session, sendReply) {
 // gate so the !login handler's own "no active session" reply speaks instead.
 function startLoginFromButton(session, sendReply) {
   const ctx = journalSessionCommandCtx(session);
-  return handleCommand(session.roomId, '!login', sendReply, ctx.sendHtml, ctx.sender);
+  return handleCommand(session.roomId, '!login', sendReply, ctx.sendHtml);
 }
 
 // The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
@@ -14954,15 +14939,6 @@ const apiServer = createServer(async (req, res) => {
           // should surface this so a wrong-but-live room is caught at once.
           notified: target.description,
         }));
-        return;
-      }
-
-      if (url.pathname === '/redact-message') {
-        // The journal has no message redaction, so this endpoint reports
-        // unsupported instead of acting. The ask-user redact_message MCP
-        // tool (ask-user.js) surfaces this text back to Claude.
-        res.writeHead(501, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Message redaction is not supported: the bridge is journal-only and has no message-redaction capability.' }));
         return;
       }
 
