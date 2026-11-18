@@ -5134,6 +5134,8 @@ function setupSubagentWatcher(session, workdir, sessionId) {
     getParentModel: () => session.currentModel || session.initData?.model,
     getParentWindow: () => contextWindowForSession(session),
     runningStore: subagentRunningStore,
+    // A finished child's transcript stops being polled after a grace period.
+    onChildFinished: agentId => session.subagentWatcher?.noteAgentFinished(agentId),
     log: console,
   });
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
