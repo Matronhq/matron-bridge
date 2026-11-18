@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// MCP server providing secure-input tools: request_secret, share_sensitive_data, redact_message.
+// MCP server providing secure-input tools (request_secret, share_sensitive_data) and the bridge's other agent tools.
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -211,38 +211,6 @@ server.tool(
         content: [{
           type: 'text',
           text: `Secure link created for "${label}":\n${url}\n\nThis link expires at ${new Date(expiresAt).toISOString()} and ${usage}.${notice}`
-        }]
-      };
-    } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
-    }
-  }
-);
-
-server.tool(
-  'redact_message',
-  'Redact (delete) a message that was sent by the bridge to the user in the Matron chat. Use this to remove sensitive information that was accidentally posted. Note: Only messages sent by the bridge bot can be redacted.',
-  {
-    eventId: z.string().describe('The event ID of the message to redact'),
-    reason: z.string().optional().describe('Optional reason for redacting the message'),
-  },
-  async ({ eventId, reason }) => {
-    try {
-      const postRes = await bridgeFetch(`${BRIDGE_API}/redact-message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, eventId, reason }),
-      });
-
-      if (!postRes.ok) {
-        const err = await postRes.text();
-        return { content: [{ type: 'text', text: `Error redacting message: ${err}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: `Message ${eventId} has been redacted.${reason ? ` Reason: ${reason}` : ''}`
         }]
       };
     } catch (err) {
