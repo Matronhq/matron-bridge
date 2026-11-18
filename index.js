@@ -6258,7 +6258,7 @@ function handleClaudeEvent(session, event) {
             if (!session.iv) session.slowToolNotices?.toolEnded(block.tool_use_id);
             // A Task tool_result means the subagent it spawned has completed —
             // finish that child convo (no-op for every non-Task tool_result).
-            session.subagentConvos?.noteTaskResult(block.tool_use_id);
+            session.subagentConvos?.noteTaskResult(block.tool_use_id, { failed: block.is_error === true });
             const entry = liveOutputStore.get(block.tool_use_id);
             // Only pay for the blockText join + three regex scans below when
             // something will actually consume the result: either the
