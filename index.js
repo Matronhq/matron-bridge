@@ -210,7 +210,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
-import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap, scopedQueueRelease } from './lib/busy-queue.js';
 import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
@@ -6189,7 +6189,7 @@ function handleClaudeEvent(session, event) {
             if (!session.iv) session.slowToolNotices?.toolEnded(block.tool_use_id);
             // A Task tool_result means the subagent it spawned has completed —
             // finish that child convo (no-op for every non-Task tool_result).
-            session.subagentConvos?.noteTaskResult(block.tool_use_id);
+            session.subagentConvos?.noteTaskResult(block.tool_use_id, { failed: block.is_error === true });
             const entry = liveOutputStore.get(block.tool_use_id);
             // Only pay for the blockText join + three regex scans below when
             // something will actually consume the result: either the
@@ -7213,13 +7213,7 @@ function pendingFlushBatch(session) {
 }
 
 function queueReleaseForBatch(session, queued) {
-  const itemIds = queuedReleaseItemIds(session, queued);
-  return {
-    listLive: (convoId) => liveQueuedReleaseEntries(convoId, itemIds),
-    dropItem: (convoId, itemId) => {
-      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-    },
-  };
+  return scopedQueueRelease(journalInputConsumer.queueRelease, queuedReleaseItemIds(session, queued));
 }
 
 // action: 'send' for a batch that went out; 'expired' for one dropped
