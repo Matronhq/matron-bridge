@@ -68,7 +68,7 @@ Prefer to configure by hand (or provisioning non-interactively)?
 
 ```bash
 cp .env.example .env
-# Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, and HMAC_SECRET (openssl rand -hex 32) for file/secret links
+# Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), and HMAC_SECRET (openssl rand -hex 32) for file/secret links
 ```
 
 ### Enable Codex
@@ -180,8 +180,14 @@ setup\service.ps1       # registers two Scheduled Tasks at logon and starts them
 The tasks (`\Matron\matron-bridge` and `\Matron\matron-bridge-viewer`) run in
 your **desktop session**, so a Claude session on that box can drive GUI
 applications; the flip side is that the bridge only runs while you are logged
-on. For an unattended machine, configure auto-logon. `index.js` loads `.env`
-itself, so after editing `.env` just run `.\restart.ps1`.
+on. For an unattended machine, configure auto-logon. After editing `.env`, run
+`.\restart.ps1` for the bridge. It does not restart the viewer task, so restart
+that too:
+
+```powershell
+Stop-ScheduledTask -TaskPath '\Matron\' -TaskName matron-bridge-viewer
+Start-ScheduledTask -TaskPath '\Matron\' -TaskName matron-bridge-viewer
+```
 
 Print mode (the default) is the supported session mode on Windows.
 `/mode interactive` (interactive TUI mode) runs through ConPTY, which
@@ -336,7 +342,7 @@ that POST instead of restarting at once.
 
 | Variable | Description | Default |
 |---|---|---|
-| `ALLOWED_USER_IDS` | Comma-separated allowlist of authorized user identities for this bridge (its sender label for journal-originated session commands) | `""` (any user) |
+| `ALLOWED_USER_IDS` | Informational: your user name on the journal, shown in the startup log. The bridge does not filter messages by it; the journal decides who can reach this bridge's conversations | `""` |
 | `DEFAULT_WORKDIR` | Default working directory for coding-agent sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `MATRON_DEFAULT_AGENT` | Default coding agent (`claude` or `codex`) for new sessions; override per command with `--claude` / `--codex`. The box's own default set in the apps (Settings ▸ Devices, journal `PUT /devices/:id/defaults`, or the `box_defaults_set` tool) takes precedence | `claude` |
 | `MATRON_DEFAULT_MODEL` | Claude model for fresh starts when none is picked (New Chat picker, `/start` without `--model`); an alias such as `fable`, `opus`, `sonnet` or a full `claude-*` name. The `default` alias resolves to this too. Resumed rooms keep their own model. The box's own default model (Settings ▸ Devices, when Claude is its default agent) and then the user's own default model (Settings in the apps, journal `GET /defaults`) take precedence when this box can run them. Claude only; the effective default is reported to the picker as `default_model`. | `fable` |
