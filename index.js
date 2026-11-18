@@ -15072,15 +15072,6 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      if (url.pathname === '/redact-message') {
-        // The journal has no message redaction, so this endpoint reports
-        // unsupported instead of acting. The ask-user redact_message MCP
-        // tool (ask-user.js) surfaces this text back to Claude.
-        res.writeHead(501, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Message redaction is not supported: the bridge is journal-only and has no message-redaction capability.' }));
-        return;
-      }
-
       if (url.pathname === '/send') {
         const { roomId, message } = data;
         if (!roomId || !message) {
