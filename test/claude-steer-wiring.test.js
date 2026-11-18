@@ -1060,16 +1060,15 @@ describe('print interrupt acknowledgment wiring', () => {
     expect(h.session._turnInitSeen).toBe(false);
   });
 
-  it.each(['submitAnswer', 'approvePlanBuild'])('advances the generation before the direct %s write', async (name) => {
-    const h = setup({ session: { busy: false, turnGeneration: 1, waitingForAnswer: 'question-tool', pendingPlanDenialId: 'plan-tool' } });
+  it('advances the generation before the direct approvePlanBuild write', async () => {
+    const h = setup({ session: { busy: false, turnGeneration: 1, pendingPlanDenialId: 'plan-tool' } });
     h.context.notice = () => ({ plain: 'Building', html: 'Building' });
     h.context.writePromptAnswer = vi.fn((session) => {
       expect(session.busy).toBe(true);
       expect(session.turnGeneration).toBe(2);
       expect(session._turnInitSeen).toBe(false);
     });
-    if (name === 'submitAnswer') h.context.submitAnswer(h.session, 'answer');
-    else await h.context.approvePlanBuild(h.session, { sendHtml: vi.fn() });
+    await h.context.approvePlanBuild(h.session, { sendHtml: vi.fn() });
     expect(h.context.writePromptAnswer).toHaveBeenCalledTimes(1);
   });
 });

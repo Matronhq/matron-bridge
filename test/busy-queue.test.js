@@ -1697,7 +1697,7 @@ describe('queued-release publisher wiring', () => {
       // Write-ahead persisted a `pending` record keyed (promptId, itemId, action)
       // BEFORE the publish.
       expect(put).toHaveBeenCalledTimes(1);
-      expect(put).toHaveBeenCalledWith('pr_123 pr_123::0 cancel', expect.objectContaining({
+      expect(put).toHaveBeenCalledWith('pr_123\u0000pr_123::0\u0000cancel', expect.objectContaining({
         convoId: 'convo-1',
         promptId: 'pr_123',
         itemId: 'pr_123::0',
@@ -1711,7 +1711,7 @@ describe('queued-release publisher wiring', () => {
         action: 'cancel',
         released: ['pr_123::0'],
         at: 1_722_000_000_000,
-      }, { idemKey: 'qr pr_123 pr_123::0 cancel' });
+      }, { idemKey: 'qr\u0000pr_123\u0000pr_123::0\u0000cancel' });
     } finally {
       now.mockRestore();
     }
