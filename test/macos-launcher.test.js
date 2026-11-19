@@ -172,9 +172,15 @@ describe.runIf(process.platform !== 'win32')('setup/service-macos.sh without nod
       fs.mkdirSync(path.join(dir, 'setup'));
       fs.copyFileSync(path.join(root, 'setup/service-macos.sh'), path.join(dir, 'setup/service-macos.sh'));
       fs.writeFileSync(path.join(dir, '.env'), 'EXAMPLE_SETTING=on\n');
-      const res = spawnSync('bash', [path.join(dir, 'setup/service-macos.sh')], {
+      // A PATH holding only dirname, the one external command the script runs
+      // before its node check, so node is missing wherever it is installed.
+      const bin = path.join(dir, 'bin');
+      fs.mkdirSync(bin);
+      fs.symlinkSync(spawnSync('bash', ['-c', 'command -v dirname'], { encoding: 'utf8' }).stdout.trim(), path.join(bin, 'dirname'));
+      const bash = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
+      const res = spawnSync(bash, [path.join(dir, 'setup/service-macos.sh')], {
         encoding: 'utf8',
-        env: { PATH: '/usr/bin:/bin', HOME: dir, MATRON_SERVICE_WRITE_ONLY: path.join(dir, 'out') },
+        env: { PATH: bin, HOME: dir, MATRON_SERVICE_WRITE_ONLY: path.join(dir, 'out') },
       });
       expect(res.status).toBe(1);
       expect(res.stderr).toMatch(/node not found/);
