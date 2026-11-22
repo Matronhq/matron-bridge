@@ -129,3 +129,20 @@ describe('item_get for a multi-select question', () => {
     expect(text).toContain('[tapped "Docs", "Billing"]');
   });
 });
+
+describe('older journals and idempotency', () => {
+  it('turns an old journal\'s invalid_actions on a multi-select write into a plain reason', async () => {
+    const { h } = fixture({ create: vi.fn(async () => ({ status: 400, data: { error: 'invalid_actions' } })) });
+    const r = await h.create({ roomId: '!r:s', kind: 'question', title: 'Q', actions: Array.from({ length: 6 }, (_, i) => `Option ${i}`), multi_select: true });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/does not support multi_select/);
+  });
+
+  it('multi_select changes the idempotency key; leaving it out keeps the old key', async () => {
+    const { itemIdemKey } = await import('../lib/missions-idem.js');
+    const base = { op: 'item_create', roomId: '!r:s', now: 0, args: { kind: 'question', title: 'Q', actions: OPTIONS } };
+    const one = itemIdemKey(base);
+    expect(itemIdemKey({ ...base, args: { ...base.args, multi_select: true } })).not.toBe(one);
+    expect(itemIdemKey({ ...base, args: { ...base.args, multi_select: false } })).toBe(one);
+  });
+});
