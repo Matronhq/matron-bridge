@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApprovalFiles } from '../lib/approval-files.js';
+import { createApprovalFiles, defaultApprovalFilesDir } from '../lib/approval-files.js';
 import { createItemsHandlers } from '../lib/items-tools.js';
 import { formatItemDetail } from '../lib/items-format.js';
 
@@ -68,6 +68,14 @@ describe.skipIf(!posix)('approval files', () => {
 
     const mine = path.join(root, 'mine');
     expect(createApprovalFiles({ dir: mine, uid: process.getuid() + 1, log: quiet }).save(12, tap())).toBeNull();
+  });
+});
+
+describe('the default directory', () => {
+  it('is under /tmp wherever there are user ids, never a per-user temp folder', () => {
+    const os = { tmpdir: () => '/var/folders/xy/T' };
+    expect(defaultApprovalFilesDir({ os, uid: 501 })).toBe(path.join('/tmp', 'matron-approvals-501'));
+    expect(defaultApprovalFilesDir({ os, uid: null })).toBe(path.join('/var/folders/xy/T', 'matron-approvals-user'));
   });
 });
 
