@@ -72,6 +72,7 @@ The journal has a full-text search API over every one of the user's conversation
 - If `MATRON_JOURNAL_PROXY_HEADER_FILE` is empty or unset, the bridge could not set up the proxy and journal search is unavailable in this session: say so once rather than retrying or looking for a token.
 - `GET /journal/search?q=<url-encoded terms>&limit=<n>&convo_id=<id>` → `{hits: [{convo_id, title, seq, ts, sender, snippet, live}]}`. Terms are ANDed literals, ranked best-match first; `limit` defaults to 20 and clamps at 50. `live: true` means that conversation's agent is running now. Only prose is indexed.
 - `GET /journal/convo/:id/messages?around_seq=<seq>&limit=<n>` — context around a hit, on any of the user's conversations (foreign reads return prose only, `limit` clamped to 30). The spec is `docs/protocol.md` in matron-journal.
+- Your own conversation id is in `$MATRON_CONVO_ID`, so a command you run can tell which conversation it came from. Treat it as a label: use it to sort or mark results, never to decide whether something is allowed.
 - Use `curl`; the proxy is plain loopback HTTP. Pace request bursts: the journal's rate limiter still applies to forwarded requests.
 
 ## Tasks & decisions (`/items` HTTP API)
