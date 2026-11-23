@@ -14,7 +14,9 @@ let root;
 beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'approval-files-')); });
 afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
-describe('approval files', () => {
+const posix = typeof process.getuid === 'function';
+
+describe.skipIf(!posix)('approval files', () => {
   it('writes exactly the stored statement and signature, readable by others, in a directory they cannot list', () => {
     const dir = path.join(root, 'a');
     const files = createApprovalFiles({ dir, log: quiet });
@@ -69,7 +71,15 @@ describe('approval files', () => {
   });
 });
 
-describe('item_get saves each signed tap', () => {
+describe('approval files without user ids', () => {
+  it('saves nothing', () => {
+    const files = createApprovalFiles({ dir: path.join(root, 'w'), uid: null, log: quiet });
+    expect(files.save(12, tap())).toBeNull();
+    expect(fs.existsSync(path.join(root, 'w'))).toBe(false);
+  });
+});
+
+describe.skipIf(!posix)('item_get saves each signed tap', () => {
   const data = () => ({
     item: { id: 'it_1', num: 12, title: 'Converge?', state: 'open' },
     comments: [tap(), { id: 'ic_10', author: 'user', created_at: 1790000000001, body: 'typed' }],
