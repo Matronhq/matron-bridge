@@ -19,6 +19,7 @@ import { createShortLinkWriter, shortenViewerUrl, shortLinksEnabled, shortLinksF
 import { createItemsClient } from './lib/items-client.js';
 import { readApprovalConfig } from './lib/approval-config.js';
 import { createApprovalGate } from './lib/approval-gate.js';
+import { createApprovalFiles, defaultApprovalFilesDir } from './lib/approval-files.js';
 import { createApprovalPaths } from './lib/approval-paths.js';
 import { createBoxLock } from './lib/box-lock.js';
 import { createAccountLock, ACCOUNT_LOCKED_LINE } from './lib/account-lock.js';
@@ -1163,6 +1164,7 @@ function outsideWorkRefused() {
 }
 // A signed tap on a tracker item, checked against the pinned keys so the
 // agent is told whether it verified on this box. null with the gate off.
+const approvalFiles = createApprovalFiles({ dir: process.env.MATRON_APPROVAL_FILES_DIR || defaultApprovalFilesDir(), log: console });
 const tapVerifier = createTapVerifier({ gate: approvalGate, getItem: (id) => itemsClient.getAsStored(id) });
 
 const trackerUrlBaseNow = () => trackerUrlBase({ httpBase: journalHttpBase, userName: journalIdentity.name() });
@@ -13189,6 +13191,8 @@ const itemsHandlers = createItemsHandlers({
   // MATRON_STEP_UP_ALL=1: every question this box files needs a signed tap.
   stepUpAll: APPROVAL_CONFIG.stepUpAll,
   verifyTap: tapVerifier ? (thread, comment) => tapVerifier.forThread(thread, comment) : null,
+  // Signed taps saved as files for the commands that check them.
+  saveApproval: (itemNum, comment) => approvalFiles.save(itemNum, comment),
 });
 
 const missionsHandlers = createMissionsHandlers({
