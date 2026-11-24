@@ -82,4 +82,34 @@ describe('Claude setup', () => {
     expect(await f.setup.request(1, { action: 'start' })).toEqual({ state: 'failed' });
     expect(await f.setup.request(0, { action: 'start' })).toEqual({ state: 'refused' });
   });
+  it('lets a rejected code be corrected in the same flow', async () => {
+    const f = fixture();
+    const first = await f.setup.request(1, { action: 'start' });
+    f.data(url + '\n');
+    await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-wrong-code' });
+    f.data("That code wasn't accepted. Make sure the full code was copied.\nPaste code here:");
+    expect(await f.setup.request(1, { flow_id: first.flow_id })).toMatchObject({ state: 'invalid_code' });
+    await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-correct-code' });
+    expect(f.proc.write).toHaveBeenLastCalledWith('synthetic-correct-code\r');
+    expect(f.launch).toHaveBeenCalledTimes(1);
+  });
+  it('stops a login on disposal and refuses another start', async () => {
+    const f = fixture();
+    await f.setup.request(1, { action: 'start' });
+    f.setup.dispose();
+    expect(f.proc.kill).toHaveBeenCalledTimes(1);
+    expect(await f.setup.request(1, { action: 'start' })).toEqual({ state: 'unavailable' });
+    expect(f.launch).toHaveBeenCalledTimes(1);
+  });
+  it('also kills a process whose spawn finishes after shutdown', async () => {
+    let release;
+    const f = fixture();
+    f.launch.mockImplementation(() => new Promise(resolve => { release = resolve; }));
+    const pending = f.setup.request(1, { action: 'start' });
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    f.setup.dispose();
+    release(f.proc);
+    expect(await pending).toEqual({ state: 'unavailable' });
+    expect(f.proc.kill).toHaveBeenCalledTimes(1);
+  });
 });

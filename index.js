@@ -1864,8 +1864,9 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
 const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
 
 
+const claudeSetup = createClaudeSetup();
 const journalRpcHandler = createRpcRequestHandler({
-  claudeSetup: createClaudeSetup(),
+  claudeSetup,
   plugins: bridgePlugins,
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
@@ -16036,6 +16037,7 @@ let shuttingDown = false;
 async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
+  claudeSetup.dispose();
   if (signal === 'SIGINT') console.log('\nShutting down...');
   if (_boxStatusRepublishHandle) { clearInterval(_boxStatusRepublishHandle); _boxStatusRepublishHandle = null; }
   // Everything is inside try/finally so a throw from ANY step (sampler, session
