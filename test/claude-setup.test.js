@@ -83,15 +83,50 @@ describe('Claude setup', () => {
     expect(await f.setup.request(0, { action: 'start' })).toEqual({ state: 'refused' });
   });
   it('lets a rejected code be corrected in the same flow', async () => {
+    vi.useFakeTimers();
     const f = fixture();
     const first = await f.setup.request(1, { action: 'start' });
     f.data(url + '\n');
     await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-wrong-code' });
-    f.data("That code wasn't accepted. Make sure the full code was copied.\nPaste code here:");
+    f.data("Paste code here:\nThat code wasn't accepted. Make sure the full code was copied.");
+    await vi.advanceTimersByTimeAsync(101);
     expect(await f.setup.request(1, { flow_id: first.flow_id })).toMatchObject({ state: 'invalid_code' });
     await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-correct-code' });
     expect(f.proc.write).toHaveBeenLastCalledWith('synthetic-correct-code\r');
     expect(f.launch).toHaveBeenCalledTimes(1);
+  });
+  it('keeps a rejection visible when the terminal repaints its old URL', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const first = await f.setup.request(1, { action: 'start' });
+    f.data(url + '\n');
+    await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-wrong-code' });
+    f.data("Invalid code. Please make sure the full code was copied.");
+    await vi.advanceTimersByTimeAsync(101);
+    f.data(url + '\nPaste code here:');
+    const result = await f.setup.request(1, { flow_id: first.flow_id });
+    expect(result.state).toBe('invalid_code');
+    expect(result.authorization_url).toBeUndefined();
+  });
+  it('ignores a stale rejection above a fresh prompt after a corrected submission', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const first = await f.setup.request(1, { action: 'start' });
+    f.data(url + '\n');
+    await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-wrong-code' });
+    f.data("That code wasn't accepted.");
+    await vi.advanceTimersByTimeAsync(101);
+    await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-correct-code' });
+    f.data("That code wasn't accepted.\n");
+    await vi.advanceTimersByTimeAsync(30);
+    f.data(url + '\nPaste code here:');
+    await vi.advanceTimersByTimeAsync(101);
+    expect(await f.setup.request(1, { flow_id: first.flow_id })).toMatchObject({ state: 'checking' });
+    await f.setup.request(1, { action: 'submit', flow_id: first.flow_id, code: 'synthetic-extra-code' });
+    expect(f.proc.write).toHaveBeenCalledTimes(2);
+    f.readConnection.mockResolvedValue({ state: 'connected' });
+    await f.exit();
+    expect(await f.setup.request(1, { flow_id: first.flow_id })).toEqual({ state: 'connected' });
   });
   it('stops a login on disposal and refuses another start', async () => {
     const f = fixture();
