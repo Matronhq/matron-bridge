@@ -203,6 +203,7 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { createClaudeSetup } from './lib/claude-setup.js';
 import { loadBridgePlugins } from './lib/bridge-plugins.js';
 import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
@@ -1863,7 +1864,9 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
 const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
 
 
+const claudeSetup = createClaudeSetup();
 const journalRpcHandler = createRpcRequestHandler({
+  claudeSetup,
   plugins: bridgePlugins,
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
@@ -16034,6 +16037,7 @@ let shuttingDown = false;
 async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
+  claudeSetup.dispose();
   if (signal === 'SIGINT') console.log('\nShutting down...');
   if (_boxStatusRepublishHandle) { clearInterval(_boxStatusRepublishHandle); _boxStatusRepublishHandle = null; }
   // Everything is inside try/finally so a throw from ANY step (sampler, session
