@@ -203,6 +203,7 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { createClaudeSetup } from './lib/claude-setup.js';
 import { loadBridgePlugins } from './lib/bridge-plugins.js';
 import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
@@ -1864,6 +1865,7 @@ const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: jour
 
 
 const journalRpcHandler = createRpcRequestHandler({
+  claudeSetup: createClaudeSetup(),
   plugins: bridgePlugins,
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,

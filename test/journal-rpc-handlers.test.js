@@ -25,6 +25,28 @@ function harness(overrides = {}) {
   return { handler, responses };
 }
 
+describe('claude_setup', () => {
+  it('forwards only the caller device and replies with sanitized setup state', async () => {
+    const request = vi.fn(async () => ({ state: 'waiting', flow_id: 'fixture' }));
+    const { handler, responses } = harness({ claudeSetup: { request } });
+    handler(REQ('claude_setup', { action: 'start' }));
+    await vi.waitFor(() => expect(responses).toHaveLength(1));
+    expect(request).toHaveBeenCalledWith(7, { action: 'start' });
+    expect(responses[0]).toMatchObject({ ok: true, result: { state: 'waiting' } });
+  });
+  it.each([
+    [{ accountLocked: () => true }, 'account_locked'],
+    [{ boxLock: { report: () => ({ on: true }) } }, 'box_locked'],
+    [{ boxLock: { report: () => ({ on: false }), inLockdown: () => true } }, 'box_locked'],
+  ])('refuses provider login when locked', async (options, code) => {
+    const request = vi.fn();
+    const { handler, responses } = harness({ claudeSetup: { request }, ...options });
+    handler(REQ('claude_setup', { action: 'start' }));
+    expect(responses[0]).toMatchObject({ ok: false, error: { code } });
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
 describe('recent_folders', () => {
   it('dedupes by workdir keeping max lastUsed, sorts newest-first, caps at 20, appends default', () => {
     const records = [];
