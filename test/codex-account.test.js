@@ -137,4 +137,25 @@ describe('Codex account metadata', () => {
     expect(applyModelSwitch).toHaveBeenCalledTimes(1);
     expect(switchEffortInSession).toHaveBeenCalledTimes(1);
   });
+
+  it('adds DeepSeek models to the picker only when a DeepInfra key is configured', () => {
+    const session = { agent: 'codex', codex: { model: 'gpt-test' }, _codexMetadata: { models } };
+    const prev = process.env.DEEPINFRA_API_KEY;
+    const prevFile = process.env.DEEPINFRA_API_KEY_FILE;
+    try {
+      delete process.env.DEEPINFRA_API_KEY;
+      delete process.env.DEEPINFRA_API_KEY_FILE;
+      const without = codexSessionOptions(session).modelOptions.map(o => o.value);
+      expect(without.some(v => v.startsWith('deepseek-ai/'))).toBe(false);
+
+      process.env.DEEPINFRA_API_KEY = 'sk-test';
+      const withKey = codexSessionOptions(session).modelOptions;
+      expect(withKey.map(o => o.value)).toContain('deepseek-ai/DeepSeek-V4.1-Flash');
+      // Config default stays last.
+      expect(withKey.at(-1).value).toBe('default');
+    } finally {
+      if (prev === undefined) delete process.env.DEEPINFRA_API_KEY; else process.env.DEEPINFRA_API_KEY = prev;
+      if (prevFile === undefined) delete process.env.DEEPINFRA_API_KEY_FILE; else process.env.DEEPINFRA_API_KEY_FILE = prevFile;
+    }
+  });
 });

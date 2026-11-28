@@ -196,7 +196,7 @@ describe('index.js child spawns are scoped', () => {
       expect(m).not.toBeNull();
       expect(m[1]).toMatch(/journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE/);
     }
-    const codex = indexSrc.match(/env: buildCodexSpawnEnv\(\{([^}]*)\}\)/);
+    const codex = indexSrc.match(/buildCodexSpawnEnv\(\{([^}]*)\}\)/);
     expect(codex).not.toBeNull();
     expect(codex[1]).toMatch(/appServer: CODEX_APP_SERVER/);
     expect(codex[1]).toMatch(/journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE/);

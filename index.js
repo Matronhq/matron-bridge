@@ -297,6 +297,7 @@ import { codexMcpConfig } from './lib/codex-mcp.js';
 import { toolRoleFor } from './lib/tool-roles.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
+import { deepseekKeyEnv } from './lib/deepseek-provider.js';
 import { createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
@@ -3328,14 +3329,19 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
     // Journal token stripped on app-server, kept on legacy exec for its /items
     // HTTP fallback (see buildCodexSpawnEnv).
-    env: buildCodexSpawnEnv({
+    // DEEPINFRA_API_KEY is placed whenever a key is configured on the box (not
+    // gated on this session's model), so a later switch onto a DeepSeek model
+    // can authenticate — the app-server child's env is fixed when it spawns. The
+    // provider itself is selected per-thread from the current model, in
+    // CodexAppServerSession.ensureThread (lib/codex-app-session.js).
+    env: { ...buildCodexSpawnEnv({
       roomId,
       convoId: codexJournalConvoId,
       apiPort: API_PORT,
       appServer: CODEX_APP_SERVER,
       journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
       apiHeaderFile: apiHeaderFileFor(roomId),
-    }),
+    }), ...deepseekKeyEnv(process.env) },
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId),
       toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true }) }) : {},

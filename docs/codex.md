@@ -152,6 +152,8 @@ The Codex-specific `.env` settings are:
 | `MATRON_CODEX_TRANSPORT` | `app-server`, or `exec` for legacy rollback without native interactive features | `app-server` |
 | `CODEX_NETWORK_ACCESS` | Command network access in workspace-write mode: `true` or `false`; empty inherits Codex configuration | unset |
 | `BRIDGE_CODEX_MD_PATH` | Developer-instructions file supplied to bridge-spawned Codex turns | repository `BRIDGE_CODEX.md` |
+| `DEEPINFRA_API_KEY` | DeepInfra API key that enables the DeepSeek models (see below). Unset hides them | unset |
+| `DEEPINFRA_API_KEY_FILE` | Path to a file holding the DeepInfra key, used when `DEEPINFRA_API_KEY` is not set | unset |
 
 Example:
 
@@ -165,6 +167,12 @@ BRIDGE_CODEX_MD_PATH=
 These values are read when the bridge starts. Restart the bridge after changing them. An invalid sandbox value is normalized to `workspace-write`.
 
 Codex still loads its normal configuration for the bridge user's account. Put model defaults, reasoning effort, MCP servers, skills, and network settings in that user's Codex configuration. `BRIDGE_CODEX.md` adds remote-operation guidance; replace it or point `BRIDGE_CODEX_MD_PATH` elsewhere if the deployment needs different instructions.
+
+### DeepSeek models (via DeepInfra)
+
+DeepSeek runs through the Codex agent pointed at [DeepInfra](https://deepinfra.com)'s OpenAI-compatible endpoint, which hosts the DeepSeek models. There is no separate agent: a session whose model is a DeepSeek id runs on DeepSeek with the same sandboxing, tools and tracker as any Codex session.
+
+To enable it on a box, give the bridge a DeepInfra key — either `DEEPINFRA_API_KEY=<key>` in the bridge `.env`, or `DEEPINFRA_API_KEY_FILE=/path/to/keyfile` pointing at a file that holds only the key. Restart the bridge. The DeepSeek models then appear in the Codex model picker (`/model` and the apps), and a session that selects one authenticates to DeepInfra with that key. With no key configured the models are hidden, so the option only shows where it would work. `lib/deepseek-provider.js` holds the model list, the provider config and the key resolution; Codex reaches DeepInfra over the Responses API.
 
 ## Sandbox and approvals
 
