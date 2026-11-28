@@ -122,6 +122,6 @@ describe('Codex sessions get the same role', () => {
   });
   it('index.js passes the session role to the Codex MCP config (source inspection)', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-    expect(src).toContain('toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true })');
+    expect(src).toContain('toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true }) }) : {},');
   });
 });

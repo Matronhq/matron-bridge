@@ -613,7 +613,7 @@ describe('index.js wiring', () => {
     const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
     expect(body).toContain('extras: isCodex && !CODEX_APP_SERVER ? [] : effectiveExtras(session.mcpExtras ?? [], DEFAULT_MCP_EXTRAS).filter(');
     // ...and legacy exec really gets no MCP config, which is why [].
-    expect(src).toContain('config: CODEX_APP_SERVER ? { ...codexMcpConfig({');
+    expect(src).toContain('config: CODEX_APP_SERVER ? codexMcpConfig({');
   });
 
   it.each([

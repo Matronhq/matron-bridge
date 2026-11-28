@@ -7,7 +7,7 @@ import {
   deepseekConfigOverrides,
   deepseekApiKey,
   deepseekAvailable,
-  deepseekSpawnEnv,
+  deepseekKeyEnv,
   deepseekModelOptions,
   DEEPSEEK_MODELS,
   DEEPINFRA_BASE_URL,
@@ -79,16 +79,12 @@ describe('deepseekAvailable', () => {
   });
 });
 
-describe('deepseekSpawnEnv', () => {
-  it('injects the key for a DeepSeek model when configured', () => {
-    expect(deepseekSpawnEnv('deepseek-ai/DeepSeek-V3.2', { [DEEPINFRA_ENV_KEY]: 'sk-x' }))
-      .toEqual({ [DEEPINFRA_ENV_KEY]: 'sk-x' });
+describe('deepseekKeyEnv', () => {
+  it('injects the key whenever one is configured, regardless of model', () => {
+    expect(deepseekKeyEnv({ [DEEPINFRA_ENV_KEY]: 'sk-x' })).toEqual({ [DEEPINFRA_ENV_KEY]: 'sk-x' });
   });
-  it('is empty for a non-DeepSeek model even when a key is present', () => {
-    expect(deepseekSpawnEnv('gpt-5-codex', { [DEEPINFRA_ENV_KEY]: 'sk-x' })).toEqual({});
-  });
-  it('is empty for a DeepSeek model when no key is configured', () => {
-    expect(deepseekSpawnEnv('deepseek-ai/DeepSeek-V3.2', {})).toEqual({});
+  it('is empty when no key is configured', () => {
+    expect(deepseekKeyEnv({})).toEqual({});
   });
 });
 
@@ -103,12 +99,13 @@ describe('deepseekModelOptions', () => {
   });
 });
 
-describe('index.js wiring (source inspection)', () => {
-  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  it('merges the DeepInfra provider config into the Codex session config', () => {
-    expect(src).toContain('...deepseekConfigOverrides(model) }');
+describe('wiring (source inspection)', () => {
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const sessionSrc = readFileSync(new URL('../lib/codex-app-session.js', import.meta.url), 'utf8');
+  it('places the DeepInfra key in every Codex session env (so a mid-session switch works)', () => {
+    expect(indexSrc).toContain('...deepseekKeyEnv(process.env) }');
   });
-  it('adds the DeepInfra key to the Codex session env for a DeepSeek model', () => {
-    expect(src).toContain('...deepseekSpawnEnv(model, process.env) }');
+  it('selects the DeepInfra provider per-thread from the current model in ensureThread', () => {
+    expect(sessionSrc).toContain('...deepseekConfigOverrides(model),');
   });
 });
