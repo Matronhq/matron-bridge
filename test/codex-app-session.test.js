@@ -258,33 +258,59 @@ describe('native Codex session lifecycle', () => {
 });
 
 describe('DeepSeek provider selection (ensureThread)', () => {
-  const settle2 = () => new Promise(resolve => setImmediate(resolve));
-  function build(options = {}) {
-    const clients = [];
-    const session = new CodexAppServerSession({ cwd: '/workspace', ...options, clientFactory: () => {
-      const client = new FakeClient(); clients.push(client); return client;
-    } });
-    return { session, clients };
-  }
+  const allCalls = clients => clients.flatMap(c => c.request.mock.calls);
+  const threadBuilds = (clients, method) => allCalls(clients).filter(([m]) => m === method);
 
   it('routes a DeepSeek model to the DeepInfra provider at thread start', async () => {
-    const h = build({ model: 'deepseek-ai/DeepSeek-V4.1-Flash' });
-    h.session.send([{ type: 'text', text: 'hi' }]); await settle2();
-    const params = h.clients[0].request.mock.calls.find(([method]) => method === 'thread/start')[1];
+    const h = setup({ model: 'deepseek-ai/DeepSeek-V4.1-Flash' });
+    h.send(); await settle();
+    const params = threadBuilds(h.clients, 'thread/start')[0][1];
     expect(params.model).toBe('deepseek-ai/DeepSeek-V4.1-Flash');
     expect(params.config.model_provider).toBe('deepinfra');
     expect(params.config.model_providers.deepinfra).toMatchObject({
       base_url: expect.stringContaining('deepinfra'), env_key: 'DEEPINFRA_API_KEY', wire_api: 'responses',
     });
-    h.session.kill();
+    h.complete(); h.session.kill();
   });
 
   it('leaves a normal Codex model on the default provider', async () => {
-    const h = build({ model: 'gpt-5-codex' });
-    h.session.send([{ type: 'text', text: 'hi' }]); await settle2();
-    const params = h.clients[0].request.mock.calls.find(([method]) => method === 'thread/start')[1];
+    const h = setup({ model: 'gpt-5-codex' });
+    h.send(); await settle();
+    const params = threadBuilds(h.clients, 'thread/start')[0][1];
     expect(params.config).not.toHaveProperty('model_provider');
     expect(params.config).not.toHaveProperty('model_providers');
-    h.session.kill();
+    h.complete(); h.session.kill();
+  });
+
+  it('starts a fresh thread when a model switch changes provider', async () => {
+    const h = setup({ model: 'gpt-5-codex' });
+    h.send(); await settle(); h.complete();
+    h.session.model = 'deepseek-ai/DeepSeek-V4.1-Flash';
+    h.send(); await settle();
+    const starts = threadBuilds(h.clients, 'thread/start');
+    expect(starts).toHaveLength(2); // one at start, one fresh after the provider change
+    const switched = starts[1][1];
+    expect(switched.config.model_provider).toBe('deepinfra');
+    expect(switched).not.toHaveProperty('threadId'); // fresh start, not a cross-provider resume
+    h.complete(); h.session.kill();
+  });
+
+  it('resumes the same thread when a model switch keeps the provider', async () => {
+    const h = setup({ model: 'gpt-5-codex' });
+    h.send(); await settle(); h.complete();
+    h.session.model = 'gpt-5.1-codex';
+    h.send(); await settle();
+    expect(threadBuilds(h.clients, 'thread/start')).toHaveLength(1);
+    expect(threadBuilds(h.clients, 'thread/resume')).toHaveLength(1);
+    h.complete(); h.session.kill();
+  });
+
+  it('resumes a persisted DeepSeek thread without starting fresh', async () => {
+    const h = setup({ model: 'deepseek-ai/DeepSeek-V4.1-Flash', threadId: 'saved' });
+    h.send(); await settle();
+    expect(threadBuilds(h.clients, 'thread/start')).toHaveLength(0);
+    const resume = threadBuilds(h.clients, 'thread/resume')[0][1];
+    expect(resume.config.model_provider).toBe('deepinfra');
+    h.complete(); h.session.kill();
   });
 });
