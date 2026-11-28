@@ -297,6 +297,7 @@ import { codexMcpConfig } from './lib/codex-mcp.js';
 import { toolRoleFor } from './lib/tool-roles.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
+import { deepseekConfigOverrides, deepseekSpawnEnv } from './lib/deepseek-provider.js';
 import { createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
@@ -3328,17 +3329,22 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
     // Journal token stripped on app-server, kept on legacy exec for its /items
     // HTTP fallback (see buildCodexSpawnEnv).
-    env: buildCodexSpawnEnv({
+    // A DeepSeek model adds DEEPINFRA_API_KEY so Codex can authenticate to the
+    // DeepInfra provider; nothing is added for any other model.
+    env: { ...buildCodexSpawnEnv({
       roomId,
       convoId: codexJournalConvoId,
       apiPort: API_PORT,
       appServer: CODEX_APP_SERVER,
       journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
       apiHeaderFile: apiHeaderFileFor(roomId),
-    }),
-    config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
+    }), ...deepseekSpawnEnv(model, process.env) },
+    // A DeepSeek model merges the DeepInfra provider table into the config so
+    // the app-server routes the turn to DeepInfra; {} for any other model.
+    config: CODEX_APP_SERVER ? { ...codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId),
-      toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true }) }) : {},
+      toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true }) }),
+      ...deepseekConfigOverrides(model) } : {},
   });
   codex.planMode = CODEX_APP_SERVER && persisted?.codexPlanMode === true;
 
