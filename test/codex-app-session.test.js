@@ -313,4 +313,15 @@ describe('DeepSeek provider selection (ensureThread)', () => {
     expect(resume.config.model_provider).toBe('deepinfra');
     h.complete(); h.session.kill();
   });
+
+  it('starts fresh when a resumed thread is switched to another provider before the first turn', async () => {
+    const h = setup({ model: 'deepseek-ai/DeepSeek-V4.1-Flash', threadId: 'saved' });
+    h.session.model = 'gpt-5-codex'; // provider change before any turn runs
+    h.send(); await settle();
+    expect(threadBuilds(h.clients, 'thread/resume')).toHaveLength(0);
+    const start = threadBuilds(h.clients, 'thread/start')[0][1];
+    expect(start).not.toHaveProperty('threadId'); // fresh, not a cross-provider resume
+    expect(start.config).not.toHaveProperty('model_provider'); // back to the default provider
+    h.complete(); h.session.kill();
+  });
 });
